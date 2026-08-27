@@ -13,6 +13,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -50,10 +52,20 @@ func newDiscoveryCache(ttl time.Duration, httpc *http.Client) *discoveryCache {
 	return &discoveryCache{ttl: ttl, entries: map[string]*discoveryEntry{}, httpc: httpc}
 }
 
+// cacheKey binds a cached tools/list to BOTH the upstream and the credential it was
+// fetched with. Keying on the URL alone leaks one caller's view of the tools — and so
+// their mappings — to every other caller for the whole TTL, whenever an MCP server
+// tailors tools/list per caller. The credential is hashed, never stored.
+func cacheKey(upstreamURL, authorization string) string {
+	sum := sha256.Sum256([]byte(authorization))
+	return upstreamURL + "\x00" + base64.RawURLEncoding.EncodeToString(sum[:8])
+}
+
 // lookup returns the COAZ view of one tool on the given MCP upstream.
 func (d *discoveryCache) lookup(ctx context.Context, upstreamURL, authorization, toolName string) (*discoveredTool, error) {
+	key := cacheKey(upstreamURL, authorization)
 	d.mu.Lock()
-	entry, ok := d.entries[upstreamURL]
+	entry, ok := d.entries[key]
 	fresh := ok && time.Since(entry.fetchedAt) < d.ttl
 	d.mu.Unlock()
 
@@ -63,11 +75,11 @@ func (d *discoveryCache) lookup(ctx context.Context, upstreamURL, authorization,
 		d.mu.Lock()
 		// keep serving a previous good entry if the refresh failed
 		if err != nil {
-			if prev, ok := d.entries[upstreamURL]; ok && prev.err == nil {
+			if prev, ok := d.entries[key]; ok && prev.err == nil {
 				entry = prev
 			}
 		}
-		d.entries[upstreamURL] = entry
+		d.entries[key] = entry
 		d.mu.Unlock()
 	}
 	if entry.err != nil {

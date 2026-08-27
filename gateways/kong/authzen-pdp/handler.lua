@@ -281,7 +281,13 @@ function AuthzenPDP:access(conf)
           },
           body = raw_body,
         }),
-        headers = { ["Content-Type"] = "application/json" },
+        headers = {
+          ["Content-Type"] = "application/json",
+          -- Matches CHECK_API_TOKEN on the coaz-pep side. That endpoint takes a
+          -- caller-supplied upstream URL and relays a caller-supplied Authorization
+          -- header, so it authenticates its callers.
+          ["Authorization"] = conf.coaz_api_key and ("Bearer " .. conf.coaz_api_key) or nil,
+        },
       })
       if not cres or cres.status ~= 200 then
         kong.log.err("coaz-pep engine call failed: ", cerr or (cres and cres.status))
@@ -362,7 +368,7 @@ function AuthzenPDP:access(conf)
       ["Content-Type"] = "application/json",
       ["Authorization"] = "Bearer " .. (conf.authzen_api_key or ""),
     },
-    ssl_verify = false,
+    ssl_verify = conf.pdp_ssl_verify ~= false,
   })
 
   -- 4) enforce (fail closed on PDP error)

@@ -63,16 +63,41 @@ func main() {
 		}),
 	}
 
-	// HTTP check API (Kong et al.)
+	// HTTP check API (Kong et al.).
+	//
+	// This endpoint takes a caller-supplied mcp_upstream_url AND a caller-supplied
+	// authorization header, then fetches that URL with that header. Left open, it is an
+	// SSRF and credential-relay primitive, so it takes two guards: a shared secret and
+	// an upstream allowlist. Both warn loudly when unset rather than silently failing
+	// open, because an operator who has not configured them should know.
+	checkToken := os.Getenv("CHECK_API_TOKEN")
+	if checkToken == "" {
+		log.Printf("WARNING: CHECK_API_TOKEN is unset — the HTTP check API on :%s is "+
+			"UNAUTHENTICATED. Set it, or keep the port off any untrusted network.", httpPort)
+	}
+	srv.upstreamAllowlist = parseAllowlist(os.Getenv("MCP_UPSTREAM_ALLOWLIST"))
+	if len(srv.upstreamAllowlist) == 0 {
+		log.Printf("WARNING: MCP_UPSTREAM_ALLOWLIST is unset — any caller-supplied " +
+			"mcp_upstream_url will be fetched server-side. Set it to the MCP servers you govern.")
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/mcp/check", srv.handleHTTPCheck)
+	mux.HandleFunc("/v1/mcp/check", requireCheckToken(checkToken, srv.handleHTTPCheck))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	httpSrv := &http.Server{
+		Addr:              envOr("HTTP_ADDR", "") + ":" + httpPort,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // Slowloris
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
-		log.Printf("coaz-pep HTTP check API listening on :%s", httpPort)
-		if err := http.ListenAndServe(":"+httpPort, mux); err != nil {
+		log.Printf("coaz-pep HTTP check API listening on %s", httpSrv.Addr)
+		if err := httpSrv.ListenAndServe(); err != nil {
 			log.Fatal(err)
 		}
 	}()

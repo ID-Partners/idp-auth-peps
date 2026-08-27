@@ -35,9 +35,15 @@ return {
           -- (discovery from tools/list, CEL evaluation, JSON-RPC errors) by
           -- the shared engine — one spec implementation for every gateway.
           { coaz_url = { type = "string" } },
+          -- Shared secret for the engine's HTTP check API (its CHECK_API_TOKEN).
+          { coaz_api_key = { type = "string", referenceable = true } },
           -- The MCP server whose tools/list declares the x-coaz-mapping
           -- objects (reached directly by the engine for discovery).
           { mcp_upstream_url = { type = "string" } },
+          -- TLS verification on the PDP and engine calls. Defaults to ON: a PEP that
+          -- silently accepts any certificate has no integrity on the decision it is
+          -- enforcing. Set false only for local development against self-signed certs.
+          { pdp_ssl_verify = { type = "boolean", default = true } },
         },
       },
     },

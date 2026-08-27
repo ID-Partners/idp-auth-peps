@@ -4,25 +4,54 @@
   "description": "AuthZEN 1.0 Policy Enforcement Point for Node — Express/Connect middleware for REST APIs and a COAZ (AuthZEN MCP profile) guard for MCP tools/call.",
   "license": "Apache-2.0",
   "type": "module",
-  "engines": { "node": ">=20" },
-  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".":          { "types": "./dist/index.d.ts",    "import": "./dist/index.js" },
-    "./express":  { "types": "./dist/express.d.ts",  "import": "./dist/express.js" },
-    "./mcp":      { "types": "./dist/mcp.d.ts",      "import": "./dist/mcp.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./express": {
+      "types": "./dist/express.d.ts",
+      "import": "./dist/express.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "keywords": ["authzen", "authorization", "pep", "pdp", "mcp", "coaz", "pingauthorize", "express", "middleware"],
-  "repository": { "type": "git", "url": "git+https://github.com/ID-Partners/idp-auth-peps.git", "directory": "sdk/node" },
+  "keywords": [
+    "authzen",
+    "authorization",
+    "pep",
+    "pdp",
+    "mcp",
+    "coaz",
+    "pingauthorize",
+    "express",
+    "middleware"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ID-Partners/idp-auth-peps.git",
+    "directory": "sdk/node"
+  },
   "devDependencies": {
+    "@types/node": "^20.16.0",
+    "@vitest/coverage-v8": "^2.1.9",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "@types/node": "^20.16.0"
+    "vitest": "^2.1.0"
   }
 }

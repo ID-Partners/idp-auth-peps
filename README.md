@@ -74,6 +74,9 @@ docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coa
 | `HTTP_PORT` | HTTP check API port | 9192 |
 | `COAZ_DISCOVERY_TTL` | `tools/list` cache TTL | 60s |
 | `PDP_TLS_INSECURE` | skip PDP TLS verification (dev only) | false |
+| `CHECK_API_TOKEN` | shared secret required on the HTTP check API | unset — **warns**, endpoint open |
+| `MCP_UPSTREAM_ALLOWLIST` | permitted `mcp_upstream_url` prefixes, comma-separated | unset — **warns**, any upstream fetched |
+| `HTTP_ADDR` | bind address for the check API | all interfaces |
 
 Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url` — is
 **per route**, and arrives as ext_authz `context_extensions` or the Kong plugin's config.

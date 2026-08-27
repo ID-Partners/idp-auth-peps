@@ -18,6 +18,13 @@ import (
 
 var celEnv = mustEnv()
 
+// Bounds on evaluating one mapping leaf. The limit is generous for the field access and
+// concatenation real mappings use, and far below anything that could stall a request.
+const (
+	celCostLimit               = 1_000_000
+	celInterruptCheckFrequency = 1_000
+)
+
 func mustEnv() *cel.Env {
 	env, err := cel.NewEnv(
 		cel.Variable("params", cel.DynType),
@@ -42,7 +49,12 @@ func compileExpr(src string) (*compiledExpr, error) {
 	if iss != nil && iss.Err() != nil {
 		return nil, fmt.Errorf("CEL expression %q failed to compile: %w", src, iss.Err())
 	}
-	prg, err := celEnv.Program(ast)
+	// Mappings arrive from a remote tools/list, so the programs are attacker-influenced.
+	// Cap evaluation cost and check for interruption, or a hostile upstream can wedge
+	// the PEP with an expensive expression.
+	prg, err := celEnv.Program(ast,
+		cel.CostLimit(celCostLimit),
+		cel.InterruptCheckFrequency(celInterruptCheckFrequency))
 	if err != nil {
 		return nil, fmt.Errorf("CEL expression %q failed to plan: %w", src, err)
 	}
@@ -117,8 +129,8 @@ func (c *compiledExpr) eval(params, token map[string]any) (any, error) {
 // replaced by compiled CEL programs. Non-string leaves (numbers, booleans,
 // null) pass through as literals.
 type compiledNode struct {
-	expr    *compiledExpr           // set when the node is a CEL string leaf
-	literal any                     // set when the node is a non-string scalar
+	expr    *compiledExpr // set when the node is a CEL string leaf
+	literal any           // set when the node is a non-string scalar
 	object  map[string]*compiledNode
 	array   []*compiledNode
 }

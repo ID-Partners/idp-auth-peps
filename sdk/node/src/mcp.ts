@@ -107,6 +107,12 @@ export interface McpGuardOptions {
   delegate?: {
     /** Base URL of the coaz-pep HTTP check API, e.g. `http://coaz-pep:9192`. */
     url: string;
+    /**
+     * Shared secret for that endpoint — its `CHECK_API_TOKEN`. Set it: the endpoint
+     * takes a caller-supplied upstream URL and relays a caller-supplied Authorization
+     * header, so it authenticates its callers.
+     */
+    apiKey?: string;
     /** Per-route knobs, the same map the ext_authz `context_extensions` carries. */
     config?: Record<string, string>;
     timeoutMs?: number;
@@ -268,7 +274,10 @@ export class McpGuard {
     try {
       const res = await this.fetchImpl(`${d.url.replace(/\/+$/, '')}/v1/mcp/check`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...(d.apiKey ? { authorization: `Bearer ${d.apiKey}` } : {}),
+        },
         body: JSON.stringify({
           config: { pep_label: this.pep, style: 'mcp', ...d.config },
           method: raw.method ?? 'POST',
@@ -279,7 +288,8 @@ export class McpGuard {
         signal: controller.signal,
       });
       if (!res.ok) {
-        return this.fail(id, CODE_PDP_ERROR, 'pdp_error', `coaz-pep check returned ${res.status}`);
+        const hint = res.status === 401 ? ' (set delegate.apiKey to its CHECK_API_TOKEN)' : '';
+        return this.fail(id, CODE_PDP_ERROR, 'pdp_error', `coaz-pep check returned ${res.status}${hint}`);
       }
       const out = (await res.json()) as {
         decision?: boolean;

@@ -33,6 +33,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -83,6 +84,9 @@ type server struct {
 	authzenAPIKey string
 	httpc         *http.Client
 	coaz          *coaz.Engine
+	// upstreamAllowlist bounds which MCP servers a caller may point the PEP at.
+	// Empty means unrestricted — main() warns when that is so.
+	upstreamAllowlist []string
 }
 
 // ---------- CheckResponse builders ----------
@@ -220,7 +224,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 
 	// 2) DPoP sender-constraint binding (RFC 9449)
 	if conf.requireDpop {
-		if resp := checkDpop(pep, scheme, method, path, headers, claims); resp != nil {
+		if resp := checkDpop(pep, scheme, method, path, token, headers, claims); resp != nil {
 			return resp
 		}
 	}
@@ -228,6 +232,13 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	// 2b) COAZ (AuthZEN MCP profile): tools/call on an MCP route with a
 	//     declared upstream is evaluated per the tool's x-coaz-mapping.
 	if conf.style == "mcp" && conf.mcpUpstreamURL != "" && isToolsCall(body) {
+		// The upstream may be caller-supplied over the HTTP check API, so it is
+		// checked before anything fetches it.
+		if !upstreamAllowed(s.upstreamAllowlist, conf.mcpUpstreamURL) {
+			log.Printf("[%s] refusing mcp_upstream_url outside the allowlist: %s", pep, conf.mcpUpstreamURL)
+			return denySimple(pep, typev3.StatusCode_Forbidden, codes.PermissionDenied,
+				"Configured MCP upstream is not permitted by this PEP.", nil)
+		}
 		// Carry the logged-in USER's token claims (from X-User-Token) into the COAZ AuthZEN
 		// context — the x-coaz-mapping is derived from the AGENT's token + tool params and
 		// can't see them. The PDP checks these against the request:
@@ -428,8 +439,15 @@ func extractToken(auth string) (token, scheme string) {
 	return strings.TrimSpace(parts[1]), strings.ToLower(parts[0])
 }
 
-// checkDpop enforces the DPoP proof / cnf.jkt binding; nil means pass.
-func checkDpop(pep, scheme, method, path string, headers map[string]string, claims map[string]any) *authv3.CheckResponse {
+// dpopReplay tracks jti values already accepted, for the proof-acceptance window.
+var dpopReplay = newReplayCache(dpopMaxAge)
+
+// checkDpop enforces the DPoP proof (RFC 9449); nil means pass.
+//
+// Order matters. The cnf.jkt comparison is only meaningful AFTER the proof's signature
+// verifies under the JWK it carries — the JWK is public in every proof, so without that
+// step anyone who has observed one proof can mint proofs for a stolen token.
+func checkDpop(pep, scheme, method, path, accessToken string, headers map[string]string, claims map[string]any) *authv3.CheckResponse {
 	fail := func(reason string) *authv3.CheckResponse {
 		return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated, reason, nil)
 	}
@@ -442,29 +460,81 @@ func checkDpop(pep, scheme, method, path string, headers map[string]string, clai
 	}
 	phdr := jwtHeader(proof)
 	pclaims := jwtClaims(proof)
-	var jkt string
-	if jwk, ok := phdr["jwk"].(map[string]any); ok {
-		jkt = jwkThumbprint(jwk)
+	if phdr == nil || pclaims == nil {
+		return fail("DPoP proof is not a well-formed JWT.")
 	}
+	if typ := claimString(phdr, "typ"); typ != "dpop+jwt" {
+		return fail("DPoP proof typ header is not dpop+jwt.")
+	}
+	jwk, ok := phdr["jwk"].(map[string]any)
+	if !ok {
+		return fail("DPoP proof header carries no jwk.")
+	}
+	// A private-key member in the JWK means the client leaked its key; treat the proof
+	// as unusable rather than quietly accepting it.
+	for _, priv := range []string{"d", "p", "q", "dp", "dq", "qi", "k"} {
+		if _, present := jwk[priv]; present {
+			return fail("DPoP proof jwk contains private key material.")
+		}
+	}
+	alg := claimString(phdr, "alg")
+	if alg == "" || alg == "none" {
+		return fail("DPoP proof has no usable alg.")
+	}
+	if err := verifyProofSignature(proof, jwk, alg); err != nil {
+		return fail("DPoP proof signature is invalid: " + err.Error())
+	}
+
+	jkt := jwkThumbprint(jwk)
 	var cnfJkt string
 	if cnf, ok := claims["cnf"].(map[string]any); ok {
 		cnfJkt, _ = cnf["jkt"].(string)
 	}
-	if jkt == "" || cnfJkt == "" || jkt != cnfJkt {
+	if jkt == "" || cnfJkt == "" || !constantTimeEqual(jkt, cnfJkt) {
 		return fail("DPoP proof key does not match the token's cnf.jkt binding.")
 	}
 	if claimString(pclaims, "htm") != method {
 		return fail("DPoP proof htm does not match the request method.")
 	}
-	if pclaims["ath"] == nil {
+
+	// ath binds this proof to THIS access token. Presence alone is worthless: without
+	// the comparison a proof minted for any token replays against any other.
+	ath := claimString(pclaims, "ath")
+	if ath == "" {
 		return fail("DPoP proof missing ath (access-token hash).")
 	}
-	// htu is validated best-effort: hosts get rewritten behind platform
-	// proxies, so a mismatch is logged rather than fatal.
+	if accessToken == "" || !constantTimeEqual(ath, accessTokenHash(accessToken)) {
+		return fail("DPoP proof ath does not match the presented access token.")
+	}
+
+	// Freshness, then single-use. A proof with no iat, or one outside the window, is
+	// replayable indefinitely.
+	iat, ok := numericClaim(pclaims, "iat")
+	if !ok {
+		return fail("DPoP proof missing iat.")
+	}
+	now := time.Now()
+	age := now.Sub(time.Unix(int64(iat), 0))
+	if age > dpopMaxAge || age < -dpopMaxAge {
+		return fail("DPoP proof iat is outside the acceptance window.")
+	}
+	if !dpopReplay.observe(claimString(pclaims, "jti"), now) {
+		return fail("DPoP proof jti is missing or has already been used.")
+	}
+
+	// htu is compared best-effort: hosts get rewritten behind platform proxies, so a
+	// path mismatch is logged rather than fatal. The ath + jti + signature checks above
+	// are what actually bind the proof.
 	if htu := claimString(pclaims, "htu"); htu != "" && !strings.Contains(htu, path) {
 		log.Printf("[%s] DPoP htu path mismatch: %s", pep, htu)
 	}
 	return nil
+}
+
+// numericClaim reads a JSON number claim, which decodes as float64.
+func numericClaim(claims map[string]any, key string) (float64, bool) {
+	v, ok := claims[key].(float64)
+	return v, ok
 }
 
 // consentedPayment pulls the amount cap + destination account from the first

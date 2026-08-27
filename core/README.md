@@ -67,6 +67,9 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `HTTP_PORT` | HTTP check API port | 9192 |
 | `COAZ_DISCOVERY_TTL` | `tools/list` cache TTL | 60s |
 | `PDP_TLS_INSECURE` | skip PDP TLS verification (dev only) | false |
+| `CHECK_API_TOKEN` | shared secret required on the HTTP check API | unset — **warns**, endpoint open |
+| `MCP_UPSTREAM_ALLOWLIST` | permitted `mcp_upstream_url` prefixes, comma-separated | unset — **warns**, any upstream fetched |
+| `HTTP_ADDR` | bind address for the check API | all interfaces |
 
 Per-route knobs are not env — they arrive as ext_authz `context_extensions` or in the
 `config` object of an HTTP check. See [`../gateways/envoy/README.md`](../gateways/envoy/README.md).
@@ -77,3 +80,34 @@ The REST mapping is a direct port of `map_request` in the Kong plugin, so both g
 send the PDP identical requests. Its route patterns are a specific banking API's
 (`/customers/:id/accounts`, `/accounts/:id/balance`, …). Treat them as a worked example:
 for your own API, either extend the switch or run the Node SDK, whose mapping you supply.
+
+## Securing the HTTP check API
+
+The gRPC port takes its per-route config from the gateway's own configuration, which no
+external caller can influence. The HTTP check API is different: the **caller** supplies
+`config.mcp_upstream_url` *and* the `authorization` header, and the PEP then fetches that
+URL with that header. Unbounded, that is a server-side request forgery and
+credential-relay primitive.
+
+Two guards, both off by default so no existing deployment breaks silently — each logs a
+warning at startup when unset:
+
+```sh
+CHECK_API_TOKEN=…                                     # callers must present it as a bearer
+MCP_UPSTREAM_ALLOWLIST=http://bank-mcp:8090/mcp,…     # prefixes that may be fetched
+```
+
+Allowlist entries match on scheme + host + path prefix, compared against the *parsed*
+URL, so `https://mcp.example.com` does not admit `https://mcp.example.com.evil.test` or
+`https://mcp.example.com@evil.test`. Callers configure the secret with
+`coaz_api_key` (Kong) or `delegate.apiKey` (Node SDK).
+
+Set both in any environment where the port is reachable by anything you do not control.
+
+## DPoP
+
+The `cnf.jkt` comparison is only meaningful once the proof's **signature** verifies under
+the JWK the proof carries — that JWK is public in every proof, so on its own the
+thumbprint proves nothing. `checkDpop` verifies the JWS (ES256/384/512, RS/PS256/384/512),
+compares `ath` against SHA-256 of the presented access token, enforces an `iat` freshness
+window, and rejects a reused `jti`. See `dpop.go` and its tests.
