@@ -1,0 +1,240 @@
+package coaz
+
+// Engine ties discovery + mapping + PDP together: given one tools/call
+// JSON-RPC request and the caller's token claims, produce a Verdict with the
+// profile's JSON-RPC error semantics.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// PDPConfig locates the AuthZEN PDP (e.g. the Ping Authorize authzen-adapter).
+type PDPConfig struct {
+	// URL is the AuthZEN API base, e.g. http://authzen-adapter:8080 — the
+	// engine appends /access/v1/evaluation(s).
+	URL string
+	// APIKey is sent as a Bearer token to the PDP.
+	APIKey string
+	// HTTPClient overrides the default (10s timeout) client.
+	HTTPClient *http.Client
+}
+
+// Options configures an Engine.
+type Options struct {
+	PDP PDPConfig
+	// DiscoveryTTL bounds how long a tools/list snapshot is reused (default 60s).
+	DiscoveryTTL time.Duration
+	// DiscoveryHTTPClient overrides the client used for tools/list fetches.
+	DiscoveryHTTPClient *http.Client
+}
+
+type Engine struct {
+	pdp   PDPConfig
+	pdpc  *http.Client
+	disco *discoveryCache
+}
+
+func NewEngine(opts Options) *Engine {
+	ttl := opts.DiscoveryTTL
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	pdpc := opts.PDP.HTTPClient
+	if pdpc == nil {
+		pdpc = &http.Client{Timeout: 10 * time.Second}
+	}
+	return &Engine{
+		pdp:   opts.PDP,
+		pdpc:  pdpc,
+		disco: newDiscoveryCache(ttl, opts.DiscoveryHTTPClient),
+	}
+}
+
+// CheckToolCall runs the COAZ flow for one tools/call JSON-RPC request.
+//
+//	upstreamURL   — the MCP server whose tools/list declares the mappings
+//	authorization — the caller's Authorization header (reused for discovery)
+//	rpcBody       — the raw tools/call JSON-RPC request body
+//	tokenClaims   — decoded claims of the caller's access token
+//	extraContext  — gateway-supplied context the mapping can't derive (e.g. user_scope)
+func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any) Verdict {
+	var rpc struct {
+		ID     any            `json:"id"`
+		Method string         `json:"method"`
+		Params map[string]any `json:"params"`
+	}
+	if err := json.Unmarshal(rpcBody, &rpc); err != nil || rpc.Method != "tools/call" {
+		return Verdict{CoazTool: false, Decision: true, Reason: "not a tools/call request"}
+	}
+	toolName, _ := rpc.Params["name"].(string)
+	if toolName == "" {
+		return Verdict{CoazTool: false, Decision: true, Reason: "tools/call without a tool name"}
+	}
+
+	dt, err := e.disco.lookup(ctx, upstreamURL, authorization, toolName)
+	if err != nil {
+		// Cannot know whether the tool is COAZ — fail closed per the
+		// profile's PDP-communication semantics.
+		return Verdict{CoazTool: true, Decision: false,
+			Reason:       fmt.Sprintf("COAZ discovery failed: %v", err),
+			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization check unavailable: tool discovery failed")}
+	}
+	if dt == nil || !dt.tool.Coaz {
+		return Verdict{CoazTool: false, Decision: true, Reason: "tool is not COAZ-declared"}
+	}
+	if dt.mappingErr != nil {
+		return Verdict{CoazTool: true, Decision: false,
+			Reason:       fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr),
+			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr))}
+	}
+
+	built, err := dt.mapping.Build(rpc.Params, tokenClaims, extraContext)
+	if err != nil {
+		return Verdict{CoazTool: true, Decision: false,
+			Reason:       fmt.Sprintf("COAZ mapping error: %v", err),
+			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
+	}
+
+	out, err := e.evaluate(ctx, built)
+	if err != nil {
+		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
+			Reason:       fmt.Sprintf("PDP error: %v", err),
+			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
+	}
+	decision, reason := out.Decision, out.Reason
+	if !decision {
+		if out.IdentityReq {
+			// mDL identity-proofing gate (origination) — NOT a hard deny. Encode the
+			// requirement + doctype in the JSON-RPC error so the MCP client relays it as an
+			// identity challenge: the app pushes the customer's phone (CIBA), the approver
+			// opens the wallet app2app, the mDL is presented, and origination resumes.
+			doctype := out.IdentityDoctype
+			if doctype == "" {
+				doctype = "org.iso.18013.5.1.mDL"
+			}
+			msg := "identity_verification_required doctype=" + doctype
+			if reason != "" {
+				msg += " :: " + reason
+			}
+			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+				JSONRPCError: jsonRPCErrorData(rpc.ID, CodeDenied, msg, map[string]any{
+					"authz_challenge": AuthzChallenge{Type: "identity_proofing", Doctype: doctype,
+						Reason: reason, PEP: "mcp-edge"}})}
+		}
+		if out.StepUp {
+			scope := out.StepUpScope
+			if scope == "" {
+				scope = "banking:payments:transfer"
+			}
+			// RFC 9470 scope step-up — NOT a hard deny. Encode insufficient_scope + the scope in
+			// the JSON-RPC error message so the MCP client relays it as a scope challenge the app
+			// can turn into a RAR step-up (sign in + consent), rather than narrating a flat denial.
+			msg := "insufficient_scope scope=" + scope
+			if reason != "" {
+				msg += " :: " + reason
+			}
+			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+				JSONRPCError: jsonRPCErrorData(rpc.ID, CodeDenied, msg, map[string]any{
+					"authz_challenge": AuthzChallenge{Type: "resource_authorisation", Scope: scope,
+						Reason: reason, PEP: "mcp-edge"}})}
+		}
+		msg := "Access denied"
+		if reason != "" {
+			msg = "Access denied: " + reason
+		}
+		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+			JSONRPCError: jsonRPCError(rpc.ID, CodeDenied, msg)}
+	}
+	if reason == "" {
+		reason = "Permitted by policy."
+	}
+	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason}
+}
+
+// pdpOutcome carries the PDP decision plus the policy's challenge advice: the RFC 9470
+// scope step-up (payments) and/or the mDL identity-proofing requirement (origination).
+type pdpOutcome struct {
+	Decision        bool
+	Reason          string
+	StepUp          bool
+	StepUpScope     string
+	IdentityReq     bool
+	IdentityDoctype string
+}
+
+// evaluate POSTs the built request to the AuthZEN PDP and folds the
+// decision(s): every decision must be true for a permit.
+func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (pdpOutcome, error) {
+	var out pdpOutcome
+	endpoint := e.pdp.URL + "/access/v1/evaluation"
+	if built.Batch {
+		endpoint = e.pdp.URL + "/access/v1/evaluations"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(built.Body))
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if e.pdp.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+e.pdp.APIKey)
+	}
+	resp, err := e.pdpc.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return out, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, fmt.Errorf("PDP returned %d", resp.StatusCode)
+	}
+
+	type decision struct {
+		Decision bool `json:"decision"`
+		Context  *struct {
+			Reason           string `json:"reason"`
+			StepUpRequired   bool   `json:"step_up_required"`
+			StepUpScope      string `json:"step_up_scope"`
+			IdentityRequired bool   `json:"identity_proofing_required"`
+			IdentityDoctype  string `json:"identity_proofing_doctype"`
+		} `json:"context"`
+	}
+	fold := func(d decision) pdpOutcome {
+		o := pdpOutcome{Decision: d.Decision}
+		if d.Context != nil {
+			o.Reason, o.StepUp, o.StepUpScope = d.Context.Reason, d.Context.StepUpRequired, d.Context.StepUpScope
+			o.IdentityReq, o.IdentityDoctype = d.Context.IdentityRequired, d.Context.IdentityDoctype
+		}
+		return o
+	}
+	if !built.Batch {
+		var d decision
+		if err := json.Unmarshal(raw, &d); err != nil {
+			return out, fmt.Errorf("bad PDP response: %w", err)
+		}
+		return fold(d), nil
+	}
+	var batch struct {
+		Evaluations []decision `json:"evaluations"`
+	}
+	if err := json.Unmarshal(raw, &batch); err != nil {
+		return out, fmt.Errorf("bad PDP evaluations response: %w", err)
+	}
+	if len(batch.Evaluations) == 0 {
+		return out, fmt.Errorf("PDP evaluations response was empty")
+	}
+	for _, d := range batch.Evaluations {
+		if !d.Decision {
+			return fold(d), nil
+		}
+	}
+	return pdpOutcome{Decision: true}, nil
+}

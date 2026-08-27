@@ -1,0 +1,127 @@
+# Istio: attach coaz-pep as an external authorizer.
+#
+# Istio speaks the same `envoy.service.auth.v3.Authorization/Check` gRPC that
+# agentgateway and plain Envoy do, so the identical coaz-pep binary serves all three.
+# Four pieces are needed, in this order:
+#
+#   1. the deployment + service, so there is something to call;
+#   2. a MeshConfig extension provider naming it — that lives in the `istio` ConfigMap
+#      and cannot be expressed as a CRD (see README.md);
+#   3. an AuthorizationPolicy with `action: CUSTOM` selecting the workload to guard;
+#   4. an EnvoyFilter, IF you need per-route knobs — see the note at the bottom.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: authz
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coaz-pep
+  namespace: authz
+  labels: { app: coaz-pep }
+spec:
+  replicas: 2 # fail-closed puts this in the request path: do not run one
+  selector:
+    matchLabels: { app: coaz-pep }
+  template:
+    metadata:
+      labels: { app: coaz-pep }
+    spec:
+      containers:
+        - name: coaz-pep
+          image: ghcr.io/id-partners/coaz-pep:latest
+          ports:
+            - { name: grpc, containerPort: 9191 }
+            - { name: http, containerPort: 9192 }
+          env:
+            # The complete set the binary reads: AUTHZEN_URL (required), AUTHZEN_API_KEY,
+            # PORT, HTTP_PORT, COAZ_DISCOVERY_TTL, PDP_TLS_INSECURE. Everything else —
+            # style, require_token, require_dpop, mcp_upstream_url — is PER ROUTE and
+            # arrives as ext_authz context_extensions, not as env.
+            - name: AUTHZEN_URL
+              value: http://authzen-adapter.authz.svc.cluster.local:8080
+            - name: AUTHZEN_API_KEY
+              valueFrom:
+                secretKeyRef: { name: coaz-pep, key: authzen-api-key }
+            - name: COAZ_DISCOVERY_TTL
+              value: 60s
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coaz-pep
+  namespace: authz
+spec:
+  selector: { app: coaz-pep }
+  ports:
+    - { name: grpc, port: 9191, targetPort: 9191, appProtocol: grpc }
+    - { name: http, port: 9192, targetPort: 9192 }
+---
+# Guard one workload. `action: CUSTOM` hands the decision to the named provider;
+# `rules` narrows WHICH requests are sent for a decision, it does not decide them.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: bank-api-authzen
+  namespace: default
+spec:
+  selector:
+    matchLabels: { app: bank-api }
+  action: CUSTOM
+  provider:
+    # Must match the extensionProviders entry in the istio ConfigMap — see README.md.
+    name: coaz-pep
+  rules:
+    - to:
+        - operation:
+            notPaths: ['/healthz', '/metrics']
+---
+# Per-route knobs.
+#
+# AuthorizationPolicy has no field for ext_authz context_extensions, so with the three
+# resources above every request arrives at the PEP with the defaults: style=rest,
+# require_token=false, no COAZ. That is enough for a plain REST resource server whose
+# tokens are already validated by a RequestAuthentication.
+#
+# It is NOT enough for an MCP edge — `style` and `mcp_upstream_url` have no defaults that
+# could be right. Patch them in with an EnvoyFilter, or give the MCP edge its own
+# provider pointing at its own coaz-pep Service. This filter shows the first.
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: coaz-pep-context-mcp
+  namespace: default
+spec:
+  workloadSelector:
+    labels: { app: bank-mcp }
+  configPatches:
+    - applyTo: HTTP_ROUTE
+      match:
+        context: SIDECAR_INBOUND
+        routeConfiguration:
+          vhost:
+            route:
+              name: default
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_authz:
+              '@type': type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+              check_settings:
+                context_extensions:
+                  pep_label: 'PEP#1 (MCP edge)'
+                  style: mcp
+                  require_token: 'true'
+                  require_dpop: 'false'
+                  require_user_login: 'true'
+                  # Enables COAZ: the PEP discovers x-coaz-mapping from this server's
+                  # tools/list and authorises each tools/call against it.
+                  mcp_upstream_url: http://bank-mcp.default.svc.cluster.local:8090/mcp

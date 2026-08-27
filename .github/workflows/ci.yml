@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: core (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  sdk:
+    name: sdk/node
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/node
+    strategy:
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  kong:
+    name: gateways/kong (lua syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y luajit
+      - name: Check the plugin parses
+        run: |
+          for f in gateways/kong/authzen-pdp/*.lua; do
+            luajit -bl "$f" >/dev/null && echo "ok  $f"
+          done

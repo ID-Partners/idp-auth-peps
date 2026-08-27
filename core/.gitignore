@@ -1,0 +1,2 @@
+# compiled binary only — NOT cmd/coaz-pep/ (the old unanchored pattern hid the PEP service from git)
+/coaz-pep

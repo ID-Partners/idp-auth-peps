@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# agentgateway (solo.io) config TEMPLATE for the agentic-banking demo — the
+# drop-in alternative to the Kong gateway (see kong/kong.yml.template).
+#
+# The __PLACEHOLDER__ tokens are substituted at container start by
+# docker-entrypoint.sh from environment variables, so the same image works both
+# in docker-compose (hostnames like bank-mcp) and on Railway (*.railway.internal):
+#   __BANK_MCP_HOST__   e.g. bank-mcp:8090          or bank-mcp.railway.internal:8090
+#   __BANK_API_HOST__   e.g. bank-api:8070          or bank-api.railway.internal:8070
+#   __EXTAUTHZ_HOST__   e.g. coaz-pep:9191  or authzen-extauthz.railway.internal:9191
+#
+# One gateway fronts BOTH governed surfaces, each with its own PEP:
+#   PEP #1  agent -> agentgateway/mcp       -> bank-mcp/mcp   (MCP edge, coarse)
+#   PEP #2  mcp   -> agentgateway/bank/...  -> bank-api/...   (Resource Server, fine)
+#
+# The PEP itself is the authzen-extauthz extension (coaz-pep),
+# attached via agentgateway's Envoy-compatible extAuthz policy. The per-route
+# `context` map below is delivered to the extension as ext_authz
+# context_extensions — the same knobs as the Kong plugin's per-route config.
+#
+# require_dpop is "false" here so the pipeline can be brought up and tested with
+# plain bearer tokens; flip both to "true" to enforce the sender-constraint.
+
+binds:
+- port: 8000
+  listeners:
+  - protocol: HTTP
+    routes:
+    - name: mcp-route
+      matches:
+      - path:
+          pathPrefix: /mcp
+      policies:
+        extAuthz:
+          host: __EXTAUTHZ_HOST__
+          failureMode: deny   # fail closed if the PEP extension is unreachable
+          includeRequestBody:
+            # the PEP inspects JSON-RPC bodies (initialize handshake detection)
+            maxRequestBytes: 65536
+            allowPartialMessage: true
+          protocol:
+            grpc:
+              context:
+                pep_label: "PEP#1 (MCP edge)"
+                style: "mcp"
+                require_token: "true"
+                require_dpop: "false"
+                # Step-up: require a logged-in end user (X-User-Token). If absent,
+                # the gateway challenges (401 login_required) so the app forces a
+                # PF login.
+                require_user_login: "true"
+                # COAZ (OpenID AuthZEN MCP profile): tools/call on COAZ-declared
+                # tools is authorized per the tool's x-coaz-mapping, discovered
+                # from this MCP server's tools/list.
+                mcp_upstream_url: "http://__BANK_MCP_HOST__/mcp"
+      backends:
+      - host: __BANK_MCP_HOST__
+
+    - name: bank-route
+      matches:
+      - path:
+          pathPrefix: /bank
+      policies:
+        extAuthz:
+          host: __EXTAUTHZ_HOST__
+          failureMode: deny
+          includeRequestBody:
+            # the PEP inspects payment bodies (amount/accounts -> policy context)
+            maxRequestBytes: 65536
+            allowPartialMessage: true
+          protocol:
+            grpc:
+              context:
+                pep_label: "PEP#2 (Bank API edge)"
+                style: "rest"
+                require_token: "true"
+                require_dpop: "false"
+                # Step-up: a transfer requires the user to have consented to this
+                # scope. Missing -> 401 insufficient_scope, and the app steps
+                # The customer up at PingFederate.
+                stepup_scope: "banking:payments:transfer"
+                stepup_action: "make_payment"
+        # Kong's strip_path equivalent: /bank/payments -> /payments upstream
+        urlRewrite:
+          path:
+            prefix: /
+      backends:
+      - host: __BANK_API_HOST__
