@@ -70,6 +70,10 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `CHECK_API_TOKEN` | shared secret required on the HTTP check API | unset — **warns**, endpoint open |
 | `MCP_UPSTREAM_ALLOWLIST` | permitted `mcp_upstream_url` prefixes, comma-separated | unset — **warns**, any upstream fetched |
 | `HTTP_ADDR` | bind address for the check API | all interfaces |
+| `ACCESS_TOKEN_JWKS_URL` | JWKS for validating the access token | unset — **warns**, token decoded not verified |
+| `ACCESS_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` | — |
+| `USER_TOKEN_JWKS_URL` | JWKS for `X-User-Token` | falls back to the access-token JWKS |
+| `USER_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` for `X-User-Token` | issuer falls back to the access-token issuer |
 
 Per-route knobs are not env — they arrive as ext_authz `context_extensions` or in the
 `config` object of an HTTP check. See [`../gateways/envoy/README.md`](../gateways/envoy/README.md).
@@ -111,3 +115,56 @@ the JWK the proof carries — that JWK is public in every proof, so on its own t
 thumbprint proves nothing. `checkDpop` verifies the JWS (ES256/384/512, RS/PS256/384/512),
 compares `ath` against SHA-256 of the presented access token, enforces an `iat` freshness
 window, and rejects a reused `jti`. See `dpop.go` and its tests.
+
+## Token validation
+
+The COAZ-MCP binding: "The access token ... MUST be validated by the PEP before its
+claims are used. The PEP MUST verify the token signature, issuer, audience, and
+expiration." Decoding is not validating.
+
+That bites twice. The access token is the obvious case. The sharper one is
+**`X-User-Token`** — its claims feed `user_scope`, `user_acr`, `authorization_details`
+and the consented-amount cap, which are exactly the inputs the step-up and consent gates
+turn on. Unverified, a forged one walks through both.
+
+```sh
+ACCESS_TOKEN_JWKS_URL=https://as.example.com/jwks
+ACCESS_TOKEN_ISSUER=https://as.example.com
+ACCESS_TOKEN_AUDIENCE=https://api.example.com
+USER_TOKEN_JWKS_URL=…      # defaults to the access-token JWKS
+```
+
+Configured, a token that fails verification is a 401 (`invalid_token`) and an
+`X-User-Token` that fails yields **no** claims, so the gates it feeds close rather than
+open. Unconfigured, tokens are decoded as before and startup warns — which keeps an
+existing deployment running without silently shipping the bypass.
+
+Verification covers signature (ES256/384/512, RS/PS256/384/512), `exp`, `nbf`, `iss` and
+`aud`, rejects `alg: none`, and refuses a token whose `kid` is not in the JWKS. The JWKS
+is cached for 10 minutes and refreshed on an unknown `kid`, rate-limited to once every
+30s so bogus kids cannot be used to force traffic at the AS.
+
+## COAZ dialects
+
+`authzen-mcp-profile-1_0` was superseded on 2026-02-13 by the
+[COAZ Framework](https://openid.github.io/authzen/authzen-coaz-framework-1_0.html) and
+the [COAZ-MCP binding](https://openid.github.io/authzen/authzen-coaz-mcp-binding-1_0.html).
+Both dialects are supported; v2 is selected automatically.
+
+| | v1 (superseded) | v2 (current) |
+| --- | --- | --- |
+| declaration | `coaz: true` + `x-coaz-mapping` | `x-authzen-mapping` in `inputSchema` |
+| shape | flat subject/action/resource/context arrays, zipped by length | an **envelope**: exactly one of `evaluation` or `evaluations` |
+| expressions | every string is CEL (`'customer'` is a literal) | only `$`-prefixed strings are CEL; `$$` escapes; the rest are literals |
+| denial code | `-32401` | `-32001` |
+| subject | ≥1 subject/context field from the token | `subject.id` anchored to the token claim and **verified** against it |
+
+A tool carrying `x-authzen-mapping` is v2 whatever else it says; `coaz: true` selects v1
+only for tools that have not migrated. v1 tools keep getting `-32401`, because a client
+that string-matches on it should not break on upgrade.
+
+The v2 trust anchor is the one to understand: where `subject.id` is `$token.sub`, the PEP
+verifies the resolved value equals that claim, so an MCP server — the party being
+authorized — cannot assert a different subject. A mapping that sets `subject.id` from
+somewhere else is permitted but logged, because the identity is then asserted by the
+mapping author rather than anchored to the token.

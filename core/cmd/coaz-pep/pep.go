@@ -87,6 +87,33 @@ type server struct {
 	// upstreamAllowlist bounds which MCP servers a caller may point the PEP at.
 	// Empty means unrestricted — main() warns when that is so.
 	upstreamAllowlist []string
+	// accessValidator verifies the Authorization access token; userValidator verifies
+	// X-User-Token. Nil means "not configured": claims are decoded as before and
+	// main() warns. Non-nil means fail closed.
+	accessValidator *Validator
+	userValidator   *Validator
+}
+
+// userClaims returns the verified claims of the X-User-Token, or nil.
+//
+// These claims drive user_scope, user_acr, authorization_details and the consented
+// amount cap — the step-up and consent gates. A forged token here is a bypass of both,
+// so when a validator is configured a token that does not verify yields NO claims
+// rather than decoded ones.
+func (s *server) userClaims(ctx context.Context, headers map[string]string) map[string]any {
+	raw := headers["x-user-token"]
+	if raw == "" {
+		return nil
+	}
+	if s.userValidator == nil {
+		return jwtClaims(raw)
+	}
+	claims, err := s.userValidator.Validate(ctx, raw)
+	if err != nil {
+		log.Printf("X-User-Token rejected: %v", err)
+		return nil
+	}
+	return claims
 }
 
 // ---------- CheckResponse builders ----------
@@ -186,7 +213,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 
 	// 0) Step-up: require a logged-in END USER (RFC 9470 step-up challenge).
 	if conf.requireUserLogin {
-		uclaims := jwtClaims(headers["x-user-token"])
+		uclaims := s.userClaims(ctx, headers)
 		if claimString(uclaims, "sub") == "" {
 			log.Printf("[%s] 401 login_required %s %s", pep, method, path)
 			return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
@@ -208,7 +235,23 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 			"No access token presented to the gateway.", nil)
 	}
 
-	claims := jwtClaims(token)
+	// The binding: "The access token ... MUST be validated by the PEP before its claims
+	// are used." When a validator is configured this fails closed; when it is not, the
+	// token is decoded as before and main() has warned at startup.
+	var claims map[string]any
+	if s.accessValidator != nil && token != "" {
+		verified, err := s.accessValidator.Validate(ctx, token)
+		if err != nil {
+			log.Printf("[%s] access token rejected: %v", pep, err)
+			return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated,
+				"Access token failed validation.", map[string]string{
+					"WWW-Authenticate": `Bearer error="invalid_token"`,
+				})
+		}
+		claims = verified
+	} else {
+		claims = jwtClaims(token)
+	}
 	sub := claimString(claims, "sub")
 	act := actorSub(claims)
 	scope := scopeString(claims)
@@ -247,7 +290,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		//   authorization_details — the fine-grained RAR (RFC 9396) the customer consented to, carried
 		//                           in their rich JWT (userJwtATM emits it). Lets the policy verify
 		//                           THIS payment is within a consented RAR entry, not just the scope.
-		uclaims := jwtClaims(headers["x-user-token"])
+		uclaims := s.userClaims(ctx, headers)
 		extraContext := map[string]any{
 			"user_scope": scopeString(uclaims),
 			// The agent token's audience (RFC 8707 / FAPI 2.0): the token is minted for THIS
@@ -308,7 +351,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	//     COAZ/MCP path (PEP #1) sends, or a payment authorized at the MCP edge gets
 	//     re-challenged here at the Bank-API edge (PEP #2) because the RAR context is
 	//     missing → the payment fails downstream and the whole flow loops on step-up.
-	uclaims := jwtClaims(headers["x-user-token"])
+	uclaims := s.userClaims(ctx, headers)
 	m.ctx["user_scope"] = scopeString(uclaims)
 	// The agent token's audience (RFC 8707 / FAPI 2.0) — this token was minted for THIS
 	// resource. Forwarded so the policy can see + enforce that a token is audience-restricted.

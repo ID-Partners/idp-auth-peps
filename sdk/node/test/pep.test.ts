@@ -4,7 +4,7 @@ import { AuthzenClient } from '../src/client.js';
 import { toHttpChallenge } from '../src/challenge.js';
 import { claimsFromToken, extractClaims, hasScope, jwkThumbprint } from '../src/claims.js';
 import { authzenMiddleware, pathMapper, type PepRequest } from '../src/express.js';
-import { CODE_DENIED, CODE_MAPPING_ERROR, CODE_PDP_ERROR, McpGuard, buildRequest, evaluateExpression } from '../src/mcp.js';
+import { CODE_DENIED, CODE_DENIED_V2, CODE_MAPPING_ERROR, CODE_PDP_ERROR, McpGuard, buildRequest, buildRequestV2, evaluateExpression } from '../src/mcp.js';
 import type { ToolDefinition } from '../src/mcp.js';
 
 /** A fetch stub that answers the PDP with a fixed body. */
@@ -455,5 +455,128 @@ describe('McpGuard', () => {
     const out = await wrapped(call('make_payment', { payment_id: 'p1' }), { sub: 'u', client_id: 'c' });
     expect(handler).not.toHaveBeenCalled();
     expect((out as { error: { code: number } }).error.code).toBe(CODE_DENIED);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('COAZ v2 (current binding)', () => {
+  const specMapping = {
+    evaluation: {
+      subject: { type: 'identity', id: '$token.sub' },
+      action: { name: 'get_customer' },
+      resource: { type: 'customer', id: '$params.arguments.id' },
+      context: { agent: '$token.?client_id', case: '$params.arguments.case' },
+    },
+  } as const;
+
+  const token = { sub: 'alice@example.com', client_id: 'http://agentprovider.com/agent-app-id' };
+
+  it('builds the binding worked example', () => {
+    const built = buildRequestV2(
+      specMapping as never,
+      { name: 'get_customer', arguments: { id: 'cust-12345', case: 'case-67890' } },
+      token,
+    );
+    expect(built.batch).toBe(false);
+    expect(built.body).toEqual({
+      // Unprefixed strings are LITERALS in v2 — the whole point of the discriminator.
+      subject: { type: 'identity', id: 'alice@example.com' },
+      action: { name: 'get_customer' },
+      resource: { type: 'customer', id: 'cust-12345' },
+      context: { agent: 'http://agentprovider.com/agent-app-id', case: 'case-67890' },
+    });
+  });
+
+  it('treats $$ as an escaped literal $ and a mid-string $ as nothing special', () => {
+    const built = buildRequestV2(
+      { evaluation: { subject: { id: '$token.sub' }, context: { price: '$$9.99', note: 'a$b' } } } as never,
+      {},
+      token,
+    );
+    const ctx = (built.body as Record<string, Record<string, unknown>>)['context']!;
+    expect(ctx['price']).toBe('$9.99');
+    expect(ctx['note']).toBe('a$b');
+  });
+
+  it('rejects an envelope that is not exactly one of evaluation/evaluations', () => {
+    for (const bad of [{}, { subject: {} }, { evaluate: {} }, { evaluation: {}, evaluations: {} }]) {
+      expect(() => buildRequestV2(bad as never, {}, token)).toThrow();
+    }
+  });
+
+  it('does not fan out on a list value — the envelope alone decides', () => {
+    const built = buildRequestV2(
+      { evaluation: { subject: { id: '$token.sub' }, resource: { type: 'account', properties: { tags: ['x', 'y'] } } } } as never,
+      {},
+      token,
+    );
+    expect(built.batch).toBe(false);
+  });
+
+  it('rejects a subject inside an evaluations entry (identity smuggling)', () => {
+    expect(() =>
+      buildRequestV2(
+        {
+          evaluations: {
+            subject: { id: '$token.sub' },
+            evaluations: [{ subject: { id: 'someone-else' }, action: { name: 'debit' } }],
+          },
+        } as never,
+        {},
+        token,
+      ),
+    ).toThrow(/only the top-level subject/);
+  });
+
+  it('supplies the default token-anchored subject when the mapping omits one', () => {
+    const built = buildRequestV2({ evaluation: { resource: { type: 'customer', id: 'c1' } } } as never, {}, token);
+    expect((built.body as Record<string, Record<string, unknown>>)['subject']).toEqual({ id: 'alice@example.com' });
+  });
+
+  it('rejects an anchored subject the token cannot back', () => {
+    expect(() => buildRequestV2(specMapping as never, { arguments: {} }, { client_id: 'c' })).toThrow(/no sub claim/);
+  });
+
+  it('omits an absent optional claim rather than sending null', () => {
+    const built = buildRequestV2(specMapping as never, { arguments: {} }, { sub: 'alice@example.com' });
+    const ctx = (built.body as Record<string, Record<string, unknown>>)['context']!;
+    expect('agent' in ctx).toBe(false);
+  });
+
+  it('denies a v2 tool with -32001, not the non-conformant -32401', async () => {
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: pdp({ decision: false, context: { reason: 'no' } }) },
+      tools: [{ name: 'get_customer', inputSchema: { 'x-authzen-mapping': specMapping } } as never],
+    });
+    const v = await guard.checkToolCall({
+      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_customer', arguments: { id: 'c1' } } },
+      claims: token,
+    });
+    expect(v.allow).toBe(false);
+    expect(v.jsonRpcError?.error.code).toBe(CODE_DENIED_V2);
+    expect(v.jsonRpcError?.error.code).not.toBe(CODE_DENIED);
+  });
+
+  it('still emits -32401 for a tool declared against v1', async () => {
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: pdp({ decision: false, context: { reason: 'no' } }) },
+      tools: [
+        {
+          name: 'legacy',
+          coaz: true,
+          'x-coaz-mapping': {
+            subject: [{ type: "'user'", id: 'token.sub' }],
+            resource: [{ type: "'customer'", id: 'params.arguments.id' }],
+            context: [{ agent: 'token.client_id' }],
+          },
+        },
+      ],
+    });
+    const v = await guard.checkToolCall({
+      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'legacy', arguments: { id: 'c1' } } },
+      claims: token,
+    });
+    expect(v.jsonRpcError?.error.code).toBe(CODE_DENIED);
   });
 });

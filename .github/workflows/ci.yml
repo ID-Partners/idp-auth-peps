@@ -21,6 +21,8 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - run: go test ./...
+      - name: Coverage ratchet
+        run: ../scripts/coverage-gate.sh
 
   sdk:
     name: sdk/node
@@ -38,7 +40,7 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm install
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run test:coverage
       - run: npm run build
 
   kong:

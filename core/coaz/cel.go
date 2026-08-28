@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/cel-go/cel"
 	celast "github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/types"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -29,6 +30,10 @@ func mustEnv() *cel.Env {
 	env, err := cel.NewEnv(
 		cel.Variable("params", cel.DynType),
 		cel.Variable("token", cel.DynType),
+		// The binding's own default mappings use optional field selection
+		// (`$token.?client_id`) for claims that may be absent, so this is not optional
+		// for us: without it every default mapping fails to compile.
+		cel.OptionalTypes(),
 	)
 	if err != nil {
 		panic(err)
@@ -118,6 +123,15 @@ func (c *compiledExpr) eval(params, token map[string]any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CEL expression %q failed: %w", c.src, err)
 	}
+	// An optional (`?field`) evaluates to an optional value. An absent one becomes nil,
+	// which the caller drops from the request — a claim that is not there should not
+	// appear as an empty string the PDP might match on.
+	if opt, ok := out.(*types.Optional); ok {
+		if !opt.HasValue() {
+			return nil, nil
+		}
+		out = opt.GetValue()
+	}
 	native, err := out.ConvertToNative(reflect.TypeOf(&structpb.Value{}))
 	if err != nil {
 		return nil, fmt.Errorf("CEL expression %q produced an unconvertible value: %w", c.src, err)
@@ -178,6 +192,12 @@ func (n *compiledNode) eval(params, token map[string]any) (any, error) {
 			v, err := c.eval(params, token)
 			if err != nil {
 				return nil, err
+			}
+			// An absent optional (`$token.?client_id` on a token without one) resolves
+			// to nil and the key is dropped. Sending `"agent": null` would invite a
+			// policy to match on it as a value; an absent claim should simply be absent.
+			if v == nil {
+				continue
 			}
 			out[k] = v
 		}

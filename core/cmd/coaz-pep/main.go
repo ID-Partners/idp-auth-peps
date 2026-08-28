@@ -81,6 +81,28 @@ func main() {
 			"mcp_upstream_url will be fetched server-side. Set it to the MCP servers you govern.")
 	}
 
+	// Token validation. Configured -> fail closed; unconfigured -> decode and warn.
+	// X-User-Token is the sharper of the two: its claims drive the step-up and consent
+	// gates, so an unverified one is a bypass of both.
+	srv.accessValidator = NewValidator(ValidatorConfig{
+		JWKSURL:  os.Getenv("ACCESS_TOKEN_JWKS_URL"),
+		Issuer:   os.Getenv("ACCESS_TOKEN_ISSUER"),
+		Audience: os.Getenv("ACCESS_TOKEN_AUDIENCE"),
+	})
+	srv.userValidator = NewValidator(ValidatorConfig{
+		JWKSURL:  envOr("USER_TOKEN_JWKS_URL", os.Getenv("ACCESS_TOKEN_JWKS_URL")),
+		Issuer:   envOr("USER_TOKEN_ISSUER", os.Getenv("ACCESS_TOKEN_ISSUER")),
+		Audience: os.Getenv("USER_TOKEN_AUDIENCE"),
+	})
+	if srv.accessValidator == nil {
+		log.Printf("WARNING: ACCESS_TOKEN_JWKS_URL is unset — access tokens are DECODED, " +
+			"NOT VERIFIED. The COAZ-MCP binding requires validation before claims are used.")
+	}
+	if srv.userValidator == nil {
+		log.Printf("WARNING: no JWKS configured for X-User-Token — it is DECODED, NOT VERIFIED. " +
+			"Its claims drive the step-up and consent gates, so a forged one bypasses them.")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/mcp/check", requireCheckToken(checkToken, srv.handleHTTPCheck))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

@@ -40,15 +40,20 @@ export type {
 
 export {
   CODE_DENIED,
+  CODE_DENIED_V2,
   CODE_MAPPING_ERROR,
   CODE_PDP_ERROR,
   McpGuard,
   buildRequest,
+  buildRequestV2,
   evaluateExpression,
   jsonRpcError,
+  v2Expression,
 } from './mcp.js';
 export type {
+  AuthzenMapping,
   CoazMapping,
+  Dialect,
   JsonRpcErrorResponse,
   JsonRpcRequest,
   MappingElement,

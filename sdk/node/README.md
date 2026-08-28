@@ -54,24 +54,44 @@ path is how a PEP ends up confidently authorising the wrong thing.
 
 ## MCP
 
-Under the [AuthZEN MCP profile](https://github.com/openid/authzen/blob/main/profiles/authzen-mcp-profile-1_0.md)
-("COAZ") a tool declares how its call becomes an authorization question:
+Under [COAZ](https://openid.github.io/authzen/authzen-coaz-mcp-binding-1_0.html) a tool
+declares how its call becomes an authorization question, in its `inputSchema`:
 
 ```jsonc
 {
   "name": "make_payment",
-  "coaz": true,
-  "x-coaz-mapping": {
-    "subject":  [{ "type": "'user'",    "id": "token.sub" }],
-    "resource": [{ "type": "'payment'", "id": "params.arguments.payment_id" }],
-    "context":  [{ "agent": "token.client_id" }]
+  "inputSchema": {
+    "type": "object",
+    "properties": { "payment_id": { "type": "string" } },
+    "x-authzen-mapping": {
+      "evaluation": {
+        "subject":  { "type": "identity", "id": "$token.sub" },
+        "resource": { "type": "payment",  "id": "$params.arguments.payment_id" },
+        "context":  { "agent": "$token.?client_id" }
+      }
+    }
   }
 }
 ```
 
-Mapping leaves are expressions over two inputs: `params` (the JSON-RPC `params` member —
-so arguments live at `params.arguments.x`) and `token` (the caller's claims). Static
-values are string literals: `"'user'"`, not `"user"`.
+Three things to get right:
+
+- The **envelope** — exactly one of `evaluation` or `evaluations` — decides single vs
+  boxcar. A list value never causes a fan-out.
+- Only strings starting with **`$`** are expressions; everything else is a literal.
+  `"identity"` is the string `identity`; `$$` escapes a leading `$`.
+- `params` binds to the whole JSON-RPC `params` member, so arguments are at
+  `params.arguments.x`.
+
+`subject.id` is **trust-anchored**: where it resolves from `$token.sub`, the SDK verifies
+the resolved value equals that claim and raises a mapping error otherwise — an MCP server
+must not be able to name a subject other than the one the token authenticated. Omit
+`subject` and the default anchored subject is supplied for you.
+
+> **v1 tools still work.** A tool declaring the superseded `coaz: true` +
+> `x-coaz-mapping` is handled in the old dialect (every string is CEL, fields zip by
+> length) and keeps its `-32401` denial code. `x-authzen-mapping` wins wherever both
+> appear.
 
 ```ts
 import { McpGuard } from '@id-partners/authzen-pep/mcp';
@@ -101,27 +121,35 @@ Error codes are the profile's:
 
 | Code | When |
 | --- | --- |
-| `-32401` | the PDP denied — `error.data.authz_challenge` carries the remedy when there is one |
+| `-32001` | the PDP denied — `error.data.authz_challenge` carries the remedy when there is one |
 | `-32602` | the mapping could not be evaluated |
 | `-32603` | the PDP could not be reached — fail closed |
 
-Tools that do not declare `coaz: true` pass straight through; whatever governed them
-before still does.
+`-32001` is v2. Tools still declared against v1 get `-32401`, which the current binding
+calls out as non-conformant with JSON-RPC — kept only so a client that string-matches on
+it does not break on upgrade.
+
+A tool that declares no mapping in either dialect passes straight through; whatever
+governed it before still does.
 
 ### The CEL caveat
 
-The profile compiles mapping leaves as CEL. There is no credible CEL evaluator for Node,
-so this SDK implements a **documented subset** and refuses anything outside it with a
-`-32602` rather than guessing:
+COAZ compiles mapping leaves as CEL. There is no credible CEL evaluator for Node, so this
+SDK implements a **documented subset** and refuses anything outside it with a `-32602`
+rather than guessing:
 
 ```
 'literal'  "literal"        string literals
 123  1.5  true  false  null
 params.a.b   params["a"]    tool call params
 token.sub    token.act.sub  token claims
+token.?client_id            optional selection — the key is omitted when absent
 string(x)  int(x)  double(x)
 a + b + 'c'                 concatenation / addition
 ```
+
+Conditionals (`$token.roles.exists(r, r == 'treasury') ? 'a' : 'b'`), which the binding's
+own examples use, are outside the subset and raise `-32602`. Delegate those.
 
 For full CEL, hand the check to the Go engine in [`../../core`](../../core), which is
 exactly what the Kong plugin does and for the same reason:
@@ -173,6 +201,7 @@ every delegated call look direct. `jwkThumbprint` computes RFC 7638 for a DPoP c
 
 ```sh
 npm install
-npm test        # 30 tests, no network
+npm test        # 40 tests, no network
+npm run test:coverage   # same, with the ratchet enforced
 npm run build
 ```

@@ -85,16 +85,25 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			Reason:       fmt.Sprintf("COAZ discovery failed: %v", err),
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization check unavailable: tool discovery failed")}
 	}
-	if dt == nil || !dt.tool.Coaz {
+	if !dt.declared() {
 		return Verdict{CoazTool: false, Decision: true, Reason: "tool is not COAZ-declared"}
 	}
+	// The denial code differs per dialect, so it is resolved once here and used for
+	// every deny below.
+	deniedCode := dt.dialect.DeniedCode()
 	if dt.mappingErr != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr),
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr))}
 	}
 
-	built, err := dt.mapping.Build(rpc.Params, tokenClaims, extraContext)
+	// Both dialects produce the same BuiltRequest; only how they get there differs.
+	var built *BuiltRequest
+	if dt.mappingV2 != nil {
+		built, err = dt.mappingV2.Build(rpc.Params, tokenClaims, extraContext)
+	} else {
+		built, err = dt.mapping.Build(rpc.Params, tokenClaims, extraContext)
+	}
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("COAZ mapping error: %v", err),
@@ -123,7 +132,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 				msg += " :: " + reason
 			}
 			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
-				JSONRPCError: jsonRPCErrorData(rpc.ID, CodeDenied, msg, map[string]any{
+				JSONRPCError: jsonRPCErrorData(rpc.ID, deniedCode, msg, map[string]any{
 					"authz_challenge": AuthzChallenge{Type: "identity_proofing", Doctype: doctype,
 						Reason: reason, PEP: "mcp-edge"}})}
 		}
@@ -140,7 +149,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 				msg += " :: " + reason
 			}
 			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
-				JSONRPCError: jsonRPCErrorData(rpc.ID, CodeDenied, msg, map[string]any{
+				JSONRPCError: jsonRPCErrorData(rpc.ID, deniedCode, msg, map[string]any{
 					"authz_challenge": AuthzChallenge{Type: "resource_authorisation", Scope: scope,
 						Reason: reason, PEP: "mcp-edge"}})}
 		}
@@ -149,7 +158,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			msg = "Access denied: " + reason
 		}
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
-			JSONRPCError: jsonRPCError(rpc.ID, CodeDenied, msg)}
+			JSONRPCError: jsonRPCError(rpc.ID, deniedCode, msg)}
 	}
 	if reason == "" {
 		reason = "Permitted by policy."

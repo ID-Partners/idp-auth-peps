@@ -31,10 +31,29 @@ import { toChallenge } from './challenge.js';
 import type { PepClaims } from './claims.js';
 import type { EvaluationRequest, EvaluationsRequest, Verdict } from './types.js';
 
-/** JSON-RPC error codes the profile defines or adopts. */
+/**
+ * JSON-RPC error codes.
+ *
+ * v2 says of -32401: "a code outside that range, such as -32401, is non-conformant with
+ * JSON-RPC and MUST NOT be used". It is emitted only for tools still declared against
+ * the superseded v1 profile, whose clients may string-match on it.
+ */
+export const CODE_DENIED_V2 = -32001;
+/** @deprecated v1 only — superseded by {@link CODE_DENIED_V2}. */
 export const CODE_DENIED = -32401;
 export const CODE_MAPPING_ERROR = -32602;
 export const CODE_PDP_ERROR = -32603;
+
+/** Which COAZ draft a tool's mapping is written against. */
+export type Dialect = 'v1' | 'v2';
+
+/**
+ * A v2 mapping: an envelope with exactly one member naming the AuthZEN API to call.
+ * The envelope alone decides single vs boxcar — a list value never fans out.
+ */
+export type AuthzenMapping =
+  | { evaluation: Record<string, unknown>; evaluations?: never }
+  | { evaluations: Record<string, unknown>; evaluation?: never };
 
 /** One AuthZEN object as declared in a mapping: leaves are expressions. */
 export type MappingElement = Record<string, unknown>;
@@ -46,14 +65,26 @@ export interface CoazMapping {
   context: MappingElement[];
 }
 
-/** The subset of an MCP tools/list entry the guard needs. */
+/**
+ * The subset of an MCP tools/list entry the guard needs.
+ *
+ * v2 declares by putting `x-authzen-mapping` in the tool's `inputSchema`; there is no
+ * marker field. v1's `coaz: true` + `x-coaz-mapping` still works for tools that have not
+ * migrated. Both forms are accepted here; `x-authzen-mapping` wins where both appear.
+ */
 export interface ToolDefinition {
   name: string;
+  /** @deprecated v1 only. */
   coaz?: boolean;
+  /** @deprecated v1 only — superseded by `inputSchema['x-authzen-mapping']`. */
   'x-coaz-mapping'?: CoazMapping;
-  inputSchema?: Record<string, unknown>;
+  inputSchema?: Record<string, unknown> & { 'x-authzen-mapping'?: AuthzenMapping };
   [key: string]: unknown;
 }
+
+/** The token claim `subject.id` anchors to. */
+const SUBJECT_IDENTITY_CLAIM = 'sub';
+const DEFAULT_SUBJECT_EXPR = `$token.${SUBJECT_IDENTITY_CLAIM}`;
 
 /** A JSON-RPC 2.0 tools/call request. */
 export interface JsonRpcRequest {
@@ -175,24 +206,36 @@ export class McpGuard {
       return this.fail(id, CODE_PDP_ERROR, 'pdp_error', `Tool discovery failed: ${message(err)}`);
     }
 
-    if (!tool?.coaz) {
+    // v2 first: `x-authzen-mapping` in the inputSchema is the current declaration and
+    // has no marker field, so its presence is what selects the dialect. v1's
+    // `coaz: true` only still matters for tools that have not migrated.
+    const v2Mapping = tool?.inputSchema?.['x-authzen-mapping'];
+    const dialect: Dialect = v2Mapping ? 'v2' : 'v1';
+    const deniedCode = dialect === 'v2' ? CODE_DENIED_V2 : CODE_DENIED;
+
+    if (!v2Mapping && !tool?.coaz) {
       return {
         allow: true,
         coazTool: false,
-        verdict: { allow: true, kind: 'ok', reason: `${toolName} does not declare coaz:true` },
+        verdict: { allow: true, kind: 'ok', reason: `${toolName} declares no COAZ mapping` },
       };
     }
 
-    const mapping = tool['x-coaz-mapping'];
-    if (!mapping) {
-      return this.fail(id, CODE_MAPPING_ERROR, 'mapping_error', `${toolName} declares coaz:true but has no x-coaz-mapping`);
-    }
+    // `params` binds to the whole JSON-RPC params member, so mappings read
+    // `params.arguments.id` — matching the binding and the Go engine in core/.
+    const callParams = (rpc.params ?? {}) as Record<string, unknown>;
 
     let built: BuiltRequest;
     try {
-      // `params` binds to the whole JSON-RPC params member, so mappings read
-      // `params.arguments.id` — matching the profile and the Go engine in core/.
-      built = buildRequest(toolName, mapping, (rpc.params ?? {}) as Record<string, unknown>, token, args.extraContext);
+      if (v2Mapping) {
+        built = buildRequestV2(v2Mapping, callParams, token, args.extraContext);
+      } else {
+        const mapping = tool!['x-coaz-mapping'];
+        if (!mapping) {
+          return this.fail(id, CODE_MAPPING_ERROR, 'mapping_error', `${toolName} declares coaz:true but has no x-coaz-mapping`);
+        }
+        built = buildRequest(toolName, mapping, callParams, token, args.extraContext);
+      }
     } catch (err) {
       return this.fail(id, CODE_MAPPING_ERROR, 'mapping_error', message(err));
     }
@@ -206,7 +249,7 @@ export class McpGuard {
     if (verdict.allow) {
       return { allow: true, coazTool: true, verdict, pdpRequest: built.body };
     }
-    const code = verdict.kind === 'pdp_error' ? CODE_PDP_ERROR : CODE_DENIED;
+    const code = verdict.kind === 'pdp_error' ? CODE_PDP_ERROR : deniedCode;
     return {
       allow: false,
       coazTool: true,
@@ -362,6 +405,138 @@ interface BuiltRequest {
 }
 
 /**
+ * Build the AuthZEN request from a v2 `x-authzen-mapping`.
+ *
+ * Differences from v1 that matter: the envelope decides single vs boxcar (a list value
+ * never fans out), only `$`-prefixed strings are expressions, and `subject.id` is
+ * trust-anchored — where it resolves from the token's subject claim the PEP MUST verify
+ * the resolved value equals that claim, which is what stops the MCP server being
+ * authorized from naming a different subject.
+ */
+export function buildRequestV2(
+  mapping: AuthzenMapping,
+  params: Record<string, unknown>,
+  token: Record<string, unknown>,
+  extraContext?: Record<string, unknown>,
+): BuiltRequest {
+  const keys = Object.keys(mapping ?? {});
+  if (keys.length !== 1 || (keys[0] !== 'evaluation' && keys[0] !== 'evaluations')) {
+    throw new Error(
+      'mapping must have exactly one top-level member (`evaluation` or `evaluations`), got ' +
+        (keys.length ? keys.join(', ') : 'none'),
+    );
+  }
+  const envelope = keys[0] as 'evaluation' | 'evaluations';
+  const batch = envelope === 'evaluations';
+  const template = (mapping as Record<string, unknown>)[envelope];
+  if (!isObject(template)) throw new Error(`mapping envelope \`${envelope}\` must contain an object`);
+
+  // Identity smuggling: with the evaluations envelope the single top-level subject
+  // governs every entry, so an entry that sets its own subject is rejected.
+  if (batch && Array.isArray(template['evaluations'])) {
+    (template['evaluations'] as unknown[]).forEach((e, i) => {
+      if (isObject(e) && 'subject' in e) {
+        throw new Error(`evaluations[${i}] sets subject; only the top-level subject may do so`);
+      }
+    });
+  }
+
+  // Work on a copy: the default subject is supplied by mutation and the declaration is
+  // shared across calls.
+  const inner = structuredClone(template) as Record<string, unknown>;
+  const anchored = normaliseSubjectV2(inner);
+
+  const resolved = evaluateNodeV2(inner, params, token);
+  if (!isObject(resolved)) throw new Error('mapping did not resolve to an object');
+
+  if (anchored) {
+    const want = token[SUBJECT_IDENTITY_CLAIM];
+    const subject = resolved['subject'];
+    const got = isObject(subject) ? subject['id'] : undefined;
+    if (typeof want !== 'string' || want === '') {
+      throw new Error(`access token carries no ${SUBJECT_IDENTITY_CLAIM} claim to anchor subject.id to`);
+    }
+    if (got !== want) {
+      throw new Error(`subject.id ${JSON.stringify(got)} does not match the validated token's ${SUBJECT_IDENTITY_CLAIM} claim`);
+    }
+  }
+
+  if (extraContext && Object.keys(extraContext).length > 0) {
+    const ctx = isObject(resolved['context']) ? (resolved['context'] as Record<string, unknown>) : {};
+    for (const [k, v] of Object.entries(extraContext)) if (!(k in ctx)) ctx[k] = v;
+    resolved['context'] = ctx;
+  }
+
+  if (batch) {
+    const entries = resolved['evaluations'];
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error('evaluations envelope resolved to an empty evaluations array');
+    }
+  }
+  return { batch, body: resolved as unknown as EvaluationRequest | EvaluationsRequest };
+}
+
+/**
+ * Supply the default subject identifier where the mapping omits one, and report whether
+ * subject.id ends up anchored to the token's subject claim. Mutates `inner`.
+ */
+function normaliseSubjectV2(inner: Record<string, unknown>): boolean {
+  let subject = inner['subject'];
+  if (!isObject(subject)) {
+    if ('subject' in inner && subject !== undefined && subject !== null) {
+      throw new Error('subject must be an object');
+    }
+    subject = {};
+    inner['subject'] = subject;
+  }
+  const sub = subject as Record<string, unknown>;
+  const id = sub['id'];
+  if (id === undefined || id === null || id === '') {
+    // "the PEP MUST supply the default subject identifier ... so that every request
+    // still carries a token-anchored subject."
+    sub['id'] = DEFAULT_SUBJECT_EXPR;
+    return true;
+  }
+  if (typeof id !== 'string') throw new Error('subject.id must be a string');
+  // Anchored only when it IS the claim. `$token.sub + '-x'` is an override, not an
+  // anchor, and must not be verified as one.
+  return id.trim() === DEFAULT_SUBJECT_EXPR;
+}
+
+/** v2 node walk: only `$`-prefixed strings are expressions; everything else is literal. */
+function evaluateNodeV2(node: unknown, params: Record<string, unknown>, token: Record<string, unknown>): unknown {
+  if (typeof node === 'string') {
+    const expr = v2Expression(node);
+    return expr === null ? node.startsWith('$$') ? node.slice(1) : node : evaluateExpression(expr, params, token);
+  }
+  if (Array.isArray(node)) return node.map((n) => evaluateNodeV2(n, params, token));
+  if (isObject(node)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node)) {
+      const resolved = evaluateNodeV2(v, params, token);
+      // An absent optional (`$token.?client_id`) drops its key rather than sending null,
+      // which a policy might otherwise match on as a value.
+      if (resolved === undefined) continue;
+      out[k] = resolved;
+    }
+    return out;
+  }
+  return node;
+}
+
+/**
+ * The leading-`$` discriminator. Returns the expression source, or null for a literal.
+ *
+ *   "$token.sub" -> `token.sub`   "$$5.00" -> literal `$5.00`
+ *   "customer"   -> literal        "a$b"    -> literal (a `$` elsewhere means nothing)
+ */
+export function v2Expression(s: string): string | null {
+  if (!s.startsWith('$')) return null;
+  if (s.startsWith('$$')) return null;
+  return s.slice(1);
+}
+
+/**
  * Evaluate a mapping and assemble the AuthZEN request:
  *  - every field single-element -> the evaluation API, fields at the top level;
  *  - any field multi-element    -> the evaluations API, single-element fields sitting at
@@ -482,6 +657,7 @@ function evaluateNode(node: unknown, params: Record<string, unknown>, token: Rec
  *   123  1.5  true  false  null  scalars
  *   params.a.b   params["a"]    tool arguments
  *   token.sub    token.act.sub  token claims
+ *   token.?client_id            optional selection — undefined when absent
  *   string(x)  int(x)  double(x)
  *   a + b + 'c'                 concatenation / addition
  */
@@ -530,7 +706,7 @@ function evaluateTerm(term: string, params: Record<string, unknown>, token: Reco
     }
   }
 
-  const pathMatch = /^(params|token)((?:\.[A-Za-z_$][\w$]*|\[(?:'[^']*'|"[^"]*")\])*)$/.exec(term);
+  const pathMatch = /^(params|token)((?:\.\??[A-Za-z_$][\w$]*|\[(?:'[^']*'|"[^"]*")\])*)$/.exec(term);
   if (pathMatch) {
     const root = pathMatch[1] === 'params' ? params : token;
     return readPath(root, pathMatch[2] ?? '');
@@ -544,7 +720,7 @@ function evaluateTerm(term: string, params: Record<string, unknown>, token: Reco
 
 function readPath(root: Record<string, unknown>, accessors: string): unknown {
   let cur: unknown = root;
-  const re = /\.([A-Za-z_$][\w$]*)|\['([^']*)'\]|\["([^"]*)"\]/g;
+  const re = /\.\??([A-Za-z_$][\w$]*)|\['([^']*)'\]|\["([^"]*)"\]/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(accessors)) !== null) {
     const key = m[1] ?? m[2] ?? m[3] ?? '';

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -27,9 +28,17 @@ import (
 const mcpProtocolVersion = "2025-03-26"
 
 type discoveredTool struct {
-	tool       Tool
-	mapping    *CompiledMapping
-	mappingErr error // a broken declared mapping is a per-call -32602
+	tool    Tool
+	dialect Dialect
+	// exactly one of these is set, per dialect
+	mapping    *CompiledMapping   // v1
+	mappingV2  *CompiledMappingV2 // v2
+	mappingErr error              // a broken declared mapping is a per-call -32602
+}
+
+// declared reports whether this tool carries a COAZ mapping in either dialect.
+func (dt *discoveredTool) declared() bool {
+	return dt != nil && (dt.mapping != nil || dt.mappingV2 != nil || dt.mappingErr != nil)
 }
 
 type discoveryEntry struct {
@@ -113,7 +122,21 @@ func (d *discoveryCache) fetchTools(ctx context.Context, upstreamURL, authorizat
 			continue
 		}
 		dt := &discoveredTool{tool: t}
-		if t.Coaz {
+		// v2 first: a tool carrying x-authzen-mapping is declared against the current
+		// drafts, whatever else it says. The v1 `coaz: true` marker no longer exists,
+		// so its presence is the only thing that selects the superseded dialect.
+		if rawV2, ok := t.InputSchema["x-authzen-mapping"].(map[string]any); ok {
+			dt.dialect = DialectV2
+			dt.mappingV2, dt.mappingErr = CompileMappingV2(t.Name, rawV2)
+			if dt.mappingErr == nil && !dt.mappingV2.Anchored() {
+				// Not fatal — the binding permits it — but a gateway is enforcing a
+				// mapping the MCP server authored, and an unanchored subject means that
+				// server is asserting who the caller is.
+				log.Printf("coaz: tool %q sets subject.id from a source that cannot be "+
+					"verified against the token; its identity is asserted by the mapping author", t.Name)
+			}
+		} else if t.Coaz {
+			dt.dialect = DialectV1
 			rawMapping, ok := t.InputSchema["x-coaz-mapping"].(map[string]any)
 			if !ok {
 				dt.mappingErr = fmt.Errorf("tool %q declares coaz but inputSchema has no x-coaz-mapping object", t.Name)

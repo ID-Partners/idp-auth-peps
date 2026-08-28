@@ -15,8 +15,13 @@ const (
 	// CodeMappingError: the PEP could not construct a valid AuthZEN request
 	// from the x-coaz-mapping and the tools/call parameters (Invalid params).
 	CodeMappingError = -32602
-	// CodeDenied: the AuthZEN PDP returned a deny decision.
+	// CodeDenied: a deny under the SUPERSEDED v1 profile. v2 says of this value:
+	// "a code outside that range, such as -32401, is non-conformant with JSON-RPC and
+	// MUST NOT be used" — so it is emitted only for tools still declared against v1.
 	CodeDenied = -32401
+	// CodeDeniedV2: a deny under the current COAZ-MCP binding. Inside the JSON-RPC
+	// implementation-defined server-error range.
+	CodeDeniedV2 = -32001
 	// CodePDPError: the PEP could not complete the check (PDP unreachable /
 	// invalid response). Standard JSON-RPC internal error.
 	CodePDPError = -32603

@@ -41,7 +41,7 @@ human reading prose.
 
 ```
 core/                        Go: the COAZ engine + the coaz-pep service
-  coaz/                        AuthZEN MCP profile — discovery, CEL, processing rules
+  coaz/                        COAZ — discovery, CEL, envelopes, trust anchoring
   cmd/coaz-pep/                ext_authz gRPC (:9191) + HTTP check API (:9192)
 gateways/
   kong/authzen-pdp/            Kong Lua plugin
@@ -77,6 +77,10 @@ docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coa
 | `CHECK_API_TOKEN` | shared secret required on the HTTP check API | unset — **warns**, endpoint open |
 | `MCP_UPSTREAM_ALLOWLIST` | permitted `mcp_upstream_url` prefixes, comma-separated | unset — **warns**, any upstream fetched |
 | `HTTP_ADDR` | bind address for the check API | all interfaces |
+| `ACCESS_TOKEN_JWKS_URL` | JWKS for validating the access token | unset — **warns**, token decoded not verified |
+| `ACCESS_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` | — |
+| `USER_TOKEN_JWKS_URL` | JWKS for `X-User-Token` | falls back to the access-token JWKS |
+| `USER_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` for `X-User-Token` | issuer falls back to the access-token issuer |
 
 Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url` — is
 **per route**, and arrives as ext_authz `context_extensions` or the Kong plugin's config.
@@ -98,6 +102,17 @@ app.use(authzenMiddleware({
 
 See [`sdk/node/README.md`](sdk/node/README.md) for the MCP guard, and for the one place
 the SDK deliberately does less than the Go engine (CEL).
+
+### COAZ dialects
+
+`authzen-mcp-profile-1_0` was superseded on 2026-02-13 by the
+[COAZ Framework](https://openid.github.io/authzen/authzen-coaz-framework-1_0.html) and the
+[COAZ-MCP binding](https://openid.github.io/authzen/authzen-coaz-mcp-binding-1_0.html).
+Every PEP here speaks both and picks per tool: `x-authzen-mapping` in a tool's
+`inputSchema` is v2, `coaz: true` is the superseded v1. New tools should be v2 — among
+other things it replaces the non-conformant `-32401` denial code with `-32001`, and it
+verifies `subject.id` against the token so an MCP server cannot assert someone else's
+identity. See [`core/README.md`](core/README.md#coaz-dialects) for the full table.
 
 ## The AuthZEN PDP
 
