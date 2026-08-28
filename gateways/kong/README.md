@@ -73,6 +73,18 @@ On permit the plugin sets `X-Auth-Principal`, `X-Auth-Agent`, `X-Auth-Scope` and
 and read the authentication context the AS asserted — rather than inferring a channel from
 a username, which is how a self-registered user ends up inheriting staff authority.
 
+## Tests
+
+```sh
+cd gateways/kong
+busted --lpath="./?.lua;./?/init.lua" spec/
+```
+
+16 behavioural tests against a mocked Kong — no gateway, no database, no network. They
+cover the pure helpers, the request mapping both gateways must agree on, and the decision
+paths: no token, permit, deny, and PDP-unreachable (which must fail closed). See
+[`spec/README.md`](../spec/README.md).
+
 ## Where this came from
 
 The current handler is the one from `idp-agentic-demo` — it moved the step-up decision

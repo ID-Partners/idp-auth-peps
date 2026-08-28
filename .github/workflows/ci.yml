@@ -44,13 +44,22 @@ jobs:
       - run: npm run build
 
   kong:
-    name: gateways/kong (lua syntax)
+    name: gateways/kong (lua)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateways/kong
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y luajit
+      - name: Install Lua and busted
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks
+          sudo luarocks install busted
       - name: Check the plugin parses
         run: |
-          for f in gateways/kong/authzen-pdp/*.lua; do
-            luajit -bl "$f" >/dev/null && echo "ok  $f"
+          for f in authzen-pdp/*.lua; do
+            lua5.4 -e "assert(loadfile('$f'))" && echo "ok  $f"
           done
+      - name: Behavioural tests (mocked Kong)
+        run: busted --lpath="./?.lua;./?/init.lua" spec/

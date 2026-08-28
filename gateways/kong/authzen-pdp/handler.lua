@@ -426,4 +426,17 @@ function AuthzenPDP:header_filter(conf)
   end
 end
 
+-- Internals exposed for unit tests. Kong never reads this; it exists so the pure
+-- helpers and the request mapping can be exercised without a running gateway
+-- (see ../spec). Keeping them `local` above means the plugin itself is unaffected.
+AuthzenPDP._TEST = {
+  b64url_decode = b64url_decode,
+  b64url_encode = b64url_encode,
+  jwt_claims = jwt_claims,
+  jwt_header = jwt_header,
+  jwk_thumbprint = jwk_thumbprint,
+  extract_token = extract_token,
+  map_request = map_request,
+}
+
 return AuthzenPDP

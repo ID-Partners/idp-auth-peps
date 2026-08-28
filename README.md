@@ -150,6 +150,20 @@ plugin, which predates AuthZEN and MCP entirely and is not carried forward here.
 The demo that exercises all of this end to end is
 [dphhyland/idp-agentic-demo](https://github.com/dphhyland/idp-agentic-demo).
 
+## Tests
+
+```sh
+cd core       && go test ./...
+cd sdk/node   && npm test
+cd gateways/kong && busted --lpath="./?.lua;./?/init.lua" spec/
+```
+
+All three run offline. CI enforces a coverage **ratchet** — floors set just under the
+current numbers, so a change that drops coverage fails while one that raises it does not
+need the gate touched. Raise a floor when coverage rises; never lower one to make CI
+pass. Floors live in [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) and
+[`sdk/node/vitest.config.ts`](sdk/node/vitest.config.ts).
+
 ## Licence
 
 Apache-2.0.
