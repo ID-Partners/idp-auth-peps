@@ -4,7 +4,7 @@ import { AuthzenClient } from '../src/client.js';
 import { toHttpChallenge } from '../src/challenge.js';
 import { claimsFromToken, extractClaims, hasScope, jwkThumbprint } from '../src/claims.js';
 import { authzenMiddleware, pathMapper, type PepRequest } from '../src/express.js';
-import { CODE_DENIED, CODE_DENIED_V2, CODE_MAPPING_ERROR, CODE_PDP_ERROR, McpGuard, buildRequest, buildRequestV2, evaluateExpression } from '../src/mcp.js';
+import { CODE_DENIED, CODE_DENIED_V2, CODE_MAPPING_ERROR, CODE_PDP_ERROR, McpGuard, buildRequest, buildRequestV2, defaultToolsCallMapping, evaluateExpression, isAnchoredSubject } from '../src/mcp.js';
 import type { ToolDefinition } from '../src/mcp.js';
 
 /** A fetch stub that answers the PDP with a fixed body. */
@@ -490,7 +490,7 @@ describe('COAZ v2 (current binding)', () => {
 
   it('treats $$ as an escaped literal $ and a mid-string $ as nothing special', () => {
     const built = buildRequestV2(
-      { evaluation: { subject: { id: '$token.sub' }, context: { price: '$$9.99', note: 'a$b' } } } as never,
+      { evaluation: { subject: { id: '$token.sub' }, action: { name: 't' }, resource: { type: 'r' }, context: { price: '$$9.99', note: 'a$b' } } } as never,
       {},
       token,
     );
@@ -507,7 +507,7 @@ describe('COAZ v2 (current binding)', () => {
 
   it('does not fan out on a list value — the envelope alone decides', () => {
     const built = buildRequestV2(
-      { evaluation: { subject: { id: '$token.sub' }, resource: { type: 'account', properties: { tags: ['x', 'y'] } } } } as never,
+      { evaluation: { subject: { id: '$token.sub' }, action: { name: 't' }, resource: { type: 'account', properties: { tags: ['x', 'y'] } } } } as never,
       {},
       token,
     );
@@ -520,7 +520,7 @@ describe('COAZ v2 (current binding)', () => {
         {
           evaluations: {
             subject: { id: '$token.sub' },
-            evaluations: [{ subject: { id: 'someone-else' }, action: { name: 'debit' } }],
+            evaluations: [{ subject: { id: 'someone-else' }, action: { name: 'debit' }, resource: { type: 'account' } }],
           },
         } as never,
         {},
@@ -530,7 +530,7 @@ describe('COAZ v2 (current binding)', () => {
   });
 
   it('supplies the default token-anchored subject when the mapping omits one', () => {
-    const built = buildRequestV2({ evaluation: { resource: { type: 'customer', id: 'c1' } } } as never, {}, token);
+    const built = buildRequestV2({ evaluation: { action: { name: 't' }, resource: { type: 'customer', id: 'c1' } } } as never, {}, token);
     expect((built.body as Record<string, Record<string, unknown>>)['subject']).toEqual({ id: 'alice@example.com' });
   });
 
@@ -538,10 +538,47 @@ describe('COAZ v2 (current binding)', () => {
     expect(() => buildRequestV2(specMapping as never, { arguments: {} }, { client_id: 'c' })).toThrow(/no sub claim/);
   });
 
-  it('omits an absent optional claim rather than sending null', () => {
-    const built = buildRequestV2(specMapping as never, { arguments: {} }, { sub: 'alice@example.com' });
+  it('omits an absent optional context claim rather than sending null', () => {
+    // Only the optional context claim is absent here; resource.id resolves.
+    const built = buildRequestV2(specMapping as never, { arguments: { id: 'c1' } }, { sub: 'alice@example.com' });
     const ctx = (built.body as Record<string, Record<string, unknown>>)['context']!;
     expect('agent' in ctx).toBe(false);
+  });
+
+  it('is a mapping error, not a silently broadened request, when resource.id goes absent', () => {
+    // The trap this guards: dropping an absent resource.id would turn "this customer"
+    // into every customer, and the PDP would be asked a different question entirely.
+    expect(() => buildRequestV2(specMapping as never, { arguments: {} }, token)).toThrow(
+      /resource\.id resolved to absent/,
+    );
+  });
+
+  it('requires subject, action and resource', () => {
+    const base = { subject: { id: '$token.sub' }, action: { name: 't' }, resource: { type: 'r', id: 'x' } };
+    for (const drop of ['action', 'resource'] as const) {
+      const m = { evaluation: { ...base } } as Record<string, Record<string, unknown>>;
+      delete m['evaluation']![drop];
+      expect(() => buildRequestV2(m as never, {}, token)).toThrow(new RegExp(`${drop} is missing`));
+    }
+  });
+
+  it('checks required fields per boxcar entry, against the top-level defaults', () => {
+    expect(() =>
+      buildRequestV2(
+        {
+          evaluations: {
+            subject: { id: '$token.sub' },
+            action: { name: 'transfer' },
+            evaluations: [
+              { resource: { type: 'account', id: 'a1' } },
+              { resource: { type: 'account', id: '$params.arguments.missing' } },
+            ],
+          },
+        } as never,
+        { arguments: {} },
+        token,
+      ),
+    ).toThrow(/evaluations\[1\]\.resource\.id/);
   });
 
   it('denies a v2 tool with -32001, not the non-conformant -32401', async () => {
@@ -578,5 +615,82 @@ describe('COAZ v2 (current binding)', () => {
       claims: token,
     });
     expect(v.jsonRpcError?.error.code).toBe(CODE_DENIED);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('COAZ v2 — defaults and anchoring warnings', () => {
+  const token = { sub: 'alice@example.com', client_id: 'agent-1' };
+  const call = (name: string) => ({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name, arguments: {} } });
+
+  it('passes an undeclared tool through when defaults are off', async () => {
+    const fetchMock = pdp({ decision: false });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchMock }, tools: [{ name: 'weather' }] });
+    const v = await guard.checkToolCall({ rpc: call('weather'), claims: token });
+    expect(v.allow).toBe(true);
+    expect(v.coazTool).toBe(false);
+  });
+
+  it('authorizes an undeclared tool against the binding default when defaults are on', async () => {
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: pdp({ decision: false, context: { reason: 'nope' } }) },
+      tools: [{ name: 'weather' }],
+      applyDefaultMappings: true,
+    });
+    const v = await guard.checkToolCall({ rpc: call('weather'), claims: token });
+    expect(v.allow).toBe(false);
+    expect(v.jsonRpcError?.error.code).toBe(CODE_DENIED_V2);
+    // The default mapping asks about the TOOL, named from params.name.
+    expect(v.pdpRequest).toMatchObject({
+      subject: { type: 'identity', id: 'alice@example.com' },
+      action: { name: 'tools/call' },
+      resource: { type: 'tool', id: 'weather' },
+    });
+  });
+
+  it('builds the binding default mapping exactly', () => {
+    const built = buildRequestV2(defaultToolsCallMapping(), { name: 'get_local_weather' }, token);
+    expect(built.batch).toBe(false);
+    expect(built.body).toEqual({
+      subject: { type: 'identity', id: 'alice@example.com' },
+      context: { agent: 'agent-1' },
+      action: { name: 'tools/call' },
+      resource: { type: 'tool', id: 'get_local_weather' },
+    });
+  });
+
+  it('warns when a declared mapping asserts a subject it cannot anchor', async () => {
+    const warnings: string[] = [];
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
+      onWarning: (m) => warnings.push(m),
+      tools: [
+        {
+          name: 'asserted',
+          inputSchema: {
+            'x-authzen-mapping': {
+              evaluation: {
+                subject: { type: 'identity', id: '$params.arguments.on_behalf_of' },
+                action: { name: 'x' },
+                resource: { type: 'r', id: 'r1' },
+              },
+            },
+          },
+        } as never,
+      ],
+    });
+    await guard.checkToolCall({
+      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'asserted', arguments: { on_behalf_of: 'bob' } } },
+      claims: token,
+    });
+    expect(warnings.join(' ')).toMatch(/asserted by the mapping author/);
+  });
+
+  it('does not warn for a token-anchored mapping, including an omitted subject', () => {
+    expect(isAnchoredSubject({ evaluation: { subject: { id: '$token.sub' } } } as never)).toBe(true);
+    expect(isAnchoredSubject({ evaluation: { action: { name: 'x' } } } as never)).toBe(true);
+    expect(isAnchoredSubject({ evaluation: { subject: { id: '$params.arguments.x' } } } as never)).toBe(false);
+    expect(isAnchoredSubject({ evaluation: { subject: { id: "$token.sub + '-x'" } } } as never)).toBe(false);
   });
 });

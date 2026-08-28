@@ -190,6 +190,28 @@ func (cm *CompiledMappingV2) Build(params, token map[string]any, extraContext ma
 		}
 	}
 
+	// Absent optionals in CONTEXT are pruned: context is optional, and sending
+	// `"agent": null` would invite a policy to match on null as a value. Absence in a
+	// required field is a mapping error instead — see requireFields below.
+	pruneNilContext(req)
+	if cm.Batch {
+		if entries, ok := req["evaluations"].([]any); ok {
+			for _, e := range entries {
+				if entry, ok := e.(map[string]any); ok {
+					pruneNilContext(entry)
+				}
+			}
+		}
+	}
+
+	// Required fields. The framework: "If an expression yields absent or null for a
+	// required field, the PEP cannot construct a valid request; this is a mapping
+	// error." Without this check an absent resource.id reaches the PDP as a malformed
+	// request and surfaces as whatever the PDP happens to say, instead of a -32602.
+	if err := requireFields(req, cm.Batch); err != nil {
+		return nil, err
+	}
+
 	if len(extraContext) > 0 {
 		ctx, _ := req["context"].(map[string]any)
 		if ctx == nil {
@@ -274,4 +296,94 @@ func v2Expression(s string) (string, bool) {
 		return s[1:], false
 	}
 	return s[1:], true
+}
+
+// requireFields checks that AuthZEN's mandatory members resolved to something usable.
+//
+// For the evaluations envelope a member may sit at the top level as a default or inside
+// each entry, so each entry is checked against the merge of the two.
+func requireFields(req map[string]any, batch bool) error {
+	if !batch {
+		return checkOne(req, "")
+	}
+	entries, _ := req["evaluations"].([]any)
+	for i, e := range entries {
+		entry, _ := e.(map[string]any)
+		merged := map[string]any{}
+		for k, v := range req {
+			if k != "evaluations" {
+				merged[k] = v
+			}
+		}
+		for k, v := range entry {
+			merged[k] = v
+		}
+		if err := checkOne(merged, fmt.Sprintf("evaluations[%d].", i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkOne enforces subject.id, action.name and resource.type on one evaluation.
+// resource.id is deliberately NOT required: AuthZEN allows a type-only resource, and the
+// binding's own tools/list default maps a whole server that way.
+func checkOne(req map[string]any, prefix string) error {
+	subject, ok := req["subject"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%ssubject is missing", prefix)
+	}
+	if !nonEmptyString(subject["id"]) {
+		return fmt.Errorf("%ssubject.id resolved to absent or null", prefix)
+	}
+	action, ok := req["action"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%saction is missing", prefix)
+	}
+	if !nonEmptyString(action["name"]) {
+		return fmt.Errorf("%saction.name resolved to absent or null", prefix)
+	}
+	resource, ok := req["resource"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%sresource is missing", prefix)
+	}
+	if !nonEmptyString(resource["type"]) {
+		return fmt.Errorf("%sresource.type resolved to absent or null", prefix)
+	}
+	if id, present := resource["id"]; present && !nonEmptyString(id) {
+		return fmt.Errorf("%sresource.id resolved to absent or null", prefix)
+	}
+	return nil
+}
+
+func nonEmptyString(v any) bool {
+	s, ok := v.(string)
+	return ok && s != ""
+}
+
+// DefaultToolsCallMapping is the binding's default mapping for tools/call, which applies
+// to a tool that declares none: "A PEP MUST apply the default mapping for a method unless
+// a declared mapping applies to the specific operation."
+func DefaultToolsCallMapping() map[string]any {
+	return map[string]any{
+		"evaluation": map[string]any{
+			"subject":  map[string]any{"type": "identity", "id": "$token.sub"},
+			"context":  map[string]any{"agent": "$token.?client_id"},
+			"action":   map[string]any{"name": "tools/call"},
+			"resource": map[string]any{"type": "tool", "id": "$params.name"},
+		},
+	}
+}
+
+// pruneNilContext removes context keys whose expression resolved to absent.
+func pruneNilContext(req map[string]any) {
+	ctx, ok := req["context"].(map[string]any)
+	if !ok {
+		return
+	}
+	for k, v := range ctx {
+		if v == nil {
+			delete(ctx, k)
+		}
+	}
 }

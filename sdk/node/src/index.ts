@@ -46,7 +46,9 @@ export {
   McpGuard,
   buildRequest,
   buildRequestV2,
+  defaultToolsCallMapping,
   evaluateExpression,
+  isAnchoredSubject,
   jsonRpcError,
   v2Expression,
 } from './mcp.js';

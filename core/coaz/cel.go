@@ -193,12 +193,11 @@ func (n *compiledNode) eval(params, token map[string]any) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			// An absent optional (`$token.?client_id` on a token without one) resolves
-			// to nil and the key is dropped. Sending `"agent": null` would invite a
-			// policy to match on it as a value; an absent claim should simply be absent.
-			if v == nil {
-				continue
-			}
+			// nil (an absent optional) is KEPT here. Dropping it at this level would
+			// silently delete an identifying field — a resource.id that vanishes turns
+			// "this customer" into "every customer" — so absence is resolved by the
+			// caller, which knows which fields are required. Optional context keys are
+			// pruned in Build.
 			out[k] = v
 		}
 		return out, nil

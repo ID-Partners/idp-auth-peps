@@ -129,8 +129,20 @@ Error codes are the profile's:
 calls out as non-conformant with JSON-RPC — kept only so a client that string-matches on
 it does not break on upgrade.
 
-A tool that declares no mapping in either dialect passes straight through; whatever
-governed it before still does.
+A tool that declares no mapping in either dialect passes straight through by default.
+That is **not conformant** — the binding says the default `tools/call` mapping applies
+instead — so set `applyDefaultMappings: true` to authorize undeclared tools against it.
+It is opt-in because turning it on makes every previously-unGoverned call require a PDP
+decision, which is a change you should time rather than discover.
+
+Two places the SDK is deliberately **stricter** than the drafts: a `subject` inside an
+`evaluations` entry is rejected (identity smuggling), and a *declared* `resource.id` that
+resolves absent is a mapping error rather than a dropped key — dropping it would silently
+turn "this customer" into every customer. Absence is pruned only from `context`.
+
+When a declared mapping sets `subject.id` from something other than the token claim, the
+SDK warns: that identity is asserted by whoever wrote the mapping, which for a gateway is
+the MCP server being authorized. Pass `onWarning` to route it somewhere useful.
 
 ### The CEL caveat
 

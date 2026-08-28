@@ -44,6 +44,10 @@ return {
           -- silently accepts any certificate has no integrity on the decision it is
           -- enforcing. Set false only for local development against self-signed certs.
           { pdp_ssl_verify = { type = "boolean", default = true } },
+          -- Authorize tools that declare no x-authzen-mapping against the COAZ-MCP
+          -- binding's default tools/call mapping, as it requires. Off keeps the
+          -- pass-through deployed routes expect — which is NOT conformant.
+          { coaz_defaults = { type = "boolean", default = false } },
         },
       },
     },

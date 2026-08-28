@@ -52,13 +52,35 @@ type discoveryCache struct {
 	ttl     time.Duration
 	entries map[string]*discoveryEntry
 	httpc   *http.Client
+	// maxEntries bounds the map. Keys include a hash of the caller's credential, so
+	// without a cap a stream of distinct tokens grows it without limit.
+	maxEntries int
+}
+
+// maxDiscoveryEntries is generous for real deployments — a handful of upstreams times
+// the credentials in play — and far below anything that would strain memory.
+const maxDiscoveryEntries = 4096
+
+// evictLocked drops expired entries, and if that is not enough, refuses to grow.
+// Reporting failure rather than evicting a live entry keeps the cache predictable under
+// a flood: a caller gets a discovery error (fail closed) instead of silent thrashing.
+func (d *discoveryCache) evictLocked(now time.Time) bool {
+	if len(d.entries) < d.maxEntries {
+		return true
+	}
+	for k, e := range d.entries {
+		if now.Sub(e.fetchedAt) >= d.ttl {
+			delete(d.entries, k)
+		}
+	}
+	return len(d.entries) < d.maxEntries
 }
 
 func newDiscoveryCache(ttl time.Duration, httpc *http.Client) *discoveryCache {
 	if httpc == nil {
 		httpc = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &discoveryCache{ttl: ttl, entries: map[string]*discoveryEntry{}, httpc: httpc}
+	return &discoveryCache{ttl: ttl, entries: map[string]*discoveryEntry{}, httpc: httpc, maxEntries: maxDiscoveryEntries}
 }
 
 // cacheKey binds a cached tools/list to BOTH the upstream and the credential it was
@@ -88,7 +110,17 @@ func (d *discoveryCache) lookup(ctx context.Context, upstreamURL, authorization,
 				entry = prev
 			}
 		}
-		d.entries[key] = entry
+		if _, replacing := d.entries[key]; replacing || d.evictLocked(time.Now()) {
+			d.entries[key] = entry
+		} else {
+			// At capacity with nothing to expire: serve this result without caching it
+			// rather than letting the map grow unbounded.
+			d.mu.Unlock()
+			if entry.err != nil {
+				return nil, entry.err
+			}
+			return entry.tools[toolName], nil
+		}
 		d.mu.Unlock()
 	}
 	if entry.err != nil {

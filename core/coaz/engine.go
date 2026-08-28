@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -32,12 +33,32 @@ type Options struct {
 	DiscoveryTTL time.Duration
 	// DiscoveryHTTPClient overrides the client used for tools/list fetches.
 	DiscoveryHTTPClient *http.Client
+	// ApplyDefaultMappings authorizes tools that declare no mapping against the
+	// binding's default tools/call mapping, as the binding requires. Off retains the
+	// pre-v2 pass-through — non-conformant, but it is what deployed routes expect, so
+	// the switch is theirs to throw.
+	ApplyDefaultMappings bool
 }
 
 type Engine struct {
 	pdp   PDPConfig
 	pdpc  *http.Client
 	disco *discoveryCache
+	// applyDefaults turns on the binding's default mappings for tools that declare
+	// none. Off leaves the pre-v2 pass-through, which is not conformant.
+	applyDefaults bool
+
+	defaultOnce sync.Once
+	defaultMap  *CompiledMappingV2
+	defaultErr  error
+}
+
+// defaultToolsCall compiles the binding's default tools/call mapping once.
+func (e *Engine) defaultToolsCall() (*CompiledMappingV2, error) {
+	e.defaultOnce.Do(func() {
+		e.defaultMap, e.defaultErr = CompileMappingV2("tools/call", DefaultToolsCallMapping())
+	})
+	return e.defaultMap, e.defaultErr
 }
 
 func NewEngine(opts Options) *Engine {
@@ -50,9 +71,10 @@ func NewEngine(opts Options) *Engine {
 		pdpc = &http.Client{Timeout: 10 * time.Second}
 	}
 	return &Engine{
-		pdp:   opts.PDP,
-		pdpc:  pdpc,
-		disco: newDiscoveryCache(ttl, opts.DiscoveryHTTPClient),
+		pdp:           opts.PDP,
+		pdpc:          pdpc,
+		disco:         newDiscoveryCache(ttl, opts.DiscoveryHTTPClient),
+		applyDefaults: opts.ApplyDefaultMappings,
 	}
 }
 
@@ -63,7 +85,17 @@ func NewEngine(opts Options) *Engine {
 //	rpcBody       — the raw tools/call JSON-RPC request body
 //	tokenClaims   — decoded claims of the caller's access token
 //	extraContext  — gateway-supplied context the mapping can't derive (e.g. user_scope)
-func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any) Verdict {
+//
+// CallOptions carries the per-ROUTE knobs. They cannot live on the Engine: one process
+// serves many routes, and whether default mappings apply is a property of the route.
+type CallOptions struct {
+	// ApplyDefaultMappings authorizes a tool that declares no mapping against the
+	// binding's default tools/call mapping, as the binding requires. False retains the
+	// non-conformant pass-through that deployed routes expect.
+	ApplyDefaultMappings bool
+}
+
+func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any, opts CallOptions) Verdict {
 	var rpc struct {
 		ID     any            `json:"id"`
 		Method string         `json:"method"`
@@ -86,7 +118,19 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization check unavailable: tool discovery failed")}
 	}
 	if !dt.declared() {
-		return Verdict{CoazTool: false, Decision: true, Reason: "tool is not COAZ-declared"}
+		// The binding: "A PEP MUST apply the default mapping for a method unless a
+		// declared mapping applies to the specific operation." Pass-through is the
+		// non-conformant behaviour, so it is opt-out and says so.
+		if !(opts.ApplyDefaultMappings || e.applyDefaults) {
+			return Verdict{CoazTool: false, Decision: true, Reason: "tool declares no mapping (defaults disabled)"}
+		}
+		def, err := e.defaultToolsCall()
+		if err != nil {
+			return Verdict{CoazTool: true, Decision: false,
+				Reason:       fmt.Sprintf("COAZ default mapping error: %v", err),
+				JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ default mapping error: %v", err))}
+		}
+		dt = &discoveredTool{tool: dt.tool, dialect: DialectV2, mappingV2: def}
 	}
 	// The denial code differs per dialect, so it is resolved once here and used for
 	// every deny below.

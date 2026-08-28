@@ -57,6 +57,9 @@ type pepConfig struct {
 	// mcpUpstreamURL enables COAZ on an MCP route: the MCP server whose
 	// tools/list declares the x-coaz-mapping objects.
 	mcpUpstreamURL string
+	// coazDefaults applies the binding's default mappings to tools that declare none.
+	// Off leaves the non-conformant pass-through that deployed routes expect.
+	coazDefaults bool
 }
 
 func configFrom(ext map[string]string) pepConfig {
@@ -76,6 +79,7 @@ func configFrom(ext map[string]string) pepConfig {
 		stepupScope:      ext["stepup_scope"],
 		stepupAction:     get("stepup_action", "make_payment"),
 		mcpUpstreamURL:   ext["mcp_upstream_url"],
+		coazDefaults:     isTrue("coaz_defaults"),
 	}
 }
 
@@ -313,7 +317,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 			}
 		}
 		v := s.coaz.CheckToolCall(ctx, conf.mcpUpstreamURL, headers["authorization"],
-			[]byte(body), claimsForCEL(claims), extraContext)
+			[]byte(body), claimsForCEL(claims), extraContext, coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults})
 		if v.CoazTool {
 			toolName := toolCallName(body)
 			if v.JSONRPCError != nil {

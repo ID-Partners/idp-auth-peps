@@ -82,6 +82,21 @@ export interface ToolDefinition {
   [key: string]: unknown;
 }
 
+/**
+ * The binding's default mapping for `tools/call`, applied to a tool that declares none.
+ * Verbatim from the default-mappings section.
+ */
+export function defaultToolsCallMapping(): AuthzenMapping {
+  return {
+    evaluation: {
+      subject: { type: 'identity', id: '$token.sub' },
+      context: { agent: '$token.?client_id' },
+      action: { name: 'tools/call' },
+      resource: { type: 'tool', id: '$params.name' },
+    },
+  };
+}
+
 /** The token claim `subject.id` anchors to. */
 const SUBJECT_IDENTITY_CLAIM = 'sub';
 const DEFAULT_SUBJECT_EXPR = `$token.${SUBJECT_IDENTITY_CLAIM}`;
@@ -130,6 +145,19 @@ export interface McpGuardOptions {
   discoveryHeaders?: Record<string, string>;
   /** Label for this PEP in challenges and logs. */
   pep?: string;
+  /**
+   * Authorize tools that declare no mapping against the binding's default `tools/call`
+   * mapping, as it requires: "A PEP MUST apply the default mapping for a method unless a
+   * declared mapping applies." Off retains pass-through, which is NOT conformant but is
+   * what existing routes expect — so the switch is yours to throw.
+   */
+  applyDefaultMappings?: boolean;
+  /**
+   * Called for conditions worth surfacing but not failing on — chiefly a declared
+   * mapping that overrides `subject.id`, where the identity is then asserted by the
+   * mapping author rather than anchored to the token. Defaults to `console.warn`.
+   */
+  onWarning?: (message: string) => void;
   /**
    * Hand the whole check to a running Go `coaz-pep` (this repo's `core/`) over its HTTP
    * check API. Use this when a mapping needs CEL beyond the subset above — it is exactly
@@ -214,11 +242,15 @@ export class McpGuard {
     const deniedCode = dialect === 'v2' ? CODE_DENIED_V2 : CODE_DENIED;
 
     if (!v2Mapping && !tool?.coaz) {
-      return {
-        allow: true,
-        coazTool: false,
-        verdict: { allow: true, kind: 'ok', reason: `${toolName} declares no COAZ mapping` },
-      };
+      if (!this.opts.applyDefaultMappings) {
+        return {
+          allow: true,
+          coazTool: false,
+          verdict: { allow: true, kind: 'ok', reason: `${toolName} declares no mapping (defaults disabled)` },
+        };
+      }
+      // Fall through to the binding's default mapping rather than skipping the PDP.
+      return this.checkAgainst(id, defaultToolsCallMapping(), rpc, token, args.extraContext, CODE_DENIED_V2, toolName);
     }
 
     // `params` binds to the whole JSON-RPC params member, so mappings read
@@ -228,6 +260,14 @@ export class McpGuard {
     let built: BuiltRequest;
     try {
       if (v2Mapping) {
+        // A gateway enforcing a mapping the MCP server authored: if subject.id is not
+        // anchored to the token, that server is asserting who the caller is.
+        if (!isAnchoredSubject(v2Mapping)) {
+          this.warn(
+            `tool ${toolName} sets subject.id from a source that cannot be verified against ` +
+              `the token; its identity is asserted by the mapping author`,
+          );
+        }
         built = buildRequestV2(v2Mapping, callParams, token, args.extraContext);
       } else {
         const mapping = tool!['x-coaz-mapping'];
@@ -280,6 +320,45 @@ export class McpGuard {
   /** Force the next check to re-discover. */
   invalidate(): void {
     this.cache = null;
+  }
+
+  private warn(message: string): void {
+    try {
+      (this.opts.onWarning ?? ((m: string) => console.warn(`[coaz] ${m}`)))(message);
+    } catch {
+      /* a broken warning sink must not break the check */
+    }
+  }
+
+  /** Build from one mapping, ask the PDP, and render the verdict. */
+  private async checkAgainst(
+    id: string | number | null,
+    mapping: AuthzenMapping,
+    rpc: JsonRpcRequest,
+    token: Record<string, unknown>,
+    extraContext: Record<string, unknown> | undefined,
+    deniedCode: number,
+    toolName: string,
+  ): Promise<McpVerdict> {
+    let built: BuiltRequest;
+    try {
+      built = buildRequestV2(mapping, (rpc.params ?? {}) as Record<string, unknown>, token, extraContext);
+    } catch (err) {
+      return this.fail(id, CODE_MAPPING_ERROR, 'mapping_error', message(err));
+    }
+    const verdict = built.batch
+      ? await this.client.evaluateAll(built.body as EvaluationsRequest)
+      : await this.client.evaluate(built.body as EvaluationRequest);
+    this.report(toolName, verdict);
+    if (verdict.allow) return { allow: true, coazTool: true, verdict, pdpRequest: built.body };
+    const code = verdict.kind === 'pdp_error' ? CODE_PDP_ERROR : deniedCode;
+    return {
+      allow: false,
+      coazTool: true,
+      verdict,
+      pdpRequest: built.body,
+      jsonRpcError: jsonRpcError(id, code, verdict.reason, this.challengeData(verdict)),
+    };
   }
 
   private challengeData(verdict: Verdict): Record<string, unknown> | undefined {
@@ -473,6 +552,19 @@ export function buildRequestV2(
       throw new Error('evaluations envelope resolved to an empty evaluations array');
     }
   }
+
+  // Absent optionals in CONTEXT are pruned — context is optional, and `"agent": null`
+  // would invite a policy to match on null as a value. Absence in a required field is a
+  // mapping error instead.
+  pruneNilContext(resolved);
+  if (batch) {
+    for (const e of resolved['evaluations'] as unknown[]) if (isObject(e)) pruneNilContext(e);
+  }
+
+  // "subject, action, and resource are required for every evaluation. If an expression
+  // yields absent or null for a required field ... this is a mapping error."
+  requireFields(resolved, batch);
+
   return { batch, body: resolved as unknown as EvaluationRequest | EvaluationsRequest };
 }
 
@@ -513,15 +605,67 @@ function evaluateNodeV2(node: unknown, params: Record<string, unknown>, token: R
   if (isObject(node)) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node)) {
-      const resolved = evaluateNodeV2(v, params, token);
-      // An absent optional (`$token.?client_id`) drops its key rather than sending null,
-      // which a policy might otherwise match on as a value.
-      if (resolved === undefined) continue;
-      out[k] = resolved;
+      // undefined (an absent optional) is KEPT here. Dropping it at this level would
+      // silently delete an identifying field — a resource.id that vanishes turns "this
+      // customer" into "every customer". Optional context keys are pruned in
+      // buildRequestV2, which knows which fields are required.
+      out[k] = evaluateNodeV2(v, params, token);
     }
     return out;
   }
   return node;
+}
+
+/**
+ * Is subject.id the token's subject claim? Anything else — including an omitted subject,
+ * which the builder fills with the anchored default — is reported here on the raw
+ * declaration, so the warning reflects what the author actually wrote.
+ */
+export function isAnchoredSubject(mapping: AuthzenMapping): boolean {
+  const inner = (mapping as Record<string, unknown>)['evaluation'] ?? (mapping as Record<string, unknown>)['evaluations'];
+  if (!isObject(inner)) return false;
+  const subject = inner['subject'];
+  if (!isObject(subject)) return true; // omitted -> the anchored default is supplied
+  const id = subject['id'];
+  if (id === undefined || id === null || id === '') return true;
+  return typeof id === 'string' && id.trim() === DEFAULT_SUBJECT_EXPR;
+}
+
+function pruneNilContext(req: Record<string, unknown>): void {
+  const ctx = req['context'];
+  if (!isObject(ctx)) return;
+  for (const [k, v] of Object.entries(ctx)) if (v === undefined || v === null) delete ctx[k];
+}
+
+/**
+ * Enforce AuthZEN's mandatory members. For the evaluations envelope a member may sit at
+ * the top level as a default or inside an entry, so each entry is checked against the
+ * merge of the two.
+ */
+function requireFields(req: Record<string, unknown>, batch: boolean): void {
+  if (!batch) return checkOne(req, '');
+  const entries = (req['evaluations'] as unknown[]) ?? [];
+  entries.forEach((e, i) => {
+    const { evaluations: _drop, ...defaults } = req;
+    checkOne({ ...defaults, ...(isObject(e) ? e : {}) }, `evaluations[${i}].`);
+  });
+}
+
+function checkOne(req: Record<string, unknown>, prefix: string): void {
+  const need = (obj: unknown, name: string, field: string) => {
+    if (!isObject(obj)) throw new Error(`${prefix}${name} is missing`);
+    const v = obj[field];
+    if (typeof v !== 'string' || v === '') {
+      throw new Error(`${prefix}${name}.${field} resolved to absent or null`);
+    }
+  };
+  need(req['subject'], 'subject', 'id');
+  need(req['action'], 'action', 'name');
+  need(req['resource'], 'resource', 'type');
+  // resource.id is optional in AuthZEN, but a DECLARED one that resolves absent would
+  // silently broaden the request, so it is an error rather than a dropped key.
+  const resource = req['resource'];
+  if (isObject(resource) && 'id' in resource) need(resource, 'resource', 'id');
 }
 
 /**

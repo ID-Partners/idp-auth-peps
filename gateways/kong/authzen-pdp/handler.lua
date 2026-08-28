@@ -272,6 +272,7 @@ function AuthzenPDP:access(conf)
             pep_label = pep,
             style = "mcp",
             mcp_upstream_url = conf.mcp_upstream_url,
+            coaz_defaults = conf.coaz_defaults and "true" or "false",
           },
           method = kong.request.get_method(),
           path = kong.request.get_path(),

@@ -3,6 +3,7 @@ package coaz
 // Conformance tests built from the profile's own non-normative examples.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -240,7 +241,7 @@ func TestEnginePermit(t *testing.T) {
 	for _, sse := range []bool{false, true} {
 		e, mcp, _, _ := newEngineForTest(t, sse, true, "ok by policy")
 		v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-			toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken, nil)
+			toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken, nil, CallOptions{})
 		if !v.CoazTool || !v.Decision || v.JSONRPCError != nil {
 			t.Fatalf("sse=%v expected permit, got %+v", sse, v)
 		}
@@ -250,7 +251,7 @@ func TestEnginePermit(t *testing.T) {
 func TestEngineDeny401(t *testing.T) {
 	e, mcp, _, _ := newEngineForTest(t, false, false, "insufficient permissions for customer record")
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken, nil)
+		toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken, nil, CallOptions{})
 	if v.Decision || v.JSONRPCError == nil {
 		t.Fatalf("expected deny, got %+v", v)
 	}
@@ -268,7 +269,7 @@ func TestEngineMappingError32602(t *testing.T) {
 	e, mcp, _, _ := newEngineForTest(t, false, true, "")
 	// `region` is not supplied -> CEL evaluation error -> -32602
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("get_customer", nil), specToken, nil)
+		toolCall("get_customer", nil), specToken, nil, CallOptions{})
 	if v.Decision || v.JSONRPCError == nil {
 		t.Fatalf("expected mapping error, got %+v", v)
 	}
@@ -281,7 +282,7 @@ func TestEngineMappingError32602(t *testing.T) {
 func TestEngineNonCoazPassthrough(t *testing.T) {
 	e, mcp, _, bodies := newEngineForTest(t, false, false, "")
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("plain_tool", map[string]any{}), specToken, nil)
+		toolCall("plain_tool", map[string]any{}), specToken, nil, CallOptions{})
 	if v.CoazTool || !v.Decision {
 		t.Fatalf("expected non-COAZ passthrough, got %+v", v)
 	}
@@ -294,12 +295,39 @@ func TestEnginePDPUnreachable32603(t *testing.T) {
 	e, mcp, pdp, _ := newEngineForTest(t, false, true, "")
 	pdp.Close()
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("get_customer", map[string]any{"id": "c"}), specToken, nil)
+		toolCall("get_customer", map[string]any{"id": "c"}), specToken, nil, CallOptions{})
 	if v.Decision || v.JSONRPCError == nil {
 		t.Fatalf("expected fail-closed, got %+v", v)
 	}
 	got := asJSON(t, json.RawMessage(v.JSONRPCError))
 	if got["error"].(map[string]any)["code"].(float64) != -32603 {
 		t.Fatalf("expected -32603, got %v", got)
+	}
+}
+
+// A tool with no declaration: pass-through by default, default mapping when the route
+// opts in. Pass-through is the non-conformant branch, so it is the one that must be
+// asked for explicitly.
+func TestUndeclaredToolUsesTheDefaultMappingWhenEnabled(t *testing.T) {
+	e, mcp, _, _ := newEngineForTest(t, false, false, "denied by policy")
+
+	off := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
+		toolCall("plain_tool", map[string]any{}), specToken, nil, CallOptions{})
+	if !off.Decision || off.CoazTool {
+		t.Fatalf("defaults off should pass through, got %+v", off)
+	}
+
+	on := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
+		toolCall("plain_tool", map[string]any{}), specToken, nil,
+		CallOptions{ApplyDefaultMappings: true})
+	if on.Decision {
+		t.Fatalf("defaults on should consult the PDP and honour its deny, got %+v", on)
+	}
+	if on.JSONRPCError == nil {
+		t.Fatal("a deny under the default mapping should carry a JSON-RPC error")
+	}
+	// v2 dialect for the default mapping, so the conformant code.
+	if !bytes.Contains(on.JSONRPCError, []byte("-32001")) {
+		t.Fatalf("default mapping should deny with -32001, got %s", on.JSONRPCError)
 	}
 }

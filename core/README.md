@@ -168,3 +168,33 @@ verifies the resolved value equals that claim, so an MCP server — the party be
 authorized — cannot assert a different subject. A mapping that sets `subject.id` from
 somewhere else is permitted but logged, because the identity is then asserted by the
 mapping author rather than anchored to the token.
+
+### Deliberate deviations
+
+Two places where this implementation is **stricter** than the drafts. Both are choices,
+not oversights.
+
+**Per-entry `subject` in an `evaluations` envelope is rejected outright.** AuthZEN's
+generic override semantics would let an entry set its own `subject`; the COAZ-MCP binding
+forbids it ("MUST NOT set `subject` within any entry"), and we enforce that as a compile
+error rather than dropping the field. A mapping that tried is malformed, and telling its
+author so beats silently authorizing a different question.
+
+**A declared `resource.id` that resolves absent is a mapping error**, not a dropped key.
+AuthZEN allows a type-only resource, so a mapping that never mentions `resource.id` is
+fine. But one that *declares* `"id": "$params.arguments.id"` and gets absent has just
+turned "this customer" into *every* customer — the request silently broadens, and the PDP
+answers a question nobody asked. Absence is only pruned from `context`, which is optional
+by definition.
+
+### Default mappings
+
+The binding: "A PEP MUST apply the default mapping for a method unless a declared mapping
+applies to the specific operation." A tool with no `x-authzen-mapping` should therefore be
+authorized against the default `tools/call` mapping, not waved through.
+
+That is off by default here, because turning it on makes every previously-unGoverned tool
+call require a PDP decision — a change deployed routes should opt into rather than
+discover. Set `coaz_defaults` (per route) or `ApplyDefaultMappings` (Go API) /
+`applyDefaultMappings` (Node SDK) to enable it. **Pass-through is not conformant**; the
+switch exists so the migration is yours to time.

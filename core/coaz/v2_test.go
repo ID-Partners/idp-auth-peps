@@ -70,6 +70,7 @@ func TestV2TreatsUnprefixedStringsAsLiterals(t *testing.T) {
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$token.sub" },
+	    "action":   { "name": "t" },
 	    "resource": { "type": "customer", "id": "a-fixed-id" },
 	    "context":  { "channel": "ai-agent", "price": "$$9.99", "note": "a$b" }
 	  }
@@ -122,6 +123,7 @@ func TestV2ListValuesDoNotFanOut(t *testing.T) {
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$token.sub" },
+	    "action":   { "name": "t" },
 	    "resource": { "type": "account", "id": "a1", "properties": { "tags": ["x", "y", "z"] } },
 	    "context":  { "agent": "$token.?client_id" }
 	  }
@@ -186,6 +188,7 @@ func TestV2VerifiesTheAnchoredSubject(t *testing.T) {
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$token.sub" },
+	    "action":   { "name": "t" },
 	    "resource": { "type": "customer", "id": "c1" },
 	    "context":  { "agent": "$token.?client_id" }
 	  }
@@ -201,8 +204,8 @@ func TestV2SuppliesTheDefaultSubjectWhenOmitted(t *testing.T) {
 	// default subject identifier ... so that every request still carries a
 	// token-anchored subject."
 	for name, raw := range map[string]string{
-		"no subject":    `{"evaluation": {"resource": {"type": "customer", "id": "c1"}}}`,
-		"no subject.id": `{"evaluation": {"subject": {"type": "identity"}, "resource": {"type": "customer", "id": "c1"}}}`,
+		"no subject":    `{"evaluation": {"action": {"name": "t"}, "resource": {"type": "customer", "id": "c1"}}}`,
+		"no subject.id": `{"evaluation": {"subject": {"type": "identity"}, "action": {"name": "t"}, "resource": {"type": "customer", "id": "c1"}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			cm := mustMappingV2(t, "t", raw)
@@ -227,6 +230,7 @@ func TestV2OverriddenSubjectIsNotAnchored(t *testing.T) {
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$params.arguments.on_behalf_of" },
+	    "action":   { "name": "t" },
 	    "resource": { "type": "customer", "id": "c1" },
 	    "context":  { "agent": "$token.?client_id" }
 	  }
@@ -259,6 +263,7 @@ func TestV2ExtraContextDoesNotOverrideTheMapping(t *testing.T) {
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$token.sub" },
+	    "action":   { "name": "t" },
 	    "resource": { "type": "customer", "id": "c1" },
 	    "context":  { "agent": "$token.?client_id" }
 	  }
@@ -289,6 +294,7 @@ func TestV2AbsentOptionalClaimIsOmittedNotNull(t *testing.T) {
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$token.sub" },
+	    "action":   { "name": "t" },
 	    "resource": { "type": "customer", "id": "c1" },
 	    "context":  { "agent": "$token.?client_id" }
 	  }
@@ -303,5 +309,83 @@ func TestV2AbsentOptionalClaimIsOmittedNotNull(t *testing.T) {
 	ctx, _ := got["context"].(map[string]any)
 	if v, present := ctx["agent"]; present {
 		t.Fatalf("an absent optional claim should be omitted, not sent as %v", v)
+	}
+}
+
+// The framework: "subject, action, and resource are required for every evaluation. If an
+// expression yields absent or null for a required field ... this is a mapping error."
+// Without this the malformed request reaches the PDP and the deny reads as policy.
+func TestV2RequiredFieldsMustResolve(t *testing.T) {
+	cases := map[string]string{
+		"no action": `{"evaluation": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "resource": {"type": "customer", "id": "c1"}}}`,
+		"no resource": `{"evaluation": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "action": {"name": "t"}}}`,
+		"resource.id absent": `{"evaluation": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "action": {"name": "t"},
+		    "resource": {"type": "customer", "id": "$token.?nope"}}}`,
+		"action.name absent": `{"evaluation": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "action": {"name": "$token.?nope"},
+		    "resource": {"type": "customer", "id": "c1"}}}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			var m map[string]any
+			_ = json.Unmarshal([]byte(raw), &m)
+			cm, err := CompileMappingV2("t", m)
+			if err != nil {
+				return // rejected at compile time is also correct
+			}
+			if _, err := cm.Build(map[string]any{}, v2Token, nil); err == nil {
+				t.Fatal("expected a mapping error for a missing required field")
+			}
+		})
+	}
+}
+
+func TestV2RequiredFieldsCheckedPerBoxcarEntry(t *testing.T) {
+	cm := mustMappingV2(t, "t", `{
+	  "evaluations": {
+	    "subject": { "type": "identity", "id": "$token.sub" },
+	    "action":  { "name": "transfer" },
+	    "evaluations": [
+	      { "resource": { "type": "account", "id": "a1" } },
+	      { "resource": { "type": "account", "id": "$params.arguments.missing" } }
+	    ]
+	  }
+	}`)
+	// The second entry's resource.id does not resolve; the top-level action covers both.
+	if _, err := cm.Build(map[string]any{"arguments": map[string]any{}}, v2Token, nil); err == nil {
+		t.Fatal("a required field absent in one entry must fail the whole request")
+	}
+}
+
+// The default mapping is the binding's, not an invention.
+func TestDefaultToolsCallMappingMatchesTheBinding(t *testing.T) {
+	cm, err := CompileMappingV2("tools/call", DefaultToolsCallMapping())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cm.Anchored() {
+		t.Fatal("the default mapping's subject must be token-anchored")
+	}
+	built, err := cm.Build(map[string]any{"name": "get_local_weather"}, v2Token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(built.Body, &got)
+	want := map[string]any{
+		"subject":  map[string]any{"type": "identity", "id": "alice@example.com"},
+		"context":  map[string]any{"agent": "http://agentprovider.com/agent-app-id"},
+		"action":   map[string]any{"name": "tools/call"},
+		"resource": map[string]any{"type": "tool", "id": "get_local_weather"},
+	}
+	if !jsonEqual(got, want) {
+		t.Fatalf("default mapping mismatch\n got: %v\nwant: %v", got, want)
 	}
 }
