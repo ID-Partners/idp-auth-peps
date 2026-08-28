@@ -64,6 +64,9 @@ const subjectIdentityClaim = "sub"
 // carries a token-anchored subject."
 const defaultSubjectExpr = "$token." + subjectIdentityClaim
 
+// defaultSubjectType is the subject type the binding's own default mappings use.
+const defaultSubjectType = "identity"
+
 // CompiledMappingV2 is a validated, compiled x-authzen-mapping.
 type CompiledMappingV2 struct {
 	ToolName string
@@ -89,18 +92,35 @@ func CompileMappingV2(toolName string, raw map[string]any) (*CompiledMappingV2, 
 	batch := envelope == "evaluations"
 
 	// Identity smuggling: with the evaluations envelope the single top-level subject
-	// governs every entry, so an entry that sets its own subject is rejected outright.
+	// governs every entry, so an entry that sets its own subject is rejected.
+	//
+	// The structure itself must be literal. An expression-valued `evaluations` (or
+	// `subject`) would defer the shape to evaluation time, where it is built from
+	// caller-controlled params — so the entries could then carry their own subjects and
+	// this check would have inspected nothing. Structure is compile-time; only leaves
+	// may be expressions.
 	if batch {
-		if entries, ok := inner["evaluations"].([]any); ok {
-			for i, e := range entries {
-				entry, ok := e.(map[string]any)
-				if !ok {
-					continue
-				}
-				if _, present := entry["subject"]; present {
-					return nil, fmt.Errorf("evaluations[%d] sets subject; only the top-level subject may do so", i)
-				}
+		raw, present := inner["evaluations"]
+		if !present {
+			return nil, fmt.Errorf("evaluations envelope has no evaluations array")
+		}
+		entries, ok := raw.([]any)
+		if !ok {
+			return nil, fmt.Errorf("evaluations must be a literal array, not an expression")
+		}
+		for i, e := range entries {
+			entry, ok := e.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("evaluations[%d] must be an object", i)
 			}
+			if _, present := entry["subject"]; present {
+				return nil, fmt.Errorf("evaluations[%d] sets subject; only the top-level subject may do so", i)
+			}
+		}
+	}
+	if _, ok := inner["subject"]; ok {
+		if _, isObj := inner["subject"].(map[string]any); !isObj {
+			return nil, fmt.Errorf("subject must be a literal object, not an expression")
 		}
 	}
 
@@ -147,6 +167,11 @@ func normaliseSubject(inner map[string]any) (bool, error) {
 		subject = map[string]any{}
 		inner["subject"] = subject
 	}
+	// AuthZEN subjects require a type, and the binding's own defaults use "identity".
+	// Supplying id without it produced a request the PDP could legitimately reject.
+	if t, ok := subject["type"]; !ok || t == nil || t == "" {
+		subject["type"] = defaultSubjectType
+	}
 	id, present := subject["id"]
 	if !present || id == nil || id == "" {
 		subject["id"] = defaultSubjectExpr
@@ -187,6 +212,22 @@ func (cm *CompiledMappingV2) Build(params, token map[string]any, extraContext ma
 		}
 		if got != want {
 			return nil, fmt.Errorf("subject.id %q does not match the validated token's %s claim", got, subjectIdentityClaim)
+		}
+	}
+
+	// Defence in depth: re-check the RESOLVED request. The compile-time checks above
+	// constrain the declaration, this constrains what actually came out of it — so a
+	// future change that lets structure through from an expression cannot silently
+	// reopen identity smuggling.
+	if cm.Batch {
+		if entries, ok := req["evaluations"].([]any); ok {
+			for i, e := range entries {
+				if entry, ok := e.(map[string]any); ok {
+					if _, present := entry["subject"]; present {
+						return nil, fmt.Errorf("evaluations[%d] resolved with its own subject; only the top-level subject may set one", i)
+					}
+				}
+			}
 		}
 	}
 
@@ -361,21 +402,16 @@ func nonEmptyString(v any) bool {
 	return ok && s != ""
 }
 
-// DefaultToolsCallMapping is the binding's default mapping for tools/call, which applies
-// to a tool that declares none: "A PEP MUST apply the default mapping for a method unless
-// a declared mapping applies to the specific operation."
+// DefaultToolsCallMapping is the binding's default mapping for tools/call, kept as a
+// named entry point; the table in defaults.go is the source of truth.
 func DefaultToolsCallMapping() map[string]any {
-	return map[string]any{
-		"evaluation": map[string]any{
-			"subject":  map[string]any{"type": "identity", "id": "$token.sub"},
-			"context":  map[string]any{"agent": "$token.?client_id"},
-			"action":   map[string]any{"name": "tools/call"},
-			"resource": map[string]any{"type": "tool", "id": "$params.name"},
-		},
-	}
+	m, _ := DefaultMappings("tools/call")
+	return m
 }
 
-// pruneNilContext removes context keys whose expression resolved to absent.
+// pruneNilContext removes context keys whose expression resolved to absent. Only
+// context: absence in a required field is a mapping error, and dropping an identifying
+// field would silently broaden the request.
 func pruneNilContext(req map[string]any) {
 	ctx, ok := req["context"].(map[string]any)
 	if !ok {

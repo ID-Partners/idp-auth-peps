@@ -1,6 +1,8 @@
 package coaz
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"testing"
 )
@@ -387,5 +389,196 @@ func TestDefaultToolsCallMappingMatchesTheBinding(t *testing.T) {
 	}
 	if !jsonEqual(got, want) {
 		t.Fatalf("default mapping mismatch\n got: %v\nwant: %v", got, want)
+	}
+}
+
+// Regression for a real bypass: an expression-valued `evaluations` deferred the
+// structure to evaluation time, where it is built from caller-controlled params — so
+// entries could carry their own subjects and the compile-time check inspected nothing.
+// The smuggled subject reached the PDP as the authorized identity.
+func TestV2RejectsExpressionValuedStructure(t *testing.T) {
+	cases := map[string]string{
+		"evaluations from an expression": `{"evaluations": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "action":  {"name": "t"},
+		    "evaluations": "$params.arguments.smuggled"}}`,
+		"subject from an expression": `{"evaluation": {
+		    "subject": "$params.arguments.whoever",
+		    "action":  {"name": "t"},
+		    "resource": {"type": "r", "id": "r1"}}}`,
+		"evaluations entry not an object": `{"evaluations": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "action":  {"name": "t"},
+		    "evaluations": ["$params.arguments.x"]}}`,
+		"evaluations missing": `{"evaluations": {
+		    "subject": {"type": "identity", "id": "$token.sub"},
+		    "action":  {"name": "t"}}}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(raw), &m); err != nil {
+				t.Fatalf("bad fixture: %v", err)
+			}
+			if _, err := CompileMappingV2("t", m); err == nil {
+				t.Fatal("structure must be literal — an expression here defers it to caller-controlled input")
+			}
+		})
+	}
+}
+
+// AuthZEN subjects require a type; the binding's own defaults use "identity".
+func TestV2DefaultedSubjectCarriesAType(t *testing.T) {
+	cm := mustMappingV2(t, "t", `{"evaluation": {
+	  "action":   {"name": "t"},
+	  "resource": {"type": "customer", "id": "c1"}}}`)
+	built, err := cm.Build(map[string]any{}, v2Token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(built.Body, &got)
+	subj := got["subject"].(map[string]any)
+	if subj["type"] != "identity" {
+		t.Fatalf("defaulted subject must carry a type, got %v", subj)
+	}
+	if subj["id"] != "alice@example.com" {
+		t.Fatalf("defaulted subject id wrong: %v", subj)
+	}
+}
+
+// Every default mapping in the binding must compile and produce the documented shape.
+func TestAllDefaultMappingsCompile(t *testing.T) {
+	methods := []string{
+		"tools/call", "tools/list",
+		"resources/list", "resources/read", "resources/subscribe", "resources/unsubscribe",
+		"prompts/list", "prompts/get",
+		"completion/complete", "logging/setLevel",
+		"tasks/get", "tasks/result", "tasks/cancel", "tasks/list",
+		"initialize", // our deliberate addition — see defaults.go
+	}
+	for _, m := range methods {
+		t.Run(m, func(t *testing.T) {
+			cm, err := CompiledDefault(m)
+			if err != nil {
+				t.Fatalf("default mapping for %s did not compile: %v", m, err)
+			}
+			if !cm.Anchored() {
+				t.Fatalf("default mapping for %s must be token-anchored", m)
+			}
+		})
+	}
+}
+
+func TestDefaultMappingShapes(t *testing.T) {
+	tokenWithAud := map[string]any{
+		"sub": "alice@example.com", "client_id": "agent-1", "aud": "https://mcp.example.com",
+	}
+	cases := []struct {
+		method string
+		params map[string]any
+		want   map[string]any
+	}{
+		{"tools/list", map[string]any{}, map[string]any{"type": "mcp_server", "id": "https://mcp.example.com"}},
+		{"resources/read", map[string]any{"uri": "file:///a"}, map[string]any{"type": "resource", "id": "file:///a"}},
+		{"prompts/get", map[string]any{"name": "greet"}, map[string]any{"type": "prompt", "id": "greet"}},
+		{"tasks/cancel", map[string]any{"taskId": "t-1"}, map[string]any{"type": "task", "id": "t-1"}},
+		// The binding's one conditional default.
+		{"completion/complete", map[string]any{"ref": map[string]any{"type": "ref/prompt", "name": "p1"}},
+			map[string]any{"type": "prompt", "id": "p1"}},
+		{"completion/complete", map[string]any{"ref": map[string]any{"type": "ref/resource", "uri": "file:///b"}},
+			map[string]any{"type": "resource", "id": "file:///b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			cm, err := CompiledDefault(tc.method)
+			if err != nil {
+				t.Fatal(err)
+			}
+			built, err := cm.Build(tc.params, tokenWithAud, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			_ = json.Unmarshal(built.Body, &got)
+			if !jsonEqual(got["resource"], tc.want) {
+				t.Fatalf("resource mismatch\n got: %v\nwant: %v", got["resource"], tc.want)
+			}
+			if action := got["action"].(map[string]any); action["name"] != tc.method {
+				t.Fatalf("action.name should be the method, got %v", action["name"])
+			}
+		})
+	}
+}
+
+func TestPassThroughAndUnknownMethods(t *testing.T) {
+	for _, m := range []string{"ping", "notifications/initialized", "notifications/cancelled"} {
+		if !IsPassThrough(m) {
+			t.Errorf("%s should be pass-through", m)
+		}
+	}
+	for _, m := range []string{"tools/call", "resources/read", "future/method"} {
+		if IsPassThrough(m) {
+			t.Errorf("%s must not be pass-through", m)
+		}
+	}
+	// Unknown methods have no default — the engine denies them (fail closed).
+	if _, ok := DefaultMappings("future/method"); ok {
+		t.Error("an unknown method must not have a default mapping")
+	}
+	// logging/setLevel carries the level in context.
+	cm, err := CompiledDefault("logging/setLevel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, err := cm.Build(map[string]any{"level": "debug"},
+		map[string]any{"sub": "a", "aud": "srv"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(built.Body, &got)
+	if ctx := got["context"].(map[string]any); ctx["level"] != "debug" {
+		t.Fatalf("logging/setLevel should carry level in context, got %v", ctx)
+	}
+}
+
+// Unknown methods fail closed, which is the point of the rule.
+func TestUnknownMethodIsDenied(t *testing.T) {
+	e, mcp, _, _ := newEngineForTest(t, false, true, "ok by policy")
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"future/method","params":{}}`)
+	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok", body, specToken, nil,
+		CallOptions{ApplyDefaultMappings: true})
+	if v.Decision {
+		t.Fatalf("an unknown method must be denied so future MCP versions fail closed, got %+v", v)
+	}
+	if !bytes.Contains(v.JSONRPCError, []byte("-32001")) {
+		t.Fatalf("expected a -32001 denial, got %s", v.JSONRPCError)
+	}
+}
+
+func TestPassThroughMethodsSkipThePDP(t *testing.T) {
+	// A PDP that denies everything — a pass-through method must not reach it.
+	e, mcp, _, _ := newEngineForTest(t, false, false, "denied by policy")
+	for _, m := range []string{"ping", "notifications/initialized"} {
+		body := []byte(`{"jsonrpc":"2.0","id":1,"method":"` + m + `","params":{}}`)
+		v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok", body, specToken, nil,
+			CallOptions{ApplyDefaultMappings: true})
+		if !v.Decision {
+			t.Fatalf("%s must proceed without a PDP call, got %+v", m, v)
+		}
+	}
+}
+
+func TestNonToolsCallMethodIsGovernedByItsDefault(t *testing.T) {
+	e, mcp, _, _ := newEngineForTest(t, false, false, "denied by policy")
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///secret"}}`)
+	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok", body, specToken, nil,
+		CallOptions{ApplyDefaultMappings: true})
+	if v.Decision {
+		t.Fatal("resources/read must be authorized against its default mapping, not waved through")
+	}
+	if !bytes.Contains(v.PDPRequest, []byte(`"file:///secret"`)) {
+		t.Fatalf("the PDP should have been asked about the resource, got %s", v.PDPRequest)
 	}
 }

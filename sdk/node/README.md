@@ -129,6 +129,13 @@ Error codes are the profile's:
 calls out as non-conformant with JSON-RPC — kept only so a client that string-matches on
 it does not break on upgrade.
 
+**Every MCP method is governed, not just `tools/call`.** With `applyDefaultMappings: true`
+the SDK applies the binding's default mapping for `tools/list`, `resources/*`,
+`prompts/*`, `completion/complete`, `logging/setLevel`, `tasks/*` and `initialize`;
+`ping` and `notifications/*` pass through; anything unknown is denied so future MCP
+methods fail closed. See [`core/README.md`](../../core/README.md#default-mappings--the-full-table)
+for the table and for two problems we found in the binding along the way.
+
 A tool that declares no mapping in either dialect passes straight through by default.
 That is **not conformant** — the binding says the default `tools/call` mapping applies
 instead — so set `applyDefaultMappings: true` to authorize undeclared tools against it.
@@ -160,8 +167,10 @@ string(x)  int(x)  double(x)
 a + b + 'c'                 concatenation / addition
 ```
 
-Conditionals (`$token.roles.exists(r, r == 'treasury') ? 'a' : 'b'`), which the binding's
-own examples use, are outside the subset and raise `-32602`. Delegate those.
+Conditionals are supported with `==` and `!=` only — the binding's own
+`completion/complete` default needs one, so a required default mapping could not be
+evaluated without them. Ordering (`>`), boolean operators and macros like
+`exists(r, ...)` are still outside the subset and raise `-32602`. Delegate those.
 
 For full CEL, hand the check to the Go engine in [`../../core`](../../core), which is
 exactly what the Kong plugin does and for the same reason:
@@ -213,7 +222,7 @@ every delegated call look direct. `jwkThumbprint` computes RFC 7638 for a DPoP c
 
 ```sh
 npm install
-npm test        # 40 tests, no network
+npm test        # 55 tests, no network
 npm run test:coverage   # same, with the ratchet enforced
 npm run build
 ```

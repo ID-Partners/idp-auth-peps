@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 )
 
@@ -47,18 +46,6 @@ type Engine struct {
 	// applyDefaults turns on the binding's default mappings for tools that declare
 	// none. Off leaves the pre-v2 pass-through, which is not conformant.
 	applyDefaults bool
-
-	defaultOnce sync.Once
-	defaultMap  *CompiledMappingV2
-	defaultErr  error
-}
-
-// defaultToolsCall compiles the binding's default tools/call mapping once.
-func (e *Engine) defaultToolsCall() (*CompiledMappingV2, error) {
-	e.defaultOnce.Do(func() {
-		e.defaultMap, e.defaultErr = CompileMappingV2("tools/call", DefaultToolsCallMapping())
-	})
-	return e.defaultMap, e.defaultErr
 }
 
 func NewEngine(opts Options) *Engine {
@@ -101,8 +88,13 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 		Method string         `json:"method"`
 		Params map[string]any `json:"params"`
 	}
-	if err := json.Unmarshal(rpcBody, &rpc); err != nil || rpc.Method != "tools/call" {
-		return Verdict{CoazTool: false, Decision: true, Reason: "not a tools/call request"}
+	if err := json.Unmarshal(rpcBody, &rpc); err != nil {
+		return Verdict{CoazTool: false, Decision: true, Reason: "not a JSON-RPC request"}
+	}
+	if rpc.Method != "tools/call" {
+		// Every other method is governed by its own default mapping — tools/call is not
+		// special, it is merely the one that can also be declared per tool.
+		return e.checkByDefaultMapping(ctx, rpc.ID, rpc.Method, rpc.Params, tokenClaims, extraContext, opts)
 	}
 	toolName, _ := rpc.Params["name"].(string)
 	if toolName == "" {
@@ -118,13 +110,10 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization check unavailable: tool discovery failed")}
 	}
 	if !dt.declared() {
-		// The binding: "A PEP MUST apply the default mapping for a method unless a
-		// declared mapping applies to the specific operation." Pass-through is the
-		// non-conformant behaviour, so it is opt-out and says so.
 		if !(opts.ApplyDefaultMappings || e.applyDefaults) {
 			return Verdict{CoazTool: false, Decision: true, Reason: "tool declares no mapping (defaults disabled)"}
 		}
-		def, err := e.defaultToolsCall()
+		def, err := CompiledDefault("tools/call")
 		if err != nil {
 			return Verdict{CoazTool: true, Decision: false,
 				Reason:       fmt.Sprintf("COAZ default mapping error: %v", err),
@@ -290,4 +279,68 @@ func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (pdpOutcome,
 		}
 	}
 	return pdpOutcome{Decision: true}, nil
+}
+
+// checkByDefaultMapping authorizes a non-tools/call MCP method.
+//
+// The binding's shape: pass-through methods proceed without a PDP call, methods with a
+// default mapping are evaluated against it, and anything else MUST be denied so that
+// methods from future MCP versions fail closed instead of slipping past.
+func (e *Engine) checkByDefaultMapping(
+	ctx context.Context,
+	id any,
+	method string,
+	params map[string]any,
+	tokenClaims map[string]any,
+	extraContext map[string]any,
+	opts CallOptions,
+) Verdict {
+	if IsPassThrough(method) {
+		return Verdict{CoazTool: false, Decision: true, Reason: "pass-through method: " + method}
+	}
+	if IsServerInitiated(method) {
+		// Out of scope for the binding: authorizing these with the client's token would
+		// be asking about the wrong identity.
+		return Verdict{CoazTool: false, Decision: true, Reason: "server-initiated request, out of scope: " + method}
+	}
+	if !(opts.ApplyDefaultMappings || e.applyDefaults) {
+		// Pre-v2 behaviour, retained so enabling defaults is a deliberate migration.
+		return Verdict{CoazTool: false, Decision: true, Reason: "defaults disabled: " + method}
+	}
+
+	cm, err := CompiledDefault(method)
+	if err != nil {
+		// Unknown method: "MUST be denied ... This ensures that methods introduced by
+		// future MCP versions or extensions fail closed rather than bypassing
+		// authorization."
+		msg := "Method not permitted: " + method
+		return Verdict{CoazTool: true, Decision: false, Reason: msg,
+			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
+	}
+
+	built, err := cm.Build(params, tokenClaims, extraContext)
+	if err != nil {
+		msg := fmt.Sprintf("COAZ mapping error: %v", err)
+		return Verdict{CoazTool: true, Decision: false, Reason: msg,
+			JSONRPCError: jsonRPCError(id, CodeMappingError, msg)}
+	}
+	out, err := e.evaluate(ctx, built)
+	if err != nil {
+		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
+			Reason:       fmt.Sprintf("PDP error: %v", err),
+			JSONRPCError: jsonRPCError(id, CodePDPError, "Authorization service unavailable")}
+	}
+	if !out.Decision {
+		msg := "Access denied"
+		if out.Reason != "" {
+			msg = "Access denied: " + out.Reason
+		}
+		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
+	}
+	reason := out.Reason
+	if reason == "" {
+		reason = "Permitted by policy."
+	}
+	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason}
 }

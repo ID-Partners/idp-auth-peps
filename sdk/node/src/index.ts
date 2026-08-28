@@ -46,9 +46,12 @@ export {
   McpGuard,
   buildRequest,
   buildRequestV2,
+  defaultMappingFor,
   defaultToolsCallMapping,
   evaluateExpression,
   isAnchoredSubject,
+  isPassThroughMethod,
+  isServerInitiatedMethod,
   jsonRpcError,
   v2Expression,
 } from './mcp.js';

@@ -198,3 +198,50 @@ call require a PDP decision — a change deployed routes should opt into rather 
 discover. Set `coaz_defaults` (per route) or `ApplyDefaultMappings` (Go API) /
 `applyDefaultMappings` (Node SDK) to enable it. **Pass-through is not conformant**; the
 switch exists so the migration is yours to time.
+
+### Default mappings — the full table
+
+Enabled per route (`coaz_defaults`), every MCP method is governed:
+
+| Method(s) | `resource` |
+| --- | --- |
+| `tools/call` | `{type: tool, id: $params.name}` |
+| `tools/list`, `resources/list`, `prompts/list`, `tasks/list` | `{type: mcp_server, id: $token.aud}` |
+| `resources/read`, `resources/subscribe`, `resources/unsubscribe` | `{type: resource, id: $params.uri}` |
+| `prompts/get` | `{type: prompt, id: $params.name}` |
+| `completion/complete` | prompt or resource, by `$params.ref.type` |
+| `logging/setLevel` | `{type: mcp_server, id: $token.aud}`, `level` in context |
+| `tasks/get`, `tasks/result`, `tasks/cancel` | `{type: task, id: $params.taskId}` |
+| `initialize` | `{type: mcp_server, id: $token.aud}` — see below |
+
+`ping` and `notifications/*` are pass-through: the PEP must not call the PDP for them.
+Server-initiated requests (`sampling/createMessage`, `elicitation/create`, `roots/list`)
+are out of scope for the binding — authorizing them with the *client's* token would ask
+about the wrong identity — so they pass through too.
+
+Anything else is **denied**, so a method from a future MCP version fails closed rather
+than slipping past authorization.
+
+### Two problems found in the binding
+
+Both are handled here and worth raising with the working group.
+
+**`initialize` is unreachable.** It appears nowhere in the binding — not in the
+default-mapping table, not in the pass-through list. By the Unknown Methods rule it
+therefore MUST be denied, which denies every MCP handshake and makes the protocol
+unusable. That reads as an omission, not a decision. Denying it breaks everything and
+passing it through leaves the handshake ungoverned, so it gets a default mapping shaped
+like the other server-scoped methods: the PDP is asked, policy decides, nothing bypasses
+authorization.
+
+**The `completion/complete` default does not compile.** The binding prints it as
+
+```
+"id": "$params.ref.type == 'ref/prompt' ? $params.ref.name : $params.ref.uri"
+```
+
+with a `$` on every reference. But the framework says only the *leading* `$` marks a
+value as an expression — "the text following the `$` is the expression itself" — and "a
+`$` anywhere else in a string has no special meaning". Stripping only the leading one
+leaves stray `$` in the CEL source, which is a syntax error. It is written here the way
+the framework's own rule requires: leading `$` to mark the expression, plain CEL inside.

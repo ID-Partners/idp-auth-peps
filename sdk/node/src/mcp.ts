@@ -82,24 +82,96 @@ export interface ToolDefinition {
   [key: string]: unknown;
 }
 
-/**
- * The binding's default mapping for `tools/call`, applied to a tool that declares none.
- * Verbatim from the default-mappings section.
- */
-export function defaultToolsCallMapping(): AuthzenMapping {
+/** One default mapping, from the parts that vary between methods. */
+function defaultEnvelope(
+  action: string,
+  resource: Record<string, unknown>,
+  extraContext?: Record<string, unknown>,
+): AuthzenMapping {
   return {
     evaluation: {
       subject: { type: 'identity', id: '$token.sub' },
-      context: { agent: '$token.?client_id' },
-      action: { name: 'tools/call' },
-      resource: { type: 'tool', id: '$params.name' },
+      context: { agent: '$token.?client_id', ...extraContext },
+      action: { name: action },
+      resource,
     },
   };
+}
+
+/** This MCP server, identified from the audience-bound token (RFC 8707). */
+const SERVER_RESOURCE = { type: 'mcp_server', id: '$token.aud' };
+
+/**
+ * The binding's default mapping for an MCP method, or undefined if it defines none.
+ *
+ * "A PEP MUST apply the default mapping for a method unless a declared mapping applies."
+ * Only `ping` and `notifications/*` are pass-through; anything with neither a default nor
+ * a declaration MUST be denied, so future MCP methods fail closed.
+ */
+export function defaultMappingFor(method: string): AuthzenMapping | undefined {
+  switch (method) {
+    case 'tools/call':
+      return defaultEnvelope(method, { type: 'tool', id: '$params.name' });
+    case 'tools/list':
+    case 'resources/list':
+    case 'prompts/list':
+    case 'tasks/list':
+      return defaultEnvelope(method, { ...SERVER_RESOURCE });
+    case 'resources/read':
+    case 'resources/subscribe':
+    case 'resources/unsubscribe':
+      return defaultEnvelope(method, { type: 'resource', id: '$params.uri' });
+    case 'prompts/get':
+      return defaultEnvelope(method, { type: 'prompt', id: '$params.name' });
+    case 'completion/complete':
+      // SPEC INCONSISTENCY, reported upstream: the binding prints this with a `$` on
+      // every reference, but the framework strips only the LEADING `$` and says a `$`
+      // elsewhere has no special meaning — so the printed form is not valid CEL. Written
+      // here the way the framework's rule requires.
+      return defaultEnvelope(method, {
+        type: "$params.ref.type == 'ref/prompt' ? 'prompt' : 'resource'",
+        id: "$params.ref.type == 'ref/prompt' ? params.ref.name : params.ref.uri",
+      });
+    case 'logging/setLevel':
+      return defaultEnvelope(method, { ...SERVER_RESOURCE }, { level: '$params.level' });
+    case 'tasks/get':
+    case 'tasks/result':
+    case 'tasks/cancel':
+      return defaultEnvelope(method, { type: 'task', id: '$params.taskId' });
+    case 'initialize':
+      // DELIBERATE DEVIATION. `initialize` appears nowhere in the binding, so the
+      // Unknown Methods rule would deny it — which denies every MCP handshake. Reads as
+      // a gap in the draft. Governed like the other server-scoped methods instead of
+      // either breaking the protocol or leaving the handshake unauthorized.
+      return defaultEnvelope(method, { ...SERVER_RESOURCE });
+    default:
+      return undefined;
+  }
+}
+
+/** Kept as a named entry point; `defaultMappingFor` is the source of truth. */
+export function defaultToolsCallMapping(): AuthzenMapping {
+  return defaultMappingFor('tools/call')!;
+}
+
+/** "The PEP MUST NOT call the PDP for them and MUST allow them to proceed." */
+export function isPassThroughMethod(method: string): boolean {
+  return method === 'ping' || method.startsWith('notifications/');
+}
+
+/**
+ * Server-initiated requests, which the binding puts out of scope: they would be
+ * authorized with the client's token, "which is not the appropriate identity".
+ */
+export function isServerInitiatedMethod(method: string): boolean {
+  return method === 'sampling/createMessage' || method === 'elicitation/create' || method === 'roots/list';
 }
 
 /** The token claim `subject.id` anchors to. */
 const SUBJECT_IDENTITY_CLAIM = 'sub';
 const DEFAULT_SUBJECT_EXPR = `$token.${SUBJECT_IDENTITY_CLAIM}`;
+/** The subject type the binding's own default mappings use. */
+const DEFAULT_SUBJECT_TYPE = 'identity';
 
 /** A JSON-RPC 2.0 tools/call request. */
 export interface JsonRpcRequest {
@@ -214,9 +286,36 @@ export class McpGuard {
     const toolName = rpc.params?.name ?? '';
     const token = isPepClaims(args.claims) ? args.claims.raw : (args.claims as Record<string, unknown>);
 
-    if (rpc.method !== 'tools/call' || !toolName) {
-      // Not a tool call — not this guard's business.
-      return { allow: true, coazTool: false, verdict: { allow: true, kind: 'ok', reason: 'not a tools/call' } };
+    const method = rpc.method ?? '';
+    if (method !== 'tools/call' || !toolName) {
+      // Every other method is governed by its own default mapping. tools/call is not
+      // special — it is merely the one that can also be declared per tool.
+      if (isPassThroughMethod(method)) {
+        return { allow: true, coazTool: false, verdict: { allow: true, kind: 'ok', reason: `pass-through: ${method}` } };
+      }
+      if (isServerInitiatedMethod(method)) {
+        return {
+          allow: true,
+          coazTool: false,
+          verdict: { allow: true, kind: 'ok', reason: `server-initiated, out of scope: ${method}` },
+        };
+      }
+      if (!this.opts.applyDefaultMappings) {
+        return { allow: true, coazTool: false, verdict: { allow: true, kind: 'ok', reason: `defaults disabled: ${method}` } };
+      }
+      const def = defaultMappingFor(method);
+      if (!def) {
+        // "MUST be denied ... so that methods introduced by future MCP versions or
+        // extensions fail closed rather than bypassing authorization."
+        const reason = `Method not permitted: ${method}`;
+        return {
+          allow: false,
+          coazTool: true,
+          verdict: { allow: false, kind: 'denied', reason },
+          jsonRpcError: jsonRpcError(id, CODE_DENIED_V2, reason),
+        };
+      }
+      return this.checkAgainst(id, def, rpc, token, args.extraContext, CODE_DENIED_V2, method);
     }
 
     if (this.opts.delegate) {
@@ -512,12 +611,25 @@ export function buildRequestV2(
 
   // Identity smuggling: with the evaluations envelope the single top-level subject
   // governs every entry, so an entry that sets its own subject is rejected.
-  if (batch && Array.isArray(template['evaluations'])) {
-    (template['evaluations'] as unknown[]).forEach((e, i) => {
-      if (isObject(e) && 'subject' in e) {
+  //
+  // The structure itself must be literal. An expression-valued `evaluations` (or
+  // `subject`) would defer the shape to evaluation time, where it is built from
+  // caller-controlled params — the entries could then carry their own subjects and this
+  // check would have inspected nothing. Structure is compile-time; only leaves may be
+  // expressions.
+  if (batch) {
+    const entries = template['evaluations'];
+    if (entries === undefined) throw new Error('evaluations envelope has no evaluations array');
+    if (!Array.isArray(entries)) throw new Error('evaluations must be a literal array, not an expression');
+    entries.forEach((e, i) => {
+      if (!isObject(e)) throw new Error(`evaluations[${i}] must be an object`);
+      if ('subject' in e) {
         throw new Error(`evaluations[${i}] sets subject; only the top-level subject may do so`);
       }
     });
+  }
+  if ('subject' in template && !isObject(template['subject'])) {
+    throw new Error('subject must be a literal object, not an expression');
   }
 
   // Work on a copy: the default subject is supplied by mutation and the declaration is
@@ -553,6 +665,17 @@ export function buildRequestV2(
     }
   }
 
+  // Defence in depth: re-check the RESOLVED request. The checks above constrain the
+  // declaration; this constrains what actually came out of it, so a future change that
+  // lets structure through from an expression cannot silently reopen identity smuggling.
+  if (batch && Array.isArray(resolved['evaluations'])) {
+    (resolved['evaluations'] as unknown[]).forEach((e, i) => {
+      if (isObject(e) && 'subject' in e) {
+        throw new Error(`evaluations[${i}] resolved with its own subject; only the top-level subject may set one`);
+      }
+    });
+  }
+
   // Absent optionals in CONTEXT are pruned — context is optional, and `"agent": null`
   // would invite a policy to match on null as a value. Absence in a required field is a
   // mapping error instead.
@@ -582,6 +705,10 @@ function normaliseSubjectV2(inner: Record<string, unknown>): boolean {
     inner['subject'] = subject;
   }
   const sub = subject as Record<string, unknown>;
+  // AuthZEN subjects require a type, and the binding's own defaults use "identity".
+  if (sub['type'] === undefined || sub['type'] === null || sub['type'] === '') {
+    sub['type'] = DEFAULT_SUBJECT_TYPE;
+  }
   const id = sub['id'];
   if (id === undefined || id === null || id === '') {
     // "the PEP MUST supply the default subject identifier ... so that every request
@@ -810,6 +937,9 @@ export function evaluateExpression(
   params: Record<string, unknown>,
   token: Record<string, unknown>,
 ): unknown {
+  const conditional = evaluateConditional(expr.trim(), params, token);
+  if (conditional) return conditional.value;
+
   const terms = splitTopLevel(expr.trim(), '+');
   if (terms.length === 0) throw new Error(`empty expression`);
   const values = terms.map((t) => evaluateTerm(t.trim(), params, token));
@@ -819,6 +949,69 @@ export function evaluateExpression(
     return (values as number[]).reduce((a, b) => a + b, 0);
   }
   return values.map((v) => (v === null || v === undefined ? '' : String(v))).join('');
+}
+
+/**
+ * A conditional, `cond ? a : b`, with `==`/`!=` comparison. Added because the binding's
+ * own `completion/complete` default needs one — without it a REQUIRED default mapping
+ * could not be evaluated. Still narrow on purpose: no ordering, no boolean operators.
+ * Returns undefined when `expr` is not a conditional.
+ */
+function evaluateConditional(
+  expr: string,
+  params: Record<string, unknown>,
+  token: Record<string, unknown>,
+): { value: unknown } | undefined {
+  // Skip `.?` — that is optional field selection (`token.?client_id`), not a
+  // conditional. Missing this turns every default mapping into a parse error.
+  let q = -1;
+  for (let from = 0; ; ) {
+    const at = indexTopLevel(expr.slice(from), '?');
+    if (at < 0) break;
+    const abs = from + at;
+    if (abs > 0 && expr[abs - 1] === '.') {
+      from = abs + 1;
+      continue;
+    }
+    q = abs;
+    break;
+  }
+  if (q < 0) return undefined;
+  const colon = indexTopLevel(expr.slice(q + 1), ':');
+  if (colon < 0) throw new Error(`conditional is missing its ':' branch: ${expr}`);
+  const cond = expr.slice(0, q).trim();
+  const whenTrue = expr.slice(q + 1, q + 1 + colon).trim();
+  const whenFalse = expr.slice(q + 2 + colon).trim();
+
+  for (const op of ['==', '!='] as const) {
+    const at = indexTopLevel(cond, op);
+    if (at < 0) continue;
+    const left = evaluateExpression(cond.slice(0, at), params, token);
+    const right = evaluateExpression(cond.slice(at + 2), params, token);
+    const equal = left === right;
+    const taken = (op === '==' ? equal : !equal) ? whenTrue : whenFalse;
+    return { value: evaluateExpression(taken, params, token) };
+  }
+  throw new Error(`unsupported condition: ${cond} — only == and != are evaluated here`);
+}
+
+/** Index of `needle` at nesting/quoting depth zero, or -1. */
+function indexTopLevel(expr: string, needle: string): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i]!;
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') depth--;
+    else if (depth === 0 && expr.startsWith(needle, i)) return i;
+  }
+  return -1;
 }
 
 function evaluateTerm(term: string, params: Record<string, unknown>, token: Record<string, unknown>): unknown {

@@ -4,7 +4,7 @@ import { AuthzenClient } from '../src/client.js';
 import { toHttpChallenge } from '../src/challenge.js';
 import { claimsFromToken, extractClaims, hasScope, jwkThumbprint } from '../src/claims.js';
 import { authzenMiddleware, pathMapper, type PepRequest } from '../src/express.js';
-import { CODE_DENIED, CODE_DENIED_V2, CODE_MAPPING_ERROR, CODE_PDP_ERROR, McpGuard, buildRequest, buildRequestV2, defaultToolsCallMapping, evaluateExpression, isAnchoredSubject } from '../src/mcp.js';
+import { CODE_DENIED, CODE_DENIED_V2, CODE_MAPPING_ERROR, CODE_PDP_ERROR, McpGuard, buildRequest, buildRequestV2, defaultMappingFor, defaultToolsCallMapping, evaluateExpression, isAnchoredSubject, isPassThroughMethod, isServerInitiatedMethod } from '../src/mcp.js';
 import type { ToolDefinition } from '../src/mcp.js';
 
 /** A fetch stub that answers the PDP with a fixed body. */
@@ -370,7 +370,11 @@ describe('COAZ mapping', () => {
     expect(evaluateExpression('token.act.sub', p, t)).toBe('agent-7');
     expect(evaluateExpression("'acct:' + params.name", p, t)).toBe('acct:ann');
     expect(evaluateExpression('string(params.amount)', p, t)).toBe('250');
-    expect(() => evaluateExpression('params.amount > 100 ? "a" : "b"', p, t)).toThrow(/unsupported expression/);
+    // Conditionals are evaluated, but only with == / != — ordering is still refused.
+    expect(evaluateExpression("params.name == 'ann' ? 'yes' : 'no'", p, t)).toBe('yes');
+    expect(evaluateExpression("params.name != 'ann' ? 'yes' : 'no'", p, t)).toBe('no');
+    expect(() => evaluateExpression('params.amount > 100 ? "a" : "b"', p, t)).toThrow(/unsupported condition/);
+    expect(() => evaluateExpression('params.foo.bar()', p, t)).toThrow(/unsupported expression/);
   });
 });
 
@@ -531,7 +535,11 @@ describe('COAZ v2 (current binding)', () => {
 
   it('supplies the default token-anchored subject when the mapping omits one', () => {
     const built = buildRequestV2({ evaluation: { action: { name: 't' }, resource: { type: 'customer', id: 'c1' } } } as never, {}, token);
-    expect((built.body as Record<string, Record<string, unknown>>)['subject']).toEqual({ id: 'alice@example.com' });
+    // AuthZEN requires a subject type; the binding's defaults use "identity".
+    expect((built.body as Record<string, Record<string, unknown>>)['subject']).toEqual({
+      type: 'identity',
+      id: 'alice@example.com',
+    });
   });
 
   it('rejects an anchored subject the token cannot back', () => {
@@ -692,5 +700,126 @@ describe('COAZ v2 — defaults and anchoring warnings', () => {
     expect(isAnchoredSubject({ evaluation: { action: { name: 'x' } } } as never)).toBe(true);
     expect(isAnchoredSubject({ evaluation: { subject: { id: '$params.arguments.x' } } } as never)).toBe(false);
     expect(isAnchoredSubject({ evaluation: { subject: { id: "$token.sub + '-x'" } } } as never)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('COAZ v2 — structure must be literal', () => {
+  const token = { sub: 'alice@example.com', client_id: 'agent-1' };
+
+  // Regression for a real bypass: an expression-valued `evaluations` deferred the
+  // structure to evaluation time, where it is built from caller-controlled params — so
+  // entries could carry their own subjects and the compile-time check saw nothing.
+  it('rejects an expression-valued evaluations or subject', () => {
+    const cases: Array<[string, unknown]> = [
+      ['evaluations from an expression', {
+        evaluations: {
+          subject: { type: 'identity', id: '$token.sub' },
+          action: { name: 't' },
+          evaluations: '$params.arguments.smuggled',
+        },
+      }],
+      ['subject from an expression', {
+        evaluation: { subject: '$params.arguments.whoever', action: { name: 't' }, resource: { type: 'r', id: 'r1' } },
+      }],
+      ['entry not an object', {
+        evaluations: {
+          subject: { type: 'identity', id: '$token.sub' },
+          action: { name: 't' },
+          evaluations: ['$params.arguments.x'],
+        },
+      }],
+      ['evaluations missing', {
+        evaluations: { subject: { type: 'identity', id: '$token.sub' }, action: { name: 't' } },
+      }],
+    ];
+    for (const [name, mapping] of cases) {
+      expect(() =>
+        buildRequestV2(mapping as never, { arguments: { smuggled: [{ subject: { id: 'victim' } }] } }, token),
+        name,
+      ).toThrow();
+    }
+  });
+
+  it('does not let a smuggled subject reach the PDP', () => {
+    // The concrete attack: the entry subject comes from tool arguments the caller controls.
+    expect(() =>
+      buildRequestV2(
+        {
+          evaluations: {
+            subject: { type: 'identity', id: '$token.sub' },
+            action: { name: 't' },
+            evaluations: '$params.arguments.smuggled',
+          },
+        } as never,
+        { arguments: { smuggled: [{ subject: { type: 'identity', id: 'victim@example.com' }, resource: { type: 'a', id: '1' } }] } },
+        token,
+      ),
+    ).toThrow(/literal array/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('COAZ v2 — default mappings for every method', () => {
+  const token = { sub: 'alice@example.com', client_id: 'agent-1', aud: 'https://mcp.example.com' };
+  const rpc = (method: string, params: Record<string, unknown> = {}) => ({ jsonrpc: '2.0', id: 9, method, params });
+  const guard = (fetchImpl: ReturnType<typeof pdp>) =>
+    new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, tools: [], applyDefaultMappings: true });
+
+  it('defines the binding default for every governed method', () => {
+    const methods = [
+      'tools/call', 'tools/list', 'resources/list', 'resources/read', 'resources/subscribe',
+      'resources/unsubscribe', 'prompts/list', 'prompts/get', 'completion/complete',
+      'logging/setLevel', 'tasks/get', 'tasks/result', 'tasks/cancel', 'tasks/list', 'initialize',
+    ];
+    for (const m of methods) expect(defaultMappingFor(m), m).toBeDefined();
+    expect(defaultMappingFor('future/method')).toBeUndefined();
+  });
+
+  it('builds each default to the documented resource shape', () => {
+    const shapes: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ['tools/list', {}, { type: 'mcp_server', id: 'https://mcp.example.com' }],
+      ['resources/read', { uri: 'file:///a' }, { type: 'resource', id: 'file:///a' }],
+      ['prompts/get', { name: 'greet' }, { type: 'prompt', id: 'greet' }],
+      ['tasks/cancel', { taskId: 't-1' }, { type: 'task', id: 't-1' }],
+      // The binding's one conditional default, both branches.
+      ['completion/complete', { ref: { type: 'ref/prompt', name: 'p1' } }, { type: 'prompt', id: 'p1' }],
+      ['completion/complete', { ref: { type: 'ref/resource', uri: 'file:///b' } }, { type: 'resource', id: 'file:///b' }],
+    ];
+    for (const [method, params, want] of shapes) {
+      const built = buildRequestV2(defaultMappingFor(method)!, params, token);
+      expect((built.body as Record<string, unknown>)['resource'], method).toEqual(want);
+    }
+  });
+
+  it('denies an unknown method so future MCP versions fail closed', async () => {
+    const v = await guard(pdp({ decision: true })).checkToolCall({ rpc: rpc('future/method'), claims: token });
+    expect(v.allow).toBe(false);
+    expect(v.jsonRpcError?.error.code).toBe(CODE_DENIED_V2);
+  });
+
+  it('lets ping and notifications through without asking the PDP', async () => {
+    // A PDP that denies everything — these must not reach it.
+    const denying = guard(pdp({ decision: false }));
+    for (const m of ['ping', 'notifications/initialized']) {
+      const v = await denying.checkToolCall({ rpc: rpc(m), claims: token });
+      expect(v.allow, m).toBe(true);
+    }
+    expect(isPassThroughMethod('tools/call')).toBe(false);
+    expect(isServerInitiatedMethod('sampling/createMessage')).toBe(true);
+  });
+
+  it('governs a non-tools/call method against its default', async () => {
+    const v = await guard(pdp({ decision: false, context: { reason: 'no' } })).checkToolCall({
+      rpc: rpc('resources/read', { uri: 'file:///secret' }),
+      claims: token,
+    });
+    expect(v.allow).toBe(false);
+    expect(v.pdpRequest).toMatchObject({
+      action: { name: 'resources/read' },
+      resource: { type: 'resource', id: 'file:///secret' },
+    });
   });
 });
