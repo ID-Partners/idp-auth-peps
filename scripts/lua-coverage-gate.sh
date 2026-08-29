@@ -6,6 +6,9 @@
 # floor when coverage rises; never lower it to make CI pass.
 set -euo pipefail
 
+# NOTE: luacov attributes lines differently across Lua versions, so this floor is only
+# meaningful when the runner and the developer use the same one. CI pins 5.4; see
+# .github/workflows/ci.yml.
 FLOOR=85
 
 cd "$(dirname "$0")/../gateways/kong"

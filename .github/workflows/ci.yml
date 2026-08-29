@@ -52,11 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Lua and busted
+        # Pin luarocks to 5.4. Ubuntu's luarocks defaults to whichever Lua its VM was
+        # built against (5.1), and luacov attributes lines differently across versions —
+        # so an unpinned runner measures a different number than a developer does, and
+        # the coverage floor becomes unmeetable on one of them.
         run: |
           sudo apt-get update
           sudo apt-get install -y lua5.4 liblua5.4-dev luarocks
-          sudo luarocks install busted
-          sudo luarocks install luacov
+          sudo luarocks --lua-version=5.4 install busted
+          sudo luarocks --lua-version=5.4 install luacov
+          lua5.4 -v
+          busted --version
       - name: Check the plugin parses
         run: |
           for f in authzen-pdp/*.lua; do
