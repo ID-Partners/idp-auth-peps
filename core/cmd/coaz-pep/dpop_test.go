@@ -4,9 +4,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -229,4 +231,149 @@ func splitJWS(t *testing.T, jws string) [3]string {
 	}
 	out[2] = jws[start:]
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Key parsing and signature verification across the algorithms a real client emits.
+
+func rsaJWK(t *testing.T, key *rsa.PrivateKey) map[string]any {
+	t.Helper()
+	return map[string]any{
+		"kty": "RSA",
+		"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString([]byte{1, 0, 1}), // 65537
+	}
+}
+
+func TestVerifyProofSignatureRSA(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwk := rsaJWK(t, key)
+
+	enc := func(v any) string {
+		raw, _ := json.Marshal(v)
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	claims := map[string]any{"htm": "POST", "jti": "r1", "iat": float64(time.Now().Unix())}
+
+	for _, alg := range []string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512"} {
+		t.Run(alg, func(t *testing.T) {
+			hdr := map[string]any{"typ": "dpop+jwt", "alg": alg, "jwk": jwk}
+			signingInput := enc(hdr) + "." + enc(claims)
+			hash, err := hashFor(alg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := hashBytes(hash, []byte(signingInput))
+
+			var sig []byte
+			if strings.HasPrefix(alg, "PS") {
+				sig, err = rsa.SignPSS(rand.Reader, key, hash, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+			} else {
+				sig, err = rsa.SignPKCS1v15(rand.Reader, key, hash, digest)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+
+			if err := verifyProofSignature(proof, jwk, alg); err != nil {
+				t.Fatalf("a genuine %s proof should verify: %v", alg, err)
+			}
+			// Tamper with the payload: the signature must stop matching.
+			tampered := enc(hdr) + "." + enc(map[string]any{"htm": "GET"}) + "." +
+				base64.RawURLEncoding.EncodeToString(sig)
+			if err := verifyProofSignature(tampered, jwk, alg); err == nil {
+				t.Fatalf("a tampered %s proof was accepted", alg)
+			}
+		})
+	}
+}
+
+func TestHashForCoversEverySupportedSize(t *testing.T) {
+	for _, alg := range []string{"ES256", "RS384", "PS512"} {
+		if _, err := hashFor(alg); err != nil {
+			t.Errorf("%s should be supported: %v", alg, err)
+		}
+	}
+	for _, alg := range []string{"", "HS256", "EdDSA", "ES128"} {
+		if _, err := hashFor(alg); err == nil {
+			t.Errorf("%q should not be accepted", alg)
+		}
+	}
+}
+
+func TestKeyParsingRejectsMismatchedOrBrokenJWKs(t *testing.T) {
+	ecKey := newKey(t)
+	ecJWK := publicJWK(ecKey)
+
+	// alg family must match the key type, or a proof could be verified with the wrong
+	// algorithm entirely.
+	if _, err := rsaFromJWK(ecJWK); err == nil {
+		t.Error("an EC JWK must not parse as RSA")
+	}
+	if _, err := ecdsaFromJWK(map[string]any{"kty": "RSA"}); err == nil {
+		t.Error("an RSA JWK must not parse as EC")
+	}
+
+	for name, jwk := range map[string]map[string]any{
+		"unknown curve":  {"kty": "EC", "crv": "P-192", "x": "AA", "y": "AA"},
+		"x not base64":   {"kty": "EC", "crv": "P-256", "x": "!!!", "y": "AA"},
+		"not on curve":   {"kty": "EC", "crv": "P-256", "x": "AQ", "y": "AQ"},
+		"empty modulus":  {"kty": "RSA", "n": "", "e": "AQAB"},
+		"empty exponent": {"kty": "RSA", "n": "AQ", "e": ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var err error
+			if jwk["kty"] == "EC" {
+				_, err = ecdsaFromJWK(jwk)
+			} else {
+				_, err = rsaFromJWK(jwk)
+			}
+			if err == nil {
+				t.Fatalf("%s should be refused", name)
+			}
+		})
+	}
+}
+
+func TestVerifyProofSignatureRejectsMalformed(t *testing.T) {
+	key := newKey(t)
+	jwk := publicJWK(key)
+	for name, proof := range map[string]string{
+		"not a JWS":        "a.b",
+		"signature junk":   "aGVhZGVy.Y2xhaW1z.!!!",
+		"wrong sig length": "aGVhZGVy.Y2xhaW1z." + base64.RawURLEncoding.EncodeToString([]byte("short")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := verifyProofSignature(proof, jwk, "ES256"); err == nil {
+				t.Fatal("expected a verification failure")
+			}
+		})
+	}
+	if err := verifyProofSignature("a.b.c", jwk, "HS256"); err == nil {
+		t.Fatal("an unsupported alg must not verify")
+	}
+}
+
+func TestReplayCacheRefusesWhenFullOfLiveEntries(t *testing.T) {
+	c := newReplayCache(time.Hour)
+	c.maxSize = 3
+	now := time.Now()
+	for i, jti := range []string{"a", "b", "c"} {
+		if !c.observe(jti, now) {
+			t.Fatalf("entry %d should be accepted", i)
+		}
+	}
+	// Full, nothing expired: refuse rather than grow without bound. Failing closed
+	// under a jti flood is the safe direction.
+	if c.observe("d", now) {
+		t.Fatal("a full cache with no expired entries must refuse, not grow")
+	}
+	// Once entries age out, it accepts again.
+	if !c.observe("d", now.Add(2*time.Hour)) {
+		t.Fatal("expired entries should be reclaimed")
+	}
 }

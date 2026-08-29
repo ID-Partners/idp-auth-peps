@@ -14,10 +14,10 @@ export default defineConfig({
       // and counting them as 0% would make the whole-project number meaningless.
       exclude: ['src/index.ts', 'src/types.ts', 'dist/**', '**/*.config.ts'],
       thresholds: {
-        statements: 81,
-        branches: 73,
-        functions: 90,
-        lines: 81,
+        statements: 94,
+        branches: 84,
+        functions: 100,
+        lines: 94,
       },
     },
   },

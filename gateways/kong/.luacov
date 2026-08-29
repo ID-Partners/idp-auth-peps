@@ -1,0 +1,5 @@
+-- Measure the plugin, not the harness that drives it.
+include = { "authzen%-pdp/" }
+exclude = { "spec/", "luacov" }
+statsfile = ".luacov.stats.out"
+reportfile = ".luacov.report.out"

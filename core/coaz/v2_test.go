@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
 func mustMappingV2(t *testing.T, name, raw string) *CompiledMappingV2 {
@@ -580,5 +582,113 @@ func TestNonToolsCallMethodIsGovernedByItsDefault(t *testing.T) {
 	}
 	if !bytes.Contains(v.PDPRequest, []byte(`"file:///secret"`)) {
 		t.Fatalf("the PDP should have been asked about the resource, got %s", v.PDPRequest)
+	}
+}
+
+func TestDialectString(t *testing.T) {
+	if DialectV2.String() != "coaz/v2" || DialectV1.String() != "coaz/v1" {
+		t.Fatalf("dialect names: %q %q", DialectV2, DialectV1)
+	}
+}
+
+func TestServerInitiatedSet(t *testing.T) {
+	for _, m := range []string{"sampling/createMessage", "elicitation/create", "roots/list"} {
+		if !IsServerInitiated(m) {
+			t.Errorf("%s is server-initiated", m)
+		}
+	}
+	for _, m := range []string{"tools/call", "ping", ""} {
+		if IsServerInitiated(m) {
+			t.Errorf("%s is not server-initiated", m)
+		}
+	}
+}
+
+func TestV2CompileRejectsUncompilableLeaves(t *testing.T) {
+	var m map[string]any
+	_ = json.Unmarshal([]byte(`{"evaluation": {
+	  "subject":  {"type": "identity", "id": "$token.sub"},
+	  "action":   {"name": "$this is not ( valid CEL"},
+	  "resource": {"type": "r", "id": "x"}}}`), &m)
+	if _, err := CompileMappingV2("t", m); err == nil {
+		t.Fatal("a leaf that will not compile must fail at compile time, not at request time")
+	}
+}
+
+func TestV2HandlesNonStringLeaves(t *testing.T) {
+	// Numbers, booleans, null and nested arrays are literals and must survive intact.
+	cm := mustMappingV2(t, "t", `{"evaluation": {
+	  "subject":  {"type": "identity", "id": "$token.sub"},
+	  "action":   {"name": "t"},
+	  "resource": {"type": "r", "id": "x", "properties": {
+	      "limit": 100, "active": true, "tags": ["a", "b"], "nested": {"deep": 1}}}}}`)
+	built, err := cm.Build(map[string]any{}, v2Token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(built.Body, &got)
+	props := got["resource"].(map[string]any)["properties"].(map[string]any)
+	if props["limit"].(float64) != 100 || props["active"] != true {
+		t.Fatalf("scalar literals mangled: %v", props)
+	}
+	if tags := props["tags"].([]any); len(tags) != 2 || tags[0] != "a" {
+		t.Fatalf("array literal mangled: %v", props["tags"])
+	}
+	if props["nested"].(map[string]any)["deep"].(float64) != 1 {
+		t.Fatalf("nested object mangled: %v", props["nested"])
+	}
+}
+
+func TestV2SubjectMustBeAnObject(t *testing.T) {
+	var m map[string]any
+	_ = json.Unmarshal([]byte(`{"evaluation": {"subject": 42, "action": {"name":"t"}, "resource": {"type":"r"}}}`), &m)
+	if _, err := CompileMappingV2("t", m); err == nil {
+		t.Fatal("a non-object subject must be rejected")
+	}
+}
+
+func TestV2NonStringResolvedSubjectFailsClosed(t *testing.T) {
+	// subject.id anchored but resolving to a non-string: must not be compared loosely.
+	cm := mustMappingV2(t, "t", `{"evaluation": {
+	  "subject":  {"type": "identity", "id": "$token.sub"},
+	  "action":   {"name": "t"},
+	  "resource": {"type": "r", "id": "x"}}}`)
+	if _, err := cm.Build(map[string]any{}, map[string]any{"sub": 12345}, nil); err == nil {
+		t.Fatal("a non-string subject claim must not satisfy the anchor")
+	}
+}
+
+func TestDiscoveryCacheEvictsAndThenRefuses(t *testing.T) {
+	d := newDiscoveryCache(time.Hour, nil)
+	d.maxEntries = 2
+	now := time.Now()
+	d.entries["a"] = &discoveryEntry{fetchedAt: now}
+	d.entries["b"] = &discoveryEntry{fetchedAt: now}
+
+	if d.evictLocked(now) {
+		t.Fatal("a full cache of live entries must refuse to grow")
+	}
+	// Once they age past the TTL they are reclaimed.
+	if !d.evictLocked(now.Add(2 * time.Hour)) {
+		t.Fatal("expired entries should be evicted to make room")
+	}
+	if len(d.entries) != 0 {
+		t.Fatalf("expired entries should be gone, %d remain", len(d.entries))
+	}
+}
+
+func TestCacheKeySeparatesCallers(t *testing.T) {
+	// The leak this prevents: one caller's tools view served to another for the TTL.
+	a := cacheKey("http://mcp", "Bearer alice")
+	b := cacheKey("http://mcp", "Bearer bob")
+	if a == b {
+		t.Fatal("different credentials must not share a cache entry")
+	}
+	if cacheKey("http://mcp", "Bearer alice") != a {
+		t.Fatal("the key must be stable for the same caller")
+	}
+	if strings.Contains(a, "alice") {
+		t.Fatalf("the credential must be hashed, not stored: %q", a)
 	}
 }

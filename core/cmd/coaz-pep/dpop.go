@@ -85,13 +85,17 @@ func verifyProofSignature(proof string, jwk map[string]any, alg string) error {
 	return fmt.Errorf("unsupported DPoP alg %q", alg)
 }
 
+// hashFor maps a JWS alg to its digest. The FAMILY is checked as well as the size:
+// matching on the suffix alone would hand back a hash for HS256, and while the callers
+// reject HS* separately, a helper that quietly accepts a symmetric alg is a trap for the
+// next caller.
 func hashFor(alg string) (crypto.Hash, error) {
-	switch {
-	case strings.HasSuffix(alg, "256"):
+	switch alg {
+	case "ES256", "RS256", "PS256":
 		return crypto.SHA256, nil
-	case strings.HasSuffix(alg, "384"):
+	case "ES384", "RS384", "PS384":
 		return crypto.SHA384, nil
-	case strings.HasSuffix(alg, "512"):
+	case "ES512", "RS512", "PS512":
 		return crypto.SHA512, nil
 	}
 	return 0, fmt.Errorf("unsupported DPoP alg %q", alg)

@@ -10,8 +10,8 @@ set -euo pipefail
 
 floor_for() {
   case "$1" in
-    */core/coaz)          echo 74 ;;
-    */core/cmd/coaz-pep)  echo 41 ;;
+    */core/coaz)          echo 76 ;;
+    */core/cmd/coaz-pep)  echo 84 ;;
     *)                    echo "" ;;
   esac
 }

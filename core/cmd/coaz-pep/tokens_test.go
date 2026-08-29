@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -238,5 +239,152 @@ func TestUserClaimsFallsBackToDecodingWhenUnconfigured(t *testing.T) {
 	}
 	if s.userClaims(context.Background(), map[string]string{}) != nil {
 		t.Fatal("no header should yield no claims")
+	}
+}
+
+func TestVerifyJWSRSAAndErrorBranches(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwk := map[string]any{
+		"kty": "RSA",
+		"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString([]byte{1, 0, 1}),
+	}
+	enc := func(v any) string {
+		raw, _ := json.Marshal(v)
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	claims := validClaims()
+
+	for _, alg := range []string{"RS256", "PS256"} {
+		t.Run(alg, func(t *testing.T) {
+			input := enc(map[string]any{"alg": alg}) + "." + enc(claims)
+			hash, _ := hashFor(alg)
+			digest := hashBytes(hash, []byte(input))
+			var sig []byte
+			if alg == "PS256" {
+				sig, err = rsa.SignPSS(rand.Reader, key, hash, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+			} else {
+				sig, err = rsa.SignPKCS1v15(rand.Reader, key, hash, digest)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			token := input + "." + base64.RawURLEncoding.EncodeToString(sig)
+			if err := verifyJWS(token, jwk, alg); err != nil {
+				t.Fatalf("a genuine %s token should verify: %v", alg, err)
+			}
+			// Flip a claim: the signature must stop matching.
+			tampered := enc(map[string]any{"alg": alg}) + "." + enc(map[string]any{"sub": "someone-else"}) +
+				"." + base64.RawURLEncoding.EncodeToString(sig)
+			if err := verifyJWS(tampered, jwk, alg); err == nil {
+				t.Fatalf("a tampered %s token was accepted", alg)
+			}
+		})
+	}
+
+	for name, tc := range map[string]struct{ token, alg string }{
+		"not a JWS":       {"a.b", "RS256"},
+		"sig not base64":  {"a.b.!!!", "RS256"},
+		"unsupported alg": {"a.b.c", "HS256"},
+		"EC alg RSA key":  {"a.b.AAAA", "ES256"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := verifyJWS(tc.token, jwk, tc.alg); err == nil {
+				t.Fatal("expected a verification failure")
+			}
+		})
+	}
+}
+
+func TestJWKSLookupWithoutAKid(t *testing.T) {
+	key := newKey(t)
+
+	t.Run("single key is used when the token names no kid", func(t *testing.T) {
+		srv := jwksServer(t, key, "")
+		defer srv.Close()
+		if _, err := newTestValidator(t, srv.URL).Validate(context.Background(), mintJWT(t, key, "", validClaims())); err != nil {
+			t.Fatalf("a lone key should be usable without a kid: %v", err)
+		}
+	})
+
+	t.Run("several keys and no kid is ambiguous, so refused", func(t *testing.T) {
+		other := newKey(t)
+		jwkA, jwkB := publicJWK(key), publicJWK(other)
+		jwkA["kid"], jwkB["kid"] = "a", "b"
+		body, _ := json.Marshal(map[string]any{"keys": []any{jwkA, jwkB}})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(body)
+		}))
+		defer srv.Close()
+		if _, err := newTestValidator(t, srv.URL).Validate(context.Background(), mintJWT(t, key, "", validClaims())); err == nil {
+			t.Fatal("with several keys and no kid there is no safe choice")
+		}
+	})
+}
+
+func TestJWKSSkipsEncryptionKeysAndEmptySets(t *testing.T) {
+	t.Run("use=enc is not a signing key", func(t *testing.T) {
+		jwk := publicJWK(newKey(t))
+		jwk["use"] = "enc"
+		jwk["kid"] = "k1"
+		body, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(body)
+		}))
+		defer srv.Close()
+		c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
+		if err := c.refresh(context.Background()); err == nil {
+			t.Fatal("a JWKS of only encryption keys has no usable signing key")
+		}
+	})
+
+	for name, body := range map[string]string{
+		"not json":  "{{{",
+		"empty set": `{"keys":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
+			if err := c.refresh(context.Background()); err == nil {
+				t.Fatalf("%s should fail", name)
+			}
+		})
+	}
+
+	t.Run("non-2xx", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
+		if err := c.refresh(context.Background()); err == nil {
+			t.Fatal("a 500 from the JWKS endpoint should fail")
+		}
+	})
+}
+
+func TestJwkThumbprintCanonicalisation(t *testing.T) {
+	// RFC 7638 §3.1 worked example.
+	rsaThumb := jwkThumbprint(map[string]any{
+		"kty": "RSA",
+		"n":   "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+		"e":   "AQAB",
+	})
+	if rsaThumb != "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs" {
+		t.Fatalf("RFC 7638 example thumbprint: %q", rsaThumb)
+	}
+	if jwkThumbprint(map[string]any{"kty": "OKP", "crv": "Ed25519", "x": "AA"}) == "" {
+		t.Fatal("OKP keys should thumbprint")
+	}
+	for _, bad := range []map[string]any{{"kty": "oct", "k": "s"}, {}, nil} {
+		if jwkThumbprint(bad) != "" {
+			t.Errorf("%v should not thumbprint", bad)
+		}
 	}
 }
