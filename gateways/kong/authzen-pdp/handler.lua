@@ -5,13 +5,27 @@
 --      (sub = principal, act.sub = acting agent, scope, cnf.jkt);
 --   2. if DPoP is required, checks the sender-constraint binding: the SHA-256
 --      JWK thumbprint of the DPoP proof header key must equal the access token's
---      cnf.jkt (RFC 9449), and the proof must carry htm/ath;
+--      cnf.jkt (RFC 9449), htm must match the method, and ath must equal
+--      base64url(SHA-256(access token)) so a proof cannot replay against a
+--      different token. SEE THE DPoP LIMITATION NOTE BELOW;
 --   3. builds an AuthZEN evaluation request (subject=agent on behalf of principal,
 --      action+resource+context derived from the HTTP request) and POSTs it to the
 --      Go authzen-adapter, which asks Ping Authorize;
 --   4. PERMIT -> forwards the request, injecting X-Auth-Principal / X-Auth-Agent /
 --      X-Auth-Scope for the Resource Server's audit trail;
 --      DENY   -> returns 403 with the policy reason.
+--
+-- DPoP LIMITATION — READ THIS BEFORE RELYING ON require_dpop.
+-- This plugin does NOT verify the DPoP proof's own JWS signature, because there is no
+-- usable JOSE verifier in Lua here (the same reason COAZ mapping is delegated to
+-- coaz-pep). The proof's public JWK travels inside the proof, so an attacker who has
+-- observed one proof can mint another that thumbprints to the same cnf.jkt. The jkt
+-- comparison below therefore does NOT by itself prove possession of the private key.
+-- What IS enforced: the jkt/cnf match, htm, and the ath token binding — enough to stop
+-- a proof being reused against a different token, not enough to stop forgery.
+-- For a real sender-constraint put the Envoy/agentgateway PEP (core/, which verifies
+-- the proof signature, iat freshness and jti replay) in front of this route, or
+-- validate DPoP in Kong's own auth layer before this plugin runs.
 --
 -- NOTE (demo honesty): this plugin reads the JWT claims and enforces the DPoP
 -- key binding, but does not itself verify the access-token JWS signature. In a
@@ -80,6 +94,13 @@ local function jwk_thumbprint(jwk)
   end
   local sha = resty_sha256:new()
   sha:update(canon)
+  return b64url_encode(sha:final())
+end
+
+-- RFC 9449 `ath`: base64url(SHA-256(access token)). Binds a proof to THIS token.
+local function access_token_hash(token)
+  local sha = resty_sha256:new()
+  sha:update(token)
   return b64url_encode(sha:final())
 end
 
@@ -243,8 +264,13 @@ function AuthzenPDP:access(conf)
     if not pclaims or pclaims.htm ~= kong.request.get_method() then
       return deny(pep, 401, "DPoP proof htm does not match the request method.")
     end
+    -- ath binds this proof to THIS access token. Presence alone is worthless: a proof
+    -- minted for any token would otherwise replay against any other.
     if not pclaims.ath then
       return deny(pep, 401, "DPoP proof missing ath (access-token hash).")
+    end
+    if pclaims.ath ~= access_token_hash(token) then
+      return deny(pep, 401, "DPoP proof ath does not match the presented access token.")
     end
     -- htu is validated best-effort: hosts get rewritten behind the platform proxy,
     -- so a mismatch is logged rather than fatal for the demo.
@@ -389,6 +415,28 @@ function AuthzenPDP:access(conf)
   pdp_ctx.reason = reason
   pdp_ctx.action = action
 
+  -- Identity-proofing advice: the customer has no verified proofing activity yet.
+  -- Challenge for a credential presentation rather than a flat deny, so the client
+  -- knows what would resolve it. Ordered before step-up because identity is the more
+  -- fundamental gate: resolve it first and let the retry surface any step-up.
+  --
+  -- This mirrors the Go PEP exactly (core/coaz/engine.go). Without it, the same policy
+  -- decision produced a resolvable challenge behind Envoy and an unexplained 403 behind
+  -- Kong, which defeats the point of sharing one decision contract.
+  if dctx.identity_proofing_required then
+    local doctype = dctx.identity_proofing_doctype or "org.iso.18013.5.1.mDL"
+    return kong.response.exit(401, {
+      error = "identity_verification_required",
+      doctype = doctype,
+      pep = pep,
+      reason = reason,
+      authz_challenge = { type = "identity_proofing", doctype = doctype, reason = reason, pep = pep },
+    }, {
+      ["Content-Type"] = "application/json",
+      ["WWW-Authenticate"] = 'Bearer error="identity_verification_required", doctype="' .. doctype .. '"',
+    })
+  end
+
   -- Step-up advice from the policy: this payment is over the threshold and the user
   -- hasn't approved it yet. Challenge for the step-up scope (RFC 9470) so the app can
   -- step the customer up, rather than a flat 403.
@@ -399,6 +447,7 @@ function AuthzenPDP:access(conf)
       scope = scope_req,
       pep = pep,
       reason = reason,
+      authz_challenge = { type = "resource_authorisation", scope = scope_req, reason = reason, pep = pep },
     }, {
       ["Content-Type"] = "application/json",
       ["WWW-Authenticate"] = 'Bearer error="insufficient_scope", scope="' .. scope_req .. '"',
@@ -435,6 +484,7 @@ AuthzenPDP._TEST = {
   jwt_claims = jwt_claims,
   jwt_header = jwt_header,
   jwk_thumbprint = jwk_thumbprint,
+  access_token_hash = access_token_hash,
   extract_token = extract_token,
   map_request = map_request,
 }

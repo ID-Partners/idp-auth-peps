@@ -164,10 +164,10 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 
 | | Coverage | Floor set in |
 | --- | --- | --- |
-| `core/coaz` | 76.7% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/coaz` | 80.8% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `core/cmd/coaz-pep` | 84.8% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `sdk/node` | 95.0% stmts / 84.1% branches | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
-| `gateways/kong` | 62.4% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
+| `gateways/kong` | 85.0% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
 
 `main()`'s listen-and-serve loop is the one thing deliberately left uncovered: it is
 process wiring with no branch worth asserting, and a test that started real listeners

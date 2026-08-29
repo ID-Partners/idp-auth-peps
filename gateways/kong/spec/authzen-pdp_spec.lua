@@ -225,3 +225,227 @@ describe('access(): the decision path', function()
     assert.equal('cust-1', sent.resource.id)
   end)
 end)
+
+describe('DPoP sender-constraint', function()
+  -- The mock's SHA-256 is deterministic ("digest:" .. input), so the expected ath can
+  -- be computed the same way the plugin does without needing real crypto here.
+  local function expected_ath(plugin, token)
+    return plugin._TEST.access_token_hash(token)
+  end
+
+  local function dpop_request(opts)
+    local claims = opts.token_claims or { sub = 'alice', cnf = { jkt = 'THUMB' } }
+    local token = mock.jwt(claims)
+    local proof_claims = opts.proof_claims or {}
+    if proof_claims.ath == nil and not opts.omit_ath then
+      proof_claims.ath = '__COMPUTED__'
+    end
+    local proof = mock.jwt(proof_claims, { typ = 'dpop+jwt', alg = 'ES256', jwk = opts.jwk or { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' } })
+    return token, proof, proof_claims
+  end
+
+  it('permits a proof whose key, method and token hash all match', function()
+    -- Build in two passes: the first tells us the thumbprint and ath the plugin expects.
+    local probe = load_plugin({})
+    local jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }
+    local thumb = probe._TEST.jwk_thumbprint(jwk)
+    local token = mock.jwt({ sub = 'alice', cnf = { jkt = thumb } })
+    local ath = probe._TEST.access_token_hash(token)
+    local proof = mock.jwt({ htm = 'GET', ath = ath, htu = '/accounts/a/balance' },
+      { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk })
+
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'DPoP ' .. token, dpop = proof },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ require_dpop = true }))
+    assert.is_nil(state.exited)
+  end)
+
+  it('REJECTS a proof minted for a different token (ath binding)', function()
+    -- The regression: ath used to be checked for presence only, so a proof for one
+    -- token replayed against any other.
+    local probe = load_plugin({})
+    local jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }
+    local thumb = probe._TEST.jwk_thumbprint(jwk)
+    local token = mock.jwt({ sub = 'alice', cnf = { jkt = thumb } })
+    local otherAth = probe._TEST.access_token_hash(mock.jwt({ sub = 'alice', jti = 'other' }))
+    local proof = mock.jwt({ htm = 'GET', ath = otherAth }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk })
+
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'DPoP ' .. token, dpop = proof },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ require_dpop = true }))
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+    assert.matches('ath does not match', state.exited.body.reason)
+  end)
+
+  it('rejects a bearer scheme, a missing proof, a jkt mismatch and a wrong method', function()
+    local probe = load_plugin({})
+    local jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }
+    local thumb = probe._TEST.jwk_thumbprint(jwk)
+    local token = mock.jwt({ sub = 'alice', cnf = { jkt = thumb } })
+    local ath = probe._TEST.access_token_hash(token)
+    local good = mock.jwt({ htm = 'GET', ath = ath }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk })
+
+    local cases = {
+      { name = 'bearer scheme', auth = 'Bearer ' .. token, proof = good },
+      { name = 'no proof header', auth = 'DPoP ' .. token, proof = nil },
+      { name = 'jkt bound elsewhere', auth = 'DPoP ' .. mock.jwt({ sub = 'alice', cnf = { jkt = 'SOMEONE-ELSE' } }), proof = good },
+      { name = 'no cnf at all', auth = 'DPoP ' .. mock.jwt({ sub = 'alice' }), proof = good },
+      { name = 'htm mismatch', auth = 'DPoP ' .. token,
+        proof = mock.jwt({ htm = 'POST', ath = ath }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk }) },
+      { name = 'no ath', auth = 'DPoP ' .. token,
+        proof = mock.jwt({ htm = 'GET' }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk }) },
+    }
+    for _, c in ipairs(cases) do
+      local headers = { authorization = c.auth }
+      if c.proof then headers.dpop = c.proof end
+      local plugin, state = load_plugin({
+        method = 'GET', path = '/accounts/a/balance', headers = headers, pdp = { decision = true },
+      })
+      mock.run_access(plugin, base_conf({ require_dpop = true }))
+      assert.is_truthy(state.exited, c.name .. ' should be denied')
+      assert.equal(401, state.exited.status, c.name)
+    end
+  end)
+
+  it('does not enforce DPoP when the route does not require it', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ require_dpop = false }))
+    assert.is_nil(state.exited)
+  end)
+end)
+
+describe('step-up and PDP advice', function()
+  local function permit_token()
+    return 'Bearer ' .. mock.jwt({ sub = 'alice', scope = 'accounts:read' })
+  end
+
+  it('relays a step-up challenge rather than a flat deny', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/payments',
+      headers = { authorization = permit_token() },
+      body = '{"from_account":"a","to_account":"b","amount":9000}',
+      pdp = {
+        decision = false,
+        context = { reason = 'over threshold', step_up_required = true, step_up_scope = 'payments:approve' },
+      },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+    -- The client needs to know WHICH scope to go and get.
+    local body = state.exited.body
+    assert.matches('payments:approve', mock.json_encode(body))
+  end)
+
+  it('relays an identity-proofing requirement with its doctype', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/accounts',
+      headers = { authorization = permit_token() },
+      body = '{"account_type":"savings"}',
+      pdp = {
+        decision = false,
+        context = { identity_proofing_required = true, identity_proofing_doctype = 'org.iso.18013.5.1.mDL' },
+      },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.is_truthy(state.exited)
+    assert.matches('mDL', mock.json_encode(state.exited.body))
+  end)
+
+  it('requires a logged-in user when the route says so', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = permit_token() }, -- no X-User-Token
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ require_user_login = true }))
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+    assert.equal(0, #state.pdp_requests) -- challenged before the PDP is consulted
+  end)
+
+  it('carries the user token scope into the PDP context', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/payments',
+      headers = {
+        authorization = permit_token(),
+        ['x-user-token'] = mock.jwt({ sub = 'alice', scope = 'payments:approve', acr = 'urn:mfa' }),
+      },
+      body = '{"from_account":"a","amount":50}',
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ require_user_login = true }))
+    assert.is_nil(state.exited)
+    local sent = mock.json_decode(state.pdp_requests[1].body)
+    assert.equal('payments:approve', sent.context.user_scope)
+  end)
+end)
+
+describe('challenge parity with the other PEPs', function()
+  -- The repo's central claim is that a client gets the same challenge whichever PEP
+  -- denies it. These pin the wire shape so a change to one PEP cannot silently drift.
+  it('renders a step-up identically to the Go PEP', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/payments',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{"from_account":"a","amount":9000}',
+      pdp = { decision = false, context = { reason = 'approve it', step_up_required = true, step_up_scope = 'pay:approve' } },
+    })
+    mock.run_access(plugin, base_conf())
+    local body = state.exited.body
+    assert.equal(401, state.exited.status)
+    assert.equal('insufficient_scope', body.error)
+    assert.equal('resource_authorisation', body.authz_challenge.type)
+    assert.equal('pay:approve', body.authz_challenge.scope)
+    assert.matches('insufficient_scope', state.exited.headers['WWW-Authenticate'])
+  end)
+
+  it('renders identity proofing identically to the Go PEP', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/accounts',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{}',
+      pdp = { decision = false, context = { identity_proofing_required = true, identity_proofing_doctype = 'org.iso.18013.5.1.mDL' } },
+    })
+    mock.run_access(plugin, base_conf())
+    local body = state.exited.body
+    assert.equal(401, state.exited.status)
+    assert.equal('identity_verification_required', body.error)
+    assert.equal('identity_proofing', body.authz_challenge.type)
+    assert.equal('org.iso.18013.5.1.mDL', body.authz_challenge.doctype)
+  end)
+
+  it('defaults the doctype when the policy names none', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/accounts',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{}',
+      pdp = { decision = false, context = { identity_proofing_required = true } },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.equal('org.iso.18013.5.1.mDL', state.exited.body.doctype)
+  end)
+
+  it('resolves identity before step-up when a policy asks for both', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/payments',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{"from_account":"a","amount":9000}',
+      pdp = { decision = false, context = {
+        identity_proofing_required = true, step_up_required = true, step_up_scope = 's' } },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.equal('identity_verification_required', state.exited.body.error)
+  end)
+end)

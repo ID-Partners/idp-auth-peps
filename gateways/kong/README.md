@@ -50,6 +50,22 @@ plugins:
 `authzen_url` and `authzen_api_key` are `referenceable`, so they take Kong vault
 references rather than literals.
 
+## DPoP: what `require_dpop` does and does not give you
+
+**Enforced:** the proof's JWK thumbprint matches the token's `cnf.jkt`, `htm` matches the
+method, and `ath` equals `base64url(SHA-256(access token))` — so a proof minted for one
+token cannot be replayed against another.
+
+**Not enforced: the proof's own JWS signature.** There is no usable JOSE verifier in Lua
+here — the same reason COAZ mapping is delegated to `coaz-pep`. The proof carries its
+public JWK, so an attacker who has observed one proof can mint another that thumbprints
+to the same `cnf.jkt`. The thumbprint comparison therefore does **not** by itself prove
+possession of the private key.
+
+If you need a real RFC 9449 sender-constraint on a route, put the Envoy/agentgateway PEP
+in front of it — [`core/`](../../core) verifies the proof signature, `iat` freshness and
+`jti` replay — or validate DPoP in Kong's own auth layer before this plugin runs.
+
 ## Why COAZ needs `coaz_url`
 
 `coaz_url` points at the HTTP check API of the Go `coaz-pep` service in
