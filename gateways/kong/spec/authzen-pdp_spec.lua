@@ -41,7 +41,7 @@ describe('pure helpers', function()
   it('round-trips base64url without padding', function()
     for _, s in ipairs({ 'a', 'ab', 'abc', 'abcd', 'hello world' }) do
       local T = helpers()
-      assert.equal(s, T.b64url_decode(T.b64url_encode(s)))
+      assert.equal(s, T.b64url_decode(mock.b64url(s)))
     end
   end)
 
@@ -49,7 +49,6 @@ describe('pure helpers', function()
     local T = helpers()
     local token = mock.jwt({ sub = 'alice@example.com', scope = 'a b' }, { alg = 'ES256', kid = 'k1' })
     assert.equal('alice@example.com', T.jwt_claims(token).sub)
-    assert.equal('k1', T.jwt_header(token).kid)
 
     for _, bad in ipairs({ 'nodots', 'only.one' }) do
       assert.is_nil(T.jwt_claims(bad))
@@ -70,27 +69,6 @@ describe('pure helpers', function()
     assert.is_nil((T.extract_token('Malformed')))
   end)
 
-  it('canonicalises a JWK per RFC 7638 member ordering', function()
-    -- The digest is stubbed; the canonical JSON is the bug-prone part, so that is what
-    -- is asserted. Members must be lexicographic, with no whitespace.
-    local shapes = {
-      { jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }, canon = '{"crv":"P-256","kty":"EC","x":"X","y":"Y"}' },
-      { jwk = { kty = 'RSA', e = 'AQAB', n = 'N' },            canon = '{"e":"AQAB","kty":"RSA","n":"N"}' },
-      { jwk = { kty = 'OKP', crv = 'Ed25519', x = 'X' },       canon = '{"crv":"Ed25519","kty":"OKP","x":"X"}' },
-    }
-    for _, case in ipairs(shapes) do
-      local plugin, state = load_plugin({})
-      assert.is_truthy(plugin._TEST.jwk_thumbprint(case.jwk))
-      assert.equal(case.canon, state.last_sha_input)
-    end
-  end)
-
-  it('refuses a JWK with no usable key type', function()
-    local T = helpers()
-    assert.is_nil(T.jwk_thumbprint({ kty = 'oct', k = 's' }))
-    assert.is_nil(T.jwk_thumbprint('not a table'))
-    assert.is_nil(T.jwk_thumbprint({}))
-  end)
 end)
 
 describe('request mapping', function()
@@ -226,95 +204,85 @@ describe('access(): the decision path', function()
   end)
 end)
 
-describe('DPoP sender-constraint', function()
-  -- The mock's SHA-256 is deterministic ("digest:" .. input), so the expected ath can
-  -- be computed the same way the plugin does without needing real crypto here.
-  local function expected_ath(plugin, token)
-    return plugin._TEST.access_token_hash(token)
-  end
-
-  local function dpop_request(opts)
-    local claims = opts.token_claims or { sub = 'alice', cnf = { jkt = 'THUMB' } }
-    local token = mock.jwt(claims)
-    local proof_claims = opts.proof_claims or {}
-    if proof_claims.ath == nil and not opts.omit_ath then
-      proof_claims.ath = '__COMPUTED__'
+describe('DPoP is delegated, and fails closed', function()
+  -- The plugin no longer verifies proofs itself. It cannot: a thumbprint comparison
+  -- proves nothing when the proof carries the very JWK being compared. Verification
+  -- goes to coaz-pep, and anything that cannot be verified is denied.
+  local function with_verifier(verdict_or_fn, over)
+    local calls = {}
+    local pdp_fn = function(url, req)
+      calls[#calls + 1] = { url = url, body = req.body }
+      if url:find('/v1/dpop/verify', 1, true) then
+        if type(verdict_or_fn) == 'function' then return verdict_or_fn(url, req) end
+        if verdict_or_fn == false then return nil, 'connection refused' end
+        return { status = 200, body = mock.json_encode(verdict_or_fn) }
+      end
+      return { status = 200, body = mock.json_encode({ decision = true }) }
     end
-    local proof = mock.jwt(proof_claims, { typ = 'dpop+jwt', alg = 'ES256', jwk = opts.jwk or { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' } })
-    return token, proof, proof_claims
-  end
-
-  it('permits a proof whose key, method and token hash all match', function()
-    -- Build in two passes: the first tells us the thumbprint and ath the plugin expects.
-    local probe = load_plugin({})
-    local jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }
-    local thumb = probe._TEST.jwk_thumbprint(jwk)
-    local token = mock.jwt({ sub = 'alice', cnf = { jkt = thumb } })
-    local ath = probe._TEST.access_token_hash(token)
-    local proof = mock.jwt({ htm = 'GET', ath = ath, htu = '/accounts/a/balance' },
-      { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk })
-
     local plugin, state = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'DPoP ' .. token, dpop = proof },
-      pdp = { decision = true },
+      headers = {
+        authorization = 'DPoP ' .. mock.jwt({ sub = 'alice', cnf = { jkt = 'THUMB' } }),
+        dpop = mock.jwt({ htm = 'GET', ath = 'AAA' }, { typ = 'dpop+jwt', alg = 'ES256' }),
+      },
+      pdp = pdp_fn,
     })
-    mock.run_access(plugin, base_conf({ require_dpop = true }))
+    local conf = base_conf({ require_dpop = true, coaz_url = 'http://coaz-pep:9192' })
+    for k, v in pairs(over or {}) do conf[k] = v end
+    mock.run_access(plugin, conf)
+    return state, calls
+  end
+
+  it('permits when the verifier says the proof is valid', function()
+    local state, calls = with_verifier({ valid = true })
     assert.is_nil(state.exited)
+    -- The proof went to the verifier, and the request still reached the PDP.
+    local saw_verify, saw_pdp = false, false
+    for _, c in ipairs(calls) do
+      if c.url:find('/v1/dpop/verify', 1, true) then saw_verify = true end
+      if c.url:find('/access/v1/evaluation', 1, true) then saw_pdp = true end
+    end
+    assert.is_true(saw_verify, 'the proof should be sent for verification')
+    assert.is_true(saw_pdp, 'a valid proof should let the request reach the PDP')
   end)
 
-  it('REJECTS a proof minted for a different token (ath binding)', function()
-    -- The regression: ath used to be checked for presence only, so a proof for one
-    -- token replayed against any other.
-    local probe = load_plugin({})
-    local jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }
-    local thumb = probe._TEST.jwk_thumbprint(jwk)
-    local token = mock.jwt({ sub = 'alice', cnf = { jkt = thumb } })
-    local otherAth = probe._TEST.access_token_hash(mock.jwt({ sub = 'alice', jti = 'other' }))
-    local proof = mock.jwt({ htm = 'GET', ath = otherAth }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk })
-
-    local plugin, state = load_plugin({
-      method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'DPoP ' .. token, dpop = proof },
-      pdp = { decision = true },
-    })
-    mock.run_access(plugin, base_conf({ require_dpop = true }))
+  it('relays the verifier reason on an invalid proof', function()
+    local state = with_verifier({ valid = false, reason = 'DPoP proof signature is invalid' })
     assert.is_truthy(state.exited)
     assert.equal(401, state.exited.status)
-    assert.matches('ath does not match', state.exited.body.reason)
+    assert.matches('signature is invalid', state.exited.body.reason)
   end)
 
-  it('rejects a bearer scheme, a missing proof, a jkt mismatch and a wrong method', function()
-    local probe = load_plugin({})
-    local jwk = { kty = 'EC', crv = 'P-256', x = 'X', y = 'Y' }
-    local thumb = probe._TEST.jwk_thumbprint(jwk)
-    local token = mock.jwt({ sub = 'alice', cnf = { jkt = thumb } })
-    local ath = probe._TEST.access_token_hash(token)
-    local good = mock.jwt({ htm = 'GET', ath = ath }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk })
-
-    local cases = {
-      { name = 'bearer scheme', auth = 'Bearer ' .. token, proof = good },
-      { name = 'no proof header', auth = 'DPoP ' .. token, proof = nil },
-      { name = 'jkt bound elsewhere', auth = 'DPoP ' .. mock.jwt({ sub = 'alice', cnf = { jkt = 'SOMEONE-ELSE' } }), proof = good },
-      { name = 'no cnf at all', auth = 'DPoP ' .. mock.jwt({ sub = 'alice' }), proof = good },
-      { name = 'htm mismatch', auth = 'DPoP ' .. token,
-        proof = mock.jwt({ htm = 'POST', ath = ath }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk }) },
-      { name = 'no ath', auth = 'DPoP ' .. token,
-        proof = mock.jwt({ htm = 'GET' }, { typ = 'dpop+jwt', alg = 'ES256', jwk = jwk }) },
-    }
-    for _, c in ipairs(cases) do
-      local headers = { authorization = c.auth }
-      if c.proof then headers.dpop = c.proof end
-      local plugin, state = load_plugin({
-        method = 'GET', path = '/accounts/a/balance', headers = headers, pdp = { decision = true },
-      })
-      mock.run_access(plugin, base_conf({ require_dpop = true }))
-      assert.is_truthy(state.exited, c.name .. ' should be denied')
-      assert.equal(401, state.exited.status, c.name)
-    end
+  it('FAILS CLOSED when the verifier is unreachable', function()
+    local state = with_verifier(false)
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+    assert.matches('unreachable', state.exited.body.reason)
   end)
 
-  it('does not enforce DPoP when the route does not require it', function()
+  it('FAILS CLOSED when the verifier errors', function()
+    local state = with_verifier(function() return { status = 500, body = 'boom' } end)
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+  end)
+
+  it('FAILS CLOSED on an unusable verifier body', function()
+    local state = with_verifier(function() return { status = 200, body = 'not json' } end)
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+  end)
+
+  it('FAILS CLOSED rather than falling back when coaz_url is unset', function()
+    -- The schema forbids this combination, so it should be unreachable — but a route
+    -- that demands sender-constrained tokens and cannot verify them must deny, never
+    -- silently downgrade to the weaker local check that used to live here.
+    local state = with_verifier({ valid = true }, { coaz_url = '' })
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+    assert.matches('verification is unavailable', state.exited.body.reason)
+  end)
+
+  it('never sends the proof anywhere when the route does not require DPoP', function()
     local plugin, state = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
       headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
@@ -322,6 +290,9 @@ describe('DPoP sender-constraint', function()
     })
     mock.run_access(plugin, base_conf({ require_dpop = false }))
     assert.is_nil(state.exited)
+    for _, r in ipairs(state.pdp_requests) do
+      assert.is_nil(r.url:find('/v1/dpop/verify', 1, true))
+    end
   end)
 end)
 
@@ -447,5 +418,159 @@ describe('challenge parity with the other PEPs', function()
     })
     mock.run_access(plugin, base_conf())
     assert.equal('identity_verification_required', state.exited.body.error)
+  end)
+end)
+
+describe('COAZ delegation on an MCP route', function()
+  local tools_call = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}'
+
+  local function mcp_route(engine, over)
+    local calls = {}
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/mcp',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice', act = { sub = 'agent-1' } }) },
+      body = tools_call,
+      pdp = function(url, req)
+        calls[#calls + 1] = url
+        if url:find('/v1/mcp/check', 1, true) then
+          if type(engine) == 'function' then return engine(url, req) end
+          if engine == false then return nil, 'connection refused' end
+          return { status = 200, body = mock.json_encode(engine) }
+        end
+        return { status = 200, body = mock.json_encode({ decision = true }) }
+      end,
+    })
+    local conf = base_conf({ style = 'mcp', coaz_url = 'http://coaz-pep:9192', mcp_upstream_url = 'http://mcp:8090/mcp' })
+    for k, v in pairs(over or {}) do conf[k] = v end
+    mock.run_access(plugin, conf)
+    return state, calls
+  end
+
+  it('delegates a tools/call to the engine and forwards its upstream headers', function()
+    local state, calls = mcp_route({
+      decision = true,
+      upstream_headers = { ['X-Auth-Principal'] = 'alice', ['X-Coaz'] = 'permit' },
+    })
+    assert.is_nil(state.exited)
+    assert.is_truthy(calls[1]:find('/v1/mcp/check', 1, true), 'the tools/call should go to the engine')
+    assert.equal('permit', state.upstream_headers['X-Coaz'])
+  end)
+
+  it('relays the engine JSON-RPC error body verbatim on a deny', function()
+    local rpc_error = '{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"denied by policy"}}'
+    local state = mcp_route({
+      decision = false,
+      response = { status = 200, body = rpc_error },
+    })
+    assert.is_truthy(state.exited)
+    -- Relayed as-is: two renderings of one decision would drift.
+    assert.equal(200, state.exited.status)
+    assert.matches('-32001', tostring(state.exited.body))
+  end)
+
+  it('FAILS CLOSED when the engine is unreachable', function()
+    local state = mcp_route(false)
+    assert.is_truthy(state.exited)
+    assert.equal(503, state.exited.status)
+    assert.matches('unreachable', state.exited.body.reason)
+  end)
+
+  it('FAILS CLOSED when the engine errors', function()
+    local state = mcp_route(function() return { status = 500, body = 'boom' } end)
+    assert.is_truthy(state.exited)
+    assert.equal(503, state.exited.status)
+  end)
+
+  it('does not delegate JSON-RPC that is not a tools/call', function()
+    local calls = {}
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/mcp',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+      pdp = function(url)
+        calls[#calls + 1] = url
+        return { status = 200, body = mock.json_encode({ decision = true }) }
+      end,
+    })
+    mock.run_access(plugin, base_conf({ style = 'mcp', coaz_url = 'http://coaz-pep:9192' }))
+    for _, u in ipairs(calls) do
+      assert.is_nil(u:find('/v1/mcp/check', 1, true), 'only tools/call is delegated')
+    end
+  end)
+
+  it('does not delegate when coaz_url is unset', function()
+    local calls = {}
+    local plugin = load_plugin({
+      method = 'POST', path = '/mcp',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = tools_call,
+      pdp = function(url)
+        calls[#calls + 1] = url
+        return { status = 200, body = mock.json_encode({ decision = true }) }
+      end,
+    })
+    mock.run_access(plugin, base_conf({ style = 'mcp' }))
+    for _, u in ipairs(calls) do
+      assert.is_nil(u:find('/v1/mcp/check', 1, true))
+    end
+  end)
+end)
+
+describe('claim handling and remaining denials', function()
+  it('denies a token with no readable subject', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ scope = 'a' }) }, -- no sub
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.is_truthy(state.exited)
+    assert.equal(401, state.exited.status)
+    assert.matches('no subject claim', state.exited.body.reason)
+  end)
+
+  it('decodes an act claim that arrived as a JSON string', function()
+    -- PingFederate serialises act as a string; read naively, every delegated call
+    -- looks direct and the agent disappears from the audit trail.
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice', act = '{"sub":"agent-9"}' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.equal('agent-9', state.upstream_headers['X-Auth-Agent'])
+  end)
+
+  it('sends a login challenge with an acr hint when no user is present', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ require_user_login = true }))
+    assert.equal(401, state.exited.status)
+    assert.matches('insufficient_user_authentication', state.exited.headers['WWW-Authenticate'])
+  end)
+
+  it('carries an internal_transfer flag and a default account type into the request', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/payments',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{"from_account":"a","to_account":"b","amount":5,"internal_transfer":true}',
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf())
+    local sent = mock.json_decode(state.pdp_requests[1].body)
+    assert.is_true(sent.context.internal_transfer)
+
+    local plugin2, state2 = load_plugin({
+      method = 'POST', path = '/accounts',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{}',
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin2, base_conf())
+    local sent2 = mock.json_decode(state2.pdp_requests[1].body)
+    assert.equal('new:savings', sent2.resource.id)
   end)
 end)

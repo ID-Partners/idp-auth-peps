@@ -50,21 +50,32 @@ plugins:
 `authzen_url` and `authzen_api_key` are `referenceable`, so they take Kong vault
 references rather than literals.
 
-## DPoP: what `require_dpop` does and does not give you
+## DPoP is delegated
 
-**Enforced:** the proof's JWK thumbprint matches the token's `cnf.jkt`, `htm` matches the
-method, and `ath` equals `base64url(SHA-256(access token))` — so a proof minted for one
-token cannot be replayed against another.
+`require_dpop` sends the proof to `coaz-pep`'s `POST /v1/dpop/verify`, which checks the
+JWS **signature**, `iat` freshness and `jti` replay as well as the `cnf.jkt` / `htm` /
+`ath` binding.
 
-**Not enforced: the proof's own JWS signature.** There is no usable JOSE verifier in Lua
-here — the same reason COAZ mapping is delegated to `coaz-pep`. The proof carries its
-public JWK, so an attacker who has observed one proof can mint another that thumbprints
-to the same `cnf.jkt`. The thumbprint comparison therefore does **not** by itself prove
-possession of the private key.
+The plugin does not do this itself and should not: there is no usable JOSE verifier
+available to it — the same reason COAZ mapping is delegated — and a local thumbprint
+comparison proves nothing, because the proof carries the very JWK being compared. Anyone
+who has seen one proof could mint another with the same thumbprint. That was the old
+behaviour, and it made `require_dpop` look like a sender-constraint without being one.
 
-If you need a real RFC 9449 sender-constraint on a route, put the Envoy/agentgateway PEP
-in front of it — [`core/`](../../core) verifies the proof signature, `iat` freshness and
-`jti` replay — or validate DPoP in Kong's own auth layer before this plugin runs.
+So `coaz_url` is **required** whenever `require_dpop` is set. The schema enforces it, so
+the mistake is a config-load failure rather than a per-request surprise:
+
+```
+require_dpop needs coaz_url: this plugin cannot verify a DPoP proof signature
+itself, so verification is delegated to coaz-pep
+```
+
+Everything fails closed. An unreachable verifier, a non-200, an unusable body, or a
+`coaz_url` that is somehow empty all deny — a route that demands sender-constrained
+tokens and cannot verify them must refuse, never silently fall back to the weaker check.
+
+Set `CHECK_API_TOKEN` on `coaz-pep` and `coaz_api_key` here; the verification endpoint is
+authenticated exactly like the COAZ check endpoint.
 
 ## Why COAZ needs `coaz_url`
 

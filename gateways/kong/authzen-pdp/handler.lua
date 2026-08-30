@@ -3,11 +3,9 @@
 -- For every proxied request this plugin:
 --   1. extracts the delegated access token (DPoP or Bearer) and reads its claims
 --      (sub = principal, act.sub = acting agent, scope, cnf.jkt);
---   2. if DPoP is required, checks the sender-constraint binding: the SHA-256
---      JWK thumbprint of the DPoP proof header key must equal the access token's
---      cnf.jkt (RFC 9449), htm must match the method, and ath must equal
---      base64url(SHA-256(access token)) so a proof cannot replay against a
---      different token. SEE THE DPoP LIMITATION NOTE BELOW;
+--   2. if DPoP is required, delegates the sender-constraint check to coaz-pep,
+--      which verifies the proof's signature, iat, jti and the cnf.jkt/htm/ath
+--      binding (RFC 9449). See the DPoP note below;
 --   3. builds an AuthZEN evaluation request (subject=agent on behalf of principal,
 --      action+resource+context derived from the HTTP request) and POSTs it to the
 --      Go authzen-adapter, which asks Ping Authorize;
@@ -15,17 +13,14 @@
 --      X-Auth-Scope for the Resource Server's audit trail;
 --      DENY   -> returns 403 with the policy reason.
 --
--- DPoP LIMITATION — READ THIS BEFORE RELYING ON require_dpop.
--- This plugin does NOT verify the DPoP proof's own JWS signature, because there is no
--- usable JOSE verifier in Lua here (the same reason COAZ mapping is delegated to
--- coaz-pep). The proof's public JWK travels inside the proof, so an attacker who has
--- observed one proof can mint another that thumbprints to the same cnf.jkt. The jkt
--- comparison below therefore does NOT by itself prove possession of the private key.
--- What IS enforced: the jkt/cnf match, htm, and the ath token binding — enough to stop
--- a proof being reused against a different token, not enough to stop forgery.
--- For a real sender-constraint put the Envoy/agentgateway PEP (core/, which verifies
--- the proof signature, iat freshness and jti replay) in front of this route, or
--- validate DPoP in Kong's own auth layer before this plugin runs.
+-- DPoP is DELEGATED to coaz-pep (/v1/dpop/verify), which verifies the proof's JWS
+-- signature, iat freshness and jti replay as well as the jkt/htm/ath binding. This
+-- plugin cannot do that itself: there is no usable JOSE verifier available to it, the
+-- same reason COAZ mapping is delegated. A local thumbprint comparison would prove
+-- nothing, since the proof carries the very JWK being compared — an attacker who has
+-- seen one proof could mint another with the same thumbprint.
+-- The schema therefore REQUIRES coaz_url whenever require_dpop is set, and an
+-- unreachable or unhappy verifier denies rather than falling back to the weaker check.
 --
 -- NOTE (demo honesty): this plugin reads the JWT claims and enforces the DPoP
 -- key binding, but does not itself verify the access-token JWS signature. In a
@@ -36,7 +31,6 @@
 
 local http = require "resty.http"
 local cjson = require "cjson.safe"
-local resty_sha256 = require "resty.sha256"
 
 local AuthzenPDP = {
   PRIORITY = 1000,  -- run before upstream proxying; after auth plugins if present
@@ -53,10 +47,6 @@ local function b64url_decode(str)
   return ngx.decode_base64(str)
 end
 
-local function b64url_encode(bytes)
-  return (ngx.encode_base64(bytes):gsub("+", "-"):gsub("/", "_"):gsub("=", ""))
-end
-
 -- decode the payload (claims) of a compact JWT; returns table or nil
 local function jwt_claims(token)
   if not token then return nil end
@@ -67,41 +57,6 @@ local function jwt_claims(token)
   local payload = b64url_decode(token:sub(dot1 + 1, dot2 - 1))
   if not payload then return nil end
   return cjson.decode(payload)
-end
-
--- decode the protected header of a compact JWT; returns table or nil
-local function jwt_header(token)
-  if not token then return nil end
-  local dot1 = token:find("%.")
-  if not dot1 then return nil end
-  local header = b64url_decode(token:sub(1, dot1 - 1))
-  if not header then return nil end
-  return cjson.decode(header)
-end
-
--- RFC 7638 JWK thumbprint (SHA-256, base64url) for EC / RSA / OKP keys
-local function jwk_thumbprint(jwk)
-  if type(jwk) ~= "table" or not jwk.kty then return nil end
-  local canon
-  if jwk.kty == "EC" then
-    canon = string.format('{"crv":"%s","kty":"EC","x":"%s","y":"%s"}', jwk.crv, jwk.x, jwk.y)
-  elseif jwk.kty == "RSA" then
-    canon = string.format('{"e":"%s","kty":"RSA","n":"%s"}', jwk.e, jwk.n)
-  elseif jwk.kty == "OKP" then
-    canon = string.format('{"crv":"%s","kty":"OKP","x":"%s"}', jwk.crv, jwk.x)
-  else
-    return nil
-  end
-  local sha = resty_sha256:new()
-  sha:update(canon)
-  return b64url_encode(sha:final())
-end
-
--- RFC 9449 `ath`: base64url(SHA-256(access token)). Binds a proof to THIS token.
-local function access_token_hash(token)
-  local sha = resty_sha256:new()
-  sha:update(token)
-  return b64url_encode(sha:final())
 end
 
 -- extract the access token from Authorization: "DPoP <t>" or "Bearer <t>"
@@ -247,35 +202,54 @@ function AuthzenPDP:access(conf)
 
   -- 2) DPoP sender-constraint binding
   if conf.require_dpop then
-    if scheme ~= "dpop" then
-      return deny(pep, 401, "DPoP-bound token required but Authorization scheme was not DPoP.")
+    -- Verification is DELEGATED to coaz-pep, which checks the proof's JWS signature,
+    -- iat freshness and jti replay in addition to the jkt/htm/ath binding. This plugin
+    -- cannot do that itself — no JOSE verifier is available to it — and a thumbprint
+    -- comparison alone proves nothing, because the proof carries the very JWK being
+    -- compared. Anything that cannot be verified is denied.
+    --
+    -- The schema requires coaz_url whenever require_dpop is set, so this should be
+    -- unreachable; it is kept because a route that demands sender-constrained tokens
+    -- and cannot verify them must fail closed, not fall back to the weaker local check.
+    if not conf.coaz_url or conf.coaz_url == "" then
+      kong.log.err("require_dpop is set but coaz_url is not: cannot verify DPoP proofs, denying")
+      return deny(pep, 401,
+        "DPoP verification is unavailable on this route (no coaz_url configured); denying rather than accepting an unverified sender-constraint.")
     end
-    local proof = kong.request.get_header("dpop")
-    if not proof then
-      return deny(pep, 401, "Missing DPoP proof header.")
+
+    local dpop_httpc = http.new()
+    dpop_httpc:set_timeout(5000)
+    local dres, derr = dpop_httpc:request_uri(conf.coaz_url .. "/v1/dpop/verify", {
+      method = "POST",
+      body = cjson.encode({
+        method = kong.request.get_method(),
+        path = kong.request.get_path(),
+        pep_label = pep,
+        headers = {
+          authorization = kong.request.get_header("authorization"),
+          dpop = kong.request.get_header("dpop"),
+        },
+      }),
+      headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = conf.coaz_api_key and ("Bearer " .. conf.coaz_api_key) or nil,
+      },
+    })
+
+    -- Fail closed on an unreachable or unusable verifier, exactly as for the PDP.
+    if not dres then
+      kong.log.err("DPoP verification call failed: ", derr)
+      return deny(pep, 401, "DPoP verification service unreachable; denying (fail-closed).")
     end
-    local phdr = jwt_header(proof)
-    local pclaims = jwt_claims(proof)
-    local jkt = phdr and jwk_thumbprint(phdr.jwk)
-    local cnf_jkt = type(claims.cnf) == "table" and claims.cnf.jkt or nil
-    if not jkt or not cnf_jkt or jkt ~= cnf_jkt then
-      return deny(pep, 401, "DPoP proof key does not match the token's cnf.jkt binding.")
+    if dres.status ~= 200 then
+      kong.log.err("DPoP verification returned ", dres.status)
+      return deny(pep, 401, "DPoP verification failed; denying (fail-closed).")
     end
-    if not pclaims or pclaims.htm ~= kong.request.get_method() then
-      return deny(pep, 401, "DPoP proof htm does not match the request method.")
-    end
-    -- ath binds this proof to THIS access token. Presence alone is worthless: a proof
-    -- minted for any token would otherwise replay against any other.
-    if not pclaims.ath then
-      return deny(pep, 401, "DPoP proof missing ath (access-token hash).")
-    end
-    if pclaims.ath ~= access_token_hash(token) then
-      return deny(pep, 401, "DPoP proof ath does not match the presented access token.")
-    end
-    -- htu is validated best-effort: hosts get rewritten behind the platform proxy,
-    -- so a mismatch is logged rather than fatal for the demo.
-    if pclaims.htu and not tostring(pclaims.htu):find(kong.request.get_path(), 1, true) then
-      kong.log.warn("DPoP htu path mismatch: ", tostring(pclaims.htu))
+    local verdict = cjson.decode(dres.body)
+    if type(verdict) ~= "table" or verdict.valid ~= true then
+      local reason = (type(verdict) == "table" and verdict.reason)
+        or "DPoP proof is not valid for this request."
+      return deny(pep, 401, reason)
     end
   end
 
@@ -480,11 +454,7 @@ end
 -- (see ../spec). Keeping them `local` above means the plugin itself is unaffected.
 AuthzenPDP._TEST = {
   b64url_decode = b64url_decode,
-  b64url_encode = b64url_encode,
   jwt_claims = jwt_claims,
-  jwt_header = jwt_header,
-  jwk_thumbprint = jwk_thumbprint,
-  access_token_hash = access_token_hash,
   extract_token = extract_token,
   map_request = map_request,
 }

@@ -105,6 +105,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/mcp/check", requireCheckToken(checkToken, srv.handleHTTPCheck))
+	// Sender-constraint verification for gateways that cannot do it themselves — the
+	// Kong plugin, which has no JOSE verifier available to it.
+	mux.HandleFunc("/v1/dpop/verify", requireCheckToken(checkToken, srv.handleDpopVerify))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

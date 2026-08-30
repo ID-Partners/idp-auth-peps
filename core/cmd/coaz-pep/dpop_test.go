@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -376,4 +378,123 @@ func TestReplayCacheRefusesWhenFullOfLiveEntries(t *testing.T) {
 	if !c.observe("d", now.Add(2*time.Hour)) {
 		t.Fatal("expired entries should be reclaimed")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The delegated verification endpoint the Kong plugin calls.
+
+func postVerify(t *testing.T, s *server, body string) (int, dpopVerifyResponse) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.handleDpopVerify(rec, httptest.NewRequest(http.MethodPost, "/v1/dpop/verify", strings.NewReader(body)))
+	var out dpopVerifyResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return rec.Code, out
+}
+
+func TestDpopVerifyEndpoint(t *testing.T) {
+	s := &server{}
+	key := newKey(t)
+	thumb := jwkThumbprint(publicJWK(key))
+	token := mintUnsigned(map[string]any{"sub": "alice", "cnf": map[string]any{"jkt": thumb}})
+
+	makeBody := func(proof string) string {
+		raw, _ := json.Marshal(map[string]any{
+			"method": "POST", "path": "/payments", "pep_label": "kong",
+			"headers": map[string]string{"Authorization": "DPoP " + token, "DPoP": proof},
+		})
+		return string(raw)
+	}
+
+	t.Run("valid proof", func(t *testing.T) {
+		proof := mintProof(t, key, map[string]any{
+			"htm": "POST", "ath": accessTokenHash(token),
+			"iat": float64(time.Now().Unix()), "jti": "verify-ok-1",
+		})
+		code, out := postVerify(t, s, makeBody(proof))
+		if code != http.StatusOK || !out.Valid {
+			t.Fatalf("a genuine proof should verify: code=%d out=%+v", code, out)
+		}
+	})
+
+	t.Run("forged proof is refused with a reason", func(t *testing.T) {
+		// Signed by the attacker, advertising the victim's JWK — the exact forgery a
+		// thumbprint-only check would accept, and the reason this endpoint exists.
+		attacker := newKey(t)
+		forged := mintProof(t, attacker, map[string]any{
+			"htm": "POST", "ath": accessTokenHash(token),
+			"iat": float64(time.Now().Unix()), "jti": "verify-forged-1",
+		})
+		hdr, _ := json.Marshal(map[string]any{"typ": "dpop+jwt", "alg": "ES256", "jwk": publicJWK(key)})
+		parts := splitJWS(t, forged)
+		swapped := base64.RawURLEncoding.EncodeToString(hdr) + "." + parts[1] + "." + parts[2]
+
+		code, out := postVerify(t, s, makeBody(swapped))
+		if code != http.StatusOK {
+			t.Fatalf("the endpoint answers 200 with a verdict, got %d", code)
+		}
+		if out.Valid {
+			t.Fatal("a proof signed by the wrong key must not verify")
+		}
+		if out.Reason == "" || out.Status != 401 {
+			t.Fatalf("a refusal should carry a reason and a status, got %+v", out)
+		}
+	})
+
+	t.Run("ath bound to another token", func(t *testing.T) {
+		proof := mintProof(t, key, map[string]any{
+			"htm": "POST", "ath": accessTokenHash("a.different.token"),
+			"iat": float64(time.Now().Unix()), "jti": "verify-ath-1",
+		})
+		if _, out := postVerify(t, s, makeBody(proof)); out.Valid {
+			t.Fatal("a proof bound to a different token must not verify")
+		}
+	})
+
+	t.Run("replay", func(t *testing.T) {
+		proof := mintProof(t, key, map[string]any{
+			"htm": "POST", "ath": accessTokenHash(token),
+			"iat": float64(time.Now().Unix()), "jti": "verify-replay-1",
+		})
+		if _, out := postVerify(t, s, makeBody(proof)); !out.Valid {
+			t.Fatal("first use should verify")
+		}
+		if _, out := postVerify(t, s, makeBody(proof)); out.Valid {
+			t.Fatal("the same proof must not verify twice")
+		}
+	})
+
+	t.Run("bearer scheme and missing proof", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{
+			"method": "POST", "path": "/payments",
+			"headers": map[string]string{"Authorization": "Bearer " + token},
+		})
+		if _, out := postVerify(t, s, string(raw)); out.Valid {
+			t.Fatal("a bearer token carries no sender-constraint to verify")
+		}
+	})
+
+	t.Run("malformed request", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		s.handleDpopVerify(rec, httptest.NewRequest(http.MethodPost, "/v1/dpop/verify", strings.NewReader("{{{")))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("a malformed body should be a 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("header case does not matter", func(t *testing.T) {
+		// Kong sends whatever case the client used; a case-sensitive lookup would make
+		// every proof look absent.
+		proof := mintProof(t, key, map[string]any{
+			"htm": "POST", "ath": accessTokenHash(token),
+			"iat": float64(time.Now().Unix()), "jti": "verify-case-1",
+		})
+		raw, _ := json.Marshal(map[string]any{
+			"method": "POST", "path": "/payments",
+			"headers": map[string]string{"AUTHORIZATION": "DPoP " + token, "DPOP": proof},
+		})
+		if _, out := postVerify(t, s, string(raw)); !out.Valid {
+			t.Fatalf("upper-cased headers should still be found: %+v", out)
+		}
+	})
 }

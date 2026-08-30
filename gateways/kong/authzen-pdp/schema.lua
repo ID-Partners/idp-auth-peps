@@ -49,6 +49,21 @@ return {
           -- pass-through deployed routes expect — which is NOT conformant.
           { coaz_defaults = { type = "boolean", default = false } },
         },
+        -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
+        -- is no JOSE verifier available to it, so on its own it can compare the proof's
+        -- JWK thumbprint to cnf.jkt without ever checking the proof's signature — and
+        -- the proof carries that JWK, so the comparison proves nothing. Verification is
+        -- delegated to coaz-pep, which means a route demanding sender-constrained
+        -- tokens with no coaz_url is misconfigured. Failing at config load is far
+        -- better than discovering it per request.
+        entity_checks = {
+          { conditional = {
+              if_field = "require_dpop", if_match = { eq = true },
+              then_field = "coaz_url",
+              then_match = { required = true },
+              then_err = "require_dpop needs coaz_url: this plugin cannot verify a DPoP proof signature itself, so verification is delegated to coaz-pep",
+          } },
+        },
       },
     },
   },

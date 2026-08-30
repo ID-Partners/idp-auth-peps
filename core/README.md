@@ -85,6 +85,29 @@ send the PDP identical requests. Its route patterns are a specific banking API's
 (`/customers/:id/accounts`, `/accounts/:id/balance`, …). Treat them as a worked example:
 for your own API, either extend the switch or run the Node SDK, whose mapping you supply.
 
+## `POST /v1/dpop/verify`
+
+A single-purpose sender-constraint check, for gateways that cannot do it themselves:
+
+```jsonc
+// request
+{ "method": "POST", "path": "/payments", "pep_label": "kong",
+  "headers": { "authorization": "DPoP <token>", "dpop": "<proof>" } }
+
+// response
+{ "valid": true }
+{ "valid": false, "reason": "DPoP proof signature is invalid: …", "status": 401 }
+```
+
+It verifies the proof's JWS signature, `iat` freshness, `jti` replay and the
+`cnf.jkt`/`htm`/`ath` binding — the full `checkDpop`, without the rest of the pipeline.
+
+Deliberately **not** `/v1/mcp/check`: that runs everything including the PDP evaluation,
+so a caller wanting only the sender-constraint checked would get a second, independent
+authorization decision as a side effect — one that could disagree with its own.
+
+Authenticated by `CHECK_API_TOKEN`, like the check API.
+
 ## Securing the HTTP check API
 
 The gRPC port takes its per-route config from the gateway's own configuration, which no
