@@ -164,8 +164,8 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 
 | | Coverage | Floor set in |
 | --- | --- | --- |
-| `core/coaz` | 80.8% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
-| `core/cmd/coaz-pep` | 84.8% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/coaz` | 86.3% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/cmd/coaz-pep` | 87.3% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `sdk/node` | 95.0% stmts / 84.1% branches | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
 | `gateways/kong` | 81.2% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
 

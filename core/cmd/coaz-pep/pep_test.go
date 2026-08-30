@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ID-Partners/idp-auth-peps/core/coaz"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 )
@@ -698,5 +699,130 @@ func TestCheckViaGRPC(t *testing.T) {
 	sent := pdp.requests[0]
 	if res := sent["resource"].(map[string]any); res["id"] != "acc-1" {
 		t.Fatalf("query string should not leak into the resource id: %v", res)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The DPoP and COAZ branches of check().
+
+func TestCheckEnforcesDpopWhenRequired(t *testing.T) {
+	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+	s := newServer(t, pdp.URL)
+	conf := restConf(map[string]string{"require_dpop": "true"})
+
+	key := newKey(t)
+	thumb := jwkThumbprint(publicJWK(key))
+	token := mintUnsigned(map[string]any{"sub": "alice", "cnf": map[string]any{"jkt": thumb}})
+	proof := mintProof(t, key, map[string]any{
+		"htm": "GET", "ath": accessTokenHash(token),
+		"iat": float64(time.Now().Unix()), "jti": "check-dpop-1",
+	})
+
+	// A genuine proof passes and the request reaches the PDP.
+	resp := s.check(context.Background(), conf, "GET", "/accounts/a/balance",
+		map[string]string{"authorization": "DPoP " + token, "dpop": proof}, "")
+	if resp == nil {
+		t.Fatal("expected a response")
+	}
+	if len(pdp.requests) != 1 {
+		t.Fatalf("a valid proof should let the request reach the PDP, got %d calls", len(pdp.requests))
+	}
+
+	// A bearer scheme on a DPoP-required route is refused before the PDP.
+	before := len(pdp.requests)
+	if r := s.check(context.Background(), conf, "GET", "/accounts/a/balance",
+		map[string]string{"authorization": "Bearer " + token}, ""); r == nil {
+		t.Fatal("a bearer token must not satisfy require_dpop")
+	}
+	if len(pdp.requests) != before {
+		t.Fatal("a failed DPoP check must not consult the PDP")
+	}
+}
+
+func TestCheckDelegatesToolsCallToTheCoazEngine(t *testing.T) {
+	// An MCP route with an upstream and a tools/call body goes through the COAZ engine
+	// rather than the plain REST mapping.
+	toolsList := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_customer",
+	  "inputSchema":{"x-authzen-mapping":{"evaluation":{
+	    "subject":{"type":"identity","id":"$token.sub"},
+	    "action":{"name":"get_customer"},
+	    "resource":{"type":"customer","id":"$params.arguments.id"}}}}}]}}`
+	mcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(toolsList))
+	}))
+	defer mcp.Close()
+
+	pdp := newPDPStub(t, map[string]any{"decision": false, "context": map[string]any{"reason": "not yours"}}, 200)
+	s := newServer(t, pdp.URL)
+	s.coaz = coaz.NewEngine(coaz.Options{PDP: coaz.PDPConfig{URL: pdp.URL}})
+
+	conf := configFrom(map[string]string{
+		"style": "mcp", "require_token": "true", "mcp_upstream_url": mcp.URL,
+	})
+	headers := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}`
+
+	resp := s.check(context.Background(), conf, "POST", "/mcp", headers, body)
+	if resp == nil {
+		t.Fatal("expected a response")
+	}
+	// A COAZ deny comes back as a JSON-RPC error body, not an HTTP-shaped denial.
+	got := resp.GetDeniedResponse().GetBody()
+	if !strings.Contains(got, "jsonrpc") {
+		t.Fatalf("a COAZ deny should relay the JSON-RPC error, got %s", got)
+	}
+	if !strings.Contains(got, "-32001") {
+		t.Fatalf("a v2-declared tool denies with -32001, got %s", got)
+	}
+}
+
+func TestCheckPermitsAToolTheEngineAllows(t *testing.T) {
+	toolsList := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_customer",
+	  "inputSchema":{"x-authzen-mapping":{"evaluation":{
+	    "subject":{"type":"identity","id":"$token.sub"},
+	    "action":{"name":"get_customer"},
+	    "resource":{"type":"customer","id":"$params.arguments.id"}}}}}]}}`
+	mcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(toolsList))
+	}))
+	defer mcp.Close()
+
+	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+	s := newServer(t, pdp.URL)
+	s.coaz = coaz.NewEngine(coaz.Options{PDP: coaz.PDPConfig{URL: pdp.URL}})
+
+	conf := configFrom(map[string]string{"style": "mcp", "require_token": "true", "mcp_upstream_url": mcp.URL})
+	headers := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}`
+
+	resp := s.check(context.Background(), conf, "POST", "/mcp", headers, body)
+	if resp.GetDeniedResponse() != nil {
+		t.Fatalf("a permitted tool call should not be denied: %s", resp.GetDeniedResponse().GetBody())
+	}
+}
+
+func TestCheckRejectsAnAccessTokenThatFailsValidation(t *testing.T) {
+	// With a validator configured, a token it cannot verify is a 401 — not a decoded
+	// set of claims handed to the PDP.
+	real := newKey(t)
+	attacker := newKey(t)
+	jwks := jwksServer(t, real, "k1")
+	defer jwks.Close()
+
+	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+	s := newServer(t, pdp.URL)
+	s.accessValidator = newTestValidator(t, jwks.URL)
+
+	forged := mintJWT(t, attacker, "k1", validClaims())
+	resp := s.check(context.Background(), restConf(nil), "GET", "/accounts/a/balance",
+		map[string]string{"authorization": "Bearer " + forged}, "")
+
+	if got := deniedStatus(resp); got != int(typev3.StatusCode_Unauthorized) {
+		t.Fatalf("a token that fails validation is a 401, got %d", got)
+	}
+	if len(pdp.requests) != 0 {
+		t.Fatal("an unverifiable token must not reach the PDP")
 	}
 }
