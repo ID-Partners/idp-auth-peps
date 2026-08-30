@@ -227,10 +227,12 @@ func TestFirstSSEData(t *testing.T) {
 		"single frame":       {"event: message\ndata: {\"a\":1}\n\n", `{"a":1}`, false},
 		"no event line":      {"data: {\"a\":1}\n\n", `{"a":1}`, false},
 		"unterminated frame": {"data: {\"a\":1}", `{"a":1}`, false},
-		"multi-line data":    {"data: {\"a\":\ndata: 1}\n\n", `{"a":1}`, false},
-		"comments ignored":   {": keepalive\ndata: {\"a\":1}\n\n", `{"a":1}`, false},
-		"no data at all":     {"event: ping\n\n", "", true},
-		"empty":              {"", "", true},
+		// Multi-line data joins with a NEWLINE, per the SSE processing model. Between
+		// JSON tokens that is still valid JSON; inside a string it would matter.
+		"multi-line data":  {"data: {\"a\":\ndata: 1}\n\n", "{\"a\":\n1}", false},
+		"comments ignored": {": keepalive\ndata: {\"a\":1}\n\n", `{"a":1}`, false},
+		"no data at all":   {"event: ping\n\n", "", true},
+		"empty":            {"", "", true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

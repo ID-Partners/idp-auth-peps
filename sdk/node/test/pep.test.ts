@@ -1349,3 +1349,350 @@ describe('SSE frame parsing matches the Go engine', () => {
     expect(v.jsonRpcError?.error.code).toBe(CODE_PDP_ERROR);
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describe('COAZ over SSE, aggressively', () => {
+  const token = { sub: 'alice@example.com', client_id: 'agent-1' };
+  const tool = {
+    name: 'make_payment',
+    inputSchema: {
+      'x-authzen-mapping': {
+        evaluation: {
+          subject: { type: 'identity', id: '$token.sub' },
+          action: { name: 'make_payment' },
+          resource: { type: 'payment', id: '$params.arguments.payment_id' },
+          context: { agent: '$token.?client_id' },
+        },
+      },
+    },
+  };
+  const call = { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'make_payment', arguments: { payment_id: 'p-1' } } };
+  const listPayload = () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [tool] } });
+
+  function frame(payload: string, opts: { crlf?: boolean; noSpace?: boolean; pretty?: boolean; junk?: string; trailer?: string; noBlankEnd?: boolean } = {}) {
+    const nl = opts.crlf ? '\r\n' : '\n';
+    const prefix = opts.noSpace ? 'data:' : 'data: ';
+    let body = '';
+    if (opts.junk) body += opts.junk.replaceAll('\n', nl);
+    if (opts.pretty) {
+      // A sender can only split where its own serialisation puts newlines — between
+      // tokens — because the receiver joins data lines with a newline.
+      for (const line of JSON.stringify(JSON.parse(payload), null, 2).split('\n')) {
+        body += prefix + line + nl;
+      }
+    } else {
+      body += prefix + payload + nl;
+    }
+    if (!opts.noBlankEnd) body += nl;
+    if (opts.trailer) body += opts.trailer.replaceAll('\n', nl);
+    return body;
+  }
+
+  async function drive(sse: string, pdpBody: unknown = { decision: true }) {
+    const asked: unknown[] = [];
+    const fetchImpl = vi.fn(async (url: unknown, init?: { body?: string }) => {
+      if (String(url).includes('/access/v1/')) {
+        asked.push(JSON.parse(init?.body ?? '{}'));
+        return new Response(JSON.stringify(pdpBody), { status: 200 });
+      }
+      return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }) as unknown as typeof globalThis.fetch;
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: fetchImpl },
+      upstreamUrl: 'http://mcp/mcp',
+      fetch: fetchImpl,
+    });
+    const v = await guard.checkToolCall({ rpc: call, claims: token });
+    return { v, asked };
+  }
+
+  const quirkCases: Array<[string, string]> = [
+    ['plain', frame(listPayload())],
+    ['crlf endings', frame(listPayload(), { crlf: true })],
+    ['no space after colon', frame(listPayload(), { noSpace: true })],
+    ['pretty-printed across data lines', frame(listPayload(), { pretty: true })],
+    ['pretty-printed with crlf', frame(listPayload(), { pretty: true, crlf: true })],
+    ['keepalives and event fields first', frame(listPayload(), { junk: ': keepalive\n: another\nevent: message\nid: 42\nretry: 3000\n' })],
+    ['second frame after the first', frame(listPayload(), { trailer: 'data: {"jsonrpc":"2.0","id":9,"result":{"tools":[]}}\n\n' })],
+    ['no terminating blank line', frame(listPayload(), { noBlankEnd: true })],
+  ];
+  for (const [name, sse] of quirkCases) {
+    it(`survives: ${name}`, async () => {
+      const { v, asked } = await drive(sse);
+      expect(v.coazTool, name).toBe(true);
+      expect(v.allow, name).toBe(true);
+      expect(JSON.stringify(asked[0]), name).toContain('"p-1"');
+    });
+  }
+
+  it('fails closed on a payload split inside a string token', async () => {
+    // The newline join makes a mid-string split unparseable, and unparseable must be
+    // a deny — never a permit on a half-read declaration.
+    const raw = listPayload();
+    const cut = raw.indexOf('make_payment') + 4;
+    const sse = `data: ${raw.slice(0, cut)}\ndata: ${raw.slice(cut)}\n\n`;
+    const { v } = await drive(sse);
+    expect(v.allow).toBe(false);
+    expect(v.jsonRpcError?.error.code).toBe(CODE_PDP_ERROR);
+  });
+
+  it('relays a step-up challenge intact through SSE discovery', async () => {
+    const { v } = await drive(frame(listPayload(), { pretty: true, crlf: true }), {
+      decision: false,
+      context: { reason: 'over limit', step_up_required: true, step_up_scope: 'payments:approve' },
+    });
+    expect(v.allow).toBe(false);
+    expect(v.jsonRpcError?.error.code).toBe(CODE_DENIED_V2);
+    expect(v.jsonRpcError?.error.data?.['authz_challenge']).toMatchObject({
+      type: 'resource_authorisation',
+      scope: 'payments:approve',
+    });
+  });
+
+  it('asks the PDP an identical question whichever transport discovery used', async () => {
+    const viaJson = await (async () => {
+      const asked: string[] = [];
+      const fetchImpl = vi.fn(async (url: unknown, init?: { body?: string }) => {
+        if (String(url).includes('/access/v1/')) {
+          asked.push(init?.body ?? '');
+          return new Response(JSON.stringify({ decision: true }), { status: 200 });
+        }
+        return new Response(listPayload(), { status: 200, headers: { 'content-type': 'application/json' } });
+      }) as unknown as typeof globalThis.fetch;
+      const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, upstreamUrl: 'http://mcp/mcp', fetch: fetchImpl });
+      await guard.checkToolCall({ rpc: call, claims: token });
+      return asked[0];
+    })();
+    const { asked } = await drive(frame(listPayload(), { pretty: true }));
+    expect(JSON.stringify(asked[0])).toBe(JSON.stringify(JSON.parse(viaJson!)));
+  });
+
+  it('fails closed on content-type confusion', async () => {
+    // JSON labelled as SSE: no data frame at all.
+    const { v } = await drive(listPayload());
+    expect(v.allow).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('coverage completeness: the remaining branches', () => {
+  it('throws when no fetch is available', () => {
+    const saved = globalThis.fetch;
+    // Simulate a runtime with no global fetch and none supplied.
+    (globalThis as { fetch?: unknown }).fetch = undefined;
+    try {
+      expect(() => new AuthzenClient({ url: 'http://pdp' })).toThrow(/No fetch/);
+    } finally {
+      globalThis.fetch = saved;
+    }
+  });
+
+  it('renders every challenge WWW-Authenticate parameter when present', () => {
+    // doctype present
+    const idp = toHttpChallenge(
+      { allow: false, kind: 'identity_proofing_required', reason: 'verify', context: { identity_proofing_required: true, identity_proofing_doctype: 'org.iso.18013.5.1.mDL' } },
+      'edge',
+    );
+    expect(idp.headers['WWW-Authenticate']).toContain('doctype="org.iso.18013.5.1.mDL"');
+    expect(idp.body['doctype']).toBe('org.iso.18013.5.1.mDL');
+    // scope present
+    const su = toHttpChallenge(
+      { allow: false, kind: 'step_up_required', reason: 'approve', context: { step_up_required: true, step_up_scope: 'pay' } },
+      'edge',
+    );
+    expect(su.headers['WWW-Authenticate']).toContain('scope="pay"');
+    expect(su.body['scope']).toBe('pay');
+    // toChallenge for the authn kind carries acr_values
+    expect(toChallenge({ allow: false, kind: 'unauthenticated', reason: 'x', context: { acr_values: 'urn:mfa' } }, 'edge')).toMatchObject({
+      type: 'authn',
+      acr_values: 'urn:mfa',
+    });
+  });
+
+  it('drops an empty WWW-Authenticate parameter rather than emitting it', () => {
+    // No scope -> the scope="" line must not appear (the `if (!v) continue` arm).
+    const out = toHttpChallenge({ allow: false, kind: 'step_up_required', reason: 'r', context: { step_up_required: true } }, 'edge');
+    expect(out.headers['WWW-Authenticate']).not.toContain('scope=');
+  });
+
+  it('decodeJwtSegment returns null on a non-object payload', () => {
+    // A segment that is valid base64url JSON but a bare array, not an object.
+    const seg = Buffer.from('[1,2,3]').toString('base64url');
+    expect(decodeJwtSegment(`a.${seg}.c`, 1)).toBeNull();
+  });
+
+  it('evaluates int() and double() casts and rejects non-numbers', () => {
+    const p = { n: '42', f: '3.14', bad: 'nope' };
+    expect(evaluateExpression('int(params.n)', p, {})).toBe(42);
+    expect(evaluateExpression('double(params.f)', p, {})).toBe(3.14);
+    expect(() => evaluateExpression('int(params.bad)', p, {})).toThrow(/not an integer/);
+    expect(() => evaluateExpression('double(params.bad)', p, {})).toThrow(/not a number/);
+  });
+
+  it('forwards X-Auth-* headers when forwardHeaders is set', async () => {
+    const res = {
+      statusCode: 0,
+      headers: {} as Record<string, string>,
+      status(c: number) { res.statusCode = c; return res; },
+      set(k: string, v: string) { res.headers[k] = v; return res; },
+      json(b: unknown) { void b; return res; },
+    };
+    const mw = authzenMiddleware({
+      client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
+      forwardHeaders: true,
+      verifyToken: async () => ({ sub: 'alice', act: { sub: 'agent-1' }, scope: 'a b', acr: 'urn:mfa' }),
+      map: (_r, claims) => ({ subject: { type: 'user', id: claims.sub }, action: { name: 'x' }, resource: { type: 'r' } }),
+    });
+    const next = vi.fn();
+    await mw({ method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'alice' })}` } }, res, next);
+    expect(next).toHaveBeenCalledOnce();
+    expect(res.headers['X-Auth-Principal']).toBe('alice');
+    expect(res.headers['X-Auth-Agent']).toBe('agent-1');
+    expect(res.headers['X-Auth-Scope']).toBe('a b');
+    expect(res.headers['X-Auth-Acr']).toBe('urn:mfa');
+  });
+
+  it('permits directly through AuthzenClient.evaluateAll when every decision permits', async () => {
+    const client = new AuthzenClient({ url: 'http://pdp', fetch: pdp({ evaluations: [{ decision: true }, { decision: true }] }) });
+    const v = await client.evaluateAll({ evaluations: [{}, {}] });
+    expect(v).toMatchObject({ allow: true, kind: 'ok' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('coverage completeness: v1 builder, delegate permit, numeric CEL', () => {
+  const token = { sub: 'alice@example.com', client_id: 'agent-1' };
+
+  it('builds a v1 mapping through the guard (legacy dialect)', async () => {
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
+      tools: [
+        {
+          name: 'legacy',
+          coaz: true,
+          'x-coaz-mapping': {
+            subject: [{ type: "'user'", id: 'token.sub' }],
+            action: [{ name: "'read'" }],
+            resource: [{ type: "'thing'", id: 'params.arguments.id' }],
+            context: [{ agent: 'token.client_id' }],
+          },
+        },
+      ],
+    });
+    const v = await guard.checkToolCall({
+      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'legacy', arguments: { id: 'x1' } } },
+      claims: token,
+    });
+    expect(v.allow).toBe(true);
+    expect(v.pdpRequest).toMatchObject({ resource: { type: 'thing', id: 'x1' } });
+  });
+
+  it('permits on a delegated permit and reports it', async () => {
+    const seen: string[] = [];
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ decision: true }), { status: 200 })) as unknown as typeof globalThis.fetch;
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: fetchImpl },
+      delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' },
+      onDecision: ({ tool }) => seen.push(tool),
+      fetch: fetchImpl,
+    });
+    const v = await guard.checkToolCall({
+      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x' } },
+      claims: token,
+      raw: { headers: { authorization: 'Bearer t' }, body: '{}' },
+    });
+    expect(v.allow).toBe(true);
+    expect(v.verdict.reason).toMatch(/delegated/);
+    expect(seen).toEqual(['x']);
+  });
+
+  it('adds numeric CEL terms and concatenates mixed ones', () => {
+    expect(evaluateExpression('params.a + params.b', { a: 2, b: 3 }, {})).toBe(5);
+    expect(evaluateExpression("params.a + '-' + params.b", { a: 'x', b: 'y' }, {})).toBe('x-y');
+    // null/undefined stringify to empty in a mixed concat.
+    expect(evaluateExpression("'v:' + params.missing", { }, {})).toBe('v:');
+  });
+
+  it('rejects an evaluations entry missing action or resource type via checkOne', () => {
+    expect(() =>
+      buildRequestV2({ evaluations: { subject: { id: '$token.sub' }, evaluations: [{ resource: { type: 'r', id: 'a' } }] } } as never, {}, token),
+    ).toThrow(/action is missing/);
+    expect(() =>
+      buildRequestV2(
+        { evaluations: { subject: { id: '$token.sub' }, action: { name: 't' }, evaluations: [{ resource: { id: 'a' } }] } } as never,
+        {},
+        token,
+      ),
+    ).toThrow(/resource\.type/);
+  });
+
+  it('throws when a declared v1 subject is not an object shape', () => {
+    // buildRequest surfaces an eval error from a bad leaf with the field/index prefix.
+    expect(() =>
+      buildRequest(
+        't',
+        { subject: [{ id: 'token.sub' }], resource: [{ id: 'params.arguments.x > 1' }], context: [{ a: 'token.sub' }] },
+        {},
+        {},
+      ),
+    ).toThrow(/resource\[0\]/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('coverage completeness: fallbacks and branch tails', () => {
+  it('folds step-up and authn with default reasons when the PDP gives none', () => {
+    expect(foldDecision({ decision: false, context: { step_up_required: true } }).reason).toMatch(/additional authorisation/);
+    expect(foldDecision({ decision: false, context: { authn_required: true } }).reason).toMatch(/Authentication required/);
+    expect(foldDecision({ decision: false, context: { identity_proofing_required: true } }).reason).toMatch(/Identity verification/);
+  });
+
+  it('builds a challenge with no pep label', () => {
+    const c = toChallenge({ allow: false, kind: 'step_up_required', reason: 'r', context: { step_up_scope: 's' } });
+    expect(c).toMatchObject({ type: 'resource_authorisation', scope: 's' });
+    expect(c && 'pep' in c).toBe(false);
+  });
+
+  it('decodes a token whose claims are not an object to null', () => {
+    // extractClaims tolerates it; decodeJwtClaims returns null for a JSON array payload.
+    const seg = Buffer.from('"just a string"').toString('base64url');
+    expect(decodeJwtSegment(`a.${seg}.c`, 1)).toBeNull();
+  });
+
+  it('pathMapper skips a rule whose method does not match', () => {
+    const map = pathMapper([
+      { method: 'POST', pattern: '/x', action: 'a', resourceType: 't' },
+      { method: 'GET', pattern: '/x', action: 'b', resourceType: 't' },
+    ]);
+    const out = map({ method: 'GET', path: '/x', headers: {} }, extractClaims({ sub: 'u' }));
+    expect(out?.action.name).toBe('b');
+  });
+
+  it('reads the path from originalUrl or url when path is absent', () => {
+    const map = pathMapper([{ pattern: '/y', action: 'a', resourceType: 't' }]);
+    expect(map({ method: 'GET', originalUrl: '/y?q=1', headers: {} }, extractClaims({ sub: 'u' }))).toBeTruthy();
+    expect(map({ method: 'GET', url: '/y', headers: {} }, extractClaims({ sub: 'u' }))).toBeTruthy();
+  });
+
+  it('takes the first value of an array Authorization header', () => {
+    const mw = authzenMiddleware({
+      client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
+      map: (_r, claims) => ({ subject: { type: 'user', id: claims.sub }, action: { name: 'x' }, resource: { type: 'r' } }),
+    });
+    const res = { statusCode: 0, headers: {} as Record<string, string>, status(c: number) { res.statusCode = c; return res; }, set(k: string, v: string) { res.headers[k] = v; return res; }, json() { return res; } };
+    const next = vi.fn();
+    return mw({ method: 'GET', path: '/x', headers: { authorization: [`Bearer ${jwt({ sub: 'alice' })}`, 'ignored'] } }, res, next).then(() => {
+      expect(next).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('stringifies a non-Error rejection from fetch', async () => {
+    const fetchImpl = vi.fn(async () => { throw 'a bare string, not an Error'; }) as unknown as typeof globalThis.fetch;
+    const v = await new AuthzenClient({ url: 'http://pdp', fetch: fetchImpl }).evaluate({ subject: { type: 'u', id: 'x' }, action: { name: 'a' }, resource: { type: 'r' } });
+    expect(v.reason).toContain('a bare string');
+  });
+});

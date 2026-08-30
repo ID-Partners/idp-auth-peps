@@ -19,6 +19,7 @@ package main
 
 import (
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -34,48 +35,57 @@ import (
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
 )
 
-func main() {
-	grpcPort := envOr("PORT", "9191")
-	httpPort := envOr("HTTP_PORT", "9192")
-	authzenURL := strings.TrimRight(os.Getenv("AUTHZEN_URL"), "/")
+// buildServer assembles the server, HTTP mux and http.Server from the environment.
+// All of the decision-bearing wiring lives here — validator config, the SSRF guards,
+// the check-token — so it is unit-testable; main() is left as the thin listen/serve
+// shell, which is the one part that cannot be exercised without binding real sockets.
+// getenv is injected so a test can drive the whole matrix of configurations.
+func buildServer(getenv func(string) string) (*server, *http.Server, string, error) {
+	env := func(k, def string) string {
+		if v := getenv(k); v != "" {
+			return v
+		}
+		return def
+	}
+	grpcPort := env("PORT", "9191")
+	httpPort := env("HTTP_PORT", "9192")
+	authzenURL := strings.TrimRight(getenv("AUTHZEN_URL"), "/")
 	if authzenURL == "" {
-		log.Fatal("AUTHZEN_URL is required (e.g. http://authzen-adapter:8080)")
+		return nil, nil, "", fmt.Errorf("AUTHZEN_URL is required (e.g. http://authzen-adapter:8080)")
 	}
 	ttl := 60 * time.Second
-	if v := os.Getenv("COAZ_DISCOVERY_TTL"); v != "" {
+	if v := getenv("COAZ_DISCOVERY_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			ttl = d
 		}
 	}
 
 	httpc := &http.Client{Timeout: 10 * time.Second}
-	if strings.EqualFold(os.Getenv("PDP_TLS_INSECURE"), "true") {
+	if strings.EqualFold(getenv("PDP_TLS_INSECURE"), "true") {
 		httpc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
 	srv := &server{
 		authzenURL:    authzenURL,
-		authzenAPIKey: os.Getenv("AUTHZEN_API_KEY"),
+		authzenAPIKey: getenv("AUTHZEN_API_KEY"),
 		httpc:         httpc,
 		coaz: coaz.NewEngine(coaz.Options{
-			PDP:          coaz.PDPConfig{URL: authzenURL, APIKey: os.Getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
+			PDP:          coaz.PDPConfig{URL: authzenURL, APIKey: getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
 			DiscoveryTTL: ttl,
 		}),
 	}
 
-	// HTTP check API (Kong et al.).
-	//
 	// This endpoint takes a caller-supplied mcp_upstream_url AND a caller-supplied
 	// authorization header, then fetches that URL with that header. Left open, it is an
 	// SSRF and credential-relay primitive, so it takes two guards: a shared secret and
 	// an upstream allowlist. Both warn loudly when unset rather than silently failing
 	// open, because an operator who has not configured them should know.
-	checkToken := os.Getenv("CHECK_API_TOKEN")
+	checkToken := getenv("CHECK_API_TOKEN")
 	if checkToken == "" {
 		log.Printf("WARNING: CHECK_API_TOKEN is unset — the HTTP check API on :%s is "+
 			"UNAUTHENTICATED. Set it, or keep the port off any untrusted network.", httpPort)
 	}
-	srv.upstreamAllowlist = parseAllowlist(os.Getenv("MCP_UPSTREAM_ALLOWLIST"))
+	srv.upstreamAllowlist = parseAllowlist(getenv("MCP_UPSTREAM_ALLOWLIST"))
 	if len(srv.upstreamAllowlist) == 0 {
 		log.Printf("WARNING: MCP_UPSTREAM_ALLOWLIST is unset — any caller-supplied " +
 			"mcp_upstream_url will be fetched server-side. Set it to the MCP servers you govern.")
@@ -85,14 +95,14 @@ func main() {
 	// X-User-Token is the sharper of the two: its claims drive the step-up and consent
 	// gates, so an unverified one is a bypass of both.
 	srv.accessValidator = NewValidator(ValidatorConfig{
-		JWKSURL:  os.Getenv("ACCESS_TOKEN_JWKS_URL"),
-		Issuer:   os.Getenv("ACCESS_TOKEN_ISSUER"),
-		Audience: os.Getenv("ACCESS_TOKEN_AUDIENCE"),
+		JWKSURL:  getenv("ACCESS_TOKEN_JWKS_URL"),
+		Issuer:   getenv("ACCESS_TOKEN_ISSUER"),
+		Audience: getenv("ACCESS_TOKEN_AUDIENCE"),
 	})
 	srv.userValidator = NewValidator(ValidatorConfig{
-		JWKSURL:  envOr("USER_TOKEN_JWKS_URL", os.Getenv("ACCESS_TOKEN_JWKS_URL")),
-		Issuer:   envOr("USER_TOKEN_ISSUER", os.Getenv("ACCESS_TOKEN_ISSUER")),
-		Audience: os.Getenv("USER_TOKEN_AUDIENCE"),
+		JWKSURL:  env("USER_TOKEN_JWKS_URL", getenv("ACCESS_TOKEN_JWKS_URL")),
+		Issuer:   env("USER_TOKEN_ISSUER", getenv("ACCESS_TOKEN_ISSUER")),
+		Audience: getenv("USER_TOKEN_AUDIENCE"),
 	})
 	if srv.accessValidator == nil {
 		log.Printf("WARNING: ACCESS_TOKEN_JWKS_URL is unset — access tokens are DECODED, " +
@@ -113,12 +123,24 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	httpSrv := &http.Server{
-		Addr:              envOr("HTTP_ADDR", "") + ":" + httpPort,
+		Addr:              env("HTTP_ADDR", "") + ":" + httpPort,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second, // Slowloris
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+	}
+	return srv, httpSrv, grpcPort, nil
+}
+
+// main is the listen/serve shell: it binds real sockets, so it is the one function that
+// cannot be meaningfully unit-tested and is excluded from the coverage bar. Everything it
+// decides is in buildServer, which is tested. Keep this function trivial — anything with
+// a branch worth asserting belongs in buildServer.
+func main() {
+	srv, httpSrv, grpcPort, err := buildServer(os.Getenv)
+	if err != nil {
+		log.Fatal(err)
 	}
 	go func() {
 		log.Printf("coaz-pep HTTP check API listening on %s", httpSrv.Addr)
@@ -127,7 +149,6 @@ func main() {
 		}
 	}()
 
-	// Envoy ext_authz gRPC
 	lis, err := net.Listen("tcp", ":"+grpcPort) // dual-stack
 	if err != nil {
 		log.Fatalf("listen :%s: %v", grpcPort, err)
@@ -135,16 +156,8 @@ func main() {
 	gs := grpc.NewServer()
 	authv3.RegisterAuthorizationServer(gs, srv)
 	healthpb.RegisterHealthServer(gs, health.NewServer())
-	log.Printf("coaz-pep ext_authz (Envoy gRPC) listening on :%s, PDP at %s, COAZ discovery TTL %s",
-		grpcPort, authzenURL, ttl)
+	log.Printf("coaz-pep ext_authz (Envoy gRPC) listening on :%s, PDP at %s", grpcPort, srv.authzenURL)
 	if err := gs.Serve(lis); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
 }

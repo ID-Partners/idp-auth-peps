@@ -492,16 +492,9 @@ func TestHandleHTTPCheckLowerCasesHeaders(t *testing.T) {
 	}
 }
 
-func TestToLowerAndEnvOr(t *testing.T) {
+func TestToLower(t *testing.T) {
 	if toLower("ABC") != "abc" || toLower("aBc") != "abc" || toLower("") != "" {
 		t.Fatal("toLower")
-	}
-	if envOr("DEFINITELY_NOT_SET_XYZ", "fallback") != "fallback" {
-		t.Fatal("envOr should fall back")
-	}
-	t.Setenv("COAZ_TEST_VAR", "value")
-	if envOr("COAZ_TEST_VAR", "fallback") != "value" {
-		t.Fatal("envOr should prefer the environment")
 	}
 }
 
@@ -904,4 +897,189 @@ func TestSubjectUsesTheAuthzenIdentifier(t *testing.T) {
 			t.Fatalf("with neither, a placeholder rather than an empty id, got %v", id)
 		}
 	})
+}
+
+// The RAR / authorization_details context path and the step-up/identity defaults.
+func TestCheckForwardsAuthorizationDetailsAndDefaults(t *testing.T) {
+	t.Run("authorization_details from the user token reaches the PDP", func(t *testing.T) {
+		pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+		s := newServer(t, pdp.URL)
+		conf := restConf(map[string]string{"require_user_login": "true"})
+		rar := []any{map[string]any{"type": "payment_initiation", "amount": 500.0, "creditorAccount": "acc-9"}}
+		headers := map[string]string{
+			"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"}),
+			"x-user-token":  mintUnsigned(map[string]any{"sub": "alice", "scope": "openid", "authorization_details": rar}),
+		}
+		s.check(context.Background(), conf, "POST", "/payments", headers, `{"from_account":"a","amount":400}`)
+		sent := pdp.requests[len(pdp.requests)-1]
+		ctx := sent["context"].(map[string]any)
+		if ctx["authorization_details"] == nil {
+			t.Fatalf("the consented RAR should reach the policy: %v", ctx)
+		}
+	})
+
+	t.Run("step-up scope defaults to the configured scope", func(t *testing.T) {
+		pdp := newPDPStub(t, map[string]any{
+			"decision": false,
+			"context":  map[string]any{"step_up_required": true}, // no scope in the advice
+		}, 200)
+		s := newServer(t, pdp.URL)
+		conf := restConf(map[string]string{"stepup_scope": "payments:approve"})
+		resp := s.check(context.Background(), conf, "POST", "/payments",
+			map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})},
+			`{"from_account":"a","amount":9000}`)
+		body := resp.GetDeniedResponse().GetBody()
+		if !strings.Contains(body, "payments:approve") {
+			t.Fatalf("an advice with no scope should fall back to the configured stepup_scope: %s", body)
+		}
+	})
+
+	t.Run("identity doctype defaults to mDL", func(t *testing.T) {
+		pdp := newPDPStub(t, map[string]any{
+			"decision": false,
+			"context":  map[string]any{"identity_proofing_required": true}, // no doctype
+		}, 200)
+		s := newServer(t, pdp.URL)
+		resp := s.check(context.Background(), restConf(nil), "POST", "/accounts",
+			map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}, `{}`)
+		if !strings.Contains(resp.GetDeniedResponse().GetBody(), "mDL") {
+			t.Fatal("a doctype-less advice should default to the mDL")
+		}
+	})
+}
+
+func TestValidateHeaderAndClaimsGuards(t *testing.T) {
+	real := newKey(t)
+	jwks := jwksServer(t, real, "k1")
+	defer jwks.Close()
+	v := newTestValidator(t, jwks.URL)
+
+	// A token whose header is not decodable base64.
+	if _, err := v.Validate(context.Background(), "!!!.ey000.sig"); err == nil {
+		t.Error("an unreadable header must fail validation")
+	}
+	// A token with a valid header but unreadable claims segment.
+	hdr := b64urlEncode([]byte(`{"alg":"ES256","kid":"k1"}`))
+	if _, err := v.Validate(context.Background(), hdr+".!!!.sig"); err == nil {
+		t.Error("unreadable claims must fail validation")
+	}
+}
+
+func TestJwtPartAndClaimsForCELEdges(t *testing.T) {
+	// jwtPart on a segment that is valid base64 but not JSON.
+	notJSON := b64urlEncode([]byte("not json"))
+	if jwtClaims("a."+notJSON+".c") != nil {
+		t.Error("a non-JSON claims segment should decode to nil")
+	}
+	// claimsForCEL on nil returns an empty map, not nil.
+	if got := claimsForCEL(nil); got == nil || len(got) != 0 {
+		t.Errorf("claimsForCEL(nil) should be an empty map, got %v", got)
+	}
+}
+
+func TestMCPPathCarriesUserRARIntoCoazContext(t *testing.T) {
+	// tools/call on an MCP route: the user token's authorization_details and the
+	// consented-payment extraction must ride into the COAZ context the engine builds.
+	toolsList := `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"make_payment",
+	  "inputSchema":{"x-authzen-mapping":{"evaluation":{
+	    "subject":{"type":"identity","id":"$token.sub"},
+	    "action":{"name":"make_payment"},
+	    "resource":{"type":"payment","id":"$params.arguments.payment_id"},
+	    "context":{"agent":"$token.?client_id"}}}}}]}}`
+	mcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(toolsList))
+	}))
+	defer mcp.Close()
+
+	var asked map[string]any
+	pdp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&asked)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision":true}`))
+	}))
+	defer pdp.Close()
+
+	s := newServer(t, pdp.URL)
+	s.coaz = coaz.NewEngine(coaz.Options{PDP: coaz.PDPConfig{URL: pdp.URL}})
+	conf := configFrom(map[string]string{
+		"style": "mcp", "require_token": "true", "mcp_upstream_url": mcp.URL,
+	})
+	rar := []any{map[string]any{"type": "payment_initiation", "amount": 500.0, "creditorAccount": "acc-9"}}
+	headers := map[string]string{
+		"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice", "client_id": "agent-1"}),
+		"x-user-token":  mintUnsigned(map[string]any{"sub": "alice", "scope": "openid", "authorization_details": rar}),
+	}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"make_payment","arguments":{"payment_id":"p-1"}}}`
+
+	resp := s.check(context.Background(), conf, "POST", "/mcp", headers, body)
+	if resp.GetDeniedResponse() != nil {
+		t.Fatalf("the call should be permitted: %s", resp.GetDeniedResponse().GetBody())
+	}
+	ctx := asked["context"].(map[string]any)
+	if ctx["authorization_details"] == nil {
+		t.Fatalf("the RAR should reach the COAZ context, got %v", ctx)
+	}
+	if ctx["consented_amount"] != 500.0 || ctx["consented_creditor"] != "acc-9" {
+		t.Fatalf("the consented payment should be pre-extracted, got %v", ctx)
+	}
+}
+
+func TestValidatedTokenWithNoSubjectIsDenied(t *testing.T) {
+	// A token that VALIDATES but carries no sub: the require_token+sub guard denies
+	// after validation, on the validated-claims path.
+	key := newKey(t)
+	jwks := jwksServer(t, key, "k1")
+	defer jwks.Close()
+	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+	s := newServer(t, pdp.URL)
+	s.accessValidator = newTestValidator(t, jwks.URL)
+
+	// validClaims has a sub; drop it.
+	noSub := validClaims()
+	delete(noSub, "sub")
+	tok := mintJWT(t, key, "k1", noSub)
+	resp := s.check(context.Background(), restConf(nil), "GET", "/accounts/a/balance",
+		map[string]string{"authorization": "Bearer " + tok}, "")
+	if resp.GetDeniedResponse() == nil {
+		t.Fatal("a validated token with no subject must be denied")
+	}
+	if len(pdp.requests) != 0 {
+		t.Fatal("it must not reach the PDP")
+	}
+}
+
+func TestVerifyJWSUnsupportedAlg(t *testing.T) {
+	// An HS* alg has no public-key verification path here and must be refused.
+	if err := verifyJWS("a.b.c", map[string]any{"kty": "oct"}, "HS256"); err == nil {
+		t.Fatal("HS256 must be unsupported for public-key verification")
+	}
+}
+
+func TestJWKSServesStaleKeyOnRefreshFailure(t *testing.T) {
+	// A cache with a known key whose refresh then fails must serve the stale key rather
+	// than failing every request during a transient JWKS outage.
+	key := newKey(t)
+	var fail bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		jwk := publicJWK(key)
+		jwk["kid"] = "k1"
+		body, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Nanosecond}
+	if _, err := c.key(context.Background(), "k1"); err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	// TTL has passed, refresh fails, but the key is known — serve it.
+	if _, err := c.key(context.Background(), "k1"); err != nil {
+		t.Fatalf("a known key should survive a failed refresh: %v", err)
+	}
 }

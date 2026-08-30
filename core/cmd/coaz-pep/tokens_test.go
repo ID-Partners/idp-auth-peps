@@ -388,3 +388,28 @@ func TestJwkThumbprintCanonicalisation(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyJWSUnsupportedAlgFamily(t *testing.T) {
+	// An alg outside ES/RS/PS reaches the final unsupported return.
+	if err := verifyJWS("aGVhZGVy.Y2xhaW1z."+base64.RawURLEncoding.EncodeToString([]byte("sig")), map[string]any{"kty": "oct"}, "ES256zz"); err == nil {
+		t.Fatal("hashFor should reject an unknown alg before the family switch")
+	}
+	// A syntactically-valid ES alg but a key that is not EC: the ecdsaFromJWK error arm.
+	if err := verifyJWS("aGVhZGVy.Y2xhaW1z."+base64.RawURLEncoding.EncodeToString(make([]byte, 64)), map[string]any{"kty": "RSA"}, "ES256"); err == nil {
+		t.Fatal("an ES alg with an RSA key must error")
+	}
+}
+
+func TestValidateUnreadableClaims(t *testing.T) {
+	// A token whose signature verifies is required to reach the claims-nil check, which
+	// cannot happen with a real token — the guard is defensive. Instead confirm the
+	// public surface: a token with a non-JSON claims segment fails earlier, at decode.
+	key := newKey(t)
+	jwks := jwksServer(t, key, "k1")
+	defer jwks.Close()
+	v := newTestValidator(t, jwks.URL)
+	hdr := b64urlEncode([]byte(`{"alg":"ES256","kid":"k1"}`))
+	if _, err := v.Validate(context.Background(), hdr+"."+b64urlEncode([]byte("not json"))+".sig"); err == nil {
+		t.Fatal("unreadable claims must fail validation")
+	}
+}

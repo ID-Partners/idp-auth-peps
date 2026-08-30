@@ -1121,17 +1121,22 @@ export function jsonRpcError(
  * is exactly the drift this repo exists to avoid.
  */
 function parseSse(text: string): unknown {
-  let data = '';
+  // Per the SSE processing model: strip ONE optional leading space after "data:" (the
+  // rest of the line is payload), join multiple data lines with a NEWLINE, and treat a
+  // blank line as the frame boundary. Matches firstSSEData in the Go engine exactly.
+  const parts: string[] = [];
   for (const line of text.split(/\r?\n/)) {
     if (line.startsWith('data:')) {
-      data += line.slice(5).trim();
-    } else if (line === '' && data !== '') {
-      return safeJson(data);
+      let payload = line.slice(5);
+      if (payload.startsWith(' ')) payload = payload.slice(1);
+      parts.push(payload);
+    } else if (line === '' && parts.length > 0) {
+      return safeJson(parts.join('\n'));
     }
     // `event:`, `id:`, `retry:` and `:` comment lines carry no payload.
   }
   // A stream that ended without a terminating blank line still has a usable frame.
-  return data === '' ? null : safeJson(data);
+  return parts.length === 0 ? null : safeJson(parts.join('\n'));
 }
 
 function safeJson(text: string): unknown {

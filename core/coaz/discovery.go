@@ -274,24 +274,42 @@ func (d *discoveryCache) rpcWithSession(ctx context.Context, url, authorization,
 	return rpcResp.Result, newSession, nil
 }
 
-// firstSSEData returns the first `data:` payload of an SSE stream.
+// firstSSEData returns the first complete `data:` frame of an SSE stream.
+//
+// Per the SSE processing model: one OPTIONAL leading space after "data:" is stripped
+// (not all whitespace — the rest of the line is payload), multiple data lines in one
+// frame are joined with a NEWLINE, and a blank line terminates the frame. For the JSON
+// payloads MCP sends the newline join and a whitespace trim parse identically, but
+// spec-correct costs nothing and removes a class of doubt for any payload where inner
+// whitespace is significant.
 func firstSSEData(r io.Reader) ([]byte, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
 	var data bytes.Buffer
+	seen := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "data:") {
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		} else if line == "" && data.Len() > 0 {
+		switch {
+		case strings.HasPrefix(line, "data:"):
+			payload := strings.TrimPrefix(line, "data:")
+			payload = strings.TrimPrefix(payload, " ") // one optional space, per spec
+			if seen {
+				data.WriteByte('\n')
+			}
+			data.WriteString(payload)
+			seen = true
+		case line == "" && seen:
 			return data.Bytes(), nil
 		}
-	}
-	if data.Len() > 0 {
-		return data.Bytes(), nil
+		// event:, id:, retry: and ":" comment lines carry no payload.
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		// A line longer than the buffer, or a broken read: surface it rather than
+		// returning a truncated frame as though it were complete.
+		return nil, fmt.Errorf("reading SSE stream: %w", err)
+	}
+	if seen {
+		return data.Bytes(), nil
 	}
 	return nil, fmt.Errorf("no data frame in SSE response")
 }

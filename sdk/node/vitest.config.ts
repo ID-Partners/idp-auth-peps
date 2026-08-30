@@ -14,10 +14,14 @@ export default defineConfig({
       // and counting them as 0% would make the whole-project number meaningless.
       exclude: ['src/index.ts', 'src/types.ts', 'dist/**', '**/*.config.ts'],
       thresholds: {
-        statements: 94,
-        branches: 84,
+        // Functions and per-file lines are held at 100 where reached; the residual
+        // statement/branch gap is defensive code unreachable on validated input
+        // (an object-claim that is not an object, AST fall-through the compiler rules
+        // out). Floors sit at the current numbers and ratchet up as that shrinks.
+        statements: 96,
+        branches: 87,
         functions: 100,
-        lines: 94,
+        lines: 96,
       },
     },
   },

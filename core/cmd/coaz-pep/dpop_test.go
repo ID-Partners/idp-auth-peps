@@ -498,3 +498,115 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 		}
 	})
 }
+
+func TestDpopProofHeaderGuards(t *testing.T) {
+	key := newKey(t)
+	claims := boundClaims(key)
+	base := freshProofClaims("guard-1")
+
+	// typ must be dpop+jwt.
+	badTyp := signWithHeader(t, key, map[string]any{"typ": "jwt", "alg": "ES256", "jwk": publicJWK(key)}, base)
+	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": badTyp}, claims) == nil {
+		t.Error("a proof without typ=dpop+jwt must be rejected")
+	}
+	// alg none.
+	noneAlg := signWithHeader(t, key, map[string]any{"typ": "dpop+jwt", "alg": "none", "jwk": publicJWK(key)}, base)
+	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": noneAlg}, claims) == nil {
+		t.Error("alg=none must be rejected")
+	}
+	// missing ath.
+	noAth := freshProofClaims("guard-ath")
+	delete(noAth, "ath")
+	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": mintProof(t, key, noAth)}, claims) == nil {
+		t.Error("a proof with no ath must be rejected")
+	}
+	// missing iat.
+	noIat := freshProofClaims("guard-iat")
+	delete(noIat, "iat")
+	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": mintProof(t, key, noIat)}, claims) == nil {
+		t.Error("a proof with no iat must be rejected")
+	}
+	// htu mismatch is logged, not fatal — a proof otherwise valid still passes.
+	withHtu := freshProofClaims("guard-htu")
+	withHtu["htu"] = "https://elsewhere.example/totally-different"
+	if r := checkDpop("t", "dpop", "POST", "/payments", testToken, map[string]string{"dpop": mintProof(t, key, withHtu)}, claims); r != nil {
+		t.Error("an htu mismatch should be logged, not fatal")
+	}
+}
+
+// signWithHeader mints a proof with an arbitrary header, for the header-guard tests.
+func signWithHeader(t *testing.T, key *ecdsa.PrivateKey, hdr map[string]any, claims map[string]any) string {
+	t.Helper()
+	enc := func(v any) string {
+		raw, _ := json.Marshal(v)
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	input := enc(hdr) + "." + enc(claims)
+	sum := sha256.Sum256([]byte(input))
+	r, s, err := ecdsa.Sign(rand.Reader, key, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := make([]byte, 64)
+	r.FillBytes(sig[:32])
+	s.FillBytes(sig[32:])
+	return input + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+func TestECDSAFromJWKCurves(t *testing.T) {
+	// P-384 and P-521 key parsing, so both non-P-256 arms run.
+	for _, tc := range []struct {
+		crv   string
+		curve elliptic.Curve
+	}{{"P-384", elliptic.P384()}, {"P-521", elliptic.P521()}} {
+		k, err := ecdsa.GenerateKey(tc.curve, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := (tc.curve.Params().BitSize + 7) / 8
+		x, y := make([]byte, n), make([]byte, n)
+		k.X.FillBytes(x)
+		k.Y.FillBytes(y)
+		jwk := map[string]any{"kty": "EC", "crv": tc.crv,
+			"x": base64.RawURLEncoding.EncodeToString(x), "y": base64.RawURLEncoding.EncodeToString(y)}
+		if _, err := ecdsaFromJWK(jwk); err != nil {
+			t.Errorf("%s should parse: %v", tc.crv, err)
+		}
+	}
+}
+
+func TestRSAExponentOutOfRange(t *testing.T) {
+	// An exponent larger than 2^31 is refused rather than silently truncated.
+	jwk := map[string]any{"kty": "RSA", "n": base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3, 4}),
+		"e": base64.RawURLEncoding.EncodeToString([]byte{0xff, 0xff, 0xff, 0xff, 0xff})}
+	if _, err := rsaFromJWK(jwk); err == nil {
+		t.Fatal("an oversized RSA exponent must be refused")
+	}
+}
+
+func TestHashForUnsupported(t *testing.T) {
+	if _, err := hashFor("ES999"); err == nil {
+		t.Fatal("an unknown alg size must be unsupported")
+	}
+}
+
+func TestVerifyProofSignatureUnsupportedAlg(t *testing.T) {
+	// verifyProofSignature reached directly with an alg outside ES/RS/PS: the final
+	// unsupported-alg return. checkDpop guards typ/alg upstream, so this is the
+	// belt-and-braces arm.
+	key := newKey(t)
+	proof := mintProof(t, key, freshProofClaims("j"))
+	if err := verifyProofSignature(proof, publicJWK(key), "EdDSA"); err == nil {
+		t.Fatal("EdDSA is not a supported proof alg here")
+	}
+}
+
+func TestDpopProofWithNoJWK(t *testing.T) {
+	// A proof header with no jwk member: the "carries no jwk" arm.
+	key := newKey(t)
+	hdr := map[string]any{"typ": "dpop+jwt", "alg": "ES256"} // no jwk
+	proof := signWithHeader(t, key, hdr, freshProofClaims("nojwk"))
+	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": proof}, boundClaims(key)) == nil {
+		t.Fatal("a proof with no jwk in its header must be rejected")
+	}
+}

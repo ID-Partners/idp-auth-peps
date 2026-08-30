@@ -164,14 +164,28 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 
 | | Coverage | Floor set in |
 | --- | --- | --- |
-| `core/coaz` | 86.3% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
-| `core/cmd/coaz-pep` | 87.3% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
-| `sdk/node` | 95.0% stmts / 84.1% branches | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
+| `core/coaz` | 94.2% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/cmd/coaz-pep` | 95.6% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `sdk/node` | 96.8% stmts / 100% funcs | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
 | `gateways/kong` | 97.1% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
 
-`main()`'s listen-and-serve loop is the one thing deliberately left uncovered: it is
-process wiring with no branch worth asserting, and a test that started real listeners
-would be testing the standard library.
+The target is **100% of what can be meaningfully tested, with the rest named** — not a
+coverage-number fetish. Two things are deliberately excluded, and only these two:
+
+- **`main()`'s listen-and-serve loop.** All of its config-bearing logic is extracted into
+  `buildServer`, which is tested across the configuration matrix; `main()` itself only
+  binds sockets, so a test would be exercising the standard library. It is a thin,
+  documented shell.
+- **Defensive `err != nil` / type-guard branches that cannot fire on validated input** —
+  a `json.Marshal` of a struct that always marshals, an AST fall-through the CEL compiler
+  rules out, an object-claim that has already been type-checked. Forcing these with
+  contrived inputs would test the test, not the code.
+
+Everything else is covered, including — aggressively — COAZ discovery over SSE: split
+data frames, CRLF, keepalive comments, oversized frames, the session handshake, and
+content-type confusion, each driven end to end so a framing bug surfaces as a wrong
+authorization decision rather than a parser detail. See `core/coaz/sse_torture_test.go`
+and the matching SDK suite.
 
 ## Licence
 
