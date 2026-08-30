@@ -574,3 +574,61 @@ describe('claim handling and remaining denials', function()
     assert.equal('new:savings', sent2.resource.id)
   end)
 end)
+
+describe('subject.identity -> subject.id migration', function()
+  local function sent_subject(over)
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({
+        sub = 'alice', act = { sub = 'agent-7' }, client_id = 'c1' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf(over))
+    return mock.json_decode(state.pdp_requests[1].body).subject
+  end
+
+  it('sends AuthZEN id', function()
+    local subject = sent_subject()
+    assert.equal('agent-7', subject.id)
+    -- The agent is the subject; the human it acts for is a property.
+    assert.equal('alice', subject.properties.on_behalf_of)
+  end)
+
+  it('still sends the legacy identity by default', function()
+    -- Upgrading the gateway alone must not break a policy reading subject.identity.
+    assert.equal('agent-7', sent_subject().identity)
+  end)
+
+  it('drops the legacy identity when turned off', function()
+    local subject = sent_subject({ legacy_subject_identity = false })
+    assert.is_nil(subject.identity)
+    assert.equal('agent-7', subject.id)
+  end)
+
+  it('matches the Go PEP subject shape exactly', function()
+    -- The two PEPs sending different subject shapes would be worse than either shape.
+    local subject = sent_subject()
+    assert.equal('agent', subject.type)
+    assert.equal('agent-7', subject.id)
+    assert.equal('ai_assistant', subject.properties.agent_type)
+    assert.equal('c1', subject.properties.client_id)
+  end)
+
+  it('falls back to client_id then a placeholder', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice', client_id = 'c1' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.equal('c1', mock.json_decode(state.pdp_requests[1].body).subject.id)
+
+    local plugin2, state2 = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin2, base_conf())
+    assert.equal('unknown-agent', mock.json_decode(state2.pdp_requests[1].body).subject.id)
+  end)
+end)

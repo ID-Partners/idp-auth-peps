@@ -60,6 +60,11 @@ type pepConfig struct {
 	// coazDefaults applies the binding's default mappings to tools that declare none.
 	// Off leaves the non-conformant pass-through that deployed routes expect.
 	coazDefaults bool
+	// legacySubjectIdentity additionally sends the non-standard `subject.identity`
+	// alongside the correct `subject.id`. On by default so upgrading the PEP alone
+	// cannot break a policy that still reads the old field; turn it off once the
+	// policies read `subject.id`, and the field goes away in a later release.
+	legacySubjectIdentity bool
 }
 
 func configFrom(ext map[string]string) pepConfig {
@@ -80,6 +85,9 @@ func configFrom(ext map[string]string) pepConfig {
 		stepupAction:     get("stepup_action", "make_payment"),
 		mcpUpstreamURL:   ext["mcp_upstream_url"],
 		coazDefaults:     isTrue("coaz_defaults"),
+		// Defaults ON: absent config must not silently drop a field a deployed policy
+		// may still be reading. Only an explicit "false" removes it.
+		legacySubjectIdentity: !strings.EqualFold(ext["legacy_subject_identity"], "false"),
 	}
 }
 
@@ -379,17 +387,24 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	if agent == "" {
 		agent = "unknown-agent"
 	}
-	authzenReq := map[string]any{
-		"subject": map[string]any{
-			"type":     "agent",
-			"identity": agent,
-			"properties": map[string]any{
-				"on_behalf_of": sub,
-				"agent_type":   "ai_assistant",
-				"scope":        scope,
-				"client_id":    clientID,
-			},
+	// AuthZEN 1.0 names the subject identifier `id`. This PEP historically sent
+	// `identity`, which no version of the spec defines, so policies written against it
+	// are reading a field we invented. See subjectIdentifier for the migration.
+	subject := map[string]any{
+		"type": "agent",
+		"id":   agent,
+		"properties": map[string]any{
+			"on_behalf_of": sub,
+			"agent_type":   "ai_assistant",
+			"scope":        scope,
+			"client_id":    clientID,
 		},
+	}
+	if conf.legacySubjectIdentity {
+		subject["identity"] = agent
+	}
+	authzenReq := map[string]any{
+		"subject":  subject,
 		"action":   map[string]any{"name": m.action},
 		"resource": map[string]any{"type": m.rtype, "id": m.rid, "properties": m.rprops},
 		"context":  m.ctx,

@@ -85,6 +85,37 @@ send the PDP identical requests. Its route patterns are a specific banking API's
 (`/customers/:id/accounts`, `/accounts/:id/balance`, …). Treat them as a worked example:
 for your own API, either extend the switch or run the Node SDK, whose mapping you supply.
 
+## Migrating `subject.identity` -> `subject.id`
+
+AuthZEN 1.0 names the subject identifier **`id`**. Both gateway PEPs historically sent
+**`identity`**, which no version of the spec defines — so a policy reading it is reading a
+field we invented, and a conformant PDP would find no subject identifier at all.
+
+The Node SDK was written against `subject.id` and is unaffected.
+
+This cannot be a flag day: the PEPs and the policies deploy separately, and swapping the
+field in one release would break every policy the moment the gateway rolled. So both PEPs
+now send **`id` always**, and `identity` **as well** while `legacy_subject_identity` is on
+— which it is by default. Upgrading a gateway on its own changes nothing a policy can see.
+
+The sequence:
+
+1. **Deploy this version.** Requests now carry both `subject.id` and `subject.identity`
+   with the same value. Nothing breaks; nothing needs coordinating.
+2. **Update the policies** to read `subject.id`. Verify against the doubled traffic — both
+   fields are present, so a policy can be switched and tested without a rollback window.
+3. **Turn the legacy field off**, per route: `legacy_subject_identity: false` (Kong) or
+   `legacy_subject_identity: "false"` (ext_authz `context_extensions`). Requests are now
+   AuthZEN-conformant.
+4. **A later release removes the field entirely**, at which point step 3 becomes a no-op.
+
+Only an explicit `false` (case-insensitive) removes it — an empty value, a typo, or `no`
+all leave it in place, because silently dropping a field a live policy depends on is the
+one failure mode this ordering exists to prevent.
+
+The two PEPs move in lockstep on purpose. Two gateways sending different subject shapes
+to the same PDP would be worse than either shape on its own.
+
 ## `POST /v1/dpop/verify`
 
 A single-purpose sender-constraint check, for gateways that cannot do it themselves:

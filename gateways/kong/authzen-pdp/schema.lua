@@ -48,6 +48,11 @@ return {
           -- binding's default tools/call mapping, as it requires. Off keeps the
           -- pass-through deployed routes expect — which is NOT conformant.
           { coaz_defaults = { type = "boolean", default = false } },
+          -- Also send the non-standard `subject.identity` alongside AuthZEN's
+          -- `subject.id`. On by default so upgrading the gateway alone cannot break a
+          -- policy still reading the old field. Set false once policies read
+          -- subject.id; the field is removed in a later release.
+          { legacy_subject_identity = { type = "boolean", default = true } },
         },
         -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
         -- is no JOSE verifier available to it, so on its own it can compare the proof's

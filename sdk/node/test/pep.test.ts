@@ -1284,3 +1284,68 @@ describe('McpGuard — discovery and delegation', () => {
     expect(out).toEqual({ ok: true });
   });
 });
+
+describe('SSE frame parsing matches the Go engine', () => {
+  const token = { sub: 'alice@example.com', client_id: 'agent-1' };
+  const tool = {
+    name: 'get_customer',
+    inputSchema: {
+      'x-authzen-mapping': {
+        evaluation: {
+          subject: { type: 'identity', id: '$token.sub' },
+          action: { name: 'get_customer' },
+          resource: { type: 'customer', id: '$params.arguments.id' },
+        },
+      },
+    },
+  };
+  const call = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_customer', arguments: { id: 'c1' } } };
+
+  async function discoverWith(sse: string) {
+    const fetchImpl = vi.fn(async (url: unknown) => {
+      if (String(url).includes('/access/v1/')) {
+        return new Response(JSON.stringify({ decision: true }), { status: 200 });
+      }
+      return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }) as unknown as typeof globalThis.fetch;
+    const guard = new McpGuard({
+      client: { url: 'http://pdp', fetch: fetchImpl },
+      upstreamUrl: 'http://mcp/mcp',
+      fetch: fetchImpl,
+    });
+    return guard.checkToolCall({ rpc: call, claims: token });
+  }
+
+  it('joins a data payload split across several lines', async () => {
+    // SSE permits this and the Go engine joins them; parsing each line alone fails.
+    const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [tool] } });
+    const half = Math.floor(payload.length / 2);
+    const sse = `event: message\ndata: ${payload.slice(0, half)}\ndata: ${payload.slice(half)}\n\n`;
+    const v = await discoverWith(sse);
+    expect(v.coazTool).toBe(true);
+  });
+
+  it('takes the FIRST complete frame, as the Go engine does', async () => {
+    const first = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [tool] } });
+    const second = JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [] } });
+    const v = await discoverWith(`data: ${first}\n\ndata: ${second}\n\n`);
+    expect(v.coazTool).toBe(true); // the second frame would have found no tools
+  });
+
+  it('accepts a frame with no terminating blank line', async () => {
+    const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [tool] } });
+    expect((await discoverWith(`data: ${payload}`)).coazTool).toBe(true);
+  });
+
+  it('ignores event, id and comment lines', async () => {
+    const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [tool] } });
+    const sse = `: keepalive\nevent: message\nid: 42\nretry: 1000\ndata: ${payload}\n\n`;
+    expect((await discoverWith(sse)).coazTool).toBe(true);
+  });
+
+  it('fails closed on a stream with no data frame', async () => {
+    const v = await discoverWith('event: ping\n\n');
+    expect(v.allow).toBe(false);
+    expect(v.jsonRpcError?.error.code).toBe(CODE_PDP_ERROR);
+  });
+});

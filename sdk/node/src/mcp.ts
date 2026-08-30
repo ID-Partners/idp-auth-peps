@@ -1111,15 +1111,27 @@ export function jsonRpcError(
   return { jsonrpc: '2.0', id, error: { code, message, ...(data ? { data } : {}) } };
 }
 
-/** Last `data:` payload of an SSE stream that parses as JSON. */
+/**
+ * The first complete `data:` frame of an SSE stream.
+ *
+ * A frame's data may span several `data:` lines, which SSE joins into one payload; a
+ * blank line terminates the frame. Parsing each line on its own would fail on any
+ * multi-line frame, so the lines are accumulated and parsed once at the frame boundary.
+ * Matches firstSSEData in the Go engine — two PEPs reading the same stream differently
+ * is exactly the drift this repo exists to avoid.
+ */
 function parseSse(text: string): unknown {
-  let last: unknown = null;
+  let data = '';
   for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith('data:')) continue;
-    const parsed = safeJson(line.slice(5).trim());
-    if (parsed !== null) last = parsed;
+    if (line.startsWith('data:')) {
+      data += line.slice(5).trim();
+    } else if (line === '' && data !== '') {
+      return safeJson(data);
+    }
+    // `event:`, `id:`, `retry:` and `:` comment lines carry no payload.
   }
-  return last;
+  // A stream that ended without a terminating blank line still has a usable frame.
+  return data === '' ? null : safeJson(data);
 }
 
 function safeJson(text: string): unknown {

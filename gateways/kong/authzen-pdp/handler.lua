@@ -344,17 +344,29 @@ function AuthzenPDP:access(conf)
     ctx.user_scope = uscope
   end
 
-  local authzen_req = {
-    subject = {
-      type = "agent",
-      identity = act or client_id or "unknown-agent",
-      properties = {
-        on_behalf_of = sub,
-        agent_type = "ai_assistant",
-        scope = scope,
-        client_id = client_id,
-      },
+  -- AuthZEN 1.0 names the subject identifier `id`. This plugin historically sent
+  -- `identity`, which no version of the spec defines, so a policy reading it is reading
+  -- a field we invented. Both are sent while legacy_subject_identity is on (the
+  -- default), so upgrading the gateway alone cannot break such a policy; turn it off
+  -- once the policies read subject.id. Kept in lockstep with the Go PEP — the two
+  -- sending different subject shapes would be worse than either shape.
+  local agent_id = act or client_id or "unknown-agent"
+  local subject = {
+    type = "agent",
+    id = agent_id,
+    properties = {
+      on_behalf_of = sub,
+      agent_type = "ai_assistant",
+      scope = scope,
+      client_id = client_id,
     },
+  }
+  if conf.legacy_subject_identity ~= false then
+    subject.identity = agent_id
+  end
+
+  local authzen_req = {
+    subject = subject,
     action = { name = action },
     resource = { type = rtype, id = rid, properties = rprops },
     context = ctx,

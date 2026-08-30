@@ -826,3 +826,82 @@ func TestCheckRejectsAnAccessTokenThatFailsValidation(t *testing.T) {
 		t.Fatal("an unverifiable token must not reach the PDP")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// subject.identity -> subject.id migration.
+
+func TestSubjectUsesTheAuthzenIdentifier(t *testing.T) {
+	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+	s := newServer(t, pdp.URL)
+	headers := map[string]string{
+		"authorization": "Bearer " + mintUnsigned(map[string]any{
+			"sub": "alice", "act": map[string]any{"sub": "agent-7"}, "client_id": "c1",
+		}),
+	}
+
+	t.Run("id is always sent", func(t *testing.T) {
+		s.check(context.Background(), restConf(nil), "GET", "/accounts/a/balance", headers, "")
+		subject := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)
+		if subject["id"] != "agent-7" {
+			t.Fatalf("AuthZEN names the subject identifier `id`, got %v", subject)
+		}
+		// The human is carried as a property; the agent is the subject.
+		props := subject["properties"].(map[string]any)
+		if props["on_behalf_of"] != "alice" {
+			t.Fatalf("the principal should stay in properties, got %v", props)
+		}
+	})
+
+	t.Run("legacy identity is sent by default", func(t *testing.T) {
+		// Upgrading the PEP alone must not break a policy still reading subject.identity.
+		s.check(context.Background(), restConf(nil), "GET", "/accounts/a/balance", headers, "")
+		subject := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)
+		if subject["identity"] != "agent-7" {
+			t.Fatalf("the legacy field should default to being sent, got %v", subject)
+		}
+	})
+
+	t.Run("legacy identity is dropped when turned off", func(t *testing.T) {
+		conf := restConf(map[string]string{"legacy_subject_identity": "false"})
+		s.check(context.Background(), conf, "GET", "/accounts/a/balance", headers, "")
+		subject := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)
+		if _, present := subject["identity"]; present {
+			t.Fatalf("legacy_subject_identity=false must remove the field, got %v", subject)
+		}
+		if subject["id"] != "agent-7" {
+			t.Fatal("id must survive")
+		}
+	})
+
+	t.Run("only an explicit false removes it", func(t *testing.T) {
+		// A typo must not silently drop a field a policy depends on.
+		for _, v := range []string{"", "no", "0", "FALSE "} {
+			conf := restConf(map[string]string{"legacy_subject_identity": v})
+			s.check(context.Background(), conf, "GET", "/accounts/a/balance", headers, "")
+			subject := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)
+			if _, present := subject["identity"]; !present {
+				t.Fatalf("%q should not have disabled the legacy field", v)
+			}
+		}
+		// Case-insensitive "false" does disable it.
+		conf := restConf(map[string]string{"legacy_subject_identity": "FALSE"})
+		s.check(context.Background(), conf, "GET", "/accounts/a/balance", headers, "")
+		subject := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)
+		if _, present := subject["identity"]; present {
+			t.Fatal(`"FALSE" should disable the legacy field`)
+		}
+	})
+
+	t.Run("falls back to the client id then a placeholder", func(t *testing.T) {
+		noAct := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice", "client_id": "c1"})}
+		s.check(context.Background(), restConf(nil), "GET", "/accounts/a/balance", noAct, "")
+		if id := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)["id"]; id != "c1" {
+			t.Fatalf("with no act, the client id identifies the agent, got %v", id)
+		}
+		bare := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}
+		s.check(context.Background(), restConf(nil), "GET", "/accounts/a/balance", bare, "")
+		if id := pdp.requests[len(pdp.requests)-1]["subject"].(map[string]any)["id"]; id != "unknown-agent" {
+			t.Fatalf("with neither, a placeholder rather than an empty id, got %v", id)
+		}
+	})
+}

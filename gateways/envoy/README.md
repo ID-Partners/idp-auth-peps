@@ -120,3 +120,5 @@ Read from `context_extensions` on every request:
 | `stepup_scope` | — | Scope demanded for `stepup_action` |
 | `stepup_action` | `make_payment` | Action the step-up applies to |
 | `mcp_upstream_url` | — | Set to enable COAZ: where to discover `tools/list` |
+| `coaz_defaults` | `false` | Apply the binding's default mappings to undeclared methods |
+| `legacy_subject_identity` | `true` | Also send the non-standard `subject.identity` beside AuthZEN's `subject.id`. Set `"false"` once policies read `subject.id` — see [core/README.md](../../core/README.md#migrating-subjectidentity---subjectid) |

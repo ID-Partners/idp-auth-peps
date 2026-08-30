@@ -50,6 +50,17 @@ plugins:
 `authzen_url` and `authzen_api_key` are `referenceable`, so they take Kong vault
 references rather than literals.
 
+## `subject.identity` -> `subject.id`
+
+AuthZEN names the subject identifier `id`; this plugin historically sent `identity`, which
+no version of the spec defines. It now sends **both**, so upgrading the gateway alone
+cannot break a policy still reading the old field. Once your policies read `subject.id`,
+set `legacy_subject_identity: false` per route and the non-standard field goes away.
+
+The full sequence is in [`core/README.md`](../../core/README.md#migrating-subjectidentity---subjectid).
+The Go PEP moves in lockstep — two gateways sending different subject shapes to one PDP
+would be worse than either shape.
+
 ## DPoP is delegated
 
 `require_dpop` sends the proof to `coaz-pep`'s `POST /v1/dpop/verify`, which checks the
