@@ -41,6 +41,7 @@ import (
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 
+	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
 )
 
@@ -65,6 +66,21 @@ type pepConfig struct {
 	// cannot break a policy that still reads the old field; turn it off once the
 	// policies read `subject.id`, and the field goes away in a later release.
 	legacySubjectIdentity bool
+	// resource is the protected resource's identifier (RFC 8707), the key PDP
+	// discovery works from. Absent, an MCP route is identified by its upstream URL and a
+	// REST route uses the static PDP.
+	resource string
+}
+
+// resourceID is the identifier handed to PDP discovery for this route.
+func (c pepConfig) resourceID() string {
+	if c.resource != "" {
+		return c.resource
+	}
+	if c.style == "mcp" {
+		return c.mcpUpstreamURL // the MCP server's URL is its own identifier
+	}
+	return ""
 }
 
 func configFrom(ext map[string]string) pepConfig {
@@ -88,6 +104,7 @@ func configFrom(ext map[string]string) pepConfig {
 		// Defaults ON: absent config must not silently drop a field a deployed policy
 		// may still be reading. Only an explicit "false" removes it.
 		legacySubjectIdentity: !strings.EqualFold(ext["legacy_subject_identity"], "false"),
+		resource:              strings.TrimRight(ext["resource"], "/"),
 	}
 }
 
@@ -96,6 +113,8 @@ type server struct {
 	authzenAPIKey string
 	httpc         *http.Client
 	coaz          *coaz.Engine
+	// resolver finds the PDP for a route's resource. Nil means the static PDP.
+	resolver discovery.Resolver
 	// upstreamAllowlist bounds which MCP servers a caller may point the PEP at.
 	// Empty means unrestricted — main() warns when that is so.
 	upstreamAllowlist []string
@@ -325,7 +344,8 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 			}
 		}
 		v := s.coaz.CheckToolCall(ctx, conf.mcpUpstreamURL, headers["authorization"],
-			[]byte(body), claimsForCEL(claims), extraContext, coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults})
+			[]byte(body), claimsForCEL(claims), extraContext,
+			coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID()})
 		if v.CoazTool {
 			toolName := toolCallName(body)
 			if v.JSONRPCError != nil {
@@ -410,7 +430,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"context":  m.ctx,
 	}
 
-	out, err := s.evaluate(ctx, authzenReq)
+	out, err := s.evaluate(ctx, conf.resourceID(), authzenReq)
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
@@ -636,16 +656,25 @@ type pepOutcome struct {
 	IdentityDoctype string
 }
 
-func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (pepOutcome, error) {
+func (s *server) evaluate(ctx context.Context, resource string, authzenReq map[string]any) (pepOutcome, error) {
 	var out pepOutcome
+	resolver := s.resolver
+	if resolver == nil {
+		resolver = discovery.Static(s.authzenURL, s.authzenAPIKey)
+	}
+	ep, err := resolver.Resolve(ctx, resource)
+	if err != nil {
+		return out, fmt.Errorf("PDP discovery: %w", err)
+	}
 	payload, _ := json.Marshal(authzenReq)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		s.authzenURL+"/access/v1/evaluation", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.Evaluation, bytes.NewReader(payload))
 	if err != nil {
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.authzenAPIKey)
+	if ep.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.APIKey)
+	}
 	resp, err := s.httpc.Do(req)
 	if err != nil {
 		return out, err

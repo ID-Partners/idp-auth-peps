@@ -74,9 +74,71 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `ACCESS_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` | — |
 | `USER_TOKEN_JWKS_URL` | JWKS for `X-User-Token` | falls back to the access-token JWKS |
 | `USER_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` for `X-User-Token` | issuer falls back to the access-token issuer |
+| `PDP_DISCOVERY` | `off`, `authzen`, `resource` or `federation` — see [PDP discovery](#pdp-discovery) | `off` |
+| `PDP_METADATA_TTL` | cache TTL for resource and PDP metadata | 5m |
+| `PDP_ALLOWLIST` | permitted discovered-PDP prefixes; `AUTHZEN_URL` is always permitted | unset — **warns**, any https PDP a resource names |
+| `RESOURCE_METADATA_ALLOWLIST` | permitted `resource` prefixes for metadata fetches | unset — **warns**, any resource fetched |
+| `PDP_DISCOVERY_INSECURE` | allow `http` for discovered URLs (dev only) | false |
+| `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
+| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for Entity Configuration and fetch-endpoint calls | unset — **warns** |
+| `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
 
 Per-route knobs are not env — they arrive as ext_authz `context_extensions` or in the
 `config` object of an HTTP check. See [`../gateways/envoy/README.md`](../gateways/envoy/README.md).
+
+## PDP discovery
+
+By default the PEP is told where the PDP is (`AUTHZEN_URL`) and assumes the AuthZEN
+paths under it. `PDP_DISCOVERY` replaces both assumptions with metadata, in four steps:
+
+```
+resource identifier (the route's `resource`, or `mcp_upstream_url` on an MCP route)
+  ├─ federation  resolved oauth_resource metadata from a Trust Chain     ← authoritative
+  ├─ resource    {resource}/.well-known/oauth-protected-resource (RFC 9728) ← self-asserted
+  └─ static      AUTHZEN_URL                                              ← always the fallback
+PDP identifier
+  ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9): access_evaluation_endpoint, …
+  └─ 404 → {pdp}/access/v1/evaluation, the spec's default paths
+```
+
+| Mode | What it reads | Falls back to |
+| --- | --- | --- |
+| `off` | nothing — static PDP, default paths, no HTTP | — |
+| `authzen` | `AUTHZEN_URL`'s `authzen-configuration` | default paths |
+| `resource` | the resource's RFC 9728 document, then the named PDP's metadata | static PDP |
+| `federation` | the resource's **resolved** `oauth_resource` metadata, then the named PDP's metadata | static PDP — never the resource's own document |
+
+The parameter that names the PDP is not standardised anywhere (not in RFC 9728, AuthZEN
+1.0, the MCP profile, or OpenID Federation 1.0), so this PEP mints one and uses it in
+both places:
+
+```json
+"authzen_policy_decision_points": ["https://pdp.example"]
+```
+
+An array of PDP *identifiers* (the AuthZEN `policy_decision_point` value, not an
+endpoint), first preferred. It is the same bytes in an RFC 9728 document and under
+`metadata.oauth_resource` in an Entity Statement — which is the point. A resource's own
+well-known is a self-assertion over TLS; a federation's Resolved Metadata is what survives
+every Superior's `metadata_policy`, signed back to a Trust Anchor you configured. So a
+federation operator can pin, per resource, which PDPs may decide for it:
+
+```json
+"metadata_policy": { "oauth_resource": { "authzen_policy_decision_points": {
+  "subset_of": ["https://pdp.bank-a.example"], "essential": true } } }
+```
+
+and a resource that names anything else has an **invalid** chain. The PEP then fails
+closed: an invalid chain, like a URL outside an allowlist, never falls through to a weaker
+source. Everything else degrades — stale cache, then the static PDP — and only when
+nothing is left is the request denied with a 503.
+
+Two things a discovered PDP never gets: the static `AUTHZEN_API_KEY` (it is bound to
+`AUTHZEN_URL` alone), and a guessed batch path (a boxcar mapping needs the PDP to
+advertise `access_evaluations_endpoint`).
+
+Per route, `resource` is the RFC 8707 identifier the chain starts from. An MCP route
+without one uses its `mcp_upstream_url`; a REST route without one uses the static PDP.
 
 ## A note on `mapping.go`
 

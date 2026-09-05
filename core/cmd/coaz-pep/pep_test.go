@@ -411,7 +411,7 @@ func TestEvaluateParsesAdvice(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pdp := newPDPStub(t, tc.response, 200)
 			s := newServer(t, pdp.URL)
-			out, err := s.evaluate(context.Background(), map[string]any{"subject": map[string]any{}})
+			out, err := s.evaluate(context.Background(), "", map[string]any{"subject": map[string]any{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -426,7 +426,7 @@ func TestEvaluateRejectsAnUnparseableResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newServer(t, srv.URL)
-	if _, err := s.evaluate(context.Background(), map[string]any{}); err == nil {
+	if _, err := s.evaluate(context.Background(), "", map[string]any{}); err == nil {
 		t.Fatal("an unparseable PDP response must be an error, not a silent permit")
 	}
 }

@@ -16,14 +16,27 @@ package main
 //   HTTP_PORT            HTTP check API port (default 9192)
 //   COAZ_DISCOVERY_TTL   tools/list cache TTL, Go duration (default 60s)
 //   PDP_TLS_INSECURE     "true" to skip PDP TLS verification (demo only)
+//
+// PDP discovery (see core/authzen/discovery):
+//   PDP_DISCOVERY                off | authzen | resource | federation (default off)
+//   PDP_METADATA_TTL             resource/PDP metadata cache TTL (default 5m)
+//   PDP_ALLOWLIST                permitted discovered PDP prefixes; AUTHZEN_URL always included
+//   RESOURCE_METADATA_ALLOWLIST  permitted `resource` prefixes for metadata fetches
+//   PDP_DISCOVERY_INSECURE       "true" allows http for discovered URLs (dev only)
+//   FEDERATION_TRUST_ANCHORS_FILE JSON {"<entity id>": {"keys":[JWK...]}}; federation mode
+//   FEDERATION_FETCH_ALLOWLIST   permitted prefixes for entity configuration / fetch calls
+//   FEDERATION_MAX_PATH_LENGTH   intermediates allowed between resource and anchor (default 4)
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,7 +45,9 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
+	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
+	"github.com/ID-Partners/idp-auth-peps/core/federation"
 )
 
 // buildServer assembles the server, HTTP mux and http.Server from the environment.
@@ -65,12 +80,19 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		httpc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
+	resolver, err := buildResolver(getenv, authzenURL, httpc)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
 	srv := &server{
 		authzenURL:    authzenURL,
 		authzenAPIKey: getenv("AUTHZEN_API_KEY"),
 		httpc:         httpc,
+		resolver:      resolver,
 		coaz: coaz.NewEngine(coaz.Options{
 			PDP:          coaz.PDPConfig{URL: authzenURL, APIKey: getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
+			Resolver:     resolver,
 			DiscoveryTTL: ttl,
 		}),
 	}
@@ -131,6 +153,116 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		IdleTimeout:       120 * time.Second,
 	}
 	return srv, httpSrv, grpcPort, nil
+}
+
+// buildResolver assembles PDP discovery from the environment. Off (the default) is the
+// static PDP with the AuthZEN default paths and no HTTP — byte-for-byte today's
+// behaviour. Warm-up failures are logged, not fatal: the resolver degrades to the
+// default paths, and a PDP that is down at boot is a runtime condition, not a config
+// error.
+func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client) (*discovery.Chain, error) {
+	mode, err := discovery.ParseMode(getenv("PDP_DISCOVERY"))
+	if err != nil {
+		return nil, err
+	}
+	metaTTL := 5 * time.Minute
+	if v := getenv("PDP_METADATA_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			metaTTL = d
+		} else {
+			log.Printf("WARNING: PDP_METADATA_TTL %q is not a duration; using %s", v, metaTTL)
+		}
+	}
+	insecure := strings.EqualFold(getenv("PDP_DISCOVERY_INSECURE"), "true")
+	resAllow := parseAllowlist(getenv("RESOURCE_METADATA_ALLOWLIST"))
+
+	opts := discovery.Options{
+		Mode:          mode,
+		StaticPDP:     authzenURL,
+		APIKeys:       map[string]string{authzenURL: getenv("AUTHZEN_API_KEY")},
+		HTTPClient:    httpc,
+		TTL:           metaTTL,
+		AllowInsecure: insecure,
+	}
+	// The static PDP is the operator's own and is always permitted; the allowlist
+	// bounds what a resource's metadata may add to it.
+	if pdpAllow := parseAllowlist(getenv("PDP_ALLOWLIST")); len(pdpAllow) > 0 {
+		pdpAllow = append(pdpAllow, authzenURL)
+		opts.PDPAllowed = func(u string) bool { return upstreamAllowed(pdpAllow, u) }
+	}
+	if mode == discovery.ModeResource || mode == discovery.ModeFederation {
+		if len(resAllow) == 0 {
+			log.Printf("WARNING: RESOURCE_METADATA_ALLOWLIST is unset — any caller-supplied " +
+				"`resource` will have its metadata fetched server-side. Set it to the resources you govern.")
+		} else {
+			opts.ResourceAllowed = func(u string) bool { return upstreamAllowed(resAllow, u) }
+		}
+		if getenv("PDP_ALLOWLIST") == "" {
+			log.Printf("WARNING: PDP_ALLOWLIST is unset — a resource's metadata may point this PEP at " +
+				"any https PDP. Set it to the PDPs you trust.")
+		}
+	}
+	if mode == discovery.ModeFederation {
+		fed, err := buildFederation(getenv, httpc, insecure)
+		if err != nil {
+			return nil, err
+		}
+		opts.Federation = fed
+	}
+	if mode != discovery.ModeOff && insecure {
+		log.Printf("WARNING: PDP_DISCOVERY_INSECURE is set — discovered http URLs are accepted. Dev only.")
+	}
+	chain, err := discovery.New(opts)
+	if err != nil {
+		return nil, err
+	}
+	if mode != discovery.ModeOff {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := chain.Warm(ctx); err != nil {
+			log.Printf("WARNING: PDP discovery warm-up for %s failed: %v", authzenURL, err)
+		} else if ep, err := chain.Resolve(ctx, ""); err == nil {
+			log.Printf("PDP discovery (%s): %s evaluates at %s", mode, ep.Identifier, ep.Evaluation)
+		}
+	}
+	return chain, nil
+}
+
+// buildFederation loads the Trust Anchors and builds the chain resolver.
+func buildFederation(getenv func(string) string, httpc *http.Client, insecure bool) (*federation.Resolver, error) {
+	path := getenv("FEDERATION_TRUST_ANCHORS_FILE")
+	if path == "" {
+		return nil, fmt.Errorf("PDP_DISCOVERY=federation requires FEDERATION_TRUST_ANCHORS_FILE")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading FEDERATION_TRUST_ANCHORS_FILE: %w", err)
+	}
+	var doc map[string]struct {
+		Keys []map[string]any `json:"keys"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("FEDERATION_TRUST_ANCHORS_FILE is not {\"<entity id>\": {\"keys\": [...]}}: %w", err)
+	}
+	var anchors []federation.TrustAnchor
+	for id, v := range doc {
+		anchors = append(anchors, federation.TrustAnchor{EntityID: strings.TrimRight(id, "/"), Keys: v.Keys})
+	}
+	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: insecure}
+	if v := getenv("FEDERATION_MAX_PATH_LENGTH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("FEDERATION_MAX_PATH_LENGTH %q is not a non-negative integer", v)
+		}
+		fopts.MaxPathLength = n
+	}
+	if allow := parseAllowlist(getenv("FEDERATION_FETCH_ALLOWLIST")); len(allow) > 0 {
+		fopts.FetchAllowed = func(u string) bool { return upstreamAllowed(allow, u) }
+	} else {
+		log.Printf("WARNING: FEDERATION_FETCH_ALLOWLIST is unset — walking a trust chain may fetch " +
+			"from any https host an authority_hints names.")
+	}
+	return federation.New(fopts)
 }
 
 // main is the listen/serve shell: it binds real sockets, so it is the one function that

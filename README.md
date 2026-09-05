@@ -81,6 +81,14 @@ docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coa
 | `ACCESS_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` | — |
 | `USER_TOKEN_JWKS_URL` | JWKS for `X-User-Token` | falls back to the access-token JWKS |
 | `USER_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` for `X-User-Token` | issuer falls back to the access-token issuer |
+| `PDP_DISCOVERY` | `off`, `authzen`, `resource` or `federation` — see [PDP discovery](core/README.md#pdp-discovery) | `off` |
+| `PDP_METADATA_TTL` | cache TTL for resource and PDP metadata | 5m |
+| `PDP_ALLOWLIST` | permitted discovered-PDP prefixes; `AUTHZEN_URL` is always permitted | unset — **warns**, any https PDP a resource names |
+| `RESOURCE_METADATA_ALLOWLIST` | permitted `resource` prefixes for metadata fetches | unset — **warns**, any resource fetched |
+| `PDP_DISCOVERY_INSECURE` | allow `http` for discovered URLs (dev only) | false |
+| `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
+| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for Entity Configuration and fetch-endpoint calls | unset — **warns** |
+| `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
 
 Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url` — is
 **per route**, and arrives as ext_authz `context_extensions` or the Kong plugin's config.
