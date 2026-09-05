@@ -37,12 +37,23 @@ Same three words in an HTTP `WWW-Authenticate` header, in a JSON body, and in an
 JSON-RPC error's `data.authz_challenge`. An agent can resolve a challenge without a
 human reading prose.
 
+**Start with [docs/architecture.md](docs/architecture.md)** for the map: what each piece
+does, the decision contract, and how a PEP finds its PDP. **Then [`demo/`](demo)** stands
+the whole thing up — a stub federation, a good PDP and a rogue one — with one
+`docker compose up` and walks through why the federation's word beats a resource's own.
+
 ## Layout
 
 ```
+docs/                        architecture.md — the explainer
+demo/                        docker compose + scripts: see discovery work, end to end
 core/                        Go: the COAZ engine + the coaz-pep service
   coaz/                        COAZ — discovery, CEL, envelopes, trust anchoring
+  authzen/discovery/           resource -> PDP -> endpoints (RFC 9728, AuthZEN well-known, federation)
+  federation/                  OpenID Federation 1.0 trust chain resolver
+  jose/                        JWS verification shared by tokens, DPoP and federation
   cmd/coaz-pep/                ext_authz gRPC (:9191) + HTTP check API (:9192)
+  cmd/demo-stubs/              the demo's stub federation and PDPs
 gateways/
   kong/authzen-pdp/            Kong Lua plugin
   envoy/agentgateway/          agentgateway (solo.io) attachment
@@ -87,7 +98,7 @@ docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coa
 | `RESOURCE_METADATA_ALLOWLIST` | permitted `resource` prefixes for metadata fetches | unset — **warns**, any resource fetched |
 | `PDP_DISCOVERY_INSECURE` | allow `http` for discovered URLs (dev only) | false |
 | `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
-| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for Entity Configuration and fetch-endpoint calls | unset — **warns** |
+| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for the climb to the anchor (Superiors' Entity Configurations and fetch endpoints); the resource's own is governed by `RESOURCE_METADATA_ALLOWLIST` | unset — **warns** |
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
 
 Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url` — is

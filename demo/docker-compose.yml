@@ -1,0 +1,108 @@
+# The PDP discovery demo. `docker compose up --build`, then `./demo.sh`.
+#
+#   stubs           a Trust Anchor, federated and non-federated resources, a good PDP and
+#                   a rogue one — see ../core/cmd/demo-stubs/main.go for the cast
+#   pep-static      coaz-pep as shipped: told where the PDP is, no discovery     :9192
+#   pep-resource    PDP_DISCOVERY=resource — trusts each resource's own well-known :9193
+#   pep-federation  PDP_DISCOVERY=federation — trusts the federation's word        :9194
+#   kong            (profile `kong`) the Kong plugin doing discovery in Lua        :8000
+#
+# Everything is plain http on a private network, hence PDP_DISCOVERY_INSECURE. Do not
+# copy that line anywhere real.
+
+services:
+  stubs:
+    build:
+      context: ../core
+      target: demo-stubs
+    environment:
+      STUB_HOST: stubs
+      ANCHORS_FILE: /shared/anchors.json
+    volumes:
+      - shared:/shared
+    ports:
+      - "9000-9007:9000-9007"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9000/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  pep-static:
+    build:
+      context: ../core
+      target: coaz-pep
+    environment: &pep-env
+      AUTHZEN_URL: http://stubs:9002
+      AUTHZEN_API_KEY: static-pdp-key
+      CHECK_API_TOKEN: demo
+      MCP_UPSTREAM_ALLOWLIST: http://stubs:9004
+    ports:
+      - "9192:9192"
+    depends_on:
+      stubs:
+        condition: service_healthy
+
+  pep-resource:
+    build:
+      context: ../core
+      target: coaz-pep
+    environment:
+      <<: *pep-env
+      PDP_DISCOVERY: resource
+      PDP_DISCOVERY_INSECURE: "true"
+      # Allowlists match scheme + host + port at a path boundary, so each stub is listed.
+      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007
+      # Deliberately no PDP_ALLOWLIST here (it warns at boot): scenario 2 shows what
+      # happens when a resource's own word is the only bound on who decides.
+    ports:
+      - "9193:9192"
+    depends_on:
+      stubs:
+        condition: service_healthy
+
+  pep-federation:
+    build:
+      context: ../core
+      target: coaz-pep
+    environment:
+      <<: *pep-env
+      PDP_DISCOVERY: federation
+      PDP_DISCOVERY_INSECURE: "true"
+      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007
+      PDP_ALLOWLIST: http://stubs:9002
+      FEDERATION_TRUST_ANCHORS_FILE: /shared/anchors.json
+      # Which resources may be looked up is RESOURCE_METADATA_ALLOWLIST's call, in every
+      # mode; this one governs the climb from a resource to the anchor.
+      FEDERATION_FETCH_ALLOWLIST: http://stubs:9000
+    volumes:
+      - shared:/shared:ro
+    ports:
+      - "9194:9192"
+    depends_on:
+      stubs:
+        condition: service_healthy
+
+  kong:
+    profiles: ["kong"]
+    image: kong:3.9
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PLUGINS: bundled,authzen-pdp
+      KONG_LUA_PACKAGE_PATH: /opt/?.lua;;
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: "off"
+      KONG_LOG_LEVEL: notice
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+    volumes:
+      - ./kong/kong.yml:/kong/kong.yml:ro
+      - ../gateways/kong/authzen-pdp:/opt/kong/plugins/authzen-pdp:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      stubs:
+        condition: service_healthy
+
+volumes:
+  shared:

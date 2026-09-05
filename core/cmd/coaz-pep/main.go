@@ -24,7 +24,8 @@ package main
 //   RESOURCE_METADATA_ALLOWLIST  permitted `resource` prefixes for metadata fetches
 //   PDP_DISCOVERY_INSECURE       "true" allows http for discovered URLs (dev only)
 //   FEDERATION_TRUST_ANCHORS_FILE JSON {"<entity id>": {"keys":[JWK...]}}; federation mode
-//   FEDERATION_FETCH_ALLOWLIST   permitted prefixes for entity configuration / fetch calls
+//   FEDERATION_FETCH_ALLOWLIST   permitted prefixes for the climb: superiors' entity configurations and fetch endpoints
+//                                (the subject's own is governed by RESOURCE_METADATA_ALLOWLIST)
 //   FEDERATION_MAX_PATH_LENGTH   intermediates allowed between resource and anchor (default 4)
 
 import (
@@ -203,7 +204,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 		}
 	}
 	if mode == discovery.ModeFederation {
-		fed, err := buildFederation(getenv, httpc, insecure)
+		fed, err := buildFederation(getenv, httpc, insecure, opts.ResourceAllowed)
 		if err != nil {
 			return nil, err
 		}
@@ -229,7 +230,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 }
 
 // buildFederation loads the Trust Anchors and builds the chain resolver.
-func buildFederation(getenv func(string) string, httpc *http.Client, insecure bool) (*federation.Resolver, error) {
+func buildFederation(getenv func(string) string, httpc *http.Client, insecure bool, resourceAllowed func(string) bool) (*federation.Resolver, error) {
 	path := getenv("FEDERATION_TRUST_ANCHORS_FILE")
 	if path == "" {
 		return nil, fmt.Errorf("PDP_DISCOVERY=federation requires FEDERATION_TRUST_ANCHORS_FILE")
@@ -248,7 +249,9 @@ func buildFederation(getenv func(string) string, httpc *http.Client, insecure bo
 	for id, v := range doc {
 		anchors = append(anchors, federation.TrustAnchor{EntityID: strings.TrimRight(id, "/"), Keys: v.Keys})
 	}
-	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: insecure}
+	// The resource allowlist governs the subject's own Entity Configuration; the fetch
+	// allowlist governs the climb from there to the anchor.
+	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: insecure, SubjectAllowed: resourceAllowed}
 	if v := getenv("FEDERATION_MAX_PATH_LENGTH"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {

@@ -540,6 +540,22 @@ func TestFetchPolicy(t *testing.T) {
 	if _, err := r.Resolve(ctx(), f.leaf.id); !errors.Is(err, ErrNotAllowed) {
 		t.Fatalf("fetch endpoint refused: %v", err)
 	}
+	// SubjectAllowed governs only the leaf's own configuration; the climb stays under
+	// FetchAllowed.
+	r = newResolver(t, Options{
+		FetchAllowed:   func(u string) bool { return !strings.HasPrefix(u, f.leaf.id) },
+		SubjectAllowed: func(u string) bool { return strings.HasPrefix(u, f.leaf.id) },
+	}, f.anchor)
+	if _, err := r.Resolve(ctx(), f.leaf.id); err != nil {
+		t.Fatalf("leaf permitted by SubjectAllowed should resolve: %v", err)
+	}
+	r = newResolver(t, Options{
+		FetchAllowed:   func(u string) bool { return true },
+		SubjectAllowed: func(u string) bool { return false },
+	}, f.anchor)
+	if _, err := r.Resolve(ctx(), f.leaf.id); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("leaf refused by SubjectAllowed: %v", err)
+	}
 	// Without AllowInsecure the http fixtures are refused outright.
 	strict, err := New(Options{TrustAnchors: []TrustAnchor{f.anchor.anchor()}})
 	if err != nil {

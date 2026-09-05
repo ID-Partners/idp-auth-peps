@@ -548,6 +548,16 @@ func TestFederationMode(t *testing.T) {
 			t.Fatalf("%v", err)
 		}
 	})
+	t.Run("the resource allowlist governs federation lookups too", func(t *testing.T) {
+		f := newMiniFed(t)
+		f.leafPDPs = []any{good.URL}
+		calls := 0
+		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t),
+			ResourceAllowed: func(string) bool { calls++; return false }})
+		if _, err := c.Resolve(ctx(), f.leaf.URL); !errors.Is(err, ErrNotAllowed) || calls != 1 {
+			t.Fatalf("err=%v calls=%d", err, calls)
+		}
+	})
 	t.Run("federated but no oauth_resource metadata falls to static", func(t *testing.T) {
 		f := newMiniFed(t)
 		f.leafNoResource = true

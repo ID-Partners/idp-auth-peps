@@ -1,0 +1,24 @@
+# DB-less Kong config for the demo: one route in front of the `plain` resource stub,
+# with the authzen-pdp plugin discovering the PDP from that resource's RFC 9728
+# metadata. `curl -H "Authorization: Bearer <jwt>" http://localhost:8000/bank/accounts/a1/balance`.
+_format_version: "3.0"
+
+services:
+  - name: plain-resource
+    url: http://stubs:9004
+    routes:
+      - name: bank
+        paths: ["/bank"]
+        strip_path: true
+    plugins:
+      - name: authzen-pdp
+        config:
+          authzen_url: http://stubs:9002
+          authzen_api_key: static-pdp-key
+          pep_label: "Kong (resource discovery)"
+          style: rest
+          require_token: true
+          pdp_discovery: resource
+          resource: http://stubs:9004
+          pdp_discovery_insecure: true
+          resource_metadata_allowlist: ["http://stubs:9004"]

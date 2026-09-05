@@ -80,7 +80,7 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `RESOURCE_METADATA_ALLOWLIST` | permitted `resource` prefixes for metadata fetches | unset — **warns**, any resource fetched |
 | `PDP_DISCOVERY_INSECURE` | allow `http` for discovered URLs (dev only) | false |
 | `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
-| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for Entity Configuration and fetch-endpoint calls | unset — **warns** |
+| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for the climb to the anchor (Superiors' Entity Configurations and fetch endpoints); the resource's own is governed by `RESOURCE_METADATA_ALLOWLIST` | unset — **warns** |
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
 
 Per-route knobs are not env — they arrive as ext_authz `context_extensions` or in the

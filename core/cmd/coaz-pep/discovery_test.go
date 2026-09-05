@@ -357,6 +357,25 @@ func TestFederationEndToEnd(t *testing.T) {
 			t.Fatalf("denied=%v static paths=%v", resp.GetDeniedResponse(), static.paths)
 		}
 	})
+	t.Run("the resource allowlist governs the subject, the fetch allowlist the climb", func(t *testing.T) {
+		f := newFedFixture(t)
+		f.pdps = []any{good.URL}
+		// Leaf permitted only by the resource allowlist; the anchor only by the fetch allowlist.
+		s, _, _, err := buildServer(fedEnv(f, t, static.URL, map[string]string{
+			"RESOURCE_METADATA_ALLOWLIST": f.leaf.URL, "FEDERATION_FETCH_ALLOWLIST": f.anchor.URL}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := s.check(context.Background(), restConf(map[string]string{"resource": f.leaf.URL}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil {
+			t.Fatalf("should permit: %s", resp.GetDeniedResponse().GetBody())
+		}
+		// A resource outside the resource allowlist is refused before any fetch.
+		resp = s.check(context.Background(), restConf(map[string]string{"resource": "http://127.0.0.1:1"}), "GET", "/accounts/a1/balance", headers, "")
+		if deniedStatus(resp) != 503 {
+			t.Fatalf("want 503, got %d", deniedStatus(resp))
+		}
+	})
 	t.Run("fetch allowlist is honoured", func(t *testing.T) {
 		f := newFedFixture(t)
 		f.pdps = []any{good.URL}

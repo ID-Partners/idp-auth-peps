@@ -232,6 +232,12 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 		}
 		candidates = []string{c.opts.StaticPDP}
 	} else {
+		// Which resources may be looked up at all is the operator's call, whatever the
+		// source. Checked here, before any cache or fetch, so a refused resource costs
+		// nothing and cannot inherit another caller's cached answer.
+		if c.opts.ResourceAllowed != nil && !c.opts.ResourceAllowed(resource) {
+			return PDPEndpoints{}, fmt.Errorf("%w: %q is outside the resource allowlist", ErrNotAllowed, resource)
+		}
 		candidates, err = c.resources.Get(ctx, resource, c.lookupPDPs)
 		if err != nil {
 			if errors.Is(err, ErrNotAllowed) {

@@ -15,7 +15,7 @@ import (
 // Configuration, the Subordinate Statements upward, and the anchor's Entity
 // Configuration, every link verified.
 func (r *Resolver) walk(ctx context.Context, entityID string) ([]*Statement, string, error) {
-	w := &walker{r: r, ctx: ctx, configs: map[string]*Statement{}, budget: r.opts.MaxFetches}
+	w := &walker{r: r, ctx: ctx, subjectID: entityID, configs: map[string]*Statement{}, budget: r.opts.MaxFetches}
 
 	leaf, err := w.entityConfiguration(entityID)
 	if err != nil {
@@ -116,18 +116,19 @@ func (r *Resolver) walk(ctx context.Context, entityID string) ([]*Statement, str
 }
 
 type walker struct {
-	r       *Resolver
-	ctx     context.Context
-	configs map[string]*Statement // verified Entity Configurations seen this resolution
-	budget  int
+	r         *Resolver
+	ctx       context.Context
+	subjectID string
+	configs   map[string]*Statement // verified Entity Configurations seen this resolution
+	budget    int
 }
 
-func (w *walker) get(raw string) ([]byte, error) {
+func (w *walker) get(raw string, client *metafetch.Client) ([]byte, error) {
 	if w.budget <= 0 {
 		return nil, fmt.Errorf("fetch budget of %d exhausted", w.r.opts.MaxFetches)
 	}
 	w.budget--
-	return w.r.fetch.Get(w.ctx, raw, contentType)
+	return client.Get(w.ctx, raw, contentType)
 }
 
 // entityConfiguration fetches and verifies the self-issued statement of entityID. A
@@ -137,7 +138,11 @@ func (w *walker) entityConfiguration(entityID string) (*Statement, error) {
 	if st, ok := w.configs[entityID]; ok {
 		return st, nil
 	}
-	body, err := w.get(strings.TrimRight(entityID, "/") + WellKnown)
+	client := w.r.fetch
+	if entityID == w.subjectID {
+		client = w.r.subject
+	}
+	body, err := w.get(strings.TrimRight(entityID, "/")+WellKnown, client)
 	if err != nil {
 		if errors.Is(err, ErrNotAllowed) || errors.Is(err, metafetch.ErrNotFound) {
 			return nil, err
@@ -181,7 +186,7 @@ func (w *walker) subordinateStatement(superior *Statement, sub string) (*Stateme
 	q.Set("iss", superior.Sub)
 	u.RawQuery = q.Encode()
 
-	body, err := w.get(u.String())
+	body, err := w.get(u.String(), w.r.fetch)
 	if err != nil {
 		if errors.Is(err, ErrNotAllowed) {
 			return nil, err

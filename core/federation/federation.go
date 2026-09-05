@@ -72,9 +72,15 @@ type Options struct {
 	MaxEntries int
 	// AllowInsecure permits http Entity Identifiers and endpoints (tests, dev).
 	AllowInsecure bool
-	// FetchAllowed is the operator's allowlist for every URL touched while walking the
-	// chain. Nil means any https host.
+	// FetchAllowed is the operator's allowlist for the URLs touched while climbing the
+	// chain: Superiors' Entity Configurations and fetch endpoints. Nil means any https
+	// host.
 	FetchAllowed func(string) bool
+	// SubjectAllowed governs the subject's own Entity Configuration, which lives at the
+	// subject. Nil means FetchAllowed applies to it too. The PEP passes its resource
+	// allowlist here, so "which resources may be looked up" and "which hosts a chain may
+	// climb through" are separate questions with separate answers.
+	SubjectAllowed func(string) bool
 	// Now is the clock; tests replace it.
 	Now func() time.Time
 }
@@ -98,6 +104,7 @@ type Resolver struct {
 	anchors map[string]TrustAnchor
 	order   map[string]int
 	fetch   *metafetch.Client
+	subject *metafetch.Client
 	cache   *ttlcache.Cache[Resolved]
 }
 
@@ -140,6 +147,10 @@ func New(o Options) (*Resolver, error) {
 		r.order[ta.EntityID] = i
 	}
 	r.fetch = metafetch.New(o.HTTPClient, metafetch.Policy{AllowInsecure: o.AllowInsecure, Allow: o.FetchAllowed}, "", 0)
+	r.subject = r.fetch
+	if o.SubjectAllowed != nil {
+		r.subject = metafetch.New(o.HTTPClient, metafetch.Policy{AllowInsecure: o.AllowInsecure, Allow: o.SubjectAllowed}, "", 0)
+	}
 	r.cache = ttlcache.New[Resolved](ttlcache.Options{
 		TTL: o.TTL, NegativeTTL: o.NegativeTTL, MaxEntries: o.MaxEntries, Now: o.Now,
 	})
