@@ -50,6 +50,43 @@ plugins:
 `authzen_url` and `authzen_api_key` are `referenceable`, so they take Kong vault
 references rather than literals.
 
+## PDP discovery
+
+By default the plugin is told where the PDP is (`authzen_url`) and assumes the AuthZEN
+paths under it. `pdp_discovery` replaces both assumptions with metadata, the same chain
+the Go PEP walks (see [`core/README.md`](../../core/README.md#pdp-discovery)), minus one
+branch:
+
+| Mode | What it reads | Falls back to |
+| --- | --- | --- |
+| `off` | nothing — static PDP, default paths, no fetch | — |
+| `authzen` | `authzen_url`'s `/.well-known/authzen-configuration` | default paths |
+| `resource` | the route's resource's RFC 9728 document (`authzen_policy_decision_points`), then that PDP's metadata | `authzen_url` |
+
+There is **no `federation` mode here**. Resolving an OpenID Federation Trust Chain means
+verifying Entity Statement signatures, and no JOSE verifier is available to a Kong plugin
+— the same reason DPoP and COAZ are delegated. A route that must take the federation's
+word over the resource's own well-known belongs behind `coaz-pep`, which does that.
+Delegated `tools/call` checks already run the engine's discovery, federation included,
+and an explicit `resource` is passed to it so both PEPs key off the same identifier.
+
+```yaml
+config:
+  authzen_url: "{vault://env/authzen-url}"        # always the fallback, always permitted
+  pdp_discovery: resource
+  resource: https://api.bank.example              # RFC 8707 identifier; mcp routes default to mcp_upstream_url
+  pdp_allowlist: ["https://pdp.bank.example"]     # what a resource may name; empty = any https PDP
+  resource_metadata_allowlist: ["https://api.bank.example"]
+  pdp_metadata_ttl: 300
+```
+
+The rules are the Go PEP's: the resource's echoed `resource` must be byte-identical
+(RFC 9728 §3.3), the PDP's `policy_decision_point` must equal the identifier it was
+fetched from, a PDP without metadata gets the spec's default paths, and metadata is
+cached per identifier with stale-while-failing. A URL outside an allowlist never falls
+through to a weaker source — the request is a 503. And a discovered PDP never receives
+`authzen_api_key`; that key is bound to `authzen_url` alone.
+
 ## `subject.identity` -> `subject.id`
 
 AuthZEN names the subject identifier `id`; this plugin historically sent `identity`, which
@@ -118,7 +155,7 @@ cd gateways/kong
 busted --lpath="./?.lua;./?/init.lua" spec/
 ```
 
-16 behavioural tests against a mocked Kong — no gateway, no database, no network. They
+The behavioural tests run against a mocked Kong — no gateway, no database, no network. They
 cover the pure helpers, the request mapping both gateways must agree on, and the decision
 paths: no token, permit, deny, and PDP-unreachable (which must fail closed). See
 [`spec/README.md`](../spec/README.md).

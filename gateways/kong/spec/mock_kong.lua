@@ -179,7 +179,18 @@ function M.install(opts)
     encode_base64 = encode_base64,
     decode_base64 = decode_base64,
     null = setmetatable({}, { __tostring = function() return 'null' end }),
+    -- A settable clock, so cache expiry can be driven without sleeping.
+    now = function() return state.now end,
   }
+  state.now = opts.now or 1700000000
+
+  -- The handler requires its sibling by module name; outside Kong that name resolves
+  -- to nothing, so point it at the file. Reloaded per install: the module holds a
+  -- per-worker cache that must not leak between tests.
+  package.loaded['kong.plugins.authzen-pdp.discovery'] = nil
+  package.preload['kong.plugins.authzen-pdp.discovery'] = function()
+    return assert(loadfile('authzen-pdp/discovery.lua'))()
+  end
 
   package.loaded['cjson.safe'] = {
     decode = function(s)

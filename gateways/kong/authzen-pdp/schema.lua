@@ -53,6 +53,28 @@ return {
           -- policy still reading the old field. Set false once policies read
           -- subject.id; the field is removed in a later release.
           { legacy_subject_identity = { type = "boolean", default = true } },
+          -- PDP discovery (see ../README.md#pdp-discovery). "off" is the static PDP
+          -- with the AuthZEN default paths and no metadata fetch; "authzen" reads
+          -- authzen_url's .well-known/authzen-configuration; "resource" reads the
+          -- route's resource's RFC 9728 metadata for the PDP that decides for it,
+          -- then that PDP's metadata, falling back to authzen_url. No federation
+          -- mode here: a Trust Chain cannot be validated without a JOSE verifier.
+          { pdp_discovery = { type = "string", default = "off",
+                              one_of = { "off", "authzen", "resource" } } },
+          -- The protected resource's identifier (RFC 8707), the key discovery starts
+          -- from. An mcp route without one uses mcp_upstream_url; a rest route
+          -- without one uses the static PDP.
+          { resource = { type = "string" } },
+          -- Cache TTL, seconds, for resource and PDP metadata.
+          { pdp_metadata_ttl = { type = "number", default = 300, gt = 0 } },
+          -- Permitted discovered-PDP prefixes; authzen_url is always permitted.
+          -- Empty means any https PDP a resource names.
+          { pdp_allowlist = { type = "array", elements = { type = "string" } } },
+          -- Permitted `resource` prefixes for metadata fetches. Empty means any.
+          { resource_metadata_allowlist = { type = "array", elements = { type = "string" } } },
+          -- Allow http for discovered URLs (dev only; authzen_url's own origin is
+          -- always trusted over http).
+          { pdp_discovery_insecure = { type = "boolean", default = false } },
         },
         -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
         -- is no JOSE verifier available to it, so on its own it can compare the proof's

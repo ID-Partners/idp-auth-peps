@@ -31,10 +31,11 @@
 
 local http = require "resty.http"
 local cjson = require "cjson.safe"
+local discovery = require "kong.plugins.authzen-pdp.discovery"
 
 local AuthzenPDP = {
   PRIORITY = 1000,  -- run before upstream proxying; after auth plugins if present
-  VERSION = "0.2.0", -- 0.2.0: COAZ (OpenID AuthZEN MCP profile) via coaz-pep
+  VERSION = "0.3.0", -- 0.3.0: PDP discovery (RFC 9728 + AuthZEN well-known); 0.2.0: COAZ via coaz-pep
 }
 
 -- ---------- helpers ----------
@@ -273,6 +274,9 @@ function AuthzenPDP:access(conf)
             style = "mcp",
             mcp_upstream_url = conf.mcp_upstream_url,
             coaz_defaults = conf.coaz_defaults and "true" or "false",
+            -- The engine runs its own PDP discovery (federation included); an
+            -- explicit resource identifier is passed so both PEPs key off the same one.
+            resource = (conf.resource and conf.resource ~= "") and conf.resource or nil,
           },
           method = kong.request.get_method(),
           path = kong.request.get_path(),
@@ -372,14 +376,24 @@ function AuthzenPDP:access(conf)
     context = ctx,
   }
 
+  -- 3b) which PDP, and where. Off by default (authzen_url + the AuthZEN paths, no
+  --     fetch). A discovery failure is a 503, like an unreachable PDP: a request whose
+  --     decider cannot be found is not one to let through.
+  local ep, derr = discovery.resolve(conf, discovery.resource_id(conf))
+  if not ep then
+    kong.log.err("PDP discovery failed: ", derr.msg)
+    return deny(pep, 503, "Authorization service could not be resolved; denying (fail-closed).")
+  end
+
   local httpc = http.new()
   httpc:set_timeout(10000)
-  local res, err = httpc:request_uri(conf.authzen_url .. "/access/v1/evaluation", {
+  local res, err = httpc:request_uri(ep.evaluation, {
     method = "POST",
     body = cjson.encode(authzen_req),
     headers = {
       ["Content-Type"] = "application/json",
-      ["Authorization"] = "Bearer " .. (conf.authzen_api_key or ""),
+      -- Bound to the PDP it was configured for; a discovered PDP gets no key.
+      ["Authorization"] = ep.api_key and ("Bearer " .. ep.api_key) or nil,
     },
     ssl_verify = conf.pdp_ssl_verify ~= false,
   })
