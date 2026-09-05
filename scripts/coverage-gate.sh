@@ -14,6 +14,7 @@ floor_for() {
     */core/cmd/coaz-pep)  echo 95 ;;
     */core/jose)          echo 95 ;;
     */core/federation)    echo 96 ;;
+    */core/authzen/discovery) echo 94 ;;
     */core/internal/ttlcache)  echo 98 ;;
     */core/internal/metafetch) echo 94 ;;
     *)                    echo "" ;;
