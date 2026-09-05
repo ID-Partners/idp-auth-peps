@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 )
 
 // PDPConfig locates the AuthZEN PDP (e.g. the Ping Authorize authzen-adapter).
@@ -27,7 +29,11 @@ type PDPConfig struct {
 
 // Options configures an Engine.
 type Options struct {
+	// PDP is the static PDP. Ignored when Resolver is set, except that callers who only
+	// have a URL keep working: a nil Resolver becomes discovery.Static(PDP.URL, PDP.APIKey).
 	PDP PDPConfig
+	// Resolver finds the PDP for a route's resource. See core/authzen/discovery.
+	Resolver discovery.Resolver
 	// DiscoveryTTL bounds how long a tools/list snapshot is reused (default 60s).
 	DiscoveryTTL time.Duration
 	// DiscoveryHTTPClient overrides the client used for tools/list fetches.
@@ -40,9 +46,9 @@ type Options struct {
 }
 
 type Engine struct {
-	pdp   PDPConfig
-	pdpc  *http.Client
-	disco *discoveryCache
+	resolver discovery.Resolver
+	pdpc     *http.Client
+	disco    *discoveryCache
 	// applyDefaults turns on the binding's default mappings for tools that declare
 	// none. Off leaves the pre-v2 pass-through, which is not conformant.
 	applyDefaults bool
@@ -57,8 +63,12 @@ func NewEngine(opts Options) *Engine {
 	if pdpc == nil {
 		pdpc = &http.Client{Timeout: 10 * time.Second}
 	}
+	resolver := opts.Resolver
+	if resolver == nil {
+		resolver = discovery.Static(opts.PDP.URL, opts.PDP.APIKey)
+	}
 	return &Engine{
-		pdp:           opts.PDP,
+		resolver:      resolver,
 		pdpc:          pdpc,
 		disco:         newDiscoveryCache(ttl, opts.DiscoveryHTTPClient),
 		applyDefaults: opts.ApplyDefaultMappings,
@@ -80,6 +90,9 @@ type CallOptions struct {
 	// binding's default tools/call mapping, as the binding requires. False retains the
 	// non-conformant pass-through that deployed routes expect.
 	ApplyDefaultMappings bool
+	// Resource is the protected resource's identifier (RFC 8707), used to discover
+	// its PDP. "" means the static PDP.
+	Resource string
 }
 
 func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any, opts CallOptions) Verdict {
@@ -143,7 +156,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
 	}
 
-	out, err := e.evaluate(ctx, built)
+	out, err := e.evaluate(ctx, opts.Resource, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
@@ -210,21 +223,31 @@ type pdpOutcome struct {
 	IdentityDoctype string
 }
 
-// evaluate POSTs the built request to the AuthZEN PDP and folds the
-// decision(s): every decision must be true for a permit.
-func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (pdpOutcome, error) {
+// evaluate resolves the PDP for resource, POSTs the built request and folds the
+// decision(s): every decision must be true for a permit. The endpoints are resolved
+// once per request, so a PDP moving mid-flight cannot split one decision across two.
+func (e *Engine) evaluate(ctx context.Context, resource string, built *BuiltRequest) (pdpOutcome, error) {
 	var out pdpOutcome
-	endpoint := e.pdp.URL + "/access/v1/evaluation"
+	ep, err := e.resolver.Resolve(ctx, resource)
+	if err != nil {
+		return out, fmt.Errorf("PDP discovery: %w", err)
+	}
+	endpoint := ep.Evaluation
 	if built.Batch {
-		endpoint = e.pdp.URL + "/access/v1/evaluations"
+		if ep.Evaluations == "" {
+			// The PDP advertises no batch endpoint; guessing a path would send a batch
+			// somewhere the PDP never said it would answer one.
+			return out, fmt.Errorf("PDP %s advertises no access_evaluations_endpoint", ep.Identifier)
+		}
+		endpoint = ep.Evaluations
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(built.Body))
 	if err != nil {
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if e.pdp.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+e.pdp.APIKey)
+	if ep.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.APIKey)
 	}
 	resp, err := e.pdpc.Do(req)
 	if err != nil {
@@ -324,7 +347,7 @@ func (e *Engine) checkByDefaultMapping(
 		return Verdict{CoazTool: true, Decision: false, Reason: msg,
 			JSONRPCError: jsonRPCError(id, CodeMappingError, msg)}
 	}
-	out, err := e.evaluate(ctx, built)
+	out, err := e.evaluate(ctx, opts.Resource, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
