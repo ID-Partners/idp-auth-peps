@@ -11,7 +11,25 @@
  */
 
 export { AuthzenClient, PdpError } from './client.js';
-export type { AuthzenClientOptions, PdpTrace } from './client.js';
+export type { AuthzenClientOptions, ClientDiscoveryOptions, EvaluateOptions, PdpTrace } from './client.js';
+
+export {
+  DiscoveryError,
+  PARAM_POLICY_DECISION_POINTS,
+  PdpDiscovery,
+  Rfc9728Source,
+  allowedByPrefix,
+  defaultEndpoints,
+  wellKnownUrl,
+} from './discovery.js';
+export type {
+  DiscoveryErrorKind,
+  DiscoveryMode,
+  MetadataSource,
+  PdpDiscoveryOptions,
+  PdpEndpoints,
+  PdpResolver,
+} from './discovery.js';
 
 export { foldDecision, toChallenge, toHttpChallenge } from './challenge.js';
 export type { HttpChallenge } from './challenge.js';

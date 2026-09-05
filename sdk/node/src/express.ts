@@ -78,6 +78,13 @@ export interface AuthzenMiddlewareOptions {
 
   /** Observe every decision — audit log, metrics, transcripts. Must not throw. */
   onDecision?: (info: { req: PepRequest; verdict: Verdict; claims: PepClaims }) => void;
+
+  /**
+   * The protected resource's identifier (RFC 8707), which PDP discovery starts from
+   * when the client has it enabled. A string, or a function of the request for a
+   * multi-tenant API. Absent means the client's static PDP.
+   */
+  resource?: string | ((req: PepRequest) => string | undefined);
 }
 
 /**
@@ -139,7 +146,8 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
       // one that returns null, and must not fall through into evaluate().
       if (request == null) return next();
 
-      const verdict = await client.evaluate(request);
+      const resource = typeof opts.resource === 'function' ? opts.resource(req) : opts.resource;
+      const verdict = await client.evaluate(request, { resource });
       report(opts, req, verdict, claims);
       if (!verdict.allow) return respond(res, verdict, pep);
 

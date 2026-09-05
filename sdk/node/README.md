@@ -186,6 +186,47 @@ await guard.checkToolCall({ rpc, claims, raw: { headers, body: rawBody } });
 The engine renders the JSON-RPC error and the SDK relays it verbatim — two renderings of
 one decision would drift.
 
+## PDP discovery
+
+By default the client is told where the PDP is (`url`) and assumes the AuthZEN paths
+under it. `discovery` replaces both assumptions with metadata — the same chain the Go
+PEP and the Kong plugin walk (see [`core/README.md`](../../core/README.md#pdp-discovery)):
+
+| Mode | What it reads | Falls back to |
+| --- | --- | --- |
+| off (default) | nothing — static PDP, default paths, no fetch | — |
+| `authzen` | `url`'s `/.well-known/authzen-configuration` | default paths |
+| `resource` | the call's resource's RFC 9728 document (`authzen_policy_decision_points`), then that PDP's metadata | `url` |
+
+```ts
+const client = new AuthzenClient({
+  url: process.env.AUTHZEN_URL!,            // always the fallback, always permitted
+  apiKey: process.env.AUTHZEN_API_KEY,      // bound to `url`; a discovered PDP never receives it
+  discovery: {
+    mode: 'resource',
+    pdpAllowlist: ['https://pdp.bank.example'],        // what a resource may name; empty = any https
+    resourceAllowlist: ['https://api.bank.example'],
+  },
+});
+
+// The resource is per call: a string or a function of the request on the middleware,
+// `resource` (defaulting to `upstreamUrl`) on the guard.
+app.use(authzenMiddleware({ client, map, resource: 'https://api.bank.example' }));
+await client.evaluate(request, { resource: 'https://api.bank.example' });
+```
+
+The rules are the Go PEP's: the resource's echoed `resource` must be byte-identical
+(RFC 9728 §3.3), the PDP's `policy_decision_point` must equal the identifier it was
+fetched from, a PDP without metadata gets the spec's default paths, a batch is never sent
+to a PDP that does not advertise `access_evaluations_endpoint`, and metadata is cached
+per identifier with stale-while-failing. A URL outside an allowlist never falls through
+to a weaker source — the verdict is a `pdp_error`.
+
+There is no federation mode in the SDK; `sources` is the seam for one, and `discovery`
+also accepts a resolver of your own (`{ resolve(resource) }`). In `delegate` mode the
+Go engine runs its own discovery, federation included, and an explicit `resource` is
+passed to it so both PEPs key off one identifier.
+
 ## Challenges
 
 A deny an agent can resolve beats a deny it cannot. When the PDP's decision context says

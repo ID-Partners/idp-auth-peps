@@ -18,10 +18,10 @@ export default defineConfig({
         // statement/branch gap is defensive code unreachable on validated input
         // (an object-claim that is not an object, AST fall-through the compiler rules
         // out). Floors sit at the current numbers and ratchet up as that shrinks.
-        statements: 96,
-        branches: 87,
+        statements: 97,
+        branches: 90,
         functions: 100,
-        lines: 96,
+        lines: 97,
       },
     },
   },

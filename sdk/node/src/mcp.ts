@@ -250,6 +250,12 @@ export interface McpGuardOptions {
   };
   fetch?: typeof globalThis.fetch;
   onDecision?: (info: { tool: string; verdict: Verdict }) => void;
+  /**
+   * The MCP server's identifier (RFC 8707), which PDP discovery starts from when the
+   * client has it enabled. Defaults to `upstreamUrl`; passed to `coaz-pep` in delegate
+   * mode so both PEPs key off one identifier.
+   */
+  resource?: string;
 }
 
 export class McpGuard {
@@ -259,9 +265,12 @@ export class McpGuard {
   private readonly fetchImpl: typeof globalThis.fetch;
   private cache: { at: number; tools: Map<string, ToolDefinition> } | null = null;
 
+  private readonly resource: string | undefined;
+
   constructor(private readonly opts: McpGuardOptions) {
     this.client = opts.client instanceof AuthzenClient ? opts.client : new AuthzenClient(opts.client);
     this.pep = opts.pep ?? 'mcp-edge';
+    this.resource = opts.resource ?? opts.upstreamUrl;
     this.ttl = opts.discoveryTtlMs ?? 60_000;
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     if (!opts.tools && !opts.upstreamUrl && !opts.delegate) {
@@ -380,8 +389,8 @@ export class McpGuard {
     }
 
     const verdict = built.batch
-      ? await this.client.evaluateAll(built.body as EvaluationsRequest)
-      : await this.client.evaluate(built.body as EvaluationRequest);
+      ? await this.client.evaluateAll(built.body as EvaluationsRequest, { resource: this.resource })
+      : await this.client.evaluate(built.body as EvaluationRequest, { resource: this.resource });
 
     this.report(toolName, verdict);
 
@@ -446,8 +455,8 @@ export class McpGuard {
       return this.fail(id, CODE_MAPPING_ERROR, 'mapping_error', message(err));
     }
     const verdict = built.batch
-      ? await this.client.evaluateAll(built.body as EvaluationsRequest)
-      : await this.client.evaluate(built.body as EvaluationRequest);
+      ? await this.client.evaluateAll(built.body as EvaluationsRequest, { resource: this.resource })
+      : await this.client.evaluate(built.body as EvaluationRequest, { resource: this.resource });
     this.report(toolName, verdict);
     if (verdict.allow) return { allow: true, coazTool: true, verdict, pdpRequest: built.body };
     const code = verdict.kind === 'pdp_error' ? CODE_PDP_ERROR : deniedCode;
@@ -500,7 +509,7 @@ export class McpGuard {
           ...(d.apiKey ? { authorization: `Bearer ${d.apiKey}` } : {}),
         },
         body: JSON.stringify({
-          config: { pep_label: this.pep, style: 'mcp', ...d.config },
+          config: { pep_label: this.pep, style: 'mcp', ...(this.opts.resource ? { resource: this.opts.resource } : {}), ...d.config },
           method: raw.method ?? 'POST',
           path: raw.path ?? '/mcp',
           headers: raw.headers,

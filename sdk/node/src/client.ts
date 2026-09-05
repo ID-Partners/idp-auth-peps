@@ -19,12 +19,33 @@ import type {
   Verdict,
 } from './types.js';
 import { foldDecision } from './challenge.js';
+import { PdpDiscovery, type PdpDiscoveryOptions, type PdpResolver } from './discovery.js';
+
+/** Discovery knobs a client accepts; the static PDP, its key and fetch come from the client. */
+export type ClientDiscoveryOptions = Omit<PdpDiscoveryOptions, 'staticPdp' | 'apiKeys' | 'fetch'>;
+
+/** Per-call options for evaluate / evaluateAll. */
+export interface EvaluateOptions {
+  /** The protected resource's identifier (RFC 8707), the key PDP discovery starts from. */
+  resource?: string;
+}
 
 export interface AuthzenClientOptions {
-  /** PDP base URL, e.g. `https://authzen-adapter.internal:8080`. `/access/v1/...` is appended. */
+  /**
+   * PDP base URL, e.g. `https://authzen-adapter.internal:8080`. Without `discovery` the
+   * AuthZEN default paths are appended; with it, this is the static PDP that every
+   * mode falls back to.
+   */
   url: string;
-  /** Sent as `Authorization: Bearer <apiKey>` when set. */
+  /** Sent as `Authorization: Bearer <apiKey>` to THIS PDP. A discovered PDP never receives it. */
   apiKey?: string;
+  /**
+   * PDP discovery (see ./discovery.ts): `{ mode: 'authzen' }` reads `url`'s
+   * `.well-known/authzen-configuration`; `{ mode: 'resource' }` follows a call's
+   * `resource` to its RFC 9728 metadata for the PDP that decides for it. Or pass a
+   * resolver of your own. Absent means off: today's behaviour, no HTTP.
+   */
+  discovery?: ClientDiscoveryOptions | PdpResolver;
   /** Per-request timeout. Default 1500ms — a PEP sits in the request path. */
   timeoutMs?: number;
   /** Extra headers on every PDP call (tracing, tenant routing). */
@@ -59,6 +80,8 @@ export class AuthzenClient {
   private readonly url: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof globalThis.fetch;
+  /** Finds the PDP for a call's resource. Static (no HTTP) unless `discovery` is set. */
+  readonly resolver: PdpResolver;
 
   constructor(private readonly opts: AuthzenClientOptions) {
     if (!opts.url) throw new Error('AuthzenClient requires a PDP url');
@@ -68,14 +91,20 @@ export class AuthzenClient {
     if (typeof this.fetchImpl !== 'function') {
       throw new Error('No fetch implementation available (Node 20+ or pass opts.fetch)');
     }
+    const apiKeys = opts.apiKey ? { [this.url]: opts.apiKey } : {};
+    this.resolver =
+      opts.discovery && 'resolve' in opts.discovery
+        ? opts.discovery
+        : new PdpDiscovery({ ...(opts.discovery ?? {}), staticPdp: this.url, apiKeys, fetch: this.fetchImpl });
   }
 
   /**
-   * POST /access/v1/evaluation. Returns a folded Verdict; never throws.
+   * POST to the PDP's evaluation endpoint. Returns a folded Verdict; never throws.
    */
-  async evaluate(request: EvaluationRequest): Promise<Verdict> {
+  async evaluate(request: EvaluationRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
-      const res = await this.post<EvaluationResponse>('/access/v1/evaluation', request);
+      const ep = await this.resolve(options.resource);
+      const res = await this.postTo<EvaluationResponse>(ep.evaluation, request, ep.apiKey);
       return { ...foldDecision(res), request };
     } catch (err) {
       return {
@@ -88,12 +117,16 @@ export class AuthzenClient {
   }
 
   /**
-   * POST /access/v1/evaluations (boxcar). Folds to a single Verdict: every decision must
-   * permit, and the FIRST deny is the one reported, so its advice survives the fold.
+   * POST to the evaluations (boxcar) endpoint. Folds to a single Verdict: every decision
+   * must permit, and the FIRST deny is the one reported, so its advice survives the fold.
+   * A PDP that advertises no evaluations endpoint is a pdp_error — a batch is never sent
+   * to a guessed path.
    */
-  async evaluateAll(request: EvaluationsRequest): Promise<Verdict> {
+  async evaluateAll(request: EvaluationsRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
-      const res = await this.post<EvaluationsResponse>('/access/v1/evaluations', request);
+      const ep = await this.resolve(options.resource);
+      if (!ep.evaluations) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
+      const res = await this.postTo<EvaluationsResponse>(ep.evaluations, request, ep.apiKey);
       const list = Array.isArray(res?.evaluations) ? res.evaluations : [];
       if (list.length === 0) {
         return { allow: false, kind: 'pdp_error', reason: 'PDP evaluations response was empty', request };
@@ -122,9 +155,24 @@ export class AuthzenClient {
     return this.post<ResourceSearchResponse>('/access/v1/search/resource', request);
   }
 
-  /** Raw POST. Throws PdpError — used by the search methods, where a caller can handle it. */
-  async post<T>(path: string, body: unknown): Promise<T> {
-    const endpoint = this.url + path;
+  private async resolve(resource?: string) {
+    try {
+      return await this.resolver.resolve(resource);
+    } catch (err) {
+      throw new PdpError(`PDP discovery: ${describe(err)}`);
+    }
+  }
+
+  /**
+   * Raw POST to a path under the static PDP. Throws PdpError — used by the search
+   * methods, where a caller can handle it.
+   */
+  post<T>(path: string, body: unknown): Promise<T> {
+    return this.postTo<T>(this.url + path, body, this.opts.apiKey);
+  }
+
+  /** Raw POST to an absolute endpoint with the key bound to it. Throws PdpError. */
+  async postTo<T>(endpoint: string, body: unknown, apiKey?: string): Promise<T> {
     const started = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -142,7 +190,7 @@ export class AuthzenClient {
         headers: {
           'content-type': 'application/json',
           accept: 'application/json',
-          ...(this.opts.apiKey ? { authorization: `Bearer ${this.opts.apiKey}` } : {}),
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
           ...this.opts.headers,
         },
         body: JSON.stringify(body),
