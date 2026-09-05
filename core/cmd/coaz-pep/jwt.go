@@ -7,59 +7,21 @@ package main
 // authorization decision itself is always made by Ping Authorize via the PDP.
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"strings"
+
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
-func b64urlDecode(s string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
-}
-
-func b64urlEncode(b []byte) string {
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// jwtPart decodes segment idx (0=header, 1=claims) of a compact JWT.
-func jwtPart(token string, idx int) map[string]any {
-	parts := strings.Split(token, ".")
-	if len(parts) < 3 || idx >= len(parts) {
-		return nil
-	}
-	raw, err := b64urlDecode(parts[idx])
-	if err != nil {
-		return nil
-	}
-	var out map[string]any
-	if json.Unmarshal(raw, &out) != nil {
-		return nil
-	}
-	return out
-}
+// The JWS/JWK primitives live in core/jose so the federation resolver and the token
+// validators verify signatures one way. These names stay for the callers here.
+func b64urlDecode(s string) ([]byte, error)        { return jose.B64URLDecode(s) }
+func b64urlEncode(b []byte) string                 { return jose.B64URLEncode(b) }
+func jwtPart(token string, idx int) map[string]any { return jose.Part(token, idx) }
+func jwkThumbprint(jwk map[string]any) string      { return jose.Thumbprint(jwk) }
 
 func jwtClaims(token string) map[string]any { return jwtPart(token, 1) }
 func jwtHeader(token string) map[string]any { return jwtPart(token, 0) }
-
-// jwkThumbprint computes the RFC 7638 SHA-256 thumbprint (base64url) of a JWK
-// for EC / RSA / OKP keys, using the canonical member ordering.
-func jwkThumbprint(jwk map[string]any) string {
-	str := func(k string) string { s, _ := jwk[k].(string); return s }
-	var canon string
-	switch str("kty") {
-	case "EC":
-		canon = fmt.Sprintf(`{"crv":"%s","kty":"EC","x":"%s","y":"%s"}`, str("crv"), str("x"), str("y"))
-	case "RSA":
-		canon = fmt.Sprintf(`{"e":"%s","kty":"RSA","n":"%s"}`, str("e"), str("n"))
-	case "OKP":
-		canon = fmt.Sprintf(`{"crv":"%s","kty":"OKP","x":"%s"}`, str("crv"), str("x"))
-	default:
-		return ""
-	}
-	sum := sha256.Sum256([]byte(canon))
-	return b64urlEncode(sum[:])
-}
 
 // claimString reads a string claim, tolerating absence.
 func claimString(claims map[string]any, key string) string {

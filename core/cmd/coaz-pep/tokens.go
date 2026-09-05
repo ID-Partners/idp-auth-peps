@@ -18,17 +18,22 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/rsa"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
+
+// verifyJWS checks a compact JWS against one JWK. Shares the key parsing and signature
+// verification used for DPoP proofs.
+func verifyJWS(token string, jwk map[string]any, alg string) error {
+	return jose.VerifyJWS(token, jwk, alg)
+}
 
 // Validator verifies compact JWTs against a JWKS and checks the registered claims.
 type Validator struct {
@@ -134,60 +139,6 @@ func audienceContains(aud any, want string) bool {
 		}
 	}
 	return false
-}
-
-// verifyJWS checks a compact JWS against one JWK. Shares the key parsing and signature
-// verification used for DPoP proofs.
-func verifyJWS(token string, jwk map[string]any, alg string) error {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return fmt.Errorf("token is not a compact JWS")
-	}
-	sig, err := b64urlDecode(parts[2])
-	if err != nil {
-		return fmt.Errorf("token signature is not base64url")
-	}
-	hash, err := hashFor(alg)
-	if err != nil {
-		return err
-	}
-	digest := hashBytes(hash, []byte(parts[0]+"."+parts[1]))
-
-	switch {
-	case strings.HasPrefix(alg, "ES"):
-		pub, err := ecdsaFromJWK(jwk)
-		if err != nil {
-			return err
-		}
-		n := (pub.Curve.Params().BitSize + 7) / 8
-		if len(sig) != 2*n {
-			return fmt.Errorf("token signature has the wrong length for %s", alg)
-		}
-		if !ecdsa.Verify(pub, digest, new(big.Int).SetBytes(sig[:n]), new(big.Int).SetBytes(sig[n:])) {
-			return fmt.Errorf("token signature does not verify")
-		}
-		return nil
-	case strings.HasPrefix(alg, "PS"):
-		pub, err := rsaFromJWK(jwk)
-		if err != nil {
-			return err
-		}
-		if err := rsa.VerifyPSS(pub, hash, digest, sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}); err != nil {
-			return fmt.Errorf("token signature does not verify")
-		}
-		return nil
-	case strings.HasPrefix(alg, "RS"):
-		pub, err := rsaFromJWK(jwk)
-		if err != nil {
-			return err
-		}
-		if err := rsa.VerifyPKCS1v15(pub, hash, digest, sig); err != nil {
-			return fmt.Errorf("token signature does not verify")
-		}
-		return nil
-	}
-	// HS* would mean a shared secret the PEP does not hold; anything else is unknown.
-	return fmt.Errorf("unsupported token alg %q", alg)
 }
 
 // jwksCache fetches and caches a JWKS, refreshing on an unknown kid (key rotation) but

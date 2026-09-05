@@ -11,18 +11,23 @@ package main
 import (
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"math/big"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
+
+func hashFor(alg string) (crypto.Hash, error)                   { return jose.HashFor(alg) }
+func hashBytes(h crypto.Hash, b []byte) []byte                  { return jose.HashBytes(h, b) }
+func ecdsaFromJWK(jwk map[string]any) (*ecdsa.PublicKey, error) { return jose.ECDSAFromJWK(jwk) }
+func rsaFromJWK(jwk map[string]any) (*rsa.PublicKey, error)     { return jose.RSAFromJWK(jwk) }
 
 // dpopMaxAge bounds how old a proof's iat may be. RFC 9449 §11.1 leaves the window to
 // the server; 300s is the commonly deployed value and tolerates modest clock skew.
@@ -83,87 +88,6 @@ func verifyProofSignature(proof string, jwk map[string]any, alg string) error {
 		return nil
 	}
 	return fmt.Errorf("unsupported DPoP alg %q", alg)
-}
-
-// hashFor maps a JWS alg to its digest. The FAMILY is checked as well as the size:
-// matching on the suffix alone would hand back a hash for HS256, and while the callers
-// reject HS* separately, a helper that quietly accepts a symmetric alg is a trap for the
-// next caller.
-func hashFor(alg string) (crypto.Hash, error) {
-	switch alg {
-	case "ES256", "RS256", "PS256":
-		return crypto.SHA256, nil
-	case "ES384", "RS384", "PS384":
-		return crypto.SHA384, nil
-	case "ES512", "RS512", "PS512":
-		return crypto.SHA512, nil
-	}
-	return 0, fmt.Errorf("unsupported DPoP alg %q", alg)
-}
-
-func hashBytes(h crypto.Hash, b []byte) []byte {
-	hasher := h.New()
-	hasher.Write(b)
-	return hasher.Sum(nil)
-}
-
-func ecdsaFromJWK(jwk map[string]any) (*ecdsa.PublicKey, error) {
-	if kty, _ := jwk["kty"].(string); kty != "EC" {
-		return nil, fmt.Errorf("proof alg is ES* but the JWK kty is not EC")
-	}
-	var curve elliptic.Curve
-	switch crv, _ := jwk["crv"].(string); crv {
-	case "P-256":
-		curve = elliptic.P256()
-	case "P-384":
-		curve = elliptic.P384()
-	case "P-521":
-		curve = elliptic.P521()
-	default:
-		return nil, fmt.Errorf("unsupported EC curve %q", crv)
-	}
-	x, err := b64urlBigInt(jwk, "x")
-	if err != nil {
-		return nil, err
-	}
-	y, err := b64urlBigInt(jwk, "y")
-	if err != nil {
-		return nil, err
-	}
-	pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
-	if !curve.IsOnCurve(x, y) {
-		return nil, fmt.Errorf("proof JWK is not a point on %s", curve.Params().Name)
-	}
-	return pub, nil
-}
-
-func rsaFromJWK(jwk map[string]any) (*rsa.PublicKey, error) {
-	if kty, _ := jwk["kty"].(string); kty != "RSA" {
-		return nil, fmt.Errorf("proof alg is RS*/PS* but the JWK kty is not RSA")
-	}
-	n, err := b64urlBigInt(jwk, "n")
-	if err != nil {
-		return nil, err
-	}
-	eBytes, err := b64urlDecode(str(jwk["e"]))
-	if err != nil || len(eBytes) == 0 || len(eBytes) > 8 {
-		return nil, fmt.Errorf("proof JWK has an unusable exponent")
-	}
-	padded := make([]byte, 8)
-	copy(padded[8-len(eBytes):], eBytes)
-	e := binary.BigEndian.Uint64(padded)
-	if e > 1<<31 {
-		return nil, fmt.Errorf("proof JWK exponent is out of range")
-	}
-	return &rsa.PublicKey{N: n, E: int(e)}, nil
-}
-
-func b64urlBigInt(jwk map[string]any, field string) (*big.Int, error) {
-	raw, err := b64urlDecode(str(jwk[field]))
-	if err != nil || len(raw) == 0 {
-		return nil, fmt.Errorf("proof JWK field %q is not base64url", field)
-	}
-	return new(big.Int).SetBytes(raw), nil
 }
 
 func str(v any) string {
