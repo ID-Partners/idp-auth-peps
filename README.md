@@ -37,7 +37,8 @@ Same three words in an HTTP `WWW-Authenticate` header, in a JSON body, and in an
 JSON-RPC error's `data.authz_challenge`. An agent can resolve a challenge without a
 human reading prose.
 
-**Start with [docs/architecture.md](docs/architecture.md)** for the map: what each piece
+**Start with [docs/architecture.md](docs/architecture.md)** (or the one-page
+[overview](docs/overview.html), open it in a browser) for the map: what each piece
 does, the decision contract, and how a PEP finds its PDP. **Then [`demo/`](demo)** stands
 the whole thing up — a stub federation, a good PDP and a rogue one — with one
 `docker compose up` and walks through why the federation's word beats a resource's own.

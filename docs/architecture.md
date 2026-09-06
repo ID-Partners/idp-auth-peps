@@ -1,7 +1,8 @@
 # Architecture
 
 What is in this repository, how the pieces fit, and the decisions behind them. The
-per-component READMEs cover installation and every knob; this page is the map.
+per-component READMEs cover installation and every knob; this page is the map. The same
+material as a single web page, for showing rather than reading: [overview.html](overview.html).
 
 ## The problem, in one paragraph
 
