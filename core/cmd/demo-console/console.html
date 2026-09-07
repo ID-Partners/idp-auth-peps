@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>PDP discovery console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --orange:#FC6401; --tint:#FFE1CE;
+  --bg:#FFFFFF; --panel:#F7F7F7; --sunk:#F1F1F1; --ink:#111111; --muted:#5E5E5E; --rule:#DCDCDC;
+  --permit:#1B7F3B; --deny:#B42318; --alarm:#C2410C; --alarm-bg:#FFF1E6;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0D0D0D; --panel:#161616; --sunk:#1C1C1C; --ink:#F2F2F2; --muted:#A6A6A6; --rule:#2C2C2C;
+    --tint:#3A2415; --permit:#4CC36F; --deny:#F0705F; --alarm:#FF8A3D; --alarm-bg:#3A2010;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0D0D0D; --panel:#161616; --sunk:#1C1C1C; --ink:#F2F2F2; --muted:#A6A6A6; --rule:#2C2C2C;
+  --tint:#3A2415; --permit:#4CC36F; --deny:#F0705F; --alarm:#FF8A3D; --alarm-bg:#3A2010;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+header{border-bottom:3px solid var(--orange);padding:18px 0 16px}
+header .wrap{display:flex;align-items:baseline;justify-content:space-between;gap:20px;flex-wrap:wrap}
+h1{margin:0;font-size:1.25rem;font-weight:800;letter-spacing:-.01em;text-transform:uppercase}
+header .sub{font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+main{padding:26px 0 60px}
+fieldset{border:0;margin:0 0 20px;padding:0}
+legend{padding:0;font-size:.72rem;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--orange);margin-bottom:10px}
+.opts{display:flex;flex-wrap:wrap;gap:8px}
+.opt{position:relative}
+.opt input{position:absolute;inset:0;opacity:0;cursor:pointer;margin:0}
+.opt span{display:block;border:1px solid var(--rule);background:var(--panel);padding:8px 14px;font-size:.9rem;cursor:pointer;white-space:nowrap}
+.opt input:checked + span{border-color:var(--orange);background:var(--tint);font-weight:600}
+.opt input:focus-visible + span{outline:2px solid var(--orange);outline-offset:2px}
+.hint{font-size:.85rem;color:var(--muted);margin:8px 0 0;min-height:1.3em}
+.hint code{font-family:var(--mono);font-size:.9em}
+.runbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;border-top:1px solid var(--rule);padding-top:18px;margin-top:4px}
+button.run{font:inherit;font-weight:700;background:var(--orange);color:#fff;border:0;padding:11px 26px;cursor:pointer;letter-spacing:.02em}
+button.run:hover{filter:brightness(1.07)}
+button.run:disabled{opacity:.55;cursor:progress}
+button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+.runbar .what{font-size:.9rem;color:var(--muted)}
+.runbar .what b{color:var(--ink);font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:26px}
+.col{border:1px solid var(--rule);background:var(--panel);display:flex;flex-direction:column}
+.col > .head{padding:14px 16px;border-bottom:1px solid var(--rule)}
+.col .name{font-weight:800;font-size:.95rem}
+.col .mode{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:2px}
+.col .blurb{font-size:.85rem;color:var(--muted);margin-top:8px}
+.verdict{padding:16px;border-bottom:1px solid var(--rule);display:flex;flex-direction:column;gap:6px;min-height:96px}
+.chip{align-self:flex-start;font-family:var(--mono);font-size:.78rem;font-weight:600;letter-spacing:.06em;padding:4px 10px;border:1px solid currentColor}
+.chip.permit{color:var(--permit)}
+.chip.deny{color:var(--deny)}
+.chip.alarm{color:var(--alarm);background:var(--alarm-bg)}
+.chip.idle{color:var(--muted)}
+.reason{font-size:.9rem}
+.ms{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:auto}
+.trace{padding:12px 16px 16px}
+.trace h3{margin:0 0 8px;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.trace ol{list-style:none;margin:0;padding:0;display:grid;gap:5px;font-family:var(--mono);font-size:.74rem;line-height:1.45}
+.trace li{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:baseline}
+.trace .ent{font-weight:600}
+.trace .metadata .ent{color:var(--muted)}
+.trace .decision .ent,.trace .verdictline .ent{color:var(--permit)}
+.trace li.rogue .ent{color:var(--alarm)}
+.trace .p{color:var(--muted);overflow-wrap:anywhere}
+.trace .none{font-family:var(--sans);font-size:.85rem;color:var(--muted)}
+.legend{margin-top:22px;border-top:1px solid var(--rule);padding-top:14px;font-size:.85rem;color:var(--muted);display:grid;gap:6px}
+.legend b{color:var(--ink)}
+@media (max-width:900px){ .grid{grid-template-columns:1fr} }
+@media (prefers-reduced-motion: no-preference){ .col{transition:border-color .18s} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <h1>PDP discovery console</h1>
+  <div class="sub">idp-auth-peps · one request, three enforcement points</div>
+</div></header>
+
+<main class="wrap">
+  <form id="form">
+    <fieldset><legend>Protected resource</legend><div class="opts" id="resources"></div><p class="hint" id="resourceHint"></p></fieldset>
+    <fieldset><legend>Acting for</legend><div class="opts" id="humans"></div><p class="hint" id="humanHint"></p></fieldset>
+    <fieldset><legend>Request</legend><div class="opts" id="actions"></div></fieldset>
+    <div class="runbar">
+      <button class="run" type="submit" id="run">Run all three</button>
+      <span class="what" id="what"></span>
+    </div>
+  </form>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="legend">
+    <div><b>The columns are the argument.</b> Same request, same policy, three ways of deciding who decides.</div>
+    <div>Grey trace lines are metadata fetches the PEP made. Green is the PDP that decided. <b class="chip alarm" style="border:0;padding:0;background:none">Orange</b> is the rogue PDP being consulted at all.</div>
+    <div>Metadata caches are set to a short TTL here so the trace stays visible on every run; the shipped default is five minutes.</div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const HUMANS = [
+  { key: 'alice', name: 'alice', blurb: 'A customer of the bank. The good PDP permits her.' },
+  { key: 'mallory', name: 'mallory', blurb: 'Not a customer. The good PDP denies her; the rogue PDP does not.' },
+];
+let config = null;
+
+function radios(container, items, name, checkedKey, onPick) {
+  container.innerHTML = '';
+  for (const item of items) {
+    const label = document.createElement('label');
+    label.className = 'opt';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = name;
+    input.value = item.key;
+    input.checked = item.key === checkedKey;
+    input.addEventListener('change', () => onPick(item));
+    const span = document.createElement('span');
+    span.textContent = item.name;
+    label.append(input, span);
+    container.append(label);
+  }
+}
+
+function selected(name) {
+  const el = document.querySelector(`input[name="${name}"]:checked`);
+  return el ? el.value : null;
+}
+
+function describe() {
+  const res = config.resources.find((r) => r.key === selected('resource'));
+  const act = config.actions.find((a) => a.key === selected('action'));
+  $('what').innerHTML = `<b>${selected('human')}</b>’s agent asks to <b>${act.name}</b> on <b>${res.name}</b>.`;
+}
+
+function skeleton() {
+  $('grid').innerHTML = '';
+  for (const p of config.peps) {
+    const col = document.createElement('section');
+    col.className = 'col';
+    col.dataset.pep = p.name;
+    col.innerHTML = `
+      <div class="head">
+        <div class="name">${p.name}</div>
+        <div class="mode">PDP_DISCOVERY=${p.mode}</div>
+        <div class="blurb">${p.blurb}</div>
+      </div>
+      <div class="verdict"><span class="chip idle">NOT RUN</span><div class="reason"></div><div class="ms"></div></div>
+      <div class="trace"><h3>What the stubs saw</h3><div class="body"><p class="none">Run to see the fetches this PEP makes.</p></div></div>`;
+    $('grid').append(col);
+  }
+}
+
+function render(results) {
+  const cols = [...document.querySelectorAll('.col')];
+  results.forEach((r, i) => {
+    const col = cols[i];
+    const verdict = col.querySelector('.verdict');
+    const chip = verdict.querySelector('.chip');
+    const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
+    chip.className = 'chip ' + (r.error ? 'deny' : rogue && r.decision ? 'alarm' : r.decision ? 'permit' : 'deny');
+    chip.textContent = r.error ? 'ERROR' : r.decision ? (rogue ? 'PERMIT — BY THE ROGUE PDP' : 'PERMIT') : `DENY · ${r.status}`;
+    verdict.querySelector('.reason').textContent = r.error || r.reason || '';
+    verdict.querySelector('.ms').textContent = `${r.ms.toFixed(1)} ms`;
+
+    const body = col.querySelector('.trace .body');
+    body.innerHTML = '';
+    if (!r.events.length) {
+      const p = document.createElement('p');
+      p.className = 'none';
+      p.textContent = r.error ? 'No stub was reached.' : 'Nothing fetched — no discovery, or every document was cached.';
+      body.append(p);
+      return;
+    }
+    const ol = document.createElement('ol');
+    for (const e of r.events) {
+      const li = document.createElement('li');
+      li.className = (e.kind === 'verdict' ? 'verdictline' : e.kind) + (e.entity === 'rogue-pdp' ? ' rogue' : '');
+      const ent = document.createElement('span');
+      ent.className = 'ent';
+      ent.textContent = e.entity;
+      const p = document.createElement('span');
+      p.className = 'p';
+      p.textContent = e.kind === 'verdict' ? `${e.path} → ${e.note}` : `${e.method} ${e.path}`;
+      li.append(ent, p);
+      ol.append(li);
+    }
+    body.append(ol);
+  });
+}
+
+async function run(ev) {
+  ev.preventDefault();
+  const button = $('run');
+  button.disabled = true;
+  button.textContent = 'Running…';
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ resource: selected('resource'), human: selected('human'), action: selected('action') }),
+    });
+    if (!res.ok) throw new Error(`console API returned ${res.status}`);
+    const data = await res.json();
+    render(data.results);
+  } catch (err) {
+    for (const col of document.querySelectorAll('.col')) {
+      const chip = col.querySelector('.chip');
+      chip.className = 'chip deny';
+      chip.textContent = 'ERROR';
+      col.querySelector('.reason').textContent = String(err.message || err);
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Run all three';
+  }
+}
+
+(async function init() {
+  config = await (await fetch('/api/config')).json();
+  radios($('resources'), config.resources, 'resource', 'impostor', (item) => {
+    $('resourceHint').textContent = item.blurb;
+    describe();
+  });
+  radios($('humans'), HUMANS, 'human', 'mallory', (item) => {
+    $('humanHint').textContent = item.blurb;
+    describe();
+  });
+  radios($('actions'), config.actions, 'action', 'balance', describe);
+  $('resourceHint').textContent = config.resources.find((r) => r.key === 'impostor').blurb;
+  $('humanHint').textContent = HUMANS.find((h) => h.key === 'mallory').blurb;
+  skeleton();
+  describe();
+  $('form').addEventListener('submit', run);
+  run(new Event('submit'));
+})();
+</script>
+</body>
+</html>

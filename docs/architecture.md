@@ -42,7 +42,7 @@ deny, whichever one said no.
 | [`gateways/kong/`](../gateways/kong) | Lua plugin | A Kong PEP. Native Lua for claims, REST mapping, challenges and PDP discovery; delegates DPoP verification and COAZ tool-call checks to `coaz-pep`, because a Kong plugin has no JOSE verifier and no CEL. |
 | [`gateways/envoy/`](../gateways/envoy) | YAML | How agentgateway, Istio and plain Envoy attach to `coaz-pep`. No code: the gateway only points at the engine. |
 | [`sdk/node/`](../sdk/node) | TypeScript | `@id-partners/authzen-pep`: an AuthZEN client, Express middleware, and an MCP guard for a process that is its own PEP. Evaluates a CEL subset itself; can delegate to `coaz-pep` for the rest. |
-| [`demo/`](../demo) | Compose + scripts | A stub federation, a good PDP and a rogue one, and three `coaz-pep` instances in three discovery modes. Stands up with `docker compose up` or with `run-local.sh`. |
+| [`demo/`](../demo) | Compose + scripts | A stub federation, a good PDP and a rogue one, and three `coaz-pep` instances in three discovery modes. Stands up with `docker compose up` or with `run-local.sh`; a console on :8088 runs one request through all three PEPs and traces what each fetched. |
 
 Inside `core/`:
 
@@ -54,7 +54,8 @@ Inside `core/`:
 | `federation` | An OpenID Federation 1.0 Trust Chain resolver: fetching, the §3.2 validation rules, the §4 invariants, §6.1 metadata policy, §6.2 constraints. |
 | `jose` | Compact JWS verification for the ES/RS/PS families, JWK parsing, RFC 7638 thumbprints. Shared by token validation, DPoP and federation. |
 | `internal/ttlcache`, `internal/metafetch` | The one cache shape and the one bounded, policy-checked GET that every metadata fetch uses. |
-| `cmd/demo-stubs` | The demo's cast of stub services. Not for production. |
+| `cmd/demo-stubs` | The demo's cast of stub services, plus the event feed the console traces. Not for production. |
+| `cmd/demo-console` | The demo's clickable walkthrough: one request, all three PEPs, side by side. Not for production. |
 
 ## The decision contract
 
@@ -187,10 +188,11 @@ a `sources` seam) and get federation by delegating to `coaz-pep`.
 
 `demo/` stands up a stub Trust Anchor, resources that are and are not members, a
 well-behaved PDP and a rogue one that permits everything, and `coaz-pep` three times in
-three discovery modes. `demo.sh` walks through the cases: the impostor resource choosing
-its own judge under `resource` mode, the federation's policy stripping the rogue PDP
-under `federation` mode, a broken chain failing closed, and a step-up challenge surviving
-discovery. See [`demo/README.md`](../demo/README.md).
+three discovery modes. `demo.sh` walks through the cases in the terminal, and a console on
+:8088 does the same by clicking: the impostor resource choosing its own judge under
+`resource` mode, the federation's policy stripping the rogue PDP under `federation` mode,
+a broken chain failing closed, and a step-up challenge surviving discovery — each shown
+beside the documents that PEP actually fetched. See [`demo/README.md`](../demo/README.md).
 
 ## Standards
 

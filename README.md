@@ -41,13 +41,15 @@ human reading prose.
 [overview](docs/overview.html), open it in a browser) for the map: what each piece
 does, the decision contract, and how a PEP finds its PDP. **Then [`demo/`](demo)** stands
 the whole thing up — a stub federation, a good PDP and a rogue one — with one
-`docker compose up` and walks through why the federation's word beats a resource's own.
+`docker compose up`, and shows why the federation's word beats a resource's own: as a
+scripted walkthrough, or a console on :8088 that runs one request through all three PEPs
+and traces what each of them fetched.
 
 ## Layout
 
 ```
 docs/                        architecture.md — the explainer
-demo/                        docker compose + scripts: see discovery work, end to end
+demo/                        docker compose + scripts + a console: see discovery work
 core/                        Go: the COAZ engine + the coaz-pep service
   coaz/                        COAZ — discovery, CEL, envelopes, trust anchoring
   authzen/discovery/           resource -> PDP -> endpoints (RFC 9728, AuthZEN well-known, federation)
@@ -55,6 +57,7 @@ core/                        Go: the COAZ engine + the coaz-pep service
   jose/                        JWS verification shared by tokens, DPoP and federation
   cmd/coaz-pep/                ext_authz gRPC (:9191) + HTTP check API (:9192)
   cmd/demo-stubs/              the demo's stub federation and PDPs
+  cmd/demo-console/            the demo's clickable walkthrough
 gateways/
   kong/authzen-pdp/            Kong Lua plugin
   envoy/agentgateway/          agentgateway (solo.io) attachment

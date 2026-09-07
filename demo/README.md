@@ -18,6 +18,28 @@ PDP is), `pep-resource` (:9193, trusts each resource's own well-known) and
 `pep-federation` (:9194, trusts the federation's word). The cast is in
 [`core/cmd/demo-stubs/main.go`](../core/cmd/demo-stubs/main.go).
 
+Two ways to drive it: `demo.sh` walks every case in the terminal, and the **console** on
+:8088 is the clickable version for showing a room.
+
+## The console
+
+Pick a resource, a user and a request, and press Run. The same check goes to all three
+PEPs and you get three columns: the decision, and underneath it every request the stubs
+saw while that PEP was deciding — which `.well-known` document it read, whether it
+climbed a trust chain, and which PDP answered. A permit obtained from the rogue PDP is
+called out in orange, because that is the failure the modes exist to prevent.
+
+Start with **impostor + mallory**: static denies her, federation denies her, and the
+middle column permits her because the resource named its own judge. Then **member +
+mallory**: watch the federation column climb `member → anchor → fetch` and come back
+with the good PDP, while the resource column takes the member's own word and reaches the
+rogue one.
+
+The metadata cache TTL is set to 15 seconds here so the trace shows fetches on every run
+rather than an empty list; the shipped default is five minutes, and a repeat run inside
+the TTL legitimately shows nothing fetched. The console reads the stubs' event feed at
+`:9008/events` — a plain in-memory ring buffer, not part of any spec.
+
 ## Run it
 
 With Docker:
@@ -26,14 +48,20 @@ With Docker:
 cd demo && docker compose up --build -d && ./demo.sh
 ```
 
+Then open **<http://localhost:8088>** for the console: pick a resource and a user, and it
+runs the identical request against all three PEPs at once, showing each decision beside
+the documents that PEP actually fetched and the PDP that actually decided.
+
 Without Docker (needs Go 1.25+; builds and runs everything on this machine):
 
 ```bash
-demo/run-local.sh
+demo/run-local.sh              # the scripted walkthrough, then exit
+demo/run-local.sh --console    # also serve the console on :8088 and stay up
 ```
 
-Add `--profile kong` to `docker compose up` to also run Kong with the Lua plugin doing
-the same discovery in front of the `plain` resource; `demo.sh` notices and adds a section.
+Add `--profile kong` to `docker compose up` to also run Kong (:8000) with the Lua plugin
+doing the same discovery in front of the `plain` resource; `demo.sh` notices and adds a
+section.
 The Node SDK version is `node demo/node-sdk.mjs` after `cd sdk/node && npm install && npm run build`.
 
 Watch the stubs while it runs: `docker compose logs -f stubs` (or `stubs.log` under

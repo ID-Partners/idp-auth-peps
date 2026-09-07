@@ -16,6 +16,7 @@
 //	:9005  impostor    not federated; RFC 9728 metadata names the rogue PDP
 //	:9006  broken      federated, but signs with a key the anchor never vouched for
 //	:9007  stray       no metadata of any kind
+//	:9008  events      every request the stubs saw, as JSON — what the console traces
 //
 // Environment:
 //
@@ -91,9 +92,66 @@ func env(k, def string) string {
 	return def
 }
 
+// recorder keeps the last few thousand requests the stubs saw. The console reads it to
+// show which metadata documents a check actually fetched, and which PDP decided — the
+// part of discovery that is otherwise invisible from outside.
+type recorder struct {
+	mu     sync.Mutex
+	seq    int64
+	events []event
+}
+
+type event struct {
+	Seq    int64  `json:"seq"`
+	At     string `json:"at"`
+	Entity string `json:"entity"`
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	Kind   string `json:"kind"` // metadata | decision | other
+	Note   string `json:"note,omitempty"`
+}
+
+const maxEvents = 4096
+
+func (r *recorder) add(entity, method, path, kind, note string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seq++
+	r.events = append(r.events, event{Seq: r.seq, At: time.Now().UTC().Format(time.RFC3339Nano),
+		Entity: entity, Method: method, Path: path, Kind: kind, Note: note})
+	if len(r.events) > maxEvents {
+		r.events = r.events[len(r.events)-maxEvents:]
+	}
+}
+
+func (r *recorder) since(seq int64) (int64, []event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]event, 0, 16)
+	for _, e := range r.events {
+		if e.Seq > seq {
+			out = append(out, e)
+		}
+	}
+	return r.seq, out
+}
+
+// kindOf classifies a request so the console can colour it without parsing paths itself.
+func kindOf(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/.well-known/"), strings.HasPrefix(path, "/fetch"):
+		return "metadata"
+	case strings.Contains(path, "decide") || strings.Contains(path, "anything-goes") || strings.Contains(path, "/access/v1/"):
+		return "decision"
+	default:
+		return "other"
+	}
+}
+
 func main() {
 	host := env("STUB_HOST", "localhost")
 	base, _ := strconv.Atoi(env("STUB_PORT", "9000"))
+	rec := &recorder{}
 
 	anchor := newEntity("anchor", base, host)
 	member := newEntity("member", base+1, host)
@@ -121,9 +179,29 @@ func main() {
 		go func() {
 			defer wg.Done()
 			log.Printf("%-10s %s", e.name, e.id)
-			log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", e.port), logged(e.name, mux)))
+			log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", e.port), logged(e.name, rec, mux)))
 		}()
 	}
+
+	// The event feed the console reads. Not an entity: no keys, no metadata, nothing
+	// federated about it.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+			var since int64
+			if v := r.URL.Query().Get("since"); v != "" {
+				since, _ = strconv.ParseInt(v, 10, 64)
+			}
+			seq, events := rec.since(since)
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			writeJSON(w, map[string]any{"seq": seq, "events": events})
+		})
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+		log.Printf("%-10s http://%s:%d/events", "events", host, base+8)
+		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", base+8), mux))
+	}()
 
 	// ---- anchor -------------------------------------------------------------------
 	{
@@ -195,7 +273,7 @@ func main() {
 	rfc9728(stray, nil)
 
 	// ---- PDPs --------------------------------------------------------------------------
-	pdp(good, "/decide", "/decide-batch", serve, func(req authzenRequest) map[string]any {
+	pdp(good, rec, "/decide", "/decide-batch", serve, func(req authzenRequest) map[string]any {
 		human := req.Subject.Properties["on_behalf_of"]
 		who := fmt.Sprintf("%v", human)
 		if who == "" || who == "<nil>" {
@@ -212,7 +290,7 @@ func main() {
 		}
 		return map[string]any{"decision": true, "context": map[string]any{"reason": fmt.Sprintf("%s may %s", who, req.Action.Name)}}
 	})
-	pdp(rogue, "/anything-goes", "", serve, func(req authzenRequest) map[string]any {
+	pdp(rogue, rec, "/anything-goes", "", serve, func(req authzenRequest) map[string]any {
 		log.Printf("rogue-pdp  !!! consulted for %s by %v — permitting, as always", req.Action.Name, req.Subject.Properties["on_behalf_of"])
 		return map[string]any{"decision": true, "context": map[string]any{"reason": "the rogue PDP permits everything"}}
 	})
@@ -233,7 +311,7 @@ type authzenRequest struct {
 	Context  map[string]any `json:"context"`
 }
 
-func pdp(e *entity, evalPath, batchPath string, serve func(*entity, *http.ServeMux), decide func(authzenRequest) map[string]any) {
+func pdp(e *entity, rec *recorder, evalPath, batchPath string, serve func(*entity, *http.ServeMux), decide func(authzenRequest) map[string]any) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/authzen-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		doc := map[string]any{"policy_decision_point": e.id, "access_evaluation_endpoint": e.id + evalPath}
@@ -248,6 +326,9 @@ func pdp(e *entity, evalPath, batchPath string, serve func(*entity, *http.ServeM
 		_ = json.Unmarshal(body, &req)
 		out := decide(req)
 		log.Printf("%-10s %s by %s (for %v) -> decision=%v", e.name, req.Action.Name, req.Subject.ID, req.Subject.Properties["on_behalf_of"], out["decision"])
+		reason, _ := out["context"].(map[string]any)["reason"].(string)
+		rec.add(e.name, "decision", fmt.Sprintf("%s for %v", req.Action.Name, req.Subject.Properties["on_behalf_of"]), "verdict",
+			fmt.Sprintf("%v — %s", out["decision"], reason))
 		writeJSON(w, out)
 	}
 	mux.HandleFunc(evalPath, evaluate)
@@ -284,10 +365,11 @@ func upstreamAPI(e *entity) http.HandlerFunc {
 	}
 }
 
-func logged(name string, h http.Handler) http.Handler {
+func logged(name string, rec *recorder, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" {
 			log.Printf("%-10s %s %s", name, r.Method, r.URL.RequestURI())
+			rec.add(name, r.Method, r.URL.RequestURI(), kindOf(r.URL.Path), "")
 		}
 		h.ServeHTTP(w, r)
 	})

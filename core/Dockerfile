@@ -2,8 +2,9 @@
 # (COAZ) support. Serves Envoy ext_authz gRPC (:9191) and an HTTP check API
 # (:9192, used by the Kong authzen-pdp plugin).
 #
-# Two images from one build: the default target is coaz-pep; `--target demo-stubs`
-# builds the stub federation + PDPs that ../demo stands up next to it.
+# Three images from one build: the default target is coaz-pep; `--target demo-stubs`
+# builds the stub federation + PDPs, and `--target demo-console` the clickable
+# walkthrough. Both demo targets are what ../demo stands up next to the PEPs.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -15,12 +16,18 @@ COPY internal/ internal/
 COPY jose/ jose/
 COPY cmd/ cmd/
 RUN CGO_ENABLED=0 go build -o /coaz-pep ./cmd/coaz-pep && \
-    CGO_ENABLED=0 go build -o /demo-stubs ./cmd/demo-stubs
+    CGO_ENABLED=0 go build -o /demo-stubs ./cmd/demo-stubs && \
+    CGO_ENABLED=0 go build -o /demo-console ./cmd/demo-console
 
 FROM alpine:3.20 AS demo-stubs
 COPY --from=build /demo-stubs /usr/local/bin/demo-stubs
-EXPOSE 9000-9007
+EXPOSE 9000-9008
 ENTRYPOINT ["/usr/local/bin/demo-stubs"]
+
+FROM alpine:3.20 AS demo-console
+COPY --from=build /demo-console /usr/local/bin/demo-console
+EXPOSE 8088
+ENTRYPOINT ["/usr/local/bin/demo-console"]
 
 FROM alpine:3.20 AS coaz-pep
 COPY --from=build /coaz-pep /usr/local/bin/coaz-pep

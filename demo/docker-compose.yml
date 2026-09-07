@@ -5,6 +5,7 @@
 #   pep-static      coaz-pep as shipped: told where the PDP is, no discovery     :9192
 #   pep-resource    PDP_DISCOVERY=resource — trusts each resource's own well-known :9193
 #   pep-federation  PDP_DISCOVERY=federation — trusts the federation's word        :9194
+#   console         a clickable walkthrough: one request, all three PEPs          :8088
 #   kong            (profile `kong`) the Kong plugin doing discovery in Lua        :8000
 #
 # Everything is plain http on a private network, hence PDP_DISCOVERY_INSECURE. Do not
@@ -21,7 +22,7 @@ services:
     volumes:
       - shared:/shared
     ports:
-      - "9000-9007:9000-9007"
+      - "9000-9008:9000-9008"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9000/healthz"]
       interval: 2s
@@ -37,6 +38,9 @@ services:
       AUTHZEN_API_KEY: static-pdp-key
       CHECK_API_TOKEN: demo
       MCP_UPSTREAM_ALLOWLIST: http://stubs:9004
+      # Short so the console's trace shows the fetches on every run. The shipped
+      # default is 5m, and production wants that or longer.
+      PDP_METADATA_TTL: 15s
     ports:
       - "9192:9192"
     depends_on:
@@ -79,6 +83,23 @@ services:
       - shared:/shared:ro
     ports:
       - "9194:9192"
+    depends_on:
+      stubs:
+        condition: service_healthy
+
+  console:
+    build:
+      context: ../core
+      target: demo-console
+    environment:
+      LISTEN: ":8088"
+      STUBS_BASE: http://stubs
+      PEP_STATIC: http://pep-static:9192
+      PEP_RESOURCE: http://pep-resource:9192
+      PEP_FEDERATION: http://pep-federation:9192
+      CHECK_API_TOKEN: demo
+    ports:
+      - "8088:8088"
     depends_on:
       stubs:
         condition: service_healthy
