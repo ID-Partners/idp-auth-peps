@@ -14,7 +14,7 @@ FEDERATION="http://${PEP_HOST}:${PEP_FEDERATION_PORT:-9194}"
 CHECK_TOKEN="${CHECK_API_TOKEN:-demo}"
 
 S="http://${STUBS_HOST}"
-MEMBER="$S:9001"; GOOD="$S:9002"; ROGUE="$S:9003"; PLAIN="$S:9004"; IMPOSTOR="$S:9005"; BROKEN="$S:9006"; STRAY="$S:9007"
+MEMBER="$S:9001"; GOOD="$S:9002"; ROGUE="$S:9003"; PLAIN="$S:9004"; IMPOSTOR="$S:9005"; BROKEN="$S:9006"; STRAY="$S:9007"; BANKB="$S:9009"
 
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 # An UNSIGNED token: coaz-pep decodes without verifying when no JWKS is configured, and
@@ -52,7 +52,8 @@ say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 step() { printf '  %-58s ' "$1"; }
 
 say "0. What the metadata says"
-echo "  the good PDP's metadata:      $(curl -s "http://${PEP_HOST}:9002/.well-known/authzen-configuration")"
+echo "  Bank A's PDP metadata:        $(curl -s "http://${PEP_HOST}:9002/.well-known/authzen-configuration")"
+echo "  Bank B's PDP metadata:        $(curl -s "http://${PEP_HOST}:9008/.well-known/authzen-configuration")"
 echo "  the rogue PDP's metadata:     $(curl -s "http://${PEP_HOST}:9003/.well-known/authzen-configuration")"
 echo "  plain resource (RFC 9728):    $(curl -s "http://${PEP_HOST}:9004/.well-known/oauth-protected-resource")"
 echo "  impostor resource (RFC 9728): $(curl -s "http://${PEP_HOST}:9005/.well-known/oauth-protected-resource")"
@@ -78,12 +79,18 @@ step "broken chain -> 503, never falls to static"; check "$FEDERATION" "$BROKEN"
 step "stray (no metadata at all) -> static PDP"; check "$FEDERATION" "$STRAY" alice GET /accounts/a1/balance
 echo "  ^ watch the stubs log: rogue-pdp is never consulted by pep-federation."
 
-say "4. The challenge contract survives discovery"
+say "4. Two banks, one gateway: the resource decides whose policy applies"
+step "pay 500 on plain (Bank A steps up over 1000)"; check "$RESOURCE" "$PLAIN" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":500,"currency":"AUD"}'
+step "pay 500 on bank-b (Bank B steps up over 100)"; check "$RESOURCE" "$BANKB" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":500,"currency":"AUD"}'
+echo "  ^ same request, two answers. The static PEP cannot tell them apart: it has one PDP for everything."
+echo "  For a PDP that MOVES, and for the batch-capability case, use the console on :8088."
+
+say "5. The challenge contract survives discovery"
 step "alice pays 50"; check "$FEDERATION" "$MEMBER" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
 step "alice pays 5000 -> step-up challenge"; check "$FEDERATION" "$MEMBER" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":5000,"currency":"AUD"}'
 
 if curl -s -o /dev/null -w '%{http_code}' "http://${PEP_HOST}:8000/bank/accounts/a1/balance" 2>/dev/null | grep -q '^[0-9]'; then
-  say "5. Kong, doing the same discovery in Lua (profile kong)"
+  say "6. Kong, doing the same discovery in Lua (profile kong)"
   step "alice via Kong"; curl -s -H "Authorization: Bearer $(jwt alice agent-1)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
   step "mallory via Kong"; curl -s -H "Authorization: Bearer $(jwt mallory agent-1)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
 fi

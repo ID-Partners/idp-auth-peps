@@ -11,7 +11,7 @@
 //
 //	LISTEN         address to serve on (default :8088)
 //	STUBS_BASE     how this process and the PEPs reach the stubs (default http://localhost)
-//	STUBS_EVENTS   the stubs' event feed (default {STUBS_BASE}:9008)
+//	STUBS_CONTROL  the stubs' event feed and control surface (default {STUBS_BASE}:9099)
 //	PEP_STATIC     HTTP check API of the no-discovery PEP     (default {…}:9192)
 //	PEP_RESOURCE   HTTP check API of the resource-mode PEP    (default {…}:9193)
 //	PEP_FEDERATION HTTP check API of the federation-mode PEP  (default {…}:9194)
@@ -64,13 +64,18 @@ type action struct {
 	Method string         `json:"method"`
 	Path   string         `json:"path"`
 	Body   map[string]any `json:"body,omitempty"`
+	// Style is the PEP's request-mapping style: "rest", or "mcp" for a JSON-RPC
+	// tools/call. An mcp action needs a resource, since the MCP server IS the resource.
+	Style string `json:"style"`
+	// Note explains what this request is for, in the UI.
+	Note string `json:"note,omitempty"`
 }
 
 type server struct {
 	peps      []pep
 	resources []resource
 	actions   []action
-	events    string
+	control   string
 	token     string
 	client    *http.Client
 }
@@ -78,9 +83,9 @@ type server struct {
 func main() {
 	base := strings.TrimRight(env("STUBS_BASE", "http://localhost"), "/")
 	s := &server{
-		events: env("STUBS_EVENTS", base+":9008"),
-		token:  env("CHECK_API_TOKEN", "demo"),
-		client: &http.Client{Timeout: 15 * time.Second},
+		control: env("STUBS_CONTROL", base+":9099"),
+		token:   env("CHECK_API_TOKEN", "demo"),
+		client:  &http.Client{Timeout: 15 * time.Second},
 		peps: []pep{
 			{Key: "static", Name: "pep-static", Mode: "off", url: env("PEP_STATIC", base+":9192"),
 				Blurb: "Told where the PDP is. No metadata is fetched at all."},
@@ -90,19 +95,25 @@ func main() {
 				Blurb: "Resolves the resource's trust chain to a configured anchor."},
 		},
 		resources: []resource{
-			{Key: "plain", Name: "plain", ID: base + ":9004", Blurb: "Not federated. Its own metadata names the good PDP."},
+			{Key: "plain", Name: "plain (Bank A)", ID: base + ":9004", Blurb: "Not federated. Its own metadata names Bank A's PDP, which steps up payments over 1000."},
+			{Key: "bank-b", Name: "bank-b", ID: base + ":9009", Blurb: "Not federated. Its own metadata names Bank B's PDP — same product, stricter threshold: step-up over 100."},
 			{Key: "impostor", Name: "impostor", ID: base + ":9005", Blurb: "Not federated. Its own metadata names the ROGUE PDP."},
-			{Key: "member", Name: "member", ID: base + ":9001", Blurb: "Federated. Its own metadata names the rogue PDP first; the anchor's policy allows only the good one."},
+			{Key: "member", Name: "member", ID: base + ":9001", Blurb: "Federated. Its own metadata names the rogue PDP first; the anchor's policy allows only Bank A's."},
 			{Key: "broken", Name: "broken", ID: base + ":9006", Blurb: "Federated, but signed with a key the anchor never vouched for."},
 			{Key: "stray", Name: "stray", ID: base + ":9007", Blurb: "No metadata of any kind."},
-			{Key: "none", Name: "(no resource)", ID: "", Blurb: "The route names no resource, so every PEP uses its configured PDP."},
+			{Key: "none", Name: "(no resource)", ID: "", Blurb: "The route names no resource, so every PEP uses the PDP it was configured with."},
 		},
 		actions: []action{
-			{Key: "balance", Name: "read a balance", Method: "GET", Path: "/accounts/a1/balance"},
-			{Key: "pay50", Name: "pay 50", Method: "POST", Path: "/payments",
+			{Key: "balance", Name: "read a balance", Method: "GET", Path: "/accounts/a1/balance", Style: "rest"},
+			{Key: "pay50", Name: "pay 50", Method: "POST", Path: "/payments", Style: "rest",
 				Body: map[string]any{"from_account": "a1", "to_account": "b2", "amount": 50, "currency": "AUD"}},
-			{Key: "pay5000", Name: "pay 5000", Method: "POST", Path: "/payments",
+			{Key: "pay500", Name: "pay 500", Method: "POST", Path: "/payments", Style: "rest",
+				Note: "Under Bank A's step-up threshold, over Bank B's. Same request, two answers.",
+				Body: map[string]any{"from_account": "a1", "to_account": "b2", "amount": 500, "currency": "AUD"}},
+			{Key: "pay5000", Name: "pay 5000", Method: "POST", Path: "/payments", Style: "rest",
 				Body: map[string]any{"from_account": "a1", "to_account": "b2", "amount": 5000, "currency": "AUD"}},
+			{Key: "transfer", Name: "MCP transfer (batch)", Method: "POST", Path: "/mcp", Style: "mcp",
+				Note: "One tool call, two evaluations. Needs a PDP that advertises a batch endpoint; against one that does not, the PEP refuses rather than guessing a path."},
 		},
 	}
 
@@ -113,12 +124,16 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// The page is baked into the binary, so a restarted demo is a changed page.
+		// Without this a browser happily shows the previous one.
+		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(consoleHTML)
 	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"peps": s.peps, "resources": s.resources, "actions": s.actions})
 	})
 	mux.HandleFunc("/api/run", s.handleRun)
+	mux.HandleFunc("/api/control", s.handleControl)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	addr := env("LISTEN", ":8088")
@@ -195,12 +210,29 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, hum
 	started := time.Now()
 	defer func() { out.MS = float64(time.Since(started).Microseconds()) / 1000 }()
 
-	cfg := map[string]string{"pep_label": p.Name, "style": "rest", "require_token": "true"}
+	style := act.Style
+	if style == "" {
+		style = "rest"
+	}
+	if style == "mcp" && res.ID == "" {
+		out.Error = "an MCP tool call needs a resource: the MCP server is the resource"
+		return out
+	}
+	cfg := map[string]string{"pep_label": p.Name, "style": style, "require_token": "true"}
 	if res.ID != "" {
 		cfg["resource"] = res.ID
 	}
 	body := ""
-	if act.Body != nil {
+	switch {
+	case style == "mcp":
+		// The MCP server the tool mapping is discovered from is the resource itself.
+		cfg["mcp_upstream_url"] = res.ID + "/mcp"
+		raw, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{"name": "transfer", "arguments": map[string]any{"from": "a1", "to": "b2"}},
+		})
+		body = string(raw)
+	case act.Body != nil:
 		raw, _ := json.Marshal(act.Body)
 		body = string(raw)
 	}
@@ -252,11 +284,44 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, hum
 			if v, ok := denial["error"].(string); ok && v != "authorization_failed" {
 				out.Reason = v + ": " + out.Reason
 			}
+			// An MCP denial is a JSON-RPC error object, per the profile.
+			if e, ok := denial["error"].(map[string]any); ok {
+				if msg, ok := e["message"].(string); ok {
+					out.Reason = msg
+				}
+			}
 		} else {
 			out.Reason = checked.Response.Body
 		}
 	}
 	return out
+}
+
+// handleControl relays the console's levers to the stubs: move a PDP's advertised
+// endpoint, hand a resource to another bank's PDP, or put everything back.
+func (s *server) handleControl(w http.ResponseWriter, r *http.Request) {
+	var body io.Reader
+	method := http.MethodGet
+	if r.Method == http.MethodPost {
+		method = http.MethodPost
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, s.control+"/control", body)
+	if err != nil {
+		http.Error(w, `{"error":"bad control request"}`, http.StatusBadRequest)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, "stubs unreachable: "+err.Error()), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 1<<20))
 }
 
 func (s *server) seq(ctx context.Context) int64 {
@@ -270,7 +335,7 @@ func (s *server) eventsSince(ctx context.Context, since int64) []event {
 }
 
 func (s *server) fetchEvents(ctx context.Context, since int64) (int64, []event) {
-	url := s.events + "/events"
+	url := s.control + "/events"
 	if since >= 0 {
 		url = fmt.Sprintf("%s?since=%d", url, since)
 	} else {

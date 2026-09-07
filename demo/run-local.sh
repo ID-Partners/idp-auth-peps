@@ -26,18 +26,18 @@ until curl -sf http://localhost:9000/healthz >/dev/null; do sleep 0.2; done
 # PDP_METADATA_TTL is short so the console's trace shows fetches on every run; the
 # shipped default is 5m.
 common=(AUTHZEN_URL=http://localhost:9002 AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo \
-  MCP_UPSTREAM_ALLOWLIST=http://localhost:9004 HTTP_ADDR=127.0.0.1 PDP_METADATA_TTL=15s)
+  MCP_UPSTREAM_ALLOWLIST=http://localhost:9001,http://localhost:9004,http://localhost:9005,http://localhost:9006,http://localhost:9009 HTTP_ADDR=127.0.0.1 PDP_METADATA_TTL=15s)
 env "${common[@]}" PORT=9291 HTTP_PORT=9192 "$OUT/coaz-pep" >"$OUT/pep-static.log" 2>&1 &
 pids+=($!)
 # Allowlists match scheme + host + port at a path boundary, so each stub is listed.
 # pep-resource deliberately has NO PDP_ALLOWLIST (it warns): the point of scenario 2 is
 # what happens when a resource's own word is the only bound. pep-federation has one.
-resources="http://localhost:9001,http://localhost:9004,http://localhost:9005,http://localhost:9006,http://localhost:9007"
+resources="http://localhost:9001,http://localhost:9004,http://localhost:9005,http://localhost:9006,http://localhost:9007,http://localhost:9009"
 env "${common[@]}" PORT=9292 HTTP_PORT=9193 PDP_DISCOVERY=resource PDP_DISCOVERY_INSECURE=true \
   RESOURCE_METADATA_ALLOWLIST="$resources" "$OUT/coaz-pep" >"$OUT/pep-resource.log" 2>&1 &
 pids+=($!)
 env "${common[@]}" PORT=9293 HTTP_PORT=9194 PDP_DISCOVERY=federation PDP_DISCOVERY_INSECURE=true \
-  RESOURCE_METADATA_ALLOWLIST="$resources" PDP_ALLOWLIST=http://localhost:9002 \
+  RESOURCE_METADATA_ALLOWLIST="$resources" PDP_ALLOWLIST=http://localhost:9002,http://localhost:9008 \
   FEDERATION_TRUST_ANCHORS_FILE="$OUT/anchors.json" \
   FEDERATION_FETCH_ALLOWLIST=http://localhost:9000 \
   "$OUT/coaz-pep" >"$OUT/pep-federation.log" 2>&1 &

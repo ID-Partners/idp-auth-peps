@@ -74,6 +74,17 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 .trace li.rogue .ent{color:var(--alarm)}
 .trace .p{color:var(--muted);overflow-wrap:anywhere}
 .trace .none{font-family:var(--sans);font-size:.85rem;color:var(--muted)}
+.levers{border:1px solid var(--rule);background:var(--sunk);padding:14px 16px;margin:0 0 20px;display:grid;gap:10px}
+.levers .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.levers button{font:inherit;font-size:.88rem;background:var(--bg);color:var(--ink);border:1px solid var(--rule);padding:7px 13px;cursor:pointer}
+.levers button:hover{border-color:var(--orange)}
+.levers button:focus-visible{outline:2px solid var(--orange);outline-offset:2px}
+.levers button[aria-pressed="true"]{border-color:var(--orange);background:var(--tint);font-weight:600}
+.levers .why{font-size:.85rem;color:var(--muted);margin:0}
+.levers .state{font-family:var(--mono);font-size:.74rem;color:var(--muted);overflow-wrap:anywhere}
+.proof{padding:10px 16px;border-bottom:1px solid var(--rule);font-size:.83rem;color:var(--muted);min-height:2.4em}
+.badge{display:inline-block;font-family:var(--mono);font-size:.66rem;letter-spacing:.05em;border:1px solid var(--rule);padding:1px 5px;margin-left:6px;color:var(--muted);white-space:nowrap}
+.badge.adv{border-color:var(--orange);color:var(--orange)}
 .legend{margin-top:22px;border-top:1px solid var(--rule);padding-top:14px;font-size:.85rem;color:var(--muted);display:grid;gap:6px}
 .legend b{color:var(--ink)}
 @media (max-width:900px){ .grid{grid-template-columns:1fr} }
@@ -90,18 +101,29 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
   <form id="form">
     <fieldset><legend>Protected resource</legend><div class="opts" id="resources"></div><p class="hint" id="resourceHint"></p></fieldset>
     <fieldset><legend>Acting for</legend><div class="opts" id="humans"></div><p class="hint" id="humanHint"></p></fieldset>
-    <fieldset><legend>Request</legend><div class="opts" id="actions"></div></fieldset>
+    <fieldset><legend>Request</legend><div class="opts" id="actions"></div><p class="hint" id="actionHint"></p></fieldset>
     <div class="runbar">
       <button class="run" type="submit" id="run">Run all three</button>
       <span class="what" id="what"></span>
     </div>
   </form>
 
+  <div class="levers">
+    <p class="why"><b>Change the world while it runs.</b> Nothing below restarts a PEP or edits its configuration. Re-run after each; the PEPs pick the change up on their next metadata refresh.</p>
+    <div class="row">
+      <button type="button" id="movePdp" aria-pressed="false">Move Bank A's PDP to /decide-v2</button>
+      <button type="button" id="repoint" aria-pressed="false">Hand plain over to Bank B's PDP</button>
+      <button type="button" id="reset">Put it back</button>
+    </div>
+    <div class="state" id="state"></div>
+  </div>
+
   <div class="grid" id="grid"></div>
 
   <div class="legend">
     <div><b>The columns are the argument.</b> Same request, same policy, three ways of deciding who decides.</div>
-    <div>Grey trace lines are metadata fetches the PEP made. Green is the PDP that decided. <b class="chip alarm" style="border:0;padding:0;background:none">Orange</b> is the rogue PDP being consulted at all.</div>
+    <div>Grey trace lines are metadata fetches the PEP made. Green is the PDP that decided. Orange is the rogue PDP being consulted at all.</div>
+    <div><b>Watch the endpoint badge.</b> <code>/access/v1/evaluation</code> is the path AuthZEN says to assume when a PDP publishes no metadata. Anything else is the endpoint that PDP advertised, and a PEP only knows it by having read the document.</div>
     <div>Metadata caches are set to a short TTL here so the trace stays visible on every run; the shipped default is five minutes.</div>
   </div>
 </main>
@@ -156,12 +178,13 @@ function skeleton() {
         <div class="blurb">${p.blurb}</div>
       </div>
       <div class="verdict"><span class="chip idle">NOT RUN</span><div class="reason"></div><div class="ms"></div></div>
+      <div class="proof"></div>
       <div class="trace"><h3>What the stubs saw</h3><div class="body"><p class="none">Run to see the fetches this PEP makes.</p></div></div>`;
     $('grid').append(col);
   }
 }
 
-function render(results) {
+function render(results, action) {
   const cols = [...document.querySelectorAll('.col')];
   results.forEach((r, i) => {
     const col = cols[i];
@@ -172,6 +195,8 @@ function render(results) {
     chip.textContent = r.error ? 'ERROR' : r.decision ? (rogue ? 'PERMIT — BY THE ROGUE PDP' : 'PERMIT') : `DENY · ${r.status}`;
     verdict.querySelector('.reason').textContent = r.error || r.reason || '';
     verdict.querySelector('.ms').textContent = `${r.ms.toFixed(1)} ms`;
+
+    col.querySelector('.proof').textContent = proofOf(r, action);
 
     const body = col.querySelector('.trace .body');
     body.innerHTML = '';
@@ -193,10 +218,63 @@ function render(results) {
       p.className = 'p';
       p.textContent = e.kind === 'verdict' ? `${e.path} → ${e.note}` : `${e.method} ${e.path}`;
       li.append(ent, p);
+      // The whole point of the PDP's metadata is which endpoint gets used. Say so.
+      if (e.kind === 'decision') {
+        const badge = document.createElement('span');
+        const assumed = e.path.startsWith('/access/v1/');
+        badge.className = 'badge' + (assumed ? '' : ' adv');
+        badge.textContent = assumed ? 'assumed default path' : 'advertised endpoint';
+        p.append(badge);
+      }
       ol.append(li);
     }
     body.append(ol);
   });
+}
+
+// proofOf says what this column just demonstrated, in the reader's terms.
+function proofOf(r, action) {
+  if (r.error) return r.error;
+  const decided = r.events.filter((e) => e.kind === 'decision');
+  const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
+  const fetched = r.events.filter((e) => e.kind === 'metadata').length;
+  const chain = r.events.some((e) => e.path.includes('openid-federation'));
+  if (!decided.length && !r.decision) {
+    // A PDP whose metadata was read but which was never sent anything is the batch
+    // case: it advertised no evaluations endpoint, so there was nowhere to send one.
+    const read = r.events.filter((e) => e.kind === 'metadata' && e.entity.includes('pdp')).pop();
+    if (read && action && action.style === 'mcp') {
+      return `Resolved ${read.entity}, which advertises no batch endpoint. This call is two evaluations, so the PEP refused rather than guessing a path.`;
+    }
+    return 'No PDP was reached. Discovery refused to resolve one, so the request fails closed.';
+  }
+  if (action && action.style === 'mcp' && decided.length) {
+    const path = decided[0].path;
+    if (path.includes('evaluations') || path.includes('batch')) {
+      const assumed = path.startsWith('/access/v1/');
+      return `Two evaluations in one call to ${decided[0].entity}, on ${assumed ? 'the default batch path, assumed because nothing was read' : 'the batch endpoint it advertises'}.`;
+    }
+  }
+  const who = decided.length ? decided[0].entity : 'no PDP';
+  const how = fetched === 0 ? 'from cache' : chain ? `after validating a trust chain (${fetched} documents)` : `after reading ${fetched} metadata document${fetched === 1 ? '' : 's'}`;
+  if (rogue) return `Decided by the rogue PDP ${how}. The resource named its own judge and nothing overruled it.`;
+  return `Decided by ${who} ${how}.`;
+}
+
+async function control(op) {
+  const res = await fetch('/api/control', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op }),
+  });
+  showState(await res.json());
+  await run(new Event('submit'));
+}
+
+function showState(state) {
+  const evalPath = (state.pdp_evaluation_path || {})['pdp-a'] || '?';
+  const plain = ((state.resource_pdps || {})['plain'] || []).join(', ');
+  $('state').textContent = `pdp-a advertises ${evalPath} · plain names ${plain}`;
+  $('movePdp').setAttribute('aria-pressed', String(evalPath === '/decide-v2'));
+  $('repoint').setAttribute('aria-pressed', String(plain.endsWith(':9008')));
 }
 
 async function run(ev) {
@@ -212,7 +290,7 @@ async function run(ev) {
     });
     if (!res.ok) throw new Error(`console API returned ${res.status}`);
     const data = await res.json();
-    render(data.results);
+    render(data.results, data.action);
   } catch (err) {
     for (const col of document.querySelectorAll('.col')) {
       const chip = col.querySelector('.chip');
@@ -236,12 +314,19 @@ async function run(ev) {
     $('humanHint').textContent = item.blurb;
     describe();
   });
-  radios($('actions'), config.actions, 'action', 'balance', describe);
+  radios($('actions'), config.actions, 'action', 'balance', (item) => {
+    $('actionHint').textContent = item.note || '';
+    describe();
+  });
   $('resourceHint').textContent = config.resources.find((r) => r.key === 'impostor').blurb;
   $('humanHint').textContent = HUMANS.find((h) => h.key === 'mallory').blurb;
   skeleton();
   describe();
   $('form').addEventListener('submit', run);
+  $('movePdp').addEventListener('click', () => control('move_pdp'));
+  $('repoint').addEventListener('click', () => control('repoint_plain'));
+  $('reset').addEventListener('click', () => control('reset'));
+  showState(await (await fetch('/api/control')).json());
   run(new Event('submit'));
 })();
 </script>
