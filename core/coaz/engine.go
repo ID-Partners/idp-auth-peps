@@ -93,6 +93,38 @@ type CallOptions struct {
 	// Resource is the protected resource's identifier (RFC 8707), used to discover
 	// its PDP. "" means the static PDP.
 	Resource string
+	// AccessToken, when set, is forwarded to the PDP as context.access_token so the PDP
+	// can examine it itself. The caller decides whether the PDP connection is one a
+	// bearer token may travel over.
+	AccessToken string
+	// Method and Path are the endpoint actually hit, forwarded as context.request so
+	// the PDP can match a resource's declared requirements to it.
+	Method, Path string
+}
+
+// forwardedContext is what every PDP call carries beyond the mapped subject, action and
+// resource: the resource's declared posture as published (scopes, acr, sender-constraint
+// requirements — whatever it said), tagged with its source; the endpoint hit; and, when
+// the route allows, the raw token. The engine enforces none of it. Comparing a token's
+// scope or acr to what a resource requires is a policy decision, and policy is offloaded
+// to the PDP, where it can weigh them alongside things a PEP never sees. Keys the caller
+// already set win: explicit context is never overwritten.
+func forwardedContext(base map[string]any, ep discovery.PDPEndpoints, opts CallOptions) map[string]any {
+	out := make(map[string]any, len(base)+4)
+	if ep.Resource != nil {
+		out["resource_metadata"] = ep.Resource.Document
+		out["resource_metadata_source"] = ep.Resource.Source
+	}
+	if opts.Method != "" || opts.Path != "" {
+		out["request"] = map[string]any{"method": opts.Method, "path": opts.Path}
+	}
+	if opts.AccessToken != "" {
+		out["access_token"] = opts.AccessToken
+	}
+	for k, v := range base {
+		out[k] = v
+	}
+	return out
 }
 
 func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any, opts CallOptions) Verdict {
@@ -143,6 +175,17 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr))}
 	}
 
+	// The PDP is resolved before the request is built, because part of what it gets
+	// asked is what the resource's metadata said. Resolved once, so one decision cannot
+	// straddle a PDP that moved.
+	ep, err := e.resolver.Resolve(ctx, opts.Resource)
+	if err != nil {
+		return Verdict{CoazTool: true, Decision: false,
+			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
+			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
+	}
+	extraContext = forwardedContext(extraContext, ep, opts)
+
 	// Both dialects produce the same BuiltRequest; only how they get there differs.
 	var built *BuiltRequest
 	if dt.mappingV2 != nil {
@@ -156,7 +199,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
 	}
 
-	out, err := e.evaluate(ctx, opts.Resource, built)
+	out, err := e.evaluate(ctx, ep, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
@@ -223,15 +266,10 @@ type pdpOutcome struct {
 	IdentityDoctype string
 }
 
-// evaluate resolves the PDP for resource, POSTs the built request and folds the
-// decision(s): every decision must be true for a permit. The endpoints are resolved
-// once per request, so a PDP moving mid-flight cannot split one decision across two.
-func (e *Engine) evaluate(ctx context.Context, resource string, built *BuiltRequest) (pdpOutcome, error) {
+// evaluate POSTs the built request to the resolved PDP and folds the decision(s):
+// every decision must be true for a permit.
+func (e *Engine) evaluate(ctx context.Context, ep discovery.PDPEndpoints, built *BuiltRequest) (pdpOutcome, error) {
 	var out pdpOutcome
-	ep, err := e.resolver.Resolve(ctx, resource)
-	if err != nil {
-		return out, fmt.Errorf("PDP discovery: %w", err)
-	}
 	endpoint := ep.Evaluation
 	if built.Batch {
 		if ep.Evaluations == "" {
@@ -341,13 +379,19 @@ func (e *Engine) checkByDefaultMapping(
 			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
 	}
 
-	built, err := cm.Build(params, tokenClaims, extraContext)
+	ep, err := e.resolver.Resolve(ctx, opts.Resource)
+	if err != nil {
+		return Verdict{CoazTool: true, Decision: false,
+			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
+			JSONRPCError: jsonRPCError(id, CodePDPError, "Authorization service unavailable")}
+	}
+	built, err := cm.Build(params, tokenClaims, forwardedContext(extraContext, ep, opts))
 	if err != nil {
 		msg := fmt.Sprintf("COAZ mapping error: %v", err)
 		return Verdict{CoazTool: true, Decision: false, Reason: msg,
 			JSONRPCError: jsonRPCError(id, CodeMappingError, msg)}
 	}
-	out, err := e.evaluate(ctx, opts.Resource, built)
+	out, err := e.evaluate(ctx, ep, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),

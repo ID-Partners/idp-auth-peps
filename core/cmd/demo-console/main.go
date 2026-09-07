@@ -147,6 +147,12 @@ type runRequest struct {
 	Resource string `json:"resource"`
 	Human    string `json:"human"`
 	Action   string `json:"action"`
+	// ACR is how the human authenticated, as the token will claim it.
+	ACR string `json:"acr"`
+	// Scope is what the token carries.
+	Scope string `json:"scope"`
+	// ForwardToken sends the raw token to the PDP (the route's forward_access_token).
+	ForwardToken bool `json:"forward_token"`
 }
 
 type runResult struct {
@@ -197,7 +203,7 @@ func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		// Each PEP's run gets its own window on the stubs' event feed, so the trace
 		// shown under a column is only what that column caused.
 		before := s.seq(r.Context())
-		result := s.check(r.Context(), p, res, act, human)
+		result := s.check(r.Context(), p, res, act, human, req)
 		result.Events = s.eventsSince(r.Context(), before)
 		out = append(out, result)
 	}
@@ -205,7 +211,7 @@ func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
 }
 
 // The return value is named so the deferred timing lands in the value the caller gets.
-func (s *server) check(ctx context.Context, p pep, res resource, act action, human string) (out runResult) {
+func (s *server) check(ctx context.Context, p pep, res resource, act action, human string, in runRequest) (out runResult) {
 	out = runResult{PEP: p.Name, Mode: p.Mode}
 	started := time.Now()
 	defer func() { out.MS = float64(time.Since(started).Microseconds()) / 1000 }()
@@ -221,6 +227,11 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, hum
 	cfg := map[string]string{"pep_label": p.Name, "style": style, "require_token": "true"}
 	if res.ID != "" {
 		cfg["resource"] = res.ID
+	}
+	if in.ForwardToken {
+		// The route's own call, not the PEP's default: a bearer token only travels to
+		// a PDP over a connection the operator has decided is fit for it.
+		cfg["forward_access_token"] = "true"
 	}
 	body := ""
 	switch {
@@ -238,7 +249,7 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, hum
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"config": cfg, "method": act.Method, "path": act.Path,
-		"headers": map[string]string{"authorization": "Bearer " + mintToken(human), "content-type": "application/json"},
+		"headers": map[string]string{"authorization": "Bearer " + mintToken(human, in.ACR, in.Scope), "content-type": "application/json"},
 		"body":    body,
 	})
 
@@ -363,15 +374,21 @@ func (s *server) fetchEvents(ctx context.Context, since int64) (int64, []event) 
 // mintToken builds the unsigned delegation token the demo uses: an agent acting for a
 // human. The PEPs decode without verifying (no JWKS is configured) and warn about it at
 // startup — this demo is about discovery, not token validation.
-func mintToken(human string) string {
+func mintToken(human, acr, scope string) string {
 	seg := func(v any) string {
 		raw, _ := json.Marshal(v)
 		return base64.RawURLEncoding.EncodeToString(raw)
 	}
+	if acr == "" {
+		acr = "urn:idp:loa:password"
+	}
+	if scope == "" {
+		scope = "accounts:read payments:write"
+	}
 	header := seg(map[string]any{"alg": "none", "typ": "JWT"})
 	claims := seg(map[string]any{
 		"sub": human, "client_id": "agent-1", "act": map[string]any{"sub": "agent-1"},
-		"scope": "accounts:read payments:write",
+		"scope": scope, "acr": acr,
 	})
 	return header + "." + claims + "."
 }

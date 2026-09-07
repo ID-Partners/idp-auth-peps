@@ -277,6 +277,7 @@ function AuthzenPDP:access(conf)
             -- The engine runs its own PDP discovery (federation included); an
             -- explicit resource identifier is passed so both PEPs key off the same one.
             resource = (conf.resource and conf.resource ~= "") and conf.resource or nil,
+            forward_access_token = conf.forward_access_token and "true" or nil,
           },
           method = kong.request.get_method(),
           path = kong.request.get_path(),
@@ -383,6 +384,26 @@ function AuthzenPDP:access(conf)
   if not ep then
     kong.log.err("PDP discovery failed: ", derr.msg)
     return deny(pep, 503, "Authorization service could not be resolved; denying (fail-closed).")
+  end
+
+  -- 3c) What the PDP gets to reason with, beyond the mapped action and resource:
+  --   resource_metadata   the resource's declared posture (scopes, acr, sender-constraint
+  --                       requirements — whatever it published), verbatim, with its
+  --                       source so the PDP knows whether the federation vouched for it.
+  --   request             the endpoint actually hit, so the PDP can match requirements
+  --                       to endpoints itself.
+  --   access_token        the raw token, when the route allows it, so the PDP can verify
+  --                       and inspect it rather than trusting what this plugin decoded.
+  -- The plugin enforces none of these. Comparing a token's scope or acr to what a
+  -- resource requires is a policy decision, and policy is offloaded to the PDP, where it
+  -- can weigh them alongside things a gateway never sees.
+  if ep.resource then
+    ctx.resource_metadata = ep.resource.document
+    ctx.resource_metadata_source = ep.resource.source
+  end
+  ctx.request = { method = kong.request.get_method(), path = kong.request.get_path() }
+  if conf.forward_access_token and token then
+    ctx.access_token = token
   end
 
   local httpc = http.new()

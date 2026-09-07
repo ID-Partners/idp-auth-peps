@@ -80,6 +80,12 @@ config:
   pdp_metadata_ttl: 300
 ```
 
+Whatever document named the PDP is forwarded to it verbatim as `context.resource_metadata`
+(with `context.resource_metadata_source`), the endpoint hit as `context.request`, and the
+raw token as `context.access_token` when the route sets `forward_access_token`. The plugin
+enforces none of it: what a resource requires is the PDP's to match, next to everything
+else the PDP knows. See [docs/architecture.md](../../docs/architecture.md#what-the-pep-forwards-and-what-it-does-not-decide).
+
 The rules are the Go PEP's: the resource's echoed `resource` must be byte-identical
 (RFC 9728 §3.3), the PDP's `policy_decision_point` must equal the identifier it was
 fetched from, a PDP without metadata gets the spec's default paths, and metadata is

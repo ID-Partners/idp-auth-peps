@@ -13,6 +13,7 @@ import {
   type PdpEndpoints,
 } from '../src/discovery.js';
 import { authzenMiddleware, type PepRequest } from '../src/express.js';
+import type { ResourceMetadata } from '../src/discovery.js';
 import { McpGuard } from '../src/mcp.js';
 
 const STATIC = 'https://static.example';
@@ -226,6 +227,7 @@ describe('discovery: resource mode', () => {
     const ep = await d.resolve(RES);
     expect(ep).toMatchObject({ identifier: GOOD, evaluation: `${GOOD}/custom/eval`, source: 'rfc9728' });
     expect(ep.apiKey).toBeUndefined();
+    expect(ep.resource).toMatchObject({ source: 'rfc9728', document: { resource: RES, ignored: true } });
     expect(count(STATIC)).toBe(0);
     await d.resolve(RES);
     expect(count(RES)).toBe(1);
@@ -236,7 +238,9 @@ describe('discovery: resource mode', () => {
 
   it('uses the static PDP for an empty resource, and keeps its key', async () => {
     const { d, count } = disco(routes());
-    expect(await d.resolve()).toMatchObject({ identifier: STATIC, apiKey: 'static-key', source: 'static' });
+    const ep = await d.resolve();
+    expect(ep).toMatchObject({ identifier: STATIC, apiKey: 'static-key', source: 'static' });
+    expect(ep.resource).toBeUndefined();
     expect(count(RES)).toBe(0);
   });
 
@@ -394,25 +398,31 @@ describe('discovery: resource mode', () => {
   });
 
   it('accepts custom sources', async () => {
-    const src: MetadataSource = { name: 'fake', pdps: async () => [GOOD] };
+    const meta = (pdps: string[]): ResourceMetadata => ({ source: 'fake', document: { from: 'fake' }, pdps });
+    const src: MetadataSource = { name: 'fake', lookup: async () => meta([GOOD]) };
     const { d } = disco(routes(), { sources: [src] });
     expect(d.status().sources).toEqual(['fake']);
-    expect((await d.resolve(RES)).identifier).toBe(GOOD);
+    const viaFake = await d.resolve(RES);
+    expect(viaFake.identifier).toBe(GOOD);
+    expect(viaFake.resource).toMatchObject({ source: 'fake', document: { from: 'fake' } });
 
-    const boom: MetadataSource = { name: 'boom', pdps: async () => { throw new Error('boom'); } };
+    const boom: MetadataSource = { name: 'boom', lookup: async () => { throw new Error('boom'); } };
     const { d: transient } = disco(routes(), { sources: [boom] });
     expect((await transient.resolve(RES)).identifier).toBe(STATIC);
     expect(transient.status().resources[RES]).toMatchObject({ cached: false });
 
-    const empty: MetadataSource = { name: 'empty', pdps: async () => [] };
+    const empty: MetadataSource = { name: 'empty', lookup: async () => meta([]) };
     const { d: viaEmpty } = disco(routes(), { sources: [empty] });
     expect((await viaEmpty.resolve(RES)).identifier).toBe(STATIC);
     expect(viaEmpty.status().resources[RES]).toMatchObject({ cached: true });
   });
 
   it('exposes the RFC 9728 source on its own', async () => {
-    const src = new Rfc9728Source(async () => ({ resource: RES, [PARAM_POLICY_DECISION_POINTS]: [GOOD] }));
-    expect(await src.pdps(RES)).toEqual([GOOD]);
+    const src = new Rfc9728Source(async () => ({ resource: RES, [PARAM_POLICY_DECISION_POINTS]: [GOOD], scopes_supported: ['accounts:read'] }));
+    const found = await src.lookup(RES);
+    expect(found.pdps).toEqual([GOOD]);
+    expect(found.source).toBe('rfc9728');
+    expect(found.document['scopes_supported']).toEqual(['accounts:read']);
     expect(src.name).toBe('rfc9728');
   });
 });
@@ -437,6 +447,66 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(hits.find((h) => h.url === `${STATIC}/access/v1/evaluation`)?.headers['authorization']).toBe('Bearer k');
     expect((await client.evaluateAll({ evaluations: [req] }, { resource: RES })).allow).toBe(true);
     expect(hits.some((h) => h.url === `${GOOD}/custom/evals`)).toBe(true);
+  });
+
+  it('forwards the resource document, the endpoint and (only when asked) the token', async () => {
+    const seen: unknown[] = [];
+    const r = router({
+      ...routes(),
+      [`${GOOD}/custom/eval`]: (_u: string, init?: RequestInit) => { seen.push(JSON.parse(String(init?.body))); return new Response('{"decision":true}', { status: 200 }); },
+      [`${STATIC}/access/v1/evaluation`]: (_u: string, init?: RequestInit) => { seen.push(JSON.parse(String(init?.body))); return new Response('{"decision":true}', { status: 200 }); },
+    });
+    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch, discovery: { mode: 'resource', ...quiet } });
+    await client.evaluate({ ...req, context: { mine: 1 } }, { resource: RES, accessToken: 'tok', request: { method: 'GET', path: '/x' } });
+    const sent = seen[0] as { context: Record<string, unknown> };
+    expect(sent.context).toMatchObject({
+      mine: 1,
+      resource_metadata: { resource: RES, [PARAM_POLICY_DECISION_POINTS]: [GOOD] },
+      resource_metadata_source: 'rfc9728',
+      request: { method: 'GET', path: '/x' },
+      access_token: 'tok',
+    });
+    // No resource: nothing read, nothing forwarded but what the caller passed.
+    await client.evaluate(req, { request: { method: 'GET', path: '/y' } });
+    const plain = seen[1] as { context: Record<string, unknown> };
+    expect(plain.context).toEqual({ request: { method: 'GET', path: '/y' } });
+    // A caller's own context key is never overwritten.
+    await client.evaluate({ ...req, context: { request: 'mine' } }, { request: { method: 'GET', path: '/z' } });
+    expect((seen[2] as { context: Record<string, unknown> }).context['request']).toBe('mine');
+  });
+
+  it('the middleware forwards the endpoint, and the token only when told to', async () => {
+    const seen: unknown[] = [];
+    const r = router({ [`${STATIC}/access/v1/evaluation`]: (_u: string, init?: RequestInit) => { seen.push(JSON.parse(String(init?.body))); return new Response('{"decision":true}', { status: 200 }); } });
+    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch });
+    const token = jwt({ sub: 'u1' });
+    const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
+    const r1: PepRequest = { method: 'GET', path: '/accounts/1', headers: { authorization: `Bearer ${token}` } };
+    await authzenMiddleware({ client, map: () => req })(r1, res, vi.fn());
+    expect((seen[0] as { context: Record<string, unknown> }).context).toEqual({ request: { method: 'GET', path: '/accounts/1' } });
+    await authzenMiddleware({ client, map: () => req, forwardAccessToken: true })(r1, res, vi.fn());
+    expect((seen[1] as { context: Record<string, unknown> }).context['access_token']).toBe(token);
+  });
+
+  it('the guard forwards the token only when told to, and tells the delegate', async () => {
+    const seen: unknown[] = [];
+    const r = router({ [`${STATIC}/access/v1/evaluation`]: (_u: string, init?: RequestInit) => { seen.push(JSON.parse(String(init?.body))); return new Response('{"decision":true}', { status: 200 }); } });
+    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch });
+    const tools = [{ name: 't', inputSchema: { 'x-authzen-mapping': { evaluation: { subject: { type: 'user', id: '$token.sub' }, action: { name: 't' }, resource: { type: 'x', id: '1' } } } } }];
+    const rpc = { jsonrpc: '2.0' as const, id: 1, method: 'tools/call', params: { name: 't', arguments: {} } };
+    await new McpGuard({ client, tools }).checkToolCall({ rpc, claims: { sub: 'u1' }, accessToken: 'tok' });
+    expect((seen[0] as { context?: Record<string, unknown> }).context?.['access_token']).toBeUndefined();
+    await new McpGuard({ client, tools, forwardAccessToken: true }).checkToolCall({ rpc, claims: { sub: 'u1' }, accessToken: 'tok' });
+    expect((seen[1] as { context: Record<string, unknown> }).context['access_token']).toBe('tok');
+    // The default-mapping path carries it too.
+    await new McpGuard({ client, tools, forwardAccessToken: true, applyDefaultMappings: true }).checkToolCall({ rpc: { ...rpc, method: 'resources/list', params: {} }, claims: { sub: 'u1', aud: 'https://m' }, accessToken: 'tok2' });
+    expect((seen[2] as { context: Record<string, unknown> }).context['access_token']).toBe('tok2');
+
+    const delegated = router({ 'http://coaz-pep:9192/v1/mcp/check': { decision: true } });
+    await new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192' }, forwardAccessToken: true, fetch: delegated.fetch })
+      .checkToolCall({ rpc, claims: { sub: 'u1' }, raw: { headers: {}, body: '{}' } });
+    const sent = JSON.parse(String((delegated.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls[0]?.[1]?.body)) as { config: Record<string, string> };
+    expect(sent.config.forward_access_token).toBe('true');
   });
 
   it('without discovery the client is byte-for-byte static', async () => {

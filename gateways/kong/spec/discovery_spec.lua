@@ -229,6 +229,10 @@ describe('discovery: resource mode', function()
     assert.equal(GOOD .. '/custom/eval', ep.evaluation)
     assert.is_nil(ep.api_key)
     assert.equal('rfc9728', ep.source)
+    -- The whole document rides along, verbatim, tagged with where it came from.
+    assert.equal('rfc9728', ep.resource.source)
+    assert.equal(RES, ep.resource.document.resource)
+    assert.is_true(ep.resource.document.ignored)
     assert.equal(0, count(hits, STATIC))
     D.resolve(conf(), RES)
     assert.equal(1, count(hits, RES), 'resource metadata is cached')
@@ -241,6 +245,7 @@ describe('discovery: resource mode', function()
     local ep = D.resolve(conf(), '')
     assert.equal(STATIC, ep.identifier)
     assert.equal('static-key', ep.api_key)
+    assert.is_nil(ep.resource, 'nothing was read, so nothing is forwarded')
     assert.equal(0, count(hits, RES))
   end)
 
@@ -260,6 +265,7 @@ describe('discovery: resource mode', function()
       local ep = D.resolve(conf(), RES)
       assert.equal(STATIC, ep.identifier, name)
       assert.equal('static-key', ep.api_key, name)
+      assert.is_nil(ep.resource, name .. ': falling to static forwards no document')
     end
     -- An identifier that cannot have metadata at all.
     local D = load({ pdp = router(routes()) })
@@ -410,6 +416,36 @@ describe('discovery: through access()', function()
     assert.is_nil(eval.headers['Authorization'])
     assert.equal(0, count(hits, STATIC))
     assert.equal('alice', state.upstream_headers['X-Auth-Principal'])
+  end)
+
+  it('forwards the resource document, the endpoint and (only when told) the token', function()
+    local fn = router({
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD }, scopes_supported = { 'accounts:read' } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [GOOD .. '/custom/eval'] = { decision = true },
+    })
+    local state = drive({ pdp_discovery = 'resource', resource = RES }, fn)
+    assert.is_nil(state.exited)
+    local sent = mock.json_decode(state.pdp_requests[#state.pdp_requests].body)
+    assert.equal('rfc9728', sent.context.resource_metadata_source)
+    assert.same({ 'accounts:read' }, sent.context.resource_metadata.scopes_supported)
+    assert.equal(RES, sent.context.resource_metadata.resource)
+    assert.same({ method = 'GET', path = '/accounts/a1/balance' }, sent.context.request)
+    assert.is_nil(sent.context.access_token, 'the raw token is not forwarded unless the route says so')
+
+    local fn2 = router({ [STATIC .. '/access/v1/evaluation'] = { decision = true } })
+    local state2 = drive({ forward_access_token = true }, fn2)
+    local sent2 = mock.json_decode(state2.pdp_requests[#state2.pdp_requests].body)
+    assert.is_string(sent2.context.access_token)
+    assert.is_nil(sent2.context.resource_metadata, 'static mode read no document')
+  end)
+
+  it('tells the COAZ engine to forward the token when the route says so', function()
+    local fn = router({ ['http://coaz-pep:9192/v1/mcp/check'] = { decision = true, upstream_headers = {} } })
+    local state = drive({ style = 'mcp', coaz_url = 'http://coaz-pep:9192', mcp_upstream_url = 'http://mcp:8090/mcp', forward_access_token = true }, fn,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{}}}', 'POST', '/mcp')
+    assert.is_nil(state.exited)
+    assert.equal('true', mock.json_decode(state.pdp_requests[1].body).config.forward_access_token)
   end)
 
   it('a REST route without a resource keeps the static PDP and its key', function()

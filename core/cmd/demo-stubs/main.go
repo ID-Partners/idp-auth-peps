@@ -28,6 +28,15 @@
 // mapping is a boxcar — two evaluations in one call. That is what exercises a PDP's
 // advertised batch endpoint, and what fails closed against a PDP with none.
 //
+// Every resource also publishes what it REQUIRES — the scopes it uses and the acr it
+// expects — as ordinary members of its metadata. No PEP here reads them. They travel
+// to the PDP verbatim as context.resource_metadata, alongside the endpoint that was
+// hit and (when the route allows) the raw token, and the PDP does the matching. That
+// is the design choice the demo exists to show: what a resource requires is policy
+// input, and policy is the PDP's, where it can be weighed against things a gateway
+// never sees. In federation mode the document is the RESOLVED one, so the anchor can
+// raise a member's floor and the member cannot lower it.
+//
 // Every endpoint here is AuthZEN's own: `/access/v1/evaluation` and
 // `/access/v1/evaluations`. Nothing invents a path. What differs between PDPs is the
 // BASE those endpoints hang off — a PDP identifier may carry a path, and a multi-tenant
@@ -152,6 +161,8 @@ type state struct {
 	pdpEval map[string]string
 	// resourcePDPs maps a resource's name to the PDP identifiers its metadata names.
 	resourcePDPs map[string][]string
+	// requires maps a resource's name to what its OWN metadata says it requires.
+	requires map[string]requirements
 	// home is each PDP's identifier path — where its endpoints sit unless moved. The
 	// console compares against it to say whether a call went to the advertised
 	// endpoint or to the one a PEP would have assumed.
@@ -165,6 +176,20 @@ func (s *state) eval(pdp string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pdpEval[pdp]
+}
+
+// requirements is what a resource declares about itself. scopes_supported is RFC 9728's
+// own member; acr_values_required has no standard home yet, so it is published under
+// that name as an example — the PEPs neither know nor care, which is the point.
+type requirements struct {
+	Scopes []string
+	ACR    []string
+}
+
+func (s *state) requirementsOf(resource string) requirements {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requires[resource]
 }
 
 func (s *state) pdps(resource string) []string {
@@ -207,10 +232,26 @@ func main() {
 	// The key the anchor vouches for `broken` is not the one it signs with.
 	brokenAsserted := newEntity("broken-asserted", base+6, host)
 
+	const (
+		acrPassword = "urn:idp:loa:password"
+		acrMFA      = "urn:idp:loa:mfa"
+	)
+	allScopes := []string{"accounts:read", "payments:write"}
 	st := &state{
-		home:         map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
-		pdpEval:      map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
-		resourcePDPs: map[string][]string{plain.name: {pdpA.id}, impostor.name: {rogue.id}, bankB.name: {pdpB.id}, member.name: {rogue.id, pdpA.id}, broken.name: {rogue.id}},
+		home:    map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
+		pdpEval: map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
+		// The member's OWN document names Bank A's PDP and says a password is enough.
+		// Its entity configuration (below) names the rogue PDP first. The anchor's
+		// policy strips the rogue AND raises the acr floor to MFA — so the same PDP
+		// gives different answers depending on which document the PEP forwarded.
+		resourcePDPs: map[string][]string{plain.name: {pdpA.id}, impostor.name: {rogue.id}, bankB.name: {pdpB.id}, member.name: {pdpA.id}, broken.name: {rogue.id}},
+		requires: map[string]requirements{
+			plain.name:    {Scopes: allScopes, ACR: []string{acrPassword}},
+			bankB.name:    {Scopes: allScopes, ACR: []string{acrMFA}},
+			impostor.name: {Scopes: allScopes, ACR: []string{acrPassword}},
+			member.name:   {Scopes: allScopes, ACR: []string{acrPassword}},
+			broken.name:   {Scopes: allScopes, ACR: []string{acrPassword}},
+		},
 	}
 	st.defEval = map[string]string{}
 	for k, v := range st.pdpEval {
@@ -251,8 +292,13 @@ func main() {
 				"metadata": map[string]any{"federation_entity": map[string]any{"organization_name": "Demo Federation", "federation_fetch_endpoint": anchor.id + "/fetch"}},
 			}))
 		})
-		// The federation's constraint on every member: only Bank A's PDP may decide.
-		policy := map[string]any{"oauth_resource": map[string]any{param: map[string]any{"subset_of": []any{pdpA.id}, "essential": true}}}
+		// The federation's constraints on every member: only Bank A's PDP may decide,
+		// and nothing less than MFA is acceptable — whatever the member says about
+		// itself. `value` overrides; the member's own acr_values_required is discarded.
+		policy := map[string]any{"oauth_resource": map[string]any{
+			param:                 map[string]any{"subset_of": []any{pdpA.id}, "essential": true},
+			"acr_values_required": map[string]any{"value": []any{acrMFA}, "essential": true},
+		}}
 		mux.HandleFunc("/fetch", func(w http.ResponseWriter, r *http.Request) {
 			sub := r.URL.Query().Get("sub")
 			iat, exp := times()
@@ -277,42 +323,56 @@ func main() {
 	// ---- resources ----------------------------------------------------------------
 	// Federated ones publish an Entity Configuration as well as their own RFC 9728
 	// document; the two deliberately disagree.
-	resource := func(e *entity, federated bool, hasMetadata bool) {
+	// document is a resource's metadata: identity, who decides for it, and what it
+	// requires. The same members go in its RFC 9728 document and in the oauth_resource
+	// block of its entity configuration; only who vouches for them differs.
+	document := func(e *entity, pdps []string) map[string]any {
+		req := st.requirementsOf(e.name)
+		doc := map[string]any{"resource": e.id, param: pdps, "bearer_methods_supported": []string{"header"}}
+		if req.Scopes != nil {
+			doc["scopes_supported"] = req.Scopes // RFC 9728 §2
+		}
+		if req.ACR != nil {
+			doc["acr_values_required"] = req.ACR // no standard home; an example name
+		}
+		return doc
+	}
+	resource := func(e *entity, federated bool, hasMetadata bool, federationPDPs []string) {
 		mux := http.NewServeMux()
 		if federated {
 			mux.HandleFunc("/.well-known/openid-federation", func(w http.ResponseWriter, _ *http.Request) {
 				iat, exp := times()
-				pdps := make([]any, 0)
-				for _, p := range st.pdps(e.name) {
-					pdps = append(pdps, p)
-				}
 				writeStatement(w, e.sign(map[string]any{
 					"iss": e.id, "sub": e.id, "iat": iat, "exp": exp,
 					"jwks":            map[string]any{"keys": []any{e.jwk}},
-					"metadata":        map[string]any{"oauth_resource": map[string]any{"resource": e.id, param: pdps}},
+					"metadata":        map[string]any{"oauth_resource": document(e, federationPDPs)},
 					"authority_hints": []any{anchor.id},
 				}))
 			})
 		}
 		if hasMetadata {
 			mux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, _ *http.Request) {
-				writeJSON(w, map[string]any{"resource": e.id, param: st.pdps(e.name)})
+				writeJSON(w, document(e, st.pdps(e.name)))
 			})
 		}
 		mux.HandleFunc("/mcp", mcpUpstream(e))
 		mux.HandleFunc("/", upstreamAPI(e))
 		serve(e, mux)
 	}
-	resource(member, true, true)
-	resource(broken, true, true)
-	resource(plain, false, true)
-	resource(impostor, false, true)
-	resource(bankB, false, true)
-	resource(stray, false, false)
+	resource(member, true, true, []string{rogue.id, pdpA.id})
+	resource(broken, true, true, []string{rogue.id})
+	resource(plain, false, true, nil)
+	resource(impostor, false, true, nil)
+	resource(bankB, false, true, nil)
+	resource(stray, false, false, nil)
 
 	// ---- PDPs ----------------------------------------------------------------------
 	// Bank A and Bank B run the same product with different thresholds — the ordinary
 	// reason two resources in one estate answer to two PDPs.
+	// customerPolicy is the whole of a bank's "policy", and the part that matters for
+	// this demo is what it reads from context: the resource's declared requirements,
+	// the endpoint hit, and the token — none of which the PEP judged. A real PDP would
+	// weigh these alongside risk, consent history and velocity; the shape is the same.
 	customerPolicy := func(stepUpOver float64) func(authzenRequest) map[string]any {
 		return func(req authzenRequest) map[string]any {
 			who := fmt.Sprintf("%v", req.Subject.Properties["on_behalf_of"])
@@ -322,6 +382,33 @@ func main() {
 			if strings.HasPrefix(strings.ToLower(who), "mallory") {
 				return deny(fmt.Sprintf("%s is not a customer of this bank", who))
 			}
+
+			// What the resource said it requires, as forwarded. Absent means the PEP
+			// resolved the PDP without reading a document (static mode), and this
+			// policy has nothing to hold the token to beyond its own rules.
+			meta, _ := req.Context["resource_metadata"].(map[string]any)
+			source, _ := req.Context["resource_metadata_source"].(string)
+			tok := examineToken(req.Context["access_token"])
+			scope := tok.scope
+			if scope == "" {
+				scope, _ = req.Subject.Properties["scope"].(string) // what the PEP decoded, second best
+			}
+
+			if required := stringsOf(meta["acr_values_required"]); len(required) > 0 {
+				switch {
+				case tok.raw == "":
+					return deny(fmt.Sprintf("this resource requires acr %v (per its %s metadata) and no token was forwarded for me to examine", required, source))
+				case !contains(required, tok.acr):
+					return deny(fmt.Sprintf("this resource requires acr %v (per its %s metadata); the token was authenticated at %q", required, source, tok.acr))
+				}
+			}
+			if supported := stringsOf(meta["scopes_supported"]); len(supported) > 0 {
+				if need := scopeFor(req.Action.Name); need != "" && contains(supported, need) && !hasScope(scope, need) {
+					return map[string]any{"decision": false, "context": map[string]any{
+						"reason":           fmt.Sprintf("%s needs scope %s here (the resource's %s metadata lists it) and the token carries %q", req.Action.Name, need, source, scope),
+						"step_up_required": true, "step_up_scope": need}}
+				}
+			}
 			if req.Action.Name == "make_payment" {
 				if amt, ok := req.Context["amount"].(float64); ok && amt > stepUpOver {
 					return map[string]any{"decision": false, "context": map[string]any{
@@ -329,7 +416,11 @@ func main() {
 						"step_up_required": true, "step_up_scope": "payments:approve"}}
 				}
 			}
-			return map[string]any{"decision": true, "context": map[string]any{"reason": fmt.Sprintf("%s may %s", who, req.Action.Name)}}
+			examined := ""
+			if tok.raw != "" {
+				examined = fmt.Sprintf(" (examined the token: client %s, acr %s)", tok.clientID, tok.acr)
+			}
+			return map[string]any{"decision": true, "context": map[string]any{"reason": fmt.Sprintf("%s may %s%s", who, req.Action.Name, examined)}}
 		}
 	}
 	pdp(pdpA, rec, st, true, serve, customerPolicy(1000))
@@ -399,6 +490,63 @@ func main() {
 	wg.Wait()
 }
 
+// examinedToken is what a PDP reads off a forwarded token for itself. The demo token
+// is unsigned, so this only decodes; a real PDP would verify the signature and the
+// sender-constraint binding here, and could introspect or risk-score the client.
+type examinedToken struct {
+	raw, acr, scope, clientID string
+}
+
+func examineToken(v any) examinedToken {
+	raw, _ := v.(string)
+	out := examinedToken{raw: raw}
+	if raw == "" {
+		return out
+	}
+	claims := jose.Claims(raw)
+	out.acr, _ = claims["acr"].(string)
+	out.scope, _ = claims["scope"].(string)
+	out.clientID, _ = claims["client_id"].(string)
+	return out
+}
+
+func stringsOf(v any) []string {
+	list, _ := v.([]any)
+	out := make([]string, 0, len(list))
+	for _, x := range list {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func hasScope(scope, need string) bool {
+	return contains(strings.Fields(scope), need)
+}
+
+// scopeFor is this bank's view of which scope an action needs. It is the PDP's mapping,
+// not the resource's and not the PEP's: the resource said which scopes exist, the PEP
+// said which action was attempted, and the policy joins the two.
+func scopeFor(action string) string {
+	switch action {
+	case "get_balance", "list_accounts":
+		return "accounts:read"
+	case "make_payment", "debit", "credit", "open_account":
+		return "payments:write"
+	}
+	return ""
+}
+
 func deny(reason string) map[string]any {
 	return map[string]any{"decision": false, "context": map[string]any{"reason": reason}}
 }
@@ -447,6 +595,7 @@ func pdp(e *entity, rec *recorder, st *state, batching bool, serve func(*entity,
 		reason, _ := out["context"].(map[string]any)["reason"].(string)
 		rec.add(e.name, "decision", fmt.Sprintf("%s for %v", req.Action.Name, valueOr(req.Subject.Properties["on_behalf_of"], req.Subject.ID)), "verdict",
 			fmt.Sprintf("%v — %s", out["decision"], reason))
+		rec.add(e.name, "context", describeContext(req.Context), "input", "")
 		writeJSON(w, out)
 	}
 	batch := func(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +627,33 @@ func pdp(e *entity, rec *recorder, st *state, batching bool, serve func(*entity,
 		}
 	}
 	serve(e, mux)
+}
+
+// describeContext is one line on what the PDP was given to reason with, for the trace.
+func describeContext(c map[string]any) string {
+	parts := []string{}
+	if meta, ok := c["resource_metadata"].(map[string]any); ok {
+		src, _ := c["resource_metadata_source"].(string)
+		req := []string{}
+		if acr := stringsOf(meta["acr_values_required"]); len(acr) > 0 {
+			req = append(req, "acr "+strings.Join(acr, "|"))
+		}
+		if sc := stringsOf(meta["scopes_supported"]); len(sc) > 0 {
+			req = append(req, "scopes "+strings.Join(sc, " "))
+		}
+		parts = append(parts, fmt.Sprintf("resource (%s) requires %s", src, strings.Join(req, ", ")))
+	} else {
+		parts = append(parts, "no resource metadata forwarded")
+	}
+	if r, ok := c["request"].(map[string]any); ok {
+		parts = append(parts, fmt.Sprintf("endpoint %v %v", r["method"], r["path"]))
+	}
+	if tok := examineToken(c["access_token"]); tok.raw != "" {
+		parts = append(parts, fmt.Sprintf("token acr=%s scope=%q", tok.acr, tok.scope))
+	} else {
+		parts = append(parts, "no token forwarded")
+	}
+	return strings.Join(parts, " · ")
 }
 
 func valueOr(v any, fallback string) string {

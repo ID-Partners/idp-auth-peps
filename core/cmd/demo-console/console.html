@@ -72,6 +72,8 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 .trace .metadata .ent{color:var(--muted)}
 .trace .decision .ent,.trace .verdictline .ent{color:var(--permit)}
 .trace li.rogue .ent{color:var(--alarm)}
+.trace .input .ent{color:var(--muted)}
+.trace .input .p{color:var(--ink)}
 .trace .p{color:var(--muted);overflow-wrap:anywhere}
 .trace .none{font-family:var(--sans);font-size:.85rem;color:var(--muted)}
 .levers{border:1px solid var(--rule);background:var(--sunk);padding:14px 16px;margin:0 0 20px;display:grid;gap:10px}
@@ -101,6 +103,9 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
   <form id="form">
     <fieldset><legend>Protected resource</legend><div class="opts" id="resources"></div><p class="hint" id="resourceHint"></p></fieldset>
     <fieldset><legend>Acting for</legend><div class="opts" id="humans"></div><p class="hint" id="humanHint"></p></fieldset>
+    <fieldset><legend>The token says they authenticated with</legend><div class="opts" id="acrs"></div><p class="hint" id="acrHint"></p></fieldset>
+    <fieldset><legend>The token carries scopes</legend><div class="opts" id="scopes"></div><p class="hint" id="scopeHint"></p></fieldset>
+    <fieldset><legend>Forward the raw token to the PDP</legend><div class="opts" id="forwards"></div><p class="hint" id="forwardHint"></p></fieldset>
     <fieldset><legend>Request</legend><div class="opts" id="actions"></div><p class="hint" id="actionHint"></p></fieldset>
     <div class="runbar">
       <button class="run" type="submit" id="run">Run all three</button>
@@ -124,6 +129,7 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
     <div><b>The columns are the argument.</b> Same request, same policy, three ways of deciding who decides.</div>
     <div>Grey trace lines are metadata fetches the PEP made. Green is the PDP that decided. Orange is the rogue PDP being consulted at all.</div>
     <div><b>Every endpoint here is AuthZEN's own name</b> — <code>/access/v1/evaluation</code> and <code>/access/v1/evaluations</code>. Nothing invents a path. What differs is the <b>base</b> they hang off: a PDP identifier may carry one, and <code>/tenants/bank-a</code> is what a multi-tenant deployment looks like.</div>
+    <div><b>The PEP judged none of it.</b> Each resource publishes what it requires — <code>scopes_supported</code> (RFC 9728) and an example <code>acr_values_required</code> — and the PEP forwards that document verbatim, with the endpoint hit and (when the route allows) the raw token. The <em>was given</em> line is what the PDP had to work with. Matching a token to a requirement is the PDP's decision, next to everything else it knows; a gateway comparing strings would be policy in two places, and the dumber one would win.</div>
     <div><b>So the badge is about the base.</b> A PEP that read no metadata posts under the PDP's own identifier path. Relocate the PDP and only the PEPs that read metadata follow — which is the whole argument, and it is invisible until something moves.</div>
     <div>Metadata caches are set to a short TTL here so the trace stays visible on every run; the shipped default is five minutes.</div>
   </div>
@@ -134,6 +140,18 @@ const $ = (id) => document.getElementById(id);
 const HUMANS = [
   { key: 'alice', name: 'alice', blurb: 'A customer of the bank. The good PDP permits her.' },
   { key: 'mallory', name: 'mallory', blurb: 'Not a customer. The good PDP denies her; the rogue PDP does not.' },
+];
+const ACRS = [
+  { key: 'urn:idp:loa:password', name: 'password', blurb: 'Enough for plain and impostor. Not for bank-b, and not for member once the federation has had its say.' },
+  { key: 'urn:idp:loa:mfa', name: 'MFA', blurb: 'Satisfies every resource here.' },
+];
+const SCOPES = [
+  { key: 'accounts:read payments:write', name: 'read + payments', blurb: 'Everything the resources list in scopes_supported.' },
+  { key: 'accounts:read', name: 'read only', blurb: 'A payment will come back as a step-up for payments:write — decided by the PDP, from what the resource published.' },
+];
+const FORWARDS = [
+  { key: 'yes', name: 'yes', blurb: 'The route sets forward_access_token. The PDP examines the token itself: its acr, its scope, its client.' },
+  { key: 'no', name: 'no', blurb: 'The PDP gets only what the PEP decoded. Watch a resource that requires an acr: the PDP cannot check it and says so.' },
 ];
 let config = null;
 
@@ -163,7 +181,9 @@ function selected(name) {
 function describe() {
   const res = config.resources.find((r) => r.key === selected('resource'));
   const act = config.actions.find((a) => a.key === selected('action'));
-  $('what').innerHTML = `<b>${selected('human')}</b>’s agent asks to <b>${act.name}</b> on <b>${res.name}</b>.`;
+  const acr = ACRS.find((a) => a.key === selected('acr'));
+  const sc = SCOPES.find((s) => s.key === selected('scope'));
+  $('what').innerHTML = `<b>${selected('human')}</b>’s agent asks to <b>${act.name}</b> on <b>${res.name}</b>, with a <b>${acr.name}</b> token carrying <b>${sc.name}</b>.`;
 }
 
 function skeleton() {
@@ -217,7 +237,7 @@ function render(results, action) {
       ent.textContent = e.entity;
       const p = document.createElement('span');
       p.className = 'p';
-      p.textContent = e.kind === 'verdict' ? `${e.path} → ${e.note}` : `${e.method} ${e.path}`;
+      p.textContent = e.kind === 'verdict' ? `${e.path} → ${e.note}` : e.kind === 'input' ? `was given: ${e.path}` : `${e.method} ${e.path}`;
       li.append(ent, p);
       // Every endpoint here is AuthZEN's own name. What tells you whether a PEP read
       // the metadata is the BASE it posted under: the PDP's own identifier path is
@@ -295,7 +315,10 @@ async function run(ev) {
     const res = await fetch('/api/run', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ resource: selected('resource'), human: selected('human'), action: selected('action') }),
+      body: JSON.stringify({
+        resource: selected('resource'), human: selected('human'), action: selected('action'),
+        acr: selected('acr'), scope: selected('scope'), forward_token: selected('forward') === 'yes',
+      }),
     });
     if (!res.ok) throw new Error(`console API returned ${res.status}`);
     const data = await res.json();
@@ -327,6 +350,12 @@ async function run(ev) {
     $('actionHint').textContent = item.note || '';
     describe();
   });
+  radios($('acrs'), ACRS, 'acr', 'urn:idp:loa:password', (item) => { $('acrHint').textContent = item.blurb; describe(); });
+  radios($('scopes'), SCOPES, 'scope', 'accounts:read payments:write', (item) => { $('scopeHint').textContent = item.blurb; describe(); });
+  radios($('forwards'), FORWARDS, 'forward', 'yes', (item) => { $('forwardHint').textContent = item.blurb; });
+  $('acrHint').textContent = ACRS[0].blurb;
+  $('scopeHint').textContent = SCOPES[0].blurb;
+  $('forwardHint').textContent = FORWARDS[0].blurb;
   $('resourceHint').textContent = config.resources.find((r) => r.key === 'impostor').blurb;
   $('humanHint').textContent = HUMANS.find((h) => h.key === 'mallory').blurb;
   skeleton();

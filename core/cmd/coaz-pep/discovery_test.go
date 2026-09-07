@@ -24,8 +24,9 @@ import (
 // A PDP stub that serves an authzen-configuration and records evaluation paths.
 type discoPDP struct {
 	*httptest.Server
-	paths []string
-	hits  int32
+	paths  []string
+	bodies []map[string]any
+	hits   int32
 }
 
 func newDiscoPDP(t *testing.T, withConfig bool) *discoPDP {
@@ -45,6 +46,9 @@ func newDiscoPDP(t *testing.T, withConfig bool) *discoPDP {
 			return
 		}
 		p.paths = append(p.paths, r.URL.Path)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		p.bodies = append(p.bodies, body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"decision":true}`))
 	}))
@@ -59,7 +63,10 @@ func newDiscoResource(t *testing.T, pdp string, asMCP bool) *httptest.Server {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/.well-known/oauth-protected-resource" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"resource": srv.URL, discovery.ParamPolicyDecisionPoints: []string{pdp}})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"resource": srv.URL, discovery.ParamPolicyDecisionPoints: []string{pdp},
+				"scopes_supported": []string{"accounts:read"}, "acr_values_required": []string{"urn:demo:mfa"},
+			})
 			return
 		}
 		if asMCP {
@@ -90,6 +97,69 @@ type errResolver struct{ err error }
 
 func (e errResolver) Resolve(context.Context, string) (discovery.PDPEndpoints, error) {
 	return discovery.PDPEndpoints{}, e.err
+}
+
+func TestCheckForwardsTheResourceDocumentEndpointAndToken(t *testing.T) {
+	static := newDiscoPDP(t, false)
+	discovered := newDiscoPDP(t, true)
+	resource := newDiscoResource(t, discovered.URL, false)
+	s := newServer(t, static.URL)
+	s.resolver = resourceChain(t, static.URL, discovery.ModeResource)
+	tok := mintUnsigned(map[string]any{"sub": "alice"})
+	headers := map[string]string{"authorization": "Bearer " + tok}
+
+	// REST, without the token knob: document + endpoint, no token.
+	resp := s.check(context.Background(), restConf(map[string]string{"resource": resource.URL}), "GET", "/accounts/a1/balance", headers, "")
+	if resp.GetDeniedResponse() != nil {
+		t.Fatalf("should permit: %s", resp.GetDeniedResponse().GetBody())
+	}
+	ctxOf := func(b map[string]any) map[string]any { c, _ := b["context"].(map[string]any); return c }
+	c := ctxOf(discovered.bodies[0])
+	if c["resource_metadata_source"] != "rfc9728" {
+		t.Fatalf("source: %v", c)
+	}
+	if doc, _ := c["resource_metadata"].(map[string]any); doc == nil || doc["acr_values_required"] == nil || doc["resource"] != resource.URL {
+		t.Fatalf("document not forwarded verbatim: %v", c)
+	}
+	if req, _ := c["request"].(map[string]any); req == nil || req["method"] != "GET" || req["path"] != "/accounts/a1/balance" {
+		t.Fatalf("endpoint not forwarded: %v", c)
+	}
+	if _, present := c["access_token"]; present {
+		t.Fatal("the raw token must not be forwarded unless the route says so")
+	}
+
+	// REST, with the knob: the token travels.
+	s.check(context.Background(), restConf(map[string]string{"resource": resource.URL, "forward_access_token": "true"}), "GET", "/accounts/a1/balance", headers, "")
+	if c := ctxOf(discovered.bodies[1]); c["access_token"] != tok {
+		t.Fatalf("token not forwarded: %v", c)
+	}
+
+	// Static, no resource: endpoint only.
+	s.check(context.Background(), restConf(nil), "GET", "/accounts/a1/balance", headers, "")
+	c = ctxOf(static.bodies[0])
+	if _, present := c["resource_metadata"]; present || c["request"] == nil {
+		t.Fatalf("static route: %v", c)
+	}
+
+	// MCP, through the engine, with the knob.
+	mcp := newDiscoResource(t, discovered.URL, true)
+	chain := resourceChain(t, static.URL, discovery.ModeResource)
+	s2 := newServer(t, static.URL)
+	s2.resolver = chain
+	s2.coaz = coaz.NewEngine(coaz.Options{Resolver: chain})
+	conf := configFrom(map[string]string{"style": "mcp", "require_token": "true", "mcp_upstream_url": mcp.URL, "forward_access_token": "true"})
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}`
+	resp = s2.check(context.Background(), conf, "POST", "/mcp", headers, body)
+	if resp.GetDeniedResponse() != nil {
+		t.Fatalf("should permit: %s", resp.GetDeniedResponse().GetBody())
+	}
+	c = ctxOf(discovered.bodies[len(discovered.bodies)-1])
+	if c["access_token"] != tok || c["resource_metadata_source"] != "rfc9728" {
+		t.Fatalf("mcp path did not forward: %v", c)
+	}
+	if req, _ := c["request"].(map[string]any); req == nil || req["path"] != "/mcp" {
+		t.Fatalf("mcp endpoint not forwarded: %v", c)
+	}
 }
 
 func TestResourceIDFallbacks(t *testing.T) {

@@ -70,6 +70,11 @@ type pepConfig struct {
 	// discovery works from. Absent, an MCP route is identified by its upstream URL and a
 	// REST route uses the static PDP.
 	resource string
+	// forwardAccessToken sends the raw token to the PDP as context.access_token, so
+	// the PDP can verify and inspect it rather than trust what this PEP decoded. Off
+	// by default: a bearer token should only travel over a PDP connection that is TLS
+	// and authenticated, and that is the operator's call.
+	forwardAccessToken bool
 }
 
 // resourceID is the identifier handed to PDP discovery for this route.
@@ -105,6 +110,7 @@ func configFrom(ext map[string]string) pepConfig {
 		// may still be reading. Only an explicit "false" removes it.
 		legacySubjectIdentity: !strings.EqualFold(ext["legacy_subject_identity"], "false"),
 		resource:              strings.TrimRight(ext["resource"], "/"),
+		forwardAccessToken:    isTrue("forward_access_token"),
 	}
 }
 
@@ -343,9 +349,12 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 				extraContext["consented_creditor"] = cred
 			}
 		}
+		callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path}
+		if conf.forwardAccessToken {
+			callOpts.AccessToken = token
+		}
 		v := s.coaz.CheckToolCall(ctx, conf.mcpUpstreamURL, headers["authorization"],
-			[]byte(body), claimsForCEL(claims), extraContext,
-			coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID()})
+			[]byte(body), claimsForCEL(claims), extraContext, callOpts)
 		if v.CoazTool {
 			toolName := toolCallName(body)
 			if v.JSONRPCError != nil {
@@ -423,6 +432,29 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	if conf.legacySubjectIdentity {
 		subject["identity"] = agent
 	}
+	// 3c) Which PDP, and what it gets to reason with beyond the mapped request: the
+	//     resource's declared posture as published (scopes, acr, sender-constraint
+	//     requirements — whatever it said), tagged with whether the federation vouched
+	//     for it; the endpoint actually hit; and, when the route allows, the raw token.
+	//     This PEP enforces none of it. Comparing a token's scope or acr to what a
+	//     resource requires is a policy decision, and policy is offloaded to the PDP,
+	//     where it can weigh them alongside risk, consent and history — things a gateway
+	//     never sees. Resolved once, so one decision cannot straddle a PDP that moved.
+	ep, err := s.resolveFor(ctx, conf.resourceID())
+	if err != nil {
+		log.Printf("[%s] PDP call failed: %v", pep, err)
+		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
+			"Authorization service unreachable; denying (fail-closed).", nil)
+	}
+	if ep.Resource != nil {
+		m.ctx["resource_metadata"] = ep.Resource.Document
+		m.ctx["resource_metadata_source"] = ep.Resource.Source
+	}
+	m.ctx["request"] = map[string]any{"method": method, "path": path}
+	if conf.forwardAccessToken && token != "" {
+		m.ctx["access_token"] = token
+	}
+
 	authzenReq := map[string]any{
 		"subject":  subject,
 		"action":   map[string]any{"name": m.action},
@@ -430,7 +462,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"context":  m.ctx,
 	}
 
-	out, err := s.evaluate(ctx, conf.resourceID(), authzenReq)
+	out, err := s.evaluateAt(ctx, ep, authzenReq)
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
@@ -656,16 +688,32 @@ type pepOutcome struct {
 	IdentityDoctype string
 }
 
-func (s *server) evaluate(ctx context.Context, resource string, authzenReq map[string]any) (pepOutcome, error) {
-	var out pepOutcome
+// resolveFor finds the PDP for a route's resource. A server built without a resolver
+// (tests, mostly) behaves as the static one.
+func (s *server) resolveFor(ctx context.Context, resource string) (discovery.PDPEndpoints, error) {
 	resolver := s.resolver
 	if resolver == nil {
 		resolver = discovery.Static(s.authzenURL, s.authzenAPIKey)
 	}
 	ep, err := resolver.Resolve(ctx, resource)
 	if err != nil {
-		return out, fmt.Errorf("PDP discovery: %w", err)
+		return ep, fmt.Errorf("PDP discovery: %w", err)
 	}
+	return ep, nil
+}
+
+// evaluate resolves the PDP for resource and asks it. Kept for callers that have only
+// a resource; the request path resolves first so the context can carry what was found.
+func (s *server) evaluate(ctx context.Context, resource string, authzenReq map[string]any) (pepOutcome, error) {
+	ep, err := s.resolveFor(ctx, resource)
+	if err != nil {
+		return pepOutcome{}, err
+	}
+	return s.evaluateAt(ctx, ep, authzenReq)
+}
+
+func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, authzenReq map[string]any) (pepOutcome, error) {
+	var out pepOutcome
 	payload, _ := json.Marshal(authzenReq)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.Evaluation, bytes.NewReader(payload))
 	if err != nil {

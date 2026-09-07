@@ -36,6 +36,20 @@ export class DiscoveryError extends Error {
   }
 }
 
+/**
+ * A resource's declared posture: its RFC 9728 document, or the federation-resolved
+ * `oauth_resource` metadata, as published. The PEP reads the PDP list out of it and
+ * forwards the rest to the PDP as context — it decides nothing from it. What a resource
+ * requires (scopes, acr, sender-constrained tokens) is policy input, and policy lives in
+ * the PDP.
+ */
+export interface ResourceMetadata {
+  source: string;
+  document: Record<string, unknown>;
+  /** The ordered PDP identifiers read out of the document, first preferred. */
+  pdps: string[];
+}
+
 /** What a PEP needs to call one PDP. */
 export interface PdpEndpoints {
   /** The PDP's `policy_decision_point` value. */
@@ -48,16 +62,18 @@ export interface PdpEndpoints {
   /** The bearer bound to this identifier; undefined for a discovered PDP. */
   apiKey?: string;
   source: string;
+  /** The resource's own metadata, when a document named this PDP. Forwarded, never read. */
+  resource?: ResourceMetadata;
 }
 
 export interface PdpResolver {
   resolve(resource?: string): Promise<PdpEndpoints>;
 }
 
-/** Yields the ordered PDP identifiers for a resource. Throw a DiscoveryError. */
+/** Yields a resource's metadata: the PDPs that decide for it, and the document that named them. */
 export interface MetadataSource {
   readonly name: string;
-  pdps(resource: string): Promise<string[]>;
+  lookup(resource: string): Promise<ResourceMetadata>;
 }
 
 export interface PdpDiscoveryOptions {
@@ -260,7 +276,7 @@ export class Rfc9728Source implements MetadataSource {
   readonly name = 'rfc9728';
   constructor(private readonly getJson: (url: string) => Promise<unknown>) {}
 
-  async pdps(resource: string): Promise<string[]> {
+  async lookup(resource: string): Promise<ResourceMetadata> {
     const wk = wellKnownUrl(resource, 'oauth-protected-resource');
     const doc = (await this.getJson(wk)) as Record<string, unknown>;
     // §3.3: the echoed identifier MUST be identical, or whoever answers at that path
@@ -268,7 +284,9 @@ export class Rfc9728Source implements MetadataSource {
     if (doc['resource'] !== resource) {
       throw new DiscoveryError('invalid', `${wk} says resource is ${JSON.stringify(doc['resource'])}, expected ${resource}`);
     }
-    return pdpList(doc[PARAM_POLICY_DECISION_POINTS], wk);
+    // The whole document travels to the PDP; this source does not know or care which
+    // other members are in it.
+    return { source: 'rfc9728', document: doc, pdps: pdpList(doc[PARAM_POLICY_DECISION_POINTS], wk) };
   }
 }
 
@@ -289,7 +307,7 @@ export class PdpDiscovery implements PdpResolver {
   private readonly resourcePolicy: UrlPolicy;
   private readonly pdpPolicy: UrlPolicy;
   private readonly sources: MetadataSource[];
-  private readonly resources: TtlCache<string[]>;
+  private readonly resources: TtlCache<ResourceMetadata>;
   private readonly pdps: TtlCache<PdpEndpoints>;
 
   constructor(opts: PdpDiscoveryOptions) {
@@ -315,7 +333,7 @@ export class PdpDiscovery implements PdpResolver {
     };
     // A resource whose metadata cannot be fetched is served by the static PDP for a
     // while rather than re-fetched in every request's path.
-    this.resources = new TtlCache<string[]>(ttl, minRefresh, minRefresh, max, now);
+    this.resources = new TtlCache<ResourceMetadata>(ttl, minRefresh, minRefresh, max, now);
     this.pdps = new TtlCache<PdpEndpoints>(ttl, minRefresh, 0, max, now);
     this.sources =
       opts.sources ??
@@ -329,6 +347,7 @@ export class PdpDiscovery implements PdpResolver {
     }
 
     let candidates: string[];
+    let from: ResourceMetadata | undefined;
     if (!resource || this.mode === 'authzen') {
       if (!this.staticPdp) throw new DiscoveryError('transient', 'no PDP configured');
       candidates = [this.staticPdp];
@@ -337,7 +356,9 @@ export class PdpDiscovery implements PdpResolver {
       // belongs to this caller.
       checkUrl(resource, this.resourcePolicy);
       try {
-        candidates = await this.resources.get(resource, (key) => this.lookupPdps(key));
+        const meta = await this.resources.get(resource, (key) => this.lookupResource(key));
+        candidates = meta.pdps;
+        if (meta.document) from = meta;
       } catch (err) {
         const derr = asDiscoveryError(err);
         if (derr.kind === 'not_allowed') throw derr;
@@ -353,7 +374,7 @@ export class PdpDiscovery implements PdpResolver {
       try {
         const ep = await this.pdps.get(pdp, (key) => this.fetchConfig(key));
         for (const u of [ep.evaluation, ep.evaluations]) if (u) checkUrl(u, this.pdpPolicy);
-        return this.withKey({ ...ep, source: pdp === this.staticPdp ? 'static' : 'rfc9728' });
+        return this.withKey({ ...ep, source: pdp === this.staticPdp ? 'static' : 'rfc9728', ...(from ? { resource: from } : {}) });
       } catch (err) {
         const derr = asDiscoveryError(err);
         if (derr.kind === 'not_allowed') throw derr;
@@ -379,11 +400,11 @@ export class PdpDiscovery implements PdpResolver {
   }
 
   /** Sources in order; no metadata anywhere resolves to the static PDP, cached. */
-  private async lookupPdps(resource: string): Promise<string[]> {
+  private async lookupResource(resource: string): Promise<ResourceMetadata> {
     for (const src of this.sources) {
       try {
-        const list = await src.pdps(resource);
-        if (list.length > 0) return list;
+        const meta = await src.lookup(resource);
+        if (meta.pdps.length > 0) return meta;
       } catch (err) {
         const derr = asDiscoveryError(err);
         if (derr.kind === 'not_allowed' || derr.kind === 'transient') throw derr;
@@ -391,7 +412,7 @@ export class PdpDiscovery implements PdpResolver {
       }
     }
     if (!this.staticPdp) throw new DiscoveryError('no_metadata', `no metadata names a PDP for ${resource}`);
-    return [this.staticPdp];
+    return { source: 'static', document: undefined as unknown as Record<string, unknown>, pdps: [this.staticPdp] };
   }
 
   /** AuthZEN 1.0 §9: the PDP's metadata, or the default paths when it has none. */

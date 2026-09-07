@@ -3,8 +3,10 @@ package coaz
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -123,6 +125,76 @@ func TestEngineResolveErrorFailsClosedOnBothPaths(t *testing.T) {
 			t.Fatalf("resource not threaded through the default-mapping path: %v", fr.resources)
 		}
 	})
+}
+
+func TestEngineForwardsWhatTheResolverFound(t *testing.T) {
+	pdp, reqs := recordingPDP(t, `{"decision":true}`)
+	mcp := mcpServing(t, singleTool)
+	var bodies [][]byte
+	pdp.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision":true}`))
+	})
+	_ = reqs
+	fr := &fakeResolver{ep: discovery.PDPEndpoints{
+		Identifier: pdp.URL, Evaluation: pdp.URL + "/e",
+		Resource: &discovery.ResourceMetadata{Source: "federation", Document: map[string]any{"scopes_supported": []any{"accounts:read"}, "acr_values_required": []any{"mfa"}}},
+	}}
+	e := NewEngine(Options{Resolver: fr})
+	v := e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(),
+		map[string]any{"sub": "alice", "client_id": "c"}, map[string]any{"user_scope": "x", "request": "caller-wins"},
+		CallOptions{Resource: "https://api.example", AccessToken: "raw.token.here", Method: "POST", Path: "/mcp"})
+	if !v.Decision {
+		t.Fatalf("%+v", v)
+	}
+	var sent struct {
+		Context map[string]any `json:"context"`
+	}
+	if err := json.Unmarshal(bodies[0], &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent.Context["resource_metadata_source"] != "federation" {
+		t.Fatalf("source not forwarded: %v", sent.Context)
+	}
+	if doc, _ := sent.Context["resource_metadata"].(map[string]any); doc == nil || doc["acr_values_required"] == nil {
+		t.Fatalf("document not forwarded verbatim: %v", sent.Context)
+	}
+	if sent.Context["access_token"] != "raw.token.here" || sent.Context["user_scope"] != "x" {
+		t.Fatalf("token or caller context missing: %v", sent.Context)
+	}
+	if sent.Context["request"] != "caller-wins" {
+		t.Fatalf("a caller's explicit context key must not be overwritten: %v", sent.Context["request"])
+	}
+
+	// Nothing to forward when the resolver found nothing and the route sends nothing.
+	// (A fresh struct each time: json.Unmarshal merges into an existing map.)
+	bodies = nil
+	e2 := NewEngine(Options{Resolver: &fakeResolver{ep: discovery.PDPEndpoints{Identifier: pdp.URL, Evaluation: pdp.URL + "/e"}}})
+	e2.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{})
+	var bare struct {
+		Context map[string]any `json:"context"`
+	}
+	_ = json.Unmarshal(bodies[0], &bare)
+	for _, k := range []string{"resource_metadata", "resource_metadata_source", "access_token", "request"} {
+		if _, present := bare.Context[k]; present {
+			t.Fatalf("%s should be absent when there is nothing to forward: %v", k, bare.Context)
+		}
+	}
+
+	// The default-mapping path forwards the same things.
+	bodies = nil
+	e3 := NewEngine(Options{Resolver: fr})
+	e3.CheckToolCall(context.Background(), mcpServing(t, `[{"name":"plain","inputSchema":{"type":"object"}}]`).URL, "", toolsCallBody("plain", nil),
+		map[string]any{"sub": "alice", "aud": "https://mcp.example"}, nil, CallOptions{ApplyDefaultMappings: true, AccessToken: "t2", Method: "POST", Path: "/mcp"})
+	var viaDefault struct {
+		Context map[string]any `json:"context"`
+	}
+	_ = json.Unmarshal(bodies[0], &viaDefault)
+	if viaDefault.Context["access_token"] != "t2" || viaDefault.Context["resource_metadata_source"] != "federation" {
+		t.Fatalf("default-mapping path did not forward: %v", viaDefault.Context)
+	}
 }
 
 func TestEngineWithoutAResolverIsStatic(t *testing.T) {

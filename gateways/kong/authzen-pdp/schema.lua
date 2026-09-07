@@ -75,6 +75,11 @@ return {
           -- Allow http for discovered URLs (dev only; authzen_url's own origin is
           -- always trusted over http).
           { pdp_discovery_insecure = { type = "boolean", default = false } },
+          -- Forward the raw access token to the PDP as context.access_token, so the
+          -- PDP can examine it itself: verify the signature, read cnf, score the client.
+          -- Off by default: the PDP call must be TLS + authenticated before a bearer
+          -- token travels over it, and that is the operator's call to make.
+          { forward_access_token = { type = "boolean", default = false } },
         },
         -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
         -- is no JOSE verifier available to it, so on its own it can compare the proof's

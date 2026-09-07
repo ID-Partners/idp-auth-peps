@@ -19,7 +19,7 @@ import type {
   Verdict,
 } from './types.js';
 import { foldDecision } from './challenge.js';
-import { PdpDiscovery, type PdpDiscoveryOptions, type PdpResolver } from './discovery.js';
+import { PdpDiscovery, type PdpDiscoveryOptions, type PdpEndpoints, type PdpResolver } from './discovery.js';
 
 /** Discovery knobs a client accepts; the static PDP, its key and fetch come from the client. */
 export type ClientDiscoveryOptions = Omit<PdpDiscoveryOptions, 'staticPdp' | 'apiKeys' | 'fetch'>;
@@ -28,6 +28,14 @@ export type ClientDiscoveryOptions = Omit<PdpDiscoveryOptions, 'staticPdp' | 'ap
 export interface EvaluateOptions {
   /** The protected resource's identifier (RFC 8707), the key PDP discovery starts from. */
   resource?: string;
+  /**
+   * The raw access token, to forward as `context.access_token` so the PDP can examine
+   * it itself — verify the signature, read `cnf`, score the client. Only forward it
+   * over a PDP connection that is TLS and authenticated.
+   */
+  accessToken?: string;
+  /** The endpoint actually hit, forwarded as `context.request` so the PDP can match a resource's requirements to it. */
+  request?: { method: string; path: string };
 }
 
 export interface AuthzenClientOptions {
@@ -104,6 +112,7 @@ export class AuthzenClient {
   async evaluate(request: EvaluationRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
       const ep = await this.resolve(options.resource);
+      request = withForwardedContext(request, ep, options);
       const res = await this.postTo<EvaluationResponse>(ep.evaluation, request, ep.apiKey);
       return { ...foldDecision(res), request };
     } catch (err) {
@@ -126,6 +135,7 @@ export class AuthzenClient {
     try {
       const ep = await this.resolve(options.resource);
       if (!ep.evaluations) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
+      request = withForwardedContext(request, ep, options);
       const res = await this.postTo<EvaluationsResponse>(ep.evaluations, request, ep.apiKey);
       const list = Array.isArray(res?.evaluations) ? res.evaluations : [];
       if (list.length === 0) {
@@ -222,6 +232,33 @@ export class AuthzenClient {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * What the PEP forwards for the PDP to reason with, beyond the mapped subject, action
+ * and resource: the resource's declared posture as published, the endpoint hit, and
+ * (when the caller allows) the raw token. The SDK enforces none of it. Comparing a
+ * token's scope or acr to what a resource requires is a policy decision, and policy is
+ * offloaded to the PDP, where it can weigh them alongside things a PEP never sees.
+ * Keys already present in the request's context win: a caller's explicit context is
+ * not overwritten.
+ */
+function withForwardedContext<T extends { context?: Record<string, unknown> }>(
+  request: T,
+  ep: PdpEndpoints,
+  options: EvaluateOptions,
+): T {
+  const extra: Record<string, unknown> = {};
+  if (ep.resource) {
+    extra['resource_metadata'] = ep.resource.document;
+    extra['resource_metadata_source'] = ep.resource.source;
+  }
+  if (options.request) extra['request'] = options.request;
+  if (options.accessToken) extra['access_token'] = options.accessToken;
+  if (Object.keys(extra).length === 0) return request;
+  const context = { ...extra, ...(request.context ?? {}) };
+  // A boxcar carries its context at the top level too; either way, the merge is the same.
+  return { ...request, context };
 }
 
 function describe(err: unknown): string {

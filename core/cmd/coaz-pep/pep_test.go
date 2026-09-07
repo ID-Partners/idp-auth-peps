@@ -81,6 +81,12 @@ func TestConfigFromReadsEveryKnob(t *testing.T) {
 	if c.pepLabel != "edge" || c.style != "mcp" {
 		t.Fatalf("labels/style wrong: %+v", c)
 	}
+	if !configFrom(map[string]string{"forward_access_token": "true"}).forwardAccessToken || configFrom(map[string]string{}).forwardAccessToken {
+		t.Fatal("forward_access_token should parse and default off")
+	}
+	if false {
+		t.Fatalf("labels/style wrong: %+v", c)
+	}
 	if !c.requireToken || !c.requireDpop || !c.requireUserLogin || !c.coazDefaults {
 		t.Fatalf("booleans should parse case-insensitively: %+v", c)
 	}

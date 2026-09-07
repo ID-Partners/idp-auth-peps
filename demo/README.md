@@ -9,24 +9,35 @@ stops it. That is the rogue PDP running through the cast below, and what `demo.s
 to two PDPs through one gateway. A PEP batches only against a PDP that says it can. Those
 are the levers and the MCP request in the console.
 
+**Who enforces what a resource requires?** Not the gateway. Each resource publishes the
+scopes it uses and the acr it expects; the PEP forwards that document to the PDP verbatim,
+with the endpoint hit and the raw token, and the PDP does the matching. That is the
+token, scope and acr pickers in the console, and section 5 of `demo.sh`.
+
 ## The cast
 
 | Stub | Port | What it is |
 | --- | --- | --- |
-| `anchor` | 9000 | A federation Trust Anchor. Its policy for members: `authzen_policy_decision_points` must be a subset of `[pdp-a]`, and is essential. |
-| `member` | 9001 | A federated resource. Its **own** metadata names the rogue PDP first. |
+| `anchor` | 9000 | A federation Trust Anchor. Its policy for members: `authzen_policy_decision_points` must be a subset of `[pdp-a]`, and `acr_values_required` **is** `[MFA]`, whatever the member says. |
+| `member` | 9001 | A federated resource. Its **own** RFC 9728 document names Bank A's PDP and says a password is enough; its entity configuration names the rogue PDP first. The anchor's policy strips the rogue **and raises the acr floor to MFA**. |
 | `pdp-a` | 9002 | Bank A's PDP, identifier `…:9002/tenants/bank-a`. Denies *mallory*; steps up payments over 1000. Advertises a batch endpoint. |
 | `rogue-pdp` | 9003 | Permits everything, logs loudly when asked, and advertises **no** batch endpoint. Bare identifier, no tenant path. |
-| `plain` | 9004 | Not federated. RFC 9728 metadata names Bank A's PDP. |
+| `plain` | 9004 | Not federated. RFC 9728 metadata names Bank A's PDP; requires a password. |
 | `impostor` | 9005 | Not federated. RFC 9728 metadata names the rogue PDP. |
 | `broken` | 9006 | Federated, but signs with a key the anchor never vouched for. |
 | `stray` | 9007 | No metadata of any kind. |
 | `pdp-b` | 9008 | Bank B's PDP, identifier `…:9008/tenants/bank-b`. Same product, stricter threshold: steps up payments over 100. |
-| `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP. |
+| `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP; requires MFA. |
 | `control` | 9099 | The event feed the console traces, and the levers it pulls. Not part of any spec. |
 
 Every resource also answers MCP `tools/list` at `/mcp` with one tool whose mapping is a
 boxcar: a transfer is a debit and a credit, evaluated in one call.
+
+Every resource with metadata publishes what it requires as ordinary members of that
+metadata: `scopes_supported` (RFC 9728's own) and `acr_values_required` (no standard home
+yet; an example name). No PEP reads either. They reach the PDP as `context.resource_metadata`,
+tagged with whether the federation vouched for them, and the two banks' PDPs hold the
+token to them.
 
 Then `coaz-pep` three times, one per discovery mode: `pep-static` (:9192, told where its
 PDP is), `pep-resource` (:9193, trusts each resource's own well-known) and
@@ -61,7 +72,9 @@ fetch is one line, and the rogue PDP announces itself.
 
 ## The console
 
-Pick a resource, a user and a request, and press Run. The same check goes to all three
+Pick a resource, a user and a request — and the shape of the token: how the user
+authenticated, which scopes it carries, and whether the route forwards it to the PDP. Press
+Run. The same check goes to all three
 PEPs and you get three columns: the decision, a line saying what that column just proved,
 and underneath it every request the stubs saw while that PEP was deciding — which
 `.well-known` document it read, whether it climbed a trust chain, and which PDP answered
@@ -77,6 +90,10 @@ PDP is the identifier `http://stubs:9002/tenants/bank-a`. Its metadata sits at
 `/.well-known/authzen-configuration/tenants/bank-a` — AuthZEN §9 inserts the well-known
 segment after the host and keeps the identifier's path — and it evaluates at
 `/tenants/bank-a/access/v1/evaluation`.
+
+Under each PDP's verdict is a **was given** line: the resource's declared requirements and
+their source, the endpoint hit, and what the token said — exactly what the PDP had to work
+with, and none of it judged by the PEP.
 
 The trace badges each evaluation as **the PDP's own base** or **advertised elsewhere**.
 Before anything moves those agree, and that is the honest picture: a correctly configured
@@ -109,6 +126,17 @@ configuration; the PEPs pick the change up on their next metadata refresh.
 - **plain, then bank-b, paying 500.** Same request, two answers, because two resources
   answer to two PDPs with different thresholds. The static column cannot tell them apart:
   it has one PDP for everything.
+- **member, password token, read a balance — resource mode then federation mode.** The
+  resource column permits: the member's own document says a password is enough, and Bank
+  A's PDP believes it. The federation column denies, from the *same* PDP with the *same*
+  policy and the *same* token, because the document it was given is the resolved one and
+  the anchor set the floor at MFA. The PDP's reason names which document it was reading.
+- **bank-b with a password token, then with MFA.** Bank B requires MFA; the PDP says so,
+  and says what would satisfy it.
+- **plain, read-only token, pay 50.** The PDP turns the resource's `scopes_supported` into
+  a step-up for `payments:write`. A gateway comparing scopes could only have said 403.
+- **Anything acr-gated with "forward the raw token" set to no.** The PDP was not given the
+  token, cannot check the acr, and says exactly that rather than guessing.
 - **MCP transfer (batch), on plain then on impostor.** One tool call, two evaluations.
   Against Bank A's PDP it goes to the `access_evaluations_endpoint` its metadata
   advertises. Against the rogue PDP, which advertises none, the PEP reads the metadata and
@@ -144,7 +172,14 @@ fallback. The `stray` resource has nothing: static PDP.
 **4. Two banks, one gateway.** A payment of 500 is permitted on `plain` and step-up
 challenged on `bank-b`, because the resource decides whose policy applies.
 
-**5. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
+**5. What the resource requires is the PDP's to enforce.** Bank B requires MFA and a
+password token is denied with the reason. The `member` says a password is enough about
+itself and the resource-mode PEP's PDP agrees; the federation-mode PEP forwards the
+resolved document, the anchor set MFA, and the same PDP denies. A read-only token trying
+to pay gets a step-up for `payments:write`, decided from the resource's own
+`scopes_supported`. With the token not forwarded, the PDP says it could not examine it.
+
+**6. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="payments:approve"` and an
 `authz_challenge` body. Discovery changed where the decision came from, not what a deny
 looks like.

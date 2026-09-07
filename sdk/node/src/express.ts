@@ -85,6 +85,13 @@ export interface AuthzenMiddlewareOptions {
    * multi-tenant API. Absent means the client's static PDP.
    */
   resource?: string | ((req: PepRequest) => string | undefined);
+
+  /**
+   * Forward the raw access token to the PDP as `context.access_token`, so the PDP can
+   * examine it itself. Default false: only turn it on when the PDP connection is TLS
+   * and authenticated.
+   */
+  forwardAccessToken?: boolean;
 }
 
 /**
@@ -147,7 +154,11 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
       if (request == null) return next();
 
       const resource = typeof opts.resource === 'function' ? opts.resource(req) : opts.resource;
-      const verdict = await client.evaluate(request, { resource });
+      const verdict = await client.evaluate(request, {
+        resource,
+        request: { method: req.method, path: requestPath(req) },
+        ...(opts.forwardAccessToken && token ? { accessToken: token } : {}),
+      });
       report(opts, req, verdict, claims);
       if (!verdict.allow) return respond(res, verdict, pep);
 

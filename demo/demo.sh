@@ -19,10 +19,10 @@ MEMBER="$S:9001"; GOOD="$S:9002/tenants/bank-a"; ROGUE="$S:9003"; PLAIN="$S:9004
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 # An UNSIGNED token: coaz-pep decodes without verifying when no JWKS is configured, and
 # says so loudly at startup. The demo is about discovery, not token validation.
-jwt() { # $1 human, $2 agent
-  local h c
+jwt() { # $1 human, $2 agent, [$3 acr], [$4 scope]
+  local h c acr="${3:-urn:idp:loa:password}" scope="${4:-accounts:read payments:write}"
   h=$(printf '{"alg":"none","typ":"JWT"}' | b64url)
-  c=$(printf '{"sub":"%s","client_id":"%s","act":{"sub":"%s"},"scope":"accounts:read payments:write","aud":"%s"}' "$1" "$2" "$2" "$PLAIN" | b64url)
+  c=$(printf '{"sub":"%s","client_id":"%s","act":{"sub":"%s"},"scope":"%s","acr":"%s","aud":"%s"}' "$1" "$2" "$2" "$scope" "$acr" "$PLAIN" | b64url)
   printf '%s.%s.' "$h" "$c"
 }
 
@@ -35,17 +35,18 @@ except Exception: pass
 print(json.dumps({"decision": d.get("decision"), "status": r.get("status"), "body": b}))'; fi
 }
 
-# check PEP RESOURCE HUMAN METHOD PATH [BODY]
+# check PEP RESOURCE HUMAN METHOD PATH [BODY] — token shape via ACR / SCOPE / FORWARD env
 check() {
   local pep="$1" resource="$2" human="$3" method="$4" path="$5" body="${6:-}"
-  local cfg
-  if [ -n "$resource" ]; then cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true","resource":"%s"}' "$resource")
-  else cfg='{"pep_label":"demo","style":"rest","require_token":"true"}'; fi
+  local cfg fwd
+  fwd=$([ "${FORWARD:-yes}" = "yes" ] && printf ',"forward_access_token":"true"' || printf '')
+  if [ -n "$resource" ]; then cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true","resource":"%s"%s}' "$resource" "$fwd")
+  else cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true"%s}' "$fwd"); fi
   local esc_body; esc_body=$(printf '%s' "$body" | sed 's/"/\\"/g')
   curl -sS -X POST "$pep/v1/mcp/check" \
     -H "Authorization: Bearer $CHECK_TOKEN" -H 'Content-Type: application/json' \
     -d "$(printf '{"config":%s,"method":"%s","path":"%s","headers":{"authorization":"Bearer %s","content-type":"application/json"},"body":"%s"}' \
-      "$cfg" "$method" "$path" "$(jwt "$human" agent-1)" "$esc_body")" | pretty
+      "$cfg" "$method" "$path" "$(jwt "$human" agent-1 "${ACR:-}" "${SCOPE:-}")" "$esc_body")" | pretty
 }
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -85,12 +86,24 @@ step "pay 500 on bank-b (Bank B steps up over 100)"; check "$RESOURCE" "$BANKB" 
 echo "  ^ same request, two answers. The static PEP cannot tell them apart: it has one PDP for everything."
 echo "  For a PDP that MOVES, and for the batch-capability case, use the console on :8088."
 
-say "5. The challenge contract survives discovery"
+say "5. What the resource requires is the PDP's to enforce, not the gateway's"
+echo "  Each resource publishes scopes_supported and an example acr_values_required. No PEP reads them;"
+echo "  they reach the PDP verbatim with the endpoint hit and the raw token, and the PDP does the matching."
+step "bank-b requires MFA; alice arrives with a password token"; check "$RESOURCE" "$BANKB" alice GET /accounts/a1/balance
+step "same, with an MFA token"; ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" alice GET /accounts/a1/balance
+step "member's OWN metadata says password is enough (resource mode)"; check "$RESOURCE" "$MEMBER" alice GET /accounts/a1/balance
+step "the federation raised member's floor to MFA (federation mode)"; check "$FEDERATION" "$MEMBER" alice GET /accounts/a1/balance
+echo "  ^ same PDP, same policy, same token. The PEP forwarded a different document, and said which one."
+step "read-only token tries to pay -> step-up for payments:write"; SCOPE="accounts:read" check "$RESOURCE" "$PLAIN" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
+step "bank-b, MFA required, but the token is NOT forwarded"; FORWARD=no ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" alice GET /accounts/a1/balance
+echo "  ^ the PDP could not examine what it was not given, and says so rather than guessing."
+
+say "6. The challenge contract survives discovery"
 step "alice pays 50"; check "$FEDERATION" "$MEMBER" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
 step "alice pays 5000 -> step-up challenge"; check "$FEDERATION" "$MEMBER" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":5000,"currency":"AUD"}'
 
 if curl -s -o /dev/null -w '%{http_code}' "http://${PEP_HOST}:8000/bank/accounts/a1/balance" 2>/dev/null | grep -q '^[0-9]'; then
-  say "6. Kong, doing the same discovery in Lua (profile kong)"
+  say "7. Kong, doing the same discovery in Lua (profile kong)"
   step "alice via Kong"; curl -s -H "Authorization: Bearer $(jwt alice agent-1)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
   step "mallory via Kong"; curl -s -H "Authorization: Bearer $(jwt mallory agent-1)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
 fi

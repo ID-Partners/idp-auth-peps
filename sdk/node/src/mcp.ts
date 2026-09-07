@@ -256,6 +256,12 @@ export interface McpGuardOptions {
    * mode so both PEPs key off one identifier.
    */
   resource?: string;
+  /**
+   * Forward the raw access token to the PDP as `context.access_token` (pass it per call
+   * as `accessToken`). Default false: only when the PDP connection is TLS and
+   * authenticated. In delegate mode the flag is passed to coaz-pep instead.
+   */
+  forwardAccessToken?: boolean;
 }
 
 export class McpGuard {
@@ -289,6 +295,8 @@ export class McpGuard {
     extraContext?: Record<string, unknown>;
     /** The untouched HTTP request. Required when `delegate` is configured. */
     raw?: { method?: string; path?: string; headers: Record<string, string>; body: string };
+    /** The raw access token, forwarded to the PDP when `forwardAccessToken` is on. */
+    accessToken?: string;
   }): Promise<McpVerdict> {
     const { rpc } = args;
     const id = rpc.id ?? null;
@@ -324,7 +332,7 @@ export class McpGuard {
           jsonRpcError: jsonRpcError(id, CODE_DENIED_V2, reason),
         };
       }
-      return this.checkAgainst(id, def, rpc, token, args.extraContext, CODE_DENIED_V2, method);
+      return this.checkAgainst(id, def, rpc, token, args.extraContext, CODE_DENIED_V2, method, args.accessToken);
     }
 
     if (this.opts.delegate) {
@@ -358,7 +366,7 @@ export class McpGuard {
         };
       }
       // Fall through to the binding's default mapping rather than skipping the PDP.
-      return this.checkAgainst(id, defaultToolsCallMapping(), rpc, token, args.extraContext, CODE_DENIED_V2, toolName);
+      return this.checkAgainst(id, defaultToolsCallMapping(), rpc, token, args.extraContext, CODE_DENIED_V2, toolName, args.accessToken);
     }
 
     // `params` binds to the whole JSON-RPC params member, so mappings read
@@ -389,8 +397,8 @@ export class McpGuard {
     }
 
     const verdict = built.batch
-      ? await this.client.evaluateAll(built.body as EvaluationsRequest, { resource: this.resource })
-      : await this.client.evaluate(built.body as EvaluationRequest, { resource: this.resource });
+      ? await this.client.evaluateAll(built.body as EvaluationsRequest, this.evaluateOptions(args.accessToken))
+      : await this.client.evaluate(built.body as EvaluationRequest, this.evaluateOptions(args.accessToken));
 
     this.report(toolName, verdict);
 
@@ -439,6 +447,14 @@ export class McpGuard {
   }
 
   /** Build from one mapping, ask the PDP, and render the verdict. */
+  /** What every PDP call carries beyond the mapped request; see client.ts. */
+  private evaluateOptions(accessToken?: string) {
+    return {
+      resource: this.resource,
+      ...(this.opts.forwardAccessToken && accessToken ? { accessToken } : {}),
+    };
+  }
+
   private async checkAgainst(
     id: string | number | null,
     mapping: AuthzenMapping,
@@ -447,6 +463,7 @@ export class McpGuard {
     extraContext: Record<string, unknown> | undefined,
     deniedCode: number,
     toolName: string,
+    accessToken?: string,
   ): Promise<McpVerdict> {
     let built: BuiltRequest;
     try {
@@ -455,8 +472,8 @@ export class McpGuard {
       return this.fail(id, CODE_MAPPING_ERROR, 'mapping_error', message(err));
     }
     const verdict = built.batch
-      ? await this.client.evaluateAll(built.body as EvaluationsRequest, { resource: this.resource })
-      : await this.client.evaluate(built.body as EvaluationRequest, { resource: this.resource });
+      ? await this.client.evaluateAll(built.body as EvaluationsRequest, this.evaluateOptions(accessToken))
+      : await this.client.evaluate(built.body as EvaluationRequest, this.evaluateOptions(accessToken));
     this.report(toolName, verdict);
     if (verdict.allow) return { allow: true, coazTool: true, verdict, pdpRequest: built.body };
     const code = verdict.kind === 'pdp_error' ? CODE_PDP_ERROR : deniedCode;
@@ -509,7 +526,13 @@ export class McpGuard {
           ...(d.apiKey ? { authorization: `Bearer ${d.apiKey}` } : {}),
         },
         body: JSON.stringify({
-          config: { pep_label: this.pep, style: 'mcp', ...(this.opts.resource ? { resource: this.opts.resource } : {}), ...d.config },
+          config: {
+            pep_label: this.pep,
+            style: 'mcp',
+            ...(this.opts.resource ? { resource: this.opts.resource } : {}),
+            ...(this.opts.forwardAccessToken ? { forward_access_token: 'true' } : {}),
+            ...d.config,
+          },
           method: raw.method ?? 'POST',
           path: raw.path ?? '/mcp',
           headers: raw.headers,

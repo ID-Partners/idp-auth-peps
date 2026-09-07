@@ -140,6 +140,15 @@ advertise `access_evaluations_endpoint`).
 Per route, `resource` is the RFC 8707 identifier the chain starts from. An MCP route
 without one uses its `mcp_upstream_url`; a REST route without one uses the static PDP.
 
+Whatever document named the PDP travels to the PDP as well, verbatim, as
+`context.resource_metadata` with `context.resource_metadata_source` saying whether it is
+the resource's own RFC 9728 document or the federation-resolved one. The endpoint hit goes
+as `context.request`, and the raw token as `context.access_token` when the route sets
+`forward_access_token`. The PEP reads only the PDP list out of the document; what a
+resource requires — `scopes_supported`, an acr, sender-constrained tokens — is policy
+input, and matching a token to it is the PDP's decision. The reasoning is in
+[docs/architecture.md](../docs/architecture.md#what-the-pep-forwards-and-what-it-does-not-decide).
+
 ## A note on `mapping.go`
 
 The REST mapping is a direct port of `map_request` in the Kong plugin, so both gateways

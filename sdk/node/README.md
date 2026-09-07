@@ -222,6 +222,14 @@ to a PDP that does not advertise `access_evaluations_endpoint`, and metadata is 
 per identifier with stale-while-failing. A URL outside an allowlist never falls through
 to a weaker source — the verdict is a `pdp_error`.
 
+Whatever document named the PDP is forwarded to it verbatim as `context.resource_metadata`
+(with `context.resource_metadata_source`). The middleware forwards the endpoint hit as
+`context.request`, and the raw token as `context.access_token` when `forwardAccessToken`
+is set; on the guard, set `forwardAccessToken` and pass `accessToken` per call. The client
+itself takes `accessToken` and `request` in `EvaluateOptions`. The SDK enforces none of it:
+what a resource requires is the PDP's to match. See
+[docs/architecture.md](../../docs/architecture.md#what-the-pep-forwards-and-what-it-does-not-decide).
+
 There is no federation mode in the SDK; `sources` is the seam for one, and `discovery`
 also accepts a resolver of your own (`{ resolve(resource) }`). In `delegate` mode the
 Go engine runs its own discovery, federation included, and an explicit `resource` is

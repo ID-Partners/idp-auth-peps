@@ -169,8 +169,11 @@ local function pdp_list(raw, from)
   return out
 end
 
---- RFC 9728: the resource's own protected resource metadata.
-local function rfc9728_pdps(resource, opts)
+--- RFC 9728: the resource's own protected resource metadata. Returns
+--- {pdps, document, source}: the PDP list is what this module uses; the document is what
+--- the plugin forwards to the PDP verbatim. Nothing here interprets scopes_supported or
+--- an acr requirement — what a resource requires is policy input, and policy is the PDP's.
+local function rfc9728_lookup(resource, opts)
   local wk, err = D.well_known_url(resource, "oauth-protected-resource")
   if not wk then return fail(INVALID, err) end
   local doc, ferr = get_json(wk, opts.resource_policy)
@@ -180,7 +183,9 @@ local function rfc9728_pdps(resource, opts)
   if doc.resource ~= resource then
     return fail(INVALID, wk .. " says resource is " .. tostring(doc.resource) .. ", expected " .. resource)
   end
-  return pdp_list(doc[D.PARAM], wk)
+  local pdps, perr = pdp_list(doc[D.PARAM], wk)
+  if not pdps then return nil, perr end
+  return { pdps = pdps, document = doc, source = "rfc9728" }
 end
 
 --- AuthZEN 1.0 §9: the PDP's own metadata, or the default paths when it has none.
@@ -254,7 +259,9 @@ local function options(conf)
 end
 
 --- Resolve the PDP endpoints for `resource` under `conf`. Returns
---- ep{identifier, evaluation, evaluations, api_key, source} | nil, err{kind,msg}.
+--- ep{identifier, evaluation, evaluations, api_key, source, resource} | nil, err{kind,msg}.
+--- ep.resource is {source, document}: the resource's metadata as published, when a
+--- document named the PDP. The plugin forwards it to the PDP and reads nothing from it.
 function D.resolve(conf, resource)
   local mode = conf.pdp_discovery or "off"
   local o = options(conf)
@@ -270,6 +277,7 @@ function D.resolve(conf, resource)
   end
 
   local candidates
+  local from -- the resource's metadata, when a document named the PDP
   if resource == nil or resource == "" or mode == "authzen" then
     if o.static == "" then return fail(TRANSIENT, "no PDP configured") end
     candidates = { o.static }
@@ -278,21 +286,22 @@ function D.resolve(conf, resource)
     -- another route's allowlist.
     local rok, rwhy = D.check_url(resource, o.resource_policy)
     if not rok then return fail(NOT_ALLOWED, rwhy) end
-    local list, err = cache_get(caches.resources, resource, o.ttl, D.MIN_REFRESH, function(key)
-      local pdps, perr = rfc9728_pdps(key, o)
-      if pdps then return pdps end
+    local meta, err = cache_get(caches.resources, resource, o.ttl, D.MIN_REFRESH, function(key)
+      local found, perr = rfc9728_lookup(key, o)
+      if found then return found end
       if perr.kind == NOT_ALLOWED or perr.kind == TRANSIENT then return nil, perr end
       if perr.kind == INVALID then kong.log.warn("pdp discovery: ", perr.msg) end
       if o.static == "" then return nil, perr end
-      return { o.static }
+      return { pdps = { o.static } }
     end)
-    if not list then
+    if not meta then
       if err.kind == NOT_ALLOWED then return nil, err end
       if o.static == "" then return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg) end
       kong.log.warn("pdp discovery: ", err.msg, "; using the static PDP")
-      list = { o.static }
+      meta = { pdps = { o.static } }
     end
-    candidates = list
+    candidates = meta.pdps
+    if meta.document then from = { source = meta.source, document = meta.document } end
   end
 
   local last
@@ -307,7 +316,7 @@ function D.resolve(conf, resource)
       end
       -- Copy: the cached table must not carry a key or a source.
       return with_key({ identifier = ep.identifier, evaluation = ep.evaluation, evaluations = ep.evaluations,
-        capabilities = ep.capabilities }, pdp == o.static and "static" or "rfc9728")
+        capabilities = ep.capabilities, resource = from }, pdp == o.static and "static" or "rfc9728")
     end
     if err.kind == NOT_ALLOWED then return nil, err end
     kong.log.warn("pdp discovery: ", pdp, ": ", err.msg)
@@ -316,6 +325,6 @@ function D.resolve(conf, resource)
   return fail(TRANSIENT, "no PDP could be resolved" .. (last and (": " .. last.msg) or ""))
 end
 
-D._TEST = { parse_url = parse_url, get_json = get_json, cache_get = cache_get, fetch_config = fetch_config, rfc9728_pdps = rfc9728_pdps, options = options }
+D._TEST = { parse_url = parse_url, get_json = get_json, cache_get = cache_get, fetch_config = fetch_config, rfc9728_lookup = rfc9728_lookup, options = options }
 
 return D

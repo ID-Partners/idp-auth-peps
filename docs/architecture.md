@@ -65,6 +65,9 @@ it acts for is `subject.properties.on_behalf_of`, and the request context carrie
 policy needs to reason about the delegation: the user token's scope, `acr`, any RFC 9396
 `authorization_details`, and the token audience.
 
+The context also carries three things the PEP found rather than decided — see
+[What the PEP forwards, and what it does not decide](#what-the-pep-forwards-and-what-it-does-not-decide).
+
 The interesting part is the deny. A flat 403 tells an agent nothing it can act on, so a
 policy that says *how* to resolve a deny gets that rendered three consistent ways:
 
@@ -153,6 +156,54 @@ federation operator can therefore pin, per resource, which PDPs may decide for i
 `subset_of` and `essential`; a resource that names anything else has an invalid chain.
 The two documents can legitimately differ, and when they do the PEP never merges them:
 `federation` mode does not consult the resource's own well-known at all.
+
+### What the PEP forwards, and what it does not decide
+
+A resource's metadata says more than who decides for it. RFC 9728 gives it
+`scopes_supported`, `bearer_methods_supported`, `dpop_bound_access_tokens_required`,
+`authorization_details_types_supported`; a federation can constrain any of them and add
+its own. A resource that wants MFA for everything it serves has somewhere to say so.
+
+The design choice is what the PEP does with that: **nothing but carry it.** Every PDP
+call carries, in `context`:
+
+| Key | What it is | Where it came from |
+| --- | --- | --- |
+| `resource_metadata` | The resource's metadata document, verbatim | The RFC 9728 document, or the federation-resolved `oauth_resource` block |
+| `resource_metadata_source` | `rfc9728` or `federation` | So the PDP knows whether it is looking at a self-assertion or at what the federation vouched for |
+| `request` | `{method, path}`, the endpoint actually hit | The request |
+| `access_token` | The raw token, when the route sets `forward_access_token` | The request |
+
+The PEP does not compare the token's scope to `scopes_supported`. It does not compare
+the token's `acr` to a requirement. It does not know the names of those members; it
+forwards the document it read and the endpoint it mapped, and the PDP does the matching.
+
+That is a deliberate offload, for three reasons:
+
+- **Policy in one place.** A gateway comparing strings would be policy in two places, and
+  the gateway's copy is the dumber one: it cannot see risk signals, consent history,
+  velocity, device posture, or the customer's relationship with the bank. The PDP can
+  weigh a resource's declared requirement against all of that, and decide that a
+  password is enough for a balance from a known device but not for a payment from a new
+  one.
+- **Changeable without a deploy.** What a resource requires is published by the resource
+  and enforced by the PDP. Neither needs the gateway to be redeployed when it changes.
+- **The deny stays resolvable.** A PDP that knows the requirement can say what would
+  satisfy it — a step-up to `payments:write`, an `acr_values` to authenticate at — and the
+  PEP renders that as a challenge. A gateway that enforced the same thing could only 403.
+
+Forwarding the raw token lets the PDP examine it for itself: verify the signature, read
+`cnf`, check the client, introspect. It is off by default, per route, because a bearer
+token should only travel to a PDP over a connection the operator has decided is fit for
+it. The PDP is the decider and already trusted with the decision; whether it is trusted
+with the token is a separate, explicit choice.
+
+In federation mode the forwarded document is the *resolved* one. That gives the
+federation a floor: an anchor whose `metadata_policy` sets `acr_values_required` to MFA
+has set it for every PDP that reads the resolved metadata, and a member cannot lower it
+by editing its own well-known. The demo's `member` publishes "password is enough" about
+itself; through the federation-mode PEP the same PDP denies a password token and says
+which document it was reading.
 
 ### The rules that never relax
 

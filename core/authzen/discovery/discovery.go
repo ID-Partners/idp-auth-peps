@@ -103,6 +103,23 @@ type PDPEndpoints struct {
 	APIKey string
 	// Source names which MetadataSource produced the identifier.
 	Source string
+	// Resource is what the resource's own metadata said, verbatim, and where it came
+	// from. Nil when the PDP came from static configuration. The PEP reads the PDP list
+	// out of it and forwards the rest to the PDP as context — it decides nothing from
+	// it. That is the point: what a resource requires (scopes, acr, sender-constrained
+	// tokens) is policy input, and policy lives in the PDP.
+	Resource *ResourceMetadata
+}
+
+// ResourceMetadata is a resource's declared posture: the RFC 9728 document, or the
+// federation-resolved oauth_resource metadata, as published. Source says which, so
+// the PDP knows whether it is looking at a self-assertion or at what the federation
+// vouched for.
+type ResourceMetadata struct {
+	Source   string
+	Document map[string]any
+	// PDPs is the ordered list read out of Document, first preferred.
+	PDPs []string
 }
 
 // DefaultEndpoints is the spec-permitted shape for a PDP without metadata.
@@ -116,10 +133,11 @@ type Resolver interface {
 	Resolve(ctx context.Context, resource string) (PDPEndpoints, error)
 }
 
-// MetadataSource yields the ordered PDP identifiers for a resource.
+// MetadataSource yields a resource's metadata: the PDPs that decide for it, and the
+// document that named them.
 type MetadataSource interface {
 	Name() string
-	PDPs(ctx context.Context, resource string) ([]string, error)
+	Lookup(ctx context.Context, resource string) (ResourceMetadata, error)
 }
 
 // Options configures a Chain.
@@ -154,7 +172,7 @@ type Options struct {
 type Chain struct {
 	opts      Options
 	sources   []MetadataSource
-	resources *ttlcache.Cache[[]string]
+	resources *ttlcache.Cache[ResourceMetadata]
 	pdps      *ttlcache.Cache[PDPEndpoints]
 	resFetch  *metafetch.Client
 	pdpFetch  *metafetch.Client
@@ -190,7 +208,7 @@ func New(o Options) (*Chain, error) {
 	if resOpts.NegativeTTL <= 0 {
 		resOpts.NegativeTTL = 30 * time.Second
 	}
-	c.resources = ttlcache.New[[]string](resOpts)
+	c.resources = ttlcache.New[ResourceMetadata](resOpts)
 	c.pdps = ttlcache.New[PDPEndpoints](cacheOpts)
 
 	switch {
@@ -225,7 +243,7 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 	}
 
 	var candidates []string
-	var err error
+	var from *ResourceMetadata
 	if resource == "" || c.opts.Mode == ModeAuthZEN {
 		if c.opts.StaticPDP == "" {
 			return PDPEndpoints{}, ErrNoPDP
@@ -238,7 +256,7 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 		if c.opts.ResourceAllowed != nil && !c.opts.ResourceAllowed(resource) {
 			return PDPEndpoints{}, fmt.Errorf("%w: %q is outside the resource allowlist", ErrNotAllowed, resource)
 		}
-		candidates, err = c.resources.Get(ctx, resource, c.lookupPDPs)
+		meta, err := c.resources.Get(ctx, resource, c.lookupResource)
 		if err != nil {
 			if errors.Is(err, ErrNotAllowed) {
 				return PDPEndpoints{}, err
@@ -250,6 +268,12 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 			}
 			c.opts.Logf("pdp discovery: %s: %v; using the static PDP", resource, err)
 			candidates = []string{c.opts.StaticPDP}
+		} else {
+			candidates = meta.PDPs
+			if meta.Document != nil {
+				m := meta
+				from = &m
+			}
 		}
 	}
 
@@ -258,6 +282,7 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 		ep, err := c.pdps.Get(ctx, pdp, c.fetchConfig)
 		if err == nil {
 			ep.APIKey = c.opts.APIKeys[ep.Identifier]
+			ep.Resource = from
 			return ep, nil
 		}
 		if errors.Is(err, ErrNotAllowed) {
@@ -269,29 +294,29 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 	return PDPEndpoints{}, fmt.Errorf("%w for %s: %v", ErrNoPDP, resource, last)
 }
 
-// lookupPDPs walks the sources in order; the first non-empty list wins. No metadata
-// anywhere resolves to the static PDP, and that answer is cached like any other. A
-// transient failure is returned as an error so the cache can serve a stale list.
-func (c *Chain) lookupPDPs(ctx context.Context, resource string) ([]string, time.Time, error) {
+// lookupResource walks the sources in order; the first that names a PDP wins. No
+// metadata anywhere resolves to the static PDP, and that answer is cached like any
+// other. A transient failure is returned as an error so the cache can serve stale.
+func (c *Chain) lookupResource(ctx context.Context, resource string) (ResourceMetadata, time.Time, error) {
 	for _, src := range c.sources {
-		pdps, err := src.PDPs(ctx, resource)
-		if err == nil && len(pdps) > 0 {
-			return pdps, time.Time{}, nil
+		meta, err := src.Lookup(ctx, resource)
+		if err == nil && len(meta.PDPs) > 0 {
+			return meta, time.Time{}, nil
 		}
 		switch {
 		case err == nil, errors.Is(err, ErrNoMetadata):
 		case errors.Is(err, ErrNotAllowed):
-			return nil, time.Time{}, err
+			return ResourceMetadata{}, time.Time{}, err
 		case errors.Is(err, ErrInvalid):
 			c.opts.Logf("pdp discovery: %s for %s: %v", src.Name(), resource, err)
 		default:
-			return nil, time.Time{}, fmt.Errorf("%s: %w", src.Name(), err)
+			return ResourceMetadata{}, time.Time{}, fmt.Errorf("%s: %w", src.Name(), err)
 		}
 	}
 	if c.opts.StaticPDP == "" {
-		return nil, time.Time{}, ErrNoMetadata
+		return ResourceMetadata{}, time.Time{}, ErrNoMetadata
 	}
-	return []string{c.opts.StaticPDP}, time.Time{}, nil
+	return ResourceMetadata{PDPs: []string{c.opts.StaticPDP}}, time.Time{}, nil
 }
 
 // fetchConfig reads {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9), falling

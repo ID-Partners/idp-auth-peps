@@ -121,5 +121,6 @@ Read from `context_extensions` on every request:
 | `stepup_action` | `make_payment` | Action the step-up applies to |
 | `mcp_upstream_url` | — | Set to enable COAZ: where to discover `tools/list` |
 | `resource` | — | The protected resource's identifier (RFC 8707), the key [PDP discovery](../../core/README.md#pdp-discovery) starts from. MCP routes default to `mcp_upstream_url`; REST routes without it use the static PDP |
+| `forward_access_token` | `false` | Send the raw access token to the PDP as `context.access_token`, so the PDP can verify and inspect it itself. Only over a PDP connection that is TLS and authenticated |
 | `coaz_defaults` | `false` | Apply the binding's default mappings to undeclared methods |
 | `legacy_subject_identity` | `true` | Also send the non-standard `subject.identity` beside AuthZEN's `subject.id`. Set `"false"` once policies read `subject.id` — see [core/README.md](../../core/README.md#migrating-subjectidentity---subjectid) |

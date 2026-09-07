@@ -217,6 +217,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
       </tbody>
     </table>
     </div>
+    <p class="small measure">The context also carries what the PEP found rather than decided: the resource's metadata document, the endpoint hit and, per route, the raw token. That is the next section.</p>
     <p class="small measure">For MCP the PEP does not authorise “POST /mcp”. It reads the JSON-RPC body, finds the tool, and authorises <em>that call</em> under the AuthZEN MCP profile (COAZ): the server's <code>tools/list</code> declares, per tool, how to map arguments and claims into an AuthZEN request. Deny and error semantics are JSON-RPC errors over HTTP 200, as the profile requires.</p>
   </div>
 </section>
@@ -292,6 +293,29 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     </table>
     </div>
     <p class="small measure">Federation resolution lives only in the Go engine. Kong and the Node SDK implement the <code>resource</code> and <code>authzen</code> modes natively and get federation by delegating.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="eyebrow">What the PEP forwards, and what it does not decide</span>
+    <h2>The gateway carries the requirement. The PDP enforces it.</h2>
+    <div class="measure">
+      <p>A resource's metadata says more than who decides for it. RFC 9728 gives it <code>scopes_supported</code>, <code>dpop_bound_access_tokens_required</code> and friends; a federation can constrain any of them and add its own. A resource that wants MFA for everything it serves has somewhere to say so.</p>
+      <p>The design choice is what the PEP does with that: <em>nothing but carry it.</em> Every PDP call carries the resource's document verbatim as <code>context.resource_metadata</code>, tagged with whether it is a self-assertion or the federation-resolved one; the endpoint hit as <code>context.request</code>; and, when the route allows, the raw token as <code>context.access_token</code>. The PEP does not compare a token's scope or <code>acr</code> to anything. It does not know the names of those members.</p>
+    </div>
+    <div class="wide">
+    <table>
+      <thead><tr><th>Why offload it</th><th>What it buys</th></tr></thead>
+      <tbody>
+        <tr><td>Policy in one place</td><td>A gateway comparing strings is policy in two places, and the gateway's copy is the dumber one: it cannot see risk, consent history, velocity or device posture. The PDP weighs a resource's requirement against all of that.</td></tr>
+        <tr><td>Changeable without a deploy</td><td>The resource publishes what it requires; the PDP enforces it. Neither needs the gateway redeployed when it changes.</td></tr>
+        <tr><td>The deny stays resolvable</td><td>A PDP that knows the requirement can say what would satisfy it, and the PEP renders that as a challenge. A gateway enforcing the same thing could only 403.</td></tr>
+        <tr><td>The PDP examines the token itself</td><td>With the raw token forwarded it can verify the signature, read <code>cnf</code>, score the client. Off by default per route: whether a PDP is trusted with the token is a separate choice from whether it is trusted with the decision.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="small measure">In federation mode the forwarded document is the <em>resolved</em> one, so an anchor that sets <code>acr_values_required</code> to MFA has set it for every PDP that reads it, and a member cannot lower it by editing its own well-known. In the demo, the same PDP with the same policy and the same token permits through the resource-mode PEP and denies through the federation-mode one, and its reason names which document it was reading.</p>
   </div>
 </section>
 
@@ -380,6 +404,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     <span><a href="https://github.com/ID-Partners/idp-auth-peps">ID-Partners/idp-auth-peps</a> on GitHub</span>
   </div>
 </footer>
+
 
 </body>
 </html>

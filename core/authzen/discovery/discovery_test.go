@@ -282,6 +282,10 @@ func TestResourceMode(t *testing.T) {
 		if ep.Identifier != good.URL || ep.Evaluation != good.URL+"/custom/eval" || ep.APIKey != "" {
 			t.Fatalf("%+v", ep)
 		}
+		// The whole document rides along, verbatim, tagged with where it came from.
+		if ep.Resource == nil || ep.Resource.Source != "rfc9728" || ep.Resource.Document["ignored"] != true || ep.Resource.Document["resource"] != res.URL {
+			t.Fatalf("resource metadata not forwarded: %+v", ep.Resource)
+		}
 		if atomic.LoadInt32(&static.hits) != 0 {
 			t.Fatal("static PDP should not be consulted")
 		}
@@ -299,12 +303,18 @@ func TestResourceMode(t *testing.T) {
 		if err != nil || ep.Identifier != static.URL || ep.APIKey != "static-key" {
 			t.Fatalf("%+v %v", ep, err)
 		}
+		if ep.Resource != nil {
+			t.Fatal("no resource metadata was read, so none should be forwarded")
+		}
 	})
 	t.Run("no metadata falls to static", func(t *testing.T) {
 		plain := newResource(t, nil)
 		ep, err := mustNew(t, opts).Resolve(ctx(), plain.URL)
 		if err != nil || ep.Identifier != static.URL {
 			t.Fatalf("%+v %v", ep, err)
+		}
+		if ep.Resource != nil {
+			t.Fatal("falling to static forwards no document")
 		}
 	})
 	t.Run("metadata without the parameter falls to static", func(t *testing.T) {
@@ -508,6 +518,14 @@ func TestFederationMode(t *testing.T) {
 		if err != nil || ep.Identifier != good.URL || ep.Evaluation != good.URL+"/custom/eval" {
 			t.Fatalf("%+v %v", ep, err)
 		}
+		// What is forwarded is the RESOLVED metadata: the policy already stripped the
+		// rogue PDP out of it, so the PDP sees what the federation vouched for.
+		if ep.Resource == nil || ep.Resource.Source != "federation" {
+			t.Fatalf("federation metadata not forwarded: %+v", ep.Resource)
+		}
+		if got, _ := ep.Resource.Document[ParamPolicyDecisionPoints].([]any); !reflect.DeepEqual(got, []any{good.URL}) {
+			t.Fatalf("forwarded document should be the resolved one: %v", got)
+		}
 		if atomic.LoadInt32(&rogue.hits) != 0 {
 			t.Fatal("the rogue PDP must never be contacted")
 		}
@@ -611,8 +629,10 @@ type fakeSource struct {
 	err  error
 }
 
-func (fakeSource) Name() string                                      { return "fake" }
-func (f *fakeSource) PDPs(context.Context, string) ([]string, error) { return f.pdps, f.err }
+func (fakeSource) Name() string { return "fake" }
+func (f *fakeSource) Lookup(context.Context, string) (ResourceMetadata, error) {
+	return ResourceMetadata{PDPs: f.pdps}, f.err
+}
 
 func TestSourceErrorHandling(t *testing.T) {
 	pdp := newPDP(t, fullConfig)
@@ -662,7 +682,7 @@ func TestSourceErrorHandling(t *testing.T) {
 		}
 	})
 	t.Run("static source empty", func(t *testing.T) {
-		if _, err := (StaticSource{}).PDPs(ctx(), ""); !errors.Is(err, ErrNoMetadata) {
+		if _, err := (StaticSource{}).Lookup(ctx(), ""); !errors.Is(err, ErrNoMetadata) {
 			t.Fatal(err)
 		}
 	})
