@@ -2,7 +2,7 @@
 #
 #   stubs           a Trust Anchor, federated and non-federated resources, two banks'
 #                   PDPs and a rogue one — see ../core/cmd/demo-stubs/main.go for the cast
-#   pep-static      coaz-pep as shipped: told where the PDP is, no discovery     :9192
+#   pep-static      coaz-pep as shipped: told where its PDP is, no discovery    :9192
 #   pep-resource    PDP_DISCOVERY=resource — trusts each resource's own well-known :9193
 #   pep-federation  PDP_DISCOVERY=federation — trusts the federation's word        :9194
 #   console         a clickable walkthrough: one request, all three PEPs          :8088
@@ -35,7 +35,7 @@ services:
       context: ../core
       target: coaz-pep
     environment: &pep-env
-      AUTHZEN_URL: http://stubs:9002
+      AUTHZEN_URL: http://stubs:9002/tenants/bank-a
       AUTHZEN_API_KEY: static-pdp-key
       CHECK_API_TOKEN: demo
       MCP_UPSTREAM_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9009

@@ -14,7 +14,7 @@ FEDERATION="http://${PEP_HOST}:${PEP_FEDERATION_PORT:-9194}"
 CHECK_TOKEN="${CHECK_API_TOKEN:-demo}"
 
 S="http://${STUBS_HOST}"
-MEMBER="$S:9001"; GOOD="$S:9002"; ROGUE="$S:9003"; PLAIN="$S:9004"; IMPOSTOR="$S:9005"; BROKEN="$S:9006"; STRAY="$S:9007"; BANKB="$S:9009"
+MEMBER="$S:9001"; GOOD="$S:9002/tenants/bank-a"; ROGUE="$S:9003"; PLAIN="$S:9004"; IMPOSTOR="$S:9005"; BROKEN="$S:9006"; STRAY="$S:9007"; BANKB="$S:9009"
 
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 # An UNSIGNED token: coaz-pep decodes without verifying when no JWKS is configured, and
@@ -52,8 +52,8 @@ say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 step() { printf '  %-58s ' "$1"; }
 
 say "0. What the metadata says"
-echo "  Bank A's PDP metadata:        $(curl -s "http://${PEP_HOST}:9002/.well-known/authzen-configuration")"
-echo "  Bank B's PDP metadata:        $(curl -s "http://${PEP_HOST}:9008/.well-known/authzen-configuration")"
+echo "  Bank A's PDP metadata:        $(curl -s "http://${PEP_HOST}:9002/.well-known/authzen-configuration/tenants/bank-a")"
+echo "  Bank B's PDP metadata:        $(curl -s "http://${PEP_HOST}:9008/.well-known/authzen-configuration/tenants/bank-b")"
 echo "  the rogue PDP's metadata:     $(curl -s "http://${PEP_HOST}:9003/.well-known/authzen-configuration")"
 echo "  plain resource (RFC 9728):    $(curl -s "http://${PEP_HOST}:9004/.well-known/oauth-protected-resource")"
 echo "  impostor resource (RFC 9728): $(curl -s "http://${PEP_HOST}:9005/.well-known/oauth-protected-resource")"

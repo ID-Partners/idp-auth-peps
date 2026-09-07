@@ -13,13 +13,13 @@
 //	:9000  anchor      Trust Anchor: entity configuration + fetch endpoint
 //	:9001  member      federated resource; its OWN metadata names the rogue PDP first,
 //	                   the anchor's policy allows only Bank A's PDP
-//	:9002  pdp-a       Bank A's PDP. Denies mallory; steps up payments over 1000
+//	:9002  pdp-a       Bank A's PDP, at /tenants/bank-a. Denies mallory; steps up over 1000
 //	:9003  rogue-pdp   permits everything, advertises no batch endpoint, and says so
 //	:9004  plain       not federated; RFC 9728 metadata names Bank A's PDP
 //	:9005  impostor    not federated; RFC 9728 metadata names the rogue PDP
 //	:9006  broken      federated, but signs with a key the anchor never vouched for
 //	:9007  stray       no metadata of any kind
-//	:9008  pdp-b       Bank B's PDP. Same denials, but steps up payments over 100
+//	:9008  pdp-b       Bank B's PDP, at /tenants/bank-b. Same denials, steps up over 100
 //	:9009  bank-b      not federated; RFC 9728 metadata names Bank B's PDP
 //	:9099  control     the event feed the console traces, and the levers it pulls
 //	                   (clear of the entity block, and of the ports desktop apps squat on)
@@ -27,6 +27,19 @@
 // Every resource also answers MCP `tools/list` at /mcp, declaring one tool whose
 // mapping is a boxcar — two evaluations in one call. That is what exercises a PDP's
 // advertised batch endpoint, and what fails closed against a PDP with none.
+//
+// Every endpoint here is AuthZEN's own: `/access/v1/evaluation` and
+// `/access/v1/evaluations`. Nothing invents a path. What differs between PDPs is the
+// BASE those endpoints hang off — a PDP identifier may carry a path, and a multi-tenant
+// deployment is the ordinary reason it does. So Bank A's PDP is the identifier
+// `http://host:9002/tenants/bank-a`, its metadata is at
+// `/.well-known/authzen-configuration/tenants/bank-a` (AuthZEN 1.0 §9 inserts the
+// well-known segment after the host and keeps the path), and it evaluates at
+// `/tenants/bank-a/access/v1/evaluation`.
+//
+// That separation is what the "move" lever exercises: the identifier is a stable name,
+// the endpoint is a location, and they are different fields for a reason. Move the
+// endpoint and a PEP that reads metadata follows; one that was told a URL does not.
 //
 // Environment:
 //
@@ -56,20 +69,35 @@ import (
 
 const param = "authzen_policy_decision_points"
 
-// defaultEvalPath is the path AuthZEN 1.0 tells a PEP to assume when a PDP publishes no
-// metadata at all. Every PDP here answers on it as well as on the one it advertises, so
-// the trace shows plainly which path a PEP chose and why.
+// The endpoint names AuthZEN 1.0 defines. A PDP that publishes no metadata is assumed
+// to serve them directly under its identifier; a PDP that publishes metadata says where
+// they actually are. Both are these two names — only the base moves.
 const (
-	defaultEvalPath  = "/access/v1/evaluation"
-	defaultBatchPath = "/access/v1/evaluations"
+	evaluationPath  = "/access/v1/evaluation"
+	evaluationsPath = "/access/v1/evaluations"
+	// movedSuffix is where Bank A's PDP relocates when the demo's lever is pulled: a
+	// new base, the same AuthZEN endpoint names, the same identifier.
+	movedBase = "/tenants/bank-a-v2"
 )
 
 type entity struct {
 	name string
 	port int
-	id   string
-	key  *ecdsa.PrivateKey
-	jwk  map[string]any
+	// origin is scheme://host:port. id is the entity identifier, which for a PDP may
+	// carry a path: a tenant, a product, whatever the deployment is shaped like.
+	origin string
+	id     string
+	base   string
+	key    *ecdsa.PrivateKey
+	jwk    map[string]any
+}
+
+// atBase gives an entity an identifier with a path component. Only PDPs use it; the
+// point is that AuthZEN's endpoint names then hang off something other than the root.
+func (e *entity) atBase(base string) *entity {
+	e.base = base
+	e.id = e.origin + base
+	return e
 }
 
 func newEntity(name string, port int, host string) *entity {
@@ -78,7 +106,8 @@ func newEntity(name string, port int, host string) *entity {
 		log.Fatal(err)
 	}
 	jwk, _ := jose.PublicJWK(key)
-	return &entity{name: name, port: port, id: fmt.Sprintf("http://%s:%d", host, port), key: key, jwk: jwk}
+	origin := fmt.Sprintf("http://%s:%d", host, port)
+	return &entity{name: name, port: port, origin: origin, id: origin, key: key, jwk: jwk}
 }
 
 func (e *entity) sign(claims map[string]any) []byte {
@@ -118,10 +147,15 @@ func env(k, def string) string {
 // can change without touching a PEP, so the demo has to be able to change them.
 type state struct {
 	mu sync.Mutex
-	// pdpEval maps a PDP's name to the path its metadata currently advertises.
+	// pdpEval maps a PDP's name to the base its metadata currently advertises the
+	// AuthZEN endpoints under.
 	pdpEval map[string]string
 	// resourcePDPs maps a resource's name to the PDP identifiers its metadata names.
 	resourcePDPs map[string][]string
+	// home is each PDP's identifier path — where its endpoints sit unless moved. The
+	// console compares against it to say whether a call went to the advertised
+	// endpoint or to the one a PEP would have assumed.
+	home map[string]string
 	// defaults, for reset.
 	defEval map[string]string
 	defRes  map[string][]string
@@ -146,13 +180,13 @@ func (s *state) snapshot() map[string]any {
 	defer s.mu.Unlock()
 	eval := map[string]string{}
 	for k, v := range s.pdpEval {
-		eval[k] = v
+		eval[k] = v + evaluationPath
 	}
 	res := map[string][]string{}
 	for k, v := range s.resourcePDPs {
 		res[k] = append([]string{}, v...)
 	}
-	return map[string]any{"pdp_evaluation_path": eval, "resource_pdps": res}
+	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res}
 }
 
 func main() {
@@ -162,19 +196,20 @@ func main() {
 
 	anchor := newEntity("anchor", base, host)
 	member := newEntity("member", base+1, host)
-	pdpA := newEntity("pdp-a", base+2, host)
+	pdpA := newEntity("pdp-a", base+2, host).atBase("/tenants/bank-a")
 	rogue := newEntity("rogue-pdp", base+3, host)
 	plain := newEntity("plain", base+4, host)
 	impostor := newEntity("impostor", base+5, host)
 	broken := newEntity("broken", base+6, host)
 	stray := newEntity("stray", base+7, host)
-	pdpB := newEntity("pdp-b", base+8, host)
+	pdpB := newEntity("pdp-b", base+8, host).atBase("/tenants/bank-b")
 	bankB := newEntity("bank-b", base+9, host)
 	// The key the anchor vouches for `broken` is not the one it signs with.
 	brokenAsserted := newEntity("broken-asserted", base+6, host)
 
 	st := &state{
-		pdpEval:      map[string]string{pdpA.name: "/decide", pdpB.name: "/decide", rogue.name: "/anything-goes"},
+		home:         map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
+		pdpEval:      map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
 		resourcePDPs: map[string][]string{plain.name: {pdpA.id}, impostor.name: {rogue.id}, bankB.name: {pdpB.id}, member.name: {rogue.id, pdpA.id}, broken.name: {rogue.id}},
 	}
 	st.defEval = map[string]string{}
@@ -297,11 +332,11 @@ func main() {
 			return map[string]any{"decision": true, "context": map[string]any{"reason": fmt.Sprintf("%s may %s", who, req.Action.Name)}}
 		}
 	}
-	pdp(pdpA, rec, st, "/decide-batch", serve, customerPolicy(1000))
-	pdp(pdpB, rec, st, "/decide-batch", serve, customerPolicy(100))
+	pdp(pdpA, rec, st, true, serve, customerPolicy(1000))
+	pdp(pdpB, rec, st, true, serve, customerPolicy(100))
 	// The rogue PDP advertises NO batch endpoint, so a PEP asked to boxcar against it
 	// has nothing to send to and must refuse rather than guess a path.
-	pdp(rogue, rec, st, "", serve, func(req authzenRequest) map[string]any {
+	pdp(rogue, rec, st, false, serve, func(req authzenRequest) map[string]any {
 		log.Printf("rogue-pdp  !!! consulted for %s by %v — permitting, as always", req.Action.Name, req.Subject.Properties["on_behalf_of"])
 		return map[string]any{"decision": true, "context": map[string]any{"reason": "the rogue PDP permits everything"}}
 	})
@@ -331,10 +366,10 @@ func main() {
 			st.mu.Lock()
 			switch body.Op {
 			case "move_pdp":
-				// Bank A's PDP starts advertising a different evaluation endpoint. It
-				// still answers on the old one, so nothing breaks mid-flight; the trace
-				// is what shows the PEPs following.
-				st.pdpEval[pdpA.name] = "/decide-v2"
+				// Bank A's PDP relocates: same identifier, same AuthZEN endpoint names,
+				// new base. It still answers on the old base, so nothing breaks
+				// mid-flight; the trace is what shows the PEPs following.
+				st.pdpEval[pdpA.name] = movedBase
 			case "repoint_plain":
 				// The plain resource is handed over to Bank B's PDP. No PEP is touched.
 				st.resourcePDPs[plain.name] = []string{pdpB.id}
@@ -383,15 +418,22 @@ type authzenRequest struct {
 
 // pdp serves one PDP stub. It answers on every path it might ever advertise plus the
 // AuthZEN defaults, and its metadata says which one it wants used right now.
-func pdp(e *entity, rec *recorder, st *state, batchPath string, serve func(*entity, *http.ServeMux), decide func(authzenRequest) map[string]any) {
+// pdp serves one PDP stub: its metadata, and AuthZEN's two endpoint names under every
+// base it might ever advertise them at. batching says whether it claims to do batch at
+// all — a PDP that does not is what makes a PEP refuse rather than guess.
+func pdp(e *entity, rec *recorder, st *state, batching bool, serve func(*entity, *http.ServeMux), decide func(authzenRequest) map[string]any) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/authzen-configuration", func(w http.ResponseWriter, _ *http.Request) {
+	// AuthZEN 1.0 §9: the well-known segment goes after the host, and the identifier's
+	// own path follows it. For http://host:9002/tenants/bank-a that is
+	// /.well-known/authzen-configuration/tenants/bank-a.
+	mux.HandleFunc("/.well-known/authzen-configuration"+e.base, func(w http.ResponseWriter, _ *http.Request) {
+		at := e.origin + st.eval(e.name)
 		doc := map[string]any{
 			"policy_decision_point":      e.id,
-			"access_evaluation_endpoint": e.id + st.eval(e.name),
+			"access_evaluation_endpoint": at + evaluationPath,
 		}
-		if batchPath != "" {
-			doc["access_evaluations_endpoint"] = e.id + batchPath
+		if batching {
+			doc["access_evaluations_endpoint"] = at + evaluationsPath
 		}
 		writeJSON(w, doc)
 	})
@@ -425,13 +467,15 @@ func pdp(e *entity, rec *recorder, st *state, batchPath string, serve func(*enti
 		writeJSON(w, map[string]any{"evaluations": out})
 	}
 
-	// Every evaluation path this PDP might advertise, plus the AuthZEN defaults.
-	for _, p := range []string{"/decide", "/decide-v2", "/anything-goes", defaultEvalPath} {
-		mux.HandleFunc(p, evaluate)
-	}
-	if batchPath != "" {
-		mux.HandleFunc(batchPath, batch)
-		mux.HandleFunc(defaultBatchPath, batch)
+	// AuthZEN's endpoint names, under this PDP's own base and under any base it may
+	// relocate to. A PEP that never read the metadata would post under the identifier's
+	// base; one that did follows the move. Both are served, so neither 404s.
+	bases := map[string]bool{e.base: true, st.eval(e.name): true, movedBase: true}
+	for b := range bases {
+		mux.HandleFunc(b+evaluationPath, evaluate)
+		if batching {
+			mux.HandleFunc(b+evaluationsPath, batch)
+		}
 	}
 	serve(e, mux)
 }
@@ -523,7 +567,7 @@ func kindOf(path string) string {
 		return "metadata"
 	case strings.HasPrefix(path, "/mcp"):
 		return "tools"
-	case strings.Contains(path, "decide") || strings.Contains(path, "anything-goes") || strings.Contains(path, "/access/v1/"):
+	case strings.Contains(path, "/access/v1/"):
 		return "decision"
 	default:
 		return "other"

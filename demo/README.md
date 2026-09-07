@@ -15,15 +15,15 @@ are the levers and the MCP request in the console.
 | --- | --- | --- |
 | `anchor` | 9000 | A federation Trust Anchor. Its policy for members: `authzen_policy_decision_points` must be a subset of `[pdp-a]`, and is essential. |
 | `member` | 9001 | A federated resource. Its **own** metadata names the rogue PDP first. |
-| `pdp-a` | 9002 | Bank A's PDP. Denies *mallory*; steps up payments over 1000. Advertises a batch endpoint. |
-| `rogue-pdp` | 9003 | Permits everything, logs loudly when asked, and advertises **no** batch endpoint. |
+| `pdp-a` | 9002 | Bank A's PDP, identifier `…:9002/tenants/bank-a`. Denies *mallory*; steps up payments over 1000. Advertises a batch endpoint. |
+| `rogue-pdp` | 9003 | Permits everything, logs loudly when asked, and advertises **no** batch endpoint. Bare identifier, no tenant path. |
 | `plain` | 9004 | Not federated. RFC 9728 metadata names Bank A's PDP. |
 | `impostor` | 9005 | Not federated. RFC 9728 metadata names the rogue PDP. |
 | `broken` | 9006 | Federated, but signs with a key the anchor never vouched for. |
 | `stray` | 9007 | No metadata of any kind. |
-| `pdp-b` | 9008 | Bank B's PDP. Same product, stricter threshold: steps up payments over 100. |
+| `pdp-b` | 9008 | Bank B's PDP, identifier `…:9008/tenants/bank-b`. Same product, stricter threshold: steps up payments over 100. |
 | `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP. |
-| `control` | 9099 | The event feed the console traces, and the levers it pulls. |
+| `control` | 9099 | The event feed the console traces, and the levers it pulls. Not part of any spec. |
 
 Every resource also answers MCP `tools/list` at `/mcp` with one tool whose mapping is a
 boxcar: a transfer is a debit and a credit, evaluated in one call.
@@ -67,19 +67,33 @@ and underneath it every request the stubs saw while that PEP was deciding — wh
 `.well-known` document it read, whether it climbed a trust chain, and which PDP answered
 **on which endpoint**.
 
-That last part is the one people miss. `POST /access/v1/evaluation` is the path AuthZEN
-tells a PEP to assume when a PDP publishes no metadata. `POST /decide` is the endpoint
-this PDP actually advertised, and a PEP only knows it by having read the document. The
-trace badges each call so the difference is visible rather than implied.
+Every endpoint in the trace is AuthZEN's own name — `/access/v1/evaluation` and
+`/access/v1/evaluations`. Nothing here invents a path, because a demo about a standard
+that shows you a made-up verb teaches the wrong thing.
+
+What differs between PDPs is the **base** those endpoints hang off. A PDP identifier may
+carry a path, and a multi-tenant deployment is the ordinary reason it does, so Bank A's
+PDP is the identifier `http://stubs:9002/tenants/bank-a`. Its metadata sits at
+`/.well-known/authzen-configuration/tenants/bank-a` — AuthZEN §9 inserts the well-known
+segment after the host and keeps the identifier's path — and it evaluates at
+`/tenants/bank-a/access/v1/evaluation`.
+
+The trace badges each evaluation as **the PDP's own base** or **advertised elsewhere**.
+Before anything moves those agree, and that is the honest picture: a correctly configured
+static PEP and a discovering one post to the same place. The difference only appears when
+something changes, which is the argument.
 
 ### The levers
 
 Three buttons change the world while it runs. None restarts a PEP or edits a PEP's
 configuration; the PEPs pick the change up on their next metadata refresh.
 
-- **Move Bank A's PDP to `/decide-v2`.** Re-run: the discovery columns follow to the new
-  endpoint; the static column carries on posting to the path it assumed. This is the
-  answer to "why not just set `AUTHZEN_URL`" — because then this is a deploy.
+- **Relocate Bank A's PDP.** Its metadata starts advertising the same AuthZEN endpoints
+  under a new base, `/tenants/bank-a-v2`. The identifier does not change: a name and a
+  location are different fields for exactly this reason. Re-run and the discovery columns
+  follow; the static column carries on posting to the old base, because it was told a URL
+  rather than sent to read one. This is the answer to "why not just set `AUTHZEN_URL`" —
+  because then this is a deploy.
 - **Hand `plain` over to Bank B's PDP.** Re-run a payment of 500: permitted under Bank A's
   threshold, needs a step-up under Bank B's. A resource changed hands between two policy
   owners and no gateway was touched.
@@ -96,9 +110,11 @@ configuration; the PEPs pick the change up on their next metadata refresh.
   answer to two PDPs with different thresholds. The static column cannot tell them apart:
   it has one PDP for everything.
 - **MCP transfer (batch), on plain then on impostor.** One tool call, two evaluations.
-  Against Bank A's PDP it goes to the advertised batch endpoint. Against the rogue PDP,
-  which advertises none, the PEP reads the metadata and **refuses** — nothing is sent at
-  all, because guessing a batch path is not something a PEP gets to do.
+  Against Bank A's PDP it goes to the `access_evaluations_endpoint` its metadata
+  advertises. Against the rogue PDP, which advertises none, the PEP reads the metadata and
+  **refuses** — nothing is sent at all. AuthZEN's default paths are what a PEP assumes
+  when there is no metadata; they are not licence to assume an endpoint a PDP declined to
+  claim.
 
 The metadata cache TTL is 15 seconds here so the trace shows fetches on every run rather
 than an empty list; the shipped default is five minutes, and a repeat run inside the TTL
@@ -107,11 +123,13 @@ legitimately shows nothing fetched. The console reads the stubs' event feed at
 
 ## What `demo.sh` walks
 
-**1. Static.** The PEP is told Bank A's PDP is at :9002. Alice is permitted, mallory is
-not. The evaluation arrives on the AuthZEN default path — nothing was discovered.
+**1. Static.** The PEP is told its PDP is `http://stubs:9002/tenants/bank-a`, and posts
+to `/access/v1/evaluation` under it — the path AuthZEN says to assume when you have no
+metadata. Alice is permitted, mallory is not. Nothing was discovered.
 
-**2. Resource mode.** The `plain` resource's well-known names Bank A's PDP; the PEP reads
-that PDP's metadata and calls the endpoint it advertises. Then the `impostor` resource
+**2. Resource mode.** The `plain` resource's well-known names Bank A's PDP; the PEP
+derives that PDP's metadata URL by the insertion rule, reads it, and calls the endpoint it
+advertises. Then the `impostor` resource
 names the rogue PDP — and **mallory is permitted**. A self-asserted document cannot
 protect the thing it asserts. (A `PDP_ALLOWLIST` would have stopped this; `pep-resource`
 deliberately has none, and warns about it at boot.)

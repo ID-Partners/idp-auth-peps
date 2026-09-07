@@ -111,7 +111,7 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
   <div class="levers">
     <p class="why"><b>Change the world while it runs.</b> Nothing below restarts a PEP or edits its configuration. Re-run after each; the PEPs pick the change up on their next metadata refresh.</p>
     <div class="row">
-      <button type="button" id="movePdp" aria-pressed="false">Move Bank A's PDP to /decide-v2</button>
+      <button type="button" id="movePdp" aria-pressed="false">Relocate Bank A's PDP</button>
       <button type="button" id="repoint" aria-pressed="false">Hand plain over to Bank B's PDP</button>
       <button type="button" id="reset">Put it back</button>
     </div>
@@ -123,7 +123,8 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
   <div class="legend">
     <div><b>The columns are the argument.</b> Same request, same policy, three ways of deciding who decides.</div>
     <div>Grey trace lines are metadata fetches the PEP made. Green is the PDP that decided. Orange is the rogue PDP being consulted at all.</div>
-    <div><b>Watch the endpoint badge.</b> <code>/access/v1/evaluation</code> is the path AuthZEN says to assume when a PDP publishes no metadata. Anything else is the endpoint that PDP advertised, and a PEP only knows it by having read the document.</div>
+    <div><b>Every endpoint here is AuthZEN's own name</b> — <code>/access/v1/evaluation</code> and <code>/access/v1/evaluations</code>. Nothing invents a path. What differs is the <b>base</b> they hang off: a PDP identifier may carry one, and <code>/tenants/bank-a</code> is what a multi-tenant deployment looks like.</div>
+    <div><b>So the badge is about the base.</b> A PEP that read no metadata posts under the PDP's own identifier path. Relocate the PDP and only the PEPs that read metadata follow — which is the whole argument, and it is invisible until something moves.</div>
     <div>Metadata caches are set to a short TTL here so the trace stays visible on every run; the shipped default is five minutes.</div>
   </div>
 </main>
@@ -218,13 +219,18 @@ function render(results, action) {
       p.className = 'p';
       p.textContent = e.kind === 'verdict' ? `${e.path} → ${e.note}` : `${e.method} ${e.path}`;
       li.append(ent, p);
-      // The whole point of the PDP's metadata is which endpoint gets used. Say so.
+      // Every endpoint here is AuthZEN's own name. What tells you whether a PEP read
+      // the metadata is the BASE it posted under: the PDP's own identifier path is
+      // where a PEP would go without reading anything.
       if (e.kind === 'decision') {
-        const badge = document.createElement('span');
-        const assumed = e.path.startsWith('/access/v1/');
-        badge.className = 'badge' + (assumed ? '' : ' adv');
-        badge.textContent = assumed ? 'assumed default path' : 'advertised endpoint';
-        p.append(badge);
+        const home = (controlState.pdp_home || {})[e.entity];
+        if (home !== undefined) {
+          const assumed = e.path.startsWith(home + '/access/v1/');
+          const badge = document.createElement('span');
+          badge.className = 'badge' + (assumed ? '' : ' adv');
+          badge.textContent = assumed ? "the PDP's own base" : 'advertised elsewhere';
+          p.append(badge);
+        }
       }
       ol.append(li);
     }
@@ -250,9 +256,8 @@ function proofOf(r, action) {
   }
   if (action && action.style === 'mcp' && decided.length) {
     const path = decided[0].path;
-    if (path.includes('evaluations') || path.includes('batch')) {
-      const assumed = path.startsWith('/access/v1/');
-      return `Two evaluations in one call to ${decided[0].entity}, on ${assumed ? 'the default batch path, assumed because nothing was read' : 'the batch endpoint it advertises'}.`;
+    if (path.endsWith('/access/v1/evaluations')) {
+      return `Two evaluations in one call to ${decided[0].entity}, on the batch endpoint its metadata advertises.`;
     }
   }
   const who = decided.length ? decided[0].entity : 'no PDP';
@@ -269,12 +274,16 @@ async function control(op) {
   await run(new Event('submit'));
 }
 
+let controlState = {};
+
 function showState(state) {
-  const evalPath = (state.pdp_evaluation_path || {})['pdp-a'] || '?';
-  const plain = ((state.resource_pdps || {})['plain'] || []).join(', ');
-  $('state').textContent = `pdp-a advertises ${evalPath} · plain names ${plain}`;
-  $('movePdp').setAttribute('aria-pressed', String(evalPath === '/decide-v2'));
-  $('repoint').setAttribute('aria-pressed', String(plain.endsWith(':9008')));
+  controlState = state || {};
+  const evalPath = (controlState.pdp_evaluation_path || {})['pdp-a'] || '?';
+  const home = (controlState.pdp_home || {})['pdp-a'] || '';
+  const plain = ((controlState.resource_pdps || {})['plain'] || []).join(', ');
+  $('state').textContent = `pdp-a evaluates at ${evalPath} · plain names ${plain}`;
+  $('movePdp').setAttribute('aria-pressed', String(!evalPath.startsWith(home + '/access/v1/')));
+  $('repoint').setAttribute('aria-pressed', String(plain.includes(':9008')));
 }
 
 async function run(ev) {

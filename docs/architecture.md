@@ -120,9 +120,13 @@ resource identifier (the route's `resource`; an MCP route's upstream URL)
   ├─ resource     {resource}/.well-known/oauth-protected-resource (RFC 9728) ← self-asserted
   └─ static       AUTHZEN_URL                                             ← always the fallback
 PDP identifier
-  ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
+  ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9, inserted after the host)
   └─ 404 → {pdp}/access/v1/evaluation, the spec's default paths
 ```
+
+The endpoint names are always AuthZEN's own. What metadata tells a PEP is the *base* they
+hang off, and whether the PDP claims a batch endpoint at all — an identifier may carry a
+path, and a multi-tenant PDP is the ordinary reason it does.
 
 No standard names a PDP from a protected resource: not RFC 9728, not AuthZEN 1.0, not the
 MCP profile, not OpenID Federation 1.0. So this repository mints one parameter and uses it
