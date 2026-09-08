@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>PDP discovery console</title>
+<title>PDP discovery</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
@@ -27,13 +27,15 @@
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5}
-.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+.wrap{max-width:1240px;margin:0 auto;padding:0 24px}
 header{border-bottom:3px solid var(--orange);padding:18px 0 16px}
 header .wrap{display:flex;align-items:baseline;justify-content:space-between;gap:20px;flex-wrap:wrap}
 h1{margin:0;font-size:1.25rem;font-weight:800;letter-spacing:-.01em;text-transform:uppercase}
 header .sub{font-family:var(--mono);font-size:.75rem;color:var(--muted)}
-main{padding:26px 0 60px}
-fieldset{border:0;margin:0 0 20px;padding:0}
+main{padding:22px 0 60px}
+.lede{font-size:1.02rem;max-width:62rem;margin:0 0 22px}
+.lede b{font-weight:700}
+fieldset{border:0;margin:0 0 18px;padding:0}
 legend{padding:0;font-size:.72rem;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--orange);margin-bottom:10px}
 .opts{display:flex;flex-wrap:wrap;gap:8px}
 .opt{position:relative}
@@ -42,7 +44,11 @@ legend{padding:0;font-size:.72rem;font-weight:700;letter-spacing:.13em;text-tran
 .opt input:checked + span{border-color:var(--orange);background:var(--tint);font-weight:600}
 .opt input:focus-visible + span{outline:2px solid var(--orange);outline-offset:2px}
 .hint{font-size:.85rem;color:var(--muted);margin:8px 0 0;min-height:1.3em}
-.hint code{font-family:var(--mono);font-size:.9em}
+.hint code,.legend code,.lede code{font-family:var(--mono);font-size:.9em}
+details.explore{border:1px solid var(--rule);background:var(--panel);padding:10px 16px;margin:0 0 18px}
+details.explore summary{cursor:pointer;font-size:.9rem;font-weight:600}
+details.explore summary span{font-weight:400;color:var(--muted)}
+details.explore fieldset{margin-top:16px}
 .runbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;border-top:1px solid var(--rule);padding-top:18px;margin-top:4px}
 button.run{font:inherit;font-weight:700;background:var(--orange);color:#fff;border:0;padding:11px 26px;cursor:pointer;letter-spacing:.02em}
 button.run:hover{filter:brightness(1.07)}
@@ -50,74 +56,88 @@ button.run:disabled{opacity:.55;cursor:progress}
 button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 .runbar .what{font-size:.9rem;color:var(--muted)}
 .runbar .what b{color:var(--ink);font-weight:600}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:26px}
-.col{border:1px solid var(--rule);background:var(--panel);display:flex;flex-direction:column}
+.levers{border:1px solid var(--rule);background:var(--sunk);padding:12px 16px;margin:18px 0 0;display:grid;gap:8px}
+.levers .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.levers button{font:inherit;font-size:.86rem;background:var(--bg);color:var(--ink);border:1px solid var(--rule);padding:6px 12px;cursor:pointer}
+.levers button:hover{border-color:var(--orange)}
+.levers button:focus-visible{outline:2px solid var(--orange);outline-offset:2px}
+.levers button[aria-pressed="true"]{border-color:var(--orange);background:var(--tint);font-weight:600}
+.levers .why{font-size:.85rem;color:var(--muted);margin:0}
+.levers .state{font-family:var(--mono);font-size:.72rem;color:var(--muted);overflow-wrap:anywhere}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}
+.col{border:1px solid var(--rule);background:var(--panel);display:flex;flex-direction:column;min-width:0}
 .col > .head{padding:14px 16px;border-bottom:1px solid var(--rule)}
 .col .name{font-weight:800;font-size:.95rem}
 .col .mode{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:2px}
-.col .blurb{font-size:.85rem;color:var(--muted);margin-top:8px}
-.verdict{padding:16px;border-bottom:1px solid var(--rule);display:flex;flex-direction:column;gap:6px;min-height:96px}
-.chip{align-self:flex-start;font-family:var(--mono);font-size:.78rem;font-weight:600;letter-spacing:.06em;padding:4px 10px;border:1px solid currentColor}
+.col .blurb{font-size:.85rem;color:var(--muted);margin-top:6px}
+.step{padding:12px 16px 14px;border-bottom:1px solid var(--rule)}
+.step:last-child{border-bottom:0}
+.step h3{margin:0 0 8px;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700;display:flex;gap:8px;align-items:baseline}
+.step h3 .n{color:var(--orange);font-family:var(--mono)}
+.step p{margin:0 0 8px;font-size:.86rem}
+.step p:last-child{margin-bottom:0}
+.step p.say{color:var(--ink)}
+.step p.quiet{color:var(--muted)}
+.fetch{font-family:var(--mono);font-size:.72rem;color:var(--muted);overflow-wrap:anywhere;margin:0 0 6px}
+.fetch b{color:var(--ink);font-weight:600}
+.doc{border:1px solid var(--rule);background:var(--bg);padding:8px 10px;margin:0 0 10px;font-family:var(--mono);font-size:.72rem;line-height:1.5}
+.doc .t{font-family:var(--sans);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:4px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.doc .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;overflow-wrap:anywhere}
+.doc .k{color:var(--muted)}
+.doc .v{color:var(--ink)}
+.doc .v.pdp{color:var(--orange);font-weight:600}
+.doc .v.req{color:var(--permit);font-weight:600}
+.doc .v.gone{color:var(--muted);text-decoration:line-through}
+.doc .v.new{color:var(--orange);font-weight:600}
+.doc details{margin-top:6px}
+.doc summary{cursor:pointer;color:var(--muted);font-family:var(--sans);font-size:.72rem}
+.doc pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.68rem;color:var(--muted)}
+.mark{display:inline-block;font-family:var(--mono);font-size:.64rem;letter-spacing:.05em;border:1px solid var(--rule);padding:0 5px;color:var(--muted);white-space:nowrap;vertical-align:middle}
+.mark.now{border-color:var(--permit);color:var(--permit)}
+.mark.warn{border-color:var(--orange);color:var(--orange)}
+.mark.bad{border-color:var(--deny);color:var(--deny)}
+.arrow{color:var(--muted)}
+.chip{display:inline-block;font-family:var(--mono);font-size:.76rem;font-weight:600;letter-spacing:.06em;padding:3px 9px;border:1px solid currentColor;margin-bottom:6px}
 .chip.permit{color:var(--permit)}
 .chip.deny{color:var(--deny)}
 .chip.alarm{color:var(--alarm);background:var(--alarm-bg)}
 .chip.idle{color:var(--muted)}
 .chip.open{color:var(--orange);background:var(--tint)}
-.trace li.outage .ent,.trace li.outage .p{color:var(--deny)}
-.reason{font-size:.9rem}
-.ms{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:auto}
-.trace{padding:12px 16px 16px}
-.trace h3{margin:0 0 8px;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}
-.trace ol{list-style:none;margin:0;padding:0;display:grid;gap:5px;font-family:var(--mono);font-size:.74rem;line-height:1.45}
-.trace li{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:baseline}
-.trace .ent{font-weight:600}
-.trace .metadata .ent{color:var(--muted)}
-.trace .decision .ent,.trace .verdictline .ent{color:var(--permit)}
-.trace li.rogue .ent{color:var(--alarm)}
-.trace .input .ent{color:var(--muted)}
-.trace .input .p{color:var(--ink)}
-.trace .p{color:var(--muted);overflow-wrap:anywhere}
-.trace .none{font-family:var(--sans);font-size:.85rem;color:var(--muted)}
-.levers{border:1px solid var(--rule);background:var(--sunk);padding:14px 16px;margin:0 0 20px;display:grid;gap:10px}
-.levers .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.levers button{font:inherit;font-size:.88rem;background:var(--bg);color:var(--ink);border:1px solid var(--rule);padding:7px 13px;cursor:pointer}
-.levers button:hover{border-color:var(--orange)}
-.levers button:focus-visible{outline:2px solid var(--orange);outline-offset:2px}
-.levers button[aria-pressed="true"]{border-color:var(--orange);background:var(--tint);font-weight:600}
-.levers .why{font-size:.85rem;color:var(--muted);margin:0}
-.levers .state{font-family:var(--mono);font-size:.74rem;color:var(--muted);overflow-wrap:anywhere}
-.proof{padding:10px 16px;border-bottom:1px solid var(--rule);font-size:.83rem;color:var(--muted);min-height:2.4em}
-.badge{display:inline-block;font-family:var(--mono);font-size:.66rem;letter-spacing:.05em;border:1px solid var(--rule);padding:1px 5px;margin-left:6px;color:var(--muted);white-space:nowrap}
-.badge.adv{border-color:var(--orange);color:var(--orange)}
+.reason{font-size:.86rem}
+.ms{font-family:var(--mono);font-size:.7rem;color:var(--muted);margin-top:6px}
 .legend{margin-top:22px;border-top:1px solid var(--rule);padding-top:14px;font-size:.85rem;color:var(--muted);display:grid;gap:6px}
 .legend b{color:var(--ink)}
-@media (max-width:900px){ .grid{grid-template-columns:1fr} }
-@media (prefers-reduced-motion: no-preference){ .col{transition:border-color .18s} }
+@media (max-width:980px){ .grid{grid-template-columns:1fr} }
 </style>
 </head>
 <body>
 <header><div class="wrap">
-  <h1>PDP discovery console</h1>
-  <div class="sub">idp-auth-peps · one request, three enforcement points</div>
+  <h1>PDP discovery</h1>
+  <div class="sub">idp-auth-peps · the gateway finds the PDP · the PDP finds what to enforce</div>
 </div></header>
 
 <main class="wrap">
+  <p class="lede"><b>Nobody configured these gateways with the PDP's address or the API's requirements.</b> The API publishes both. A gateway that reads the document finds its PDP and hands the PDP what the API requires; a federation decides whether the document is to be believed. Pick an API, press Discover, and read the chain each gateway followed.</p>
+
   <form id="form">
-    <fieldset><legend>Protected resource</legend><div class="opts" id="resources"></div><p class="hint" id="resourceHint"></p></fieldset>
-    <fieldset><legend>Policy layers on the route</legend><div class="opts" id="layers"></div><p class="hint" id="layerHint"></p></fieldset>
-    <fieldset><legend>The token was issued to</legend><div class="opts" id="clients"></div><p class="hint" id="clientHint"></p></fieldset>
-    <fieldset><legend>The token says the customer authenticated with</legend><div class="opts" id="acrs"></div><p class="hint" id="acrHint"></p></fieldset>
-    <fieldset><legend>The token carries scopes</legend><div class="opts" id="scopes"></div><p class="hint" id="scopeHint"></p></fieldset>
-    <fieldset><legend>Forward the raw token to the PDP</legend><div class="opts" id="forwards"></div><p class="hint" id="forwardHint"></p></fieldset>
-    <fieldset><legend>Request</legend><div class="opts" id="actions"></div><p class="hint" id="actionHint"></p></fieldset>
+    <fieldset><legend>The API behind the gateway</legend><div class="opts" id="resources"></div><p class="hint" id="resourceHint"></p></fieldset>
+    <fieldset><legend>The request</legend><div class="opts" id="actions"></div><p class="hint" id="actionHint"></p></fieldset>
+    <details class="explore">
+      <summary>The token and the route's policy <span id="exploreState"></span></summary>
+      <fieldset><legend>The token was issued to</legend><div class="opts" id="clients"></div><p class="hint" id="clientHint"></p></fieldset>
+      <fieldset><legend>The token says the customer authenticated with</legend><div class="opts" id="acrs"></div><p class="hint" id="acrHint"></p></fieldset>
+      <fieldset><legend>The token carries scopes</legend><div class="opts" id="scopes"></div><p class="hint" id="scopeHint"></p></fieldset>
+      <fieldset><legend>Forward the raw token to the PDP</legend><div class="opts" id="forwards"></div><p class="hint" id="forwardHint"></p></fieldset>
+      <fieldset><legend>Policy layers on the route</legend><div class="opts" id="layers"></div><p class="hint" id="layerHint"></p></fieldset>
+    </details>
     <div class="runbar">
-      <button class="run" type="submit" id="run">Run all three</button>
+      <button class="run" type="submit" id="run">Discover</button>
       <span class="what" id="what"></span>
     </div>
   </form>
 
   <div class="levers">
-    <p class="why"><b>Change the world while it runs.</b> Nothing below restarts a PEP or edits its configuration. Re-run after each; the PEPs pick the change up on their next metadata refresh.</p>
+    <p class="why"><b>Change the world, then discover again.</b> None of these touches a gateway.</p>
     <div class="row">
       <button type="button" id="movePdp" aria-pressed="false">Relocate Bank A's PDP</button>
       <button type="button" id="repoint" aria-pressed="false">Hand plain over to Bank B's PDP</button>
@@ -130,12 +150,11 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
   <div class="grid" id="grid"></div>
 
   <div class="legend">
-    <div><b>The columns are the argument.</b> Same request, same policy, three ways of deciding who decides.</div>
-    <div>Grey trace lines are metadata fetches the PEP made. Green is the PDP that decided. Orange is the rogue PDP being consulted at all.</div>
-    <div><b>Every endpoint here is AuthZEN's own name</b> — <code>/access/v1/evaluation</code> and <code>/access/v1/evaluations</code>. Nothing invents a path. What differs is the <b>base</b> they hang off: a PDP identifier may carry one, and <code>/tenants/bank-a</code> is what a multi-tenant deployment looks like.</div>
-    <div><b>The PEP judged none of it.</b> Each resource publishes what it requires — <code>scopes_supported</code> (RFC 9728) and an example <code>acr_values_required</code> — and the PEP forwards that document verbatim, with the endpoint hit and (when the route allows) the raw token. The <em>was given</em> line is what the PDP had to work with. Matching a token to a requirement is the PDP's decision, next to everything else it knows; a gateway comparing strings would be policy in two places, and the dumber one would win.</div>
-    <div><b>So the badge is about the base.</b> A PEP that read no metadata posts under the PDP's own identifier path. Relocate the PDP and only the PEPs that read metadata follow — which is the whole argument, and it is invisible until something moves.</div>
-    <div>Metadata caches are set to a short TTL here so the trace stays visible on every run; the shipped default is five minutes.</div>
+    <div><b>Two discoveries, read top to bottom.</b> First the gateway finds the PDP: it asks the API (RFC 9728 <code>/.well-known/oauth-protected-resource</code>) or the federation (a signed entity configuration, checked against the anchor's policy), reads <code>authzen_policy_decision_points</code>, then asks that PDP where its endpoints are (AuthZEN <code>/.well-known/authzen-configuration</code>). Then the PDP finds what to enforce: the gateway hands it the API's document verbatim, with the endpoint hit and the token, and the PDP reads <code>scopes_supported</code> and <code>acr_values_required</code> out of it.</div>
+    <div><b>The gateway judged nothing.</b> It compared no scope and no acr. The PDP did, and its reason says so. A gateway that compared them would be policy in two places, and the dumber one would win.</div>
+    <div><b>Orange is a PDP identifier.</b> Green is a requirement the PDP will apply. Struck through is what the federation's policy removed from an API's own claim about itself.</div>
+    <div><b>Every endpoint is AuthZEN's own name.</b> What differs is the base it hangs off: a PDP identifier may carry a path, and <code>/tenants/bank-a</code> is what a multi-tenant deployment looks like. A gateway that never read the PDP's metadata assumes the identifier's base, which is fine until the PDP moves.</div>
+    <div>Documents are shown as published now. A step marked <span class="mark now">fetched</span> was read by that gateway during this run; otherwise it was already in its cache (the demo's TTL is 15 seconds).</div>
   </div>
 </main>
 
@@ -146,23 +165,25 @@ const CLIENTS = [
   { key: 'agent-risky', name: 'agent-risky', blurb: "On the estate PDP's watch list. With the estate layer in front, nothing further is asked." },
 ];
 const layerChoices = (estate) => [
-  { key: 'resource', name: "the resource's PDP alone", blurb: 'One PDP, found by discovery. Today\'s single behaviour.' },
-  { key: `${estate},resource`, name: "estate PDP first, then the resource's", blurb: 'A generic PDP that judges the token and the client, in front of the one that knows the resource. Every layer must permit; the first that does not is the answer.' },
-  { key: `${estate} fail-open,resource`, name: "the same, with the estate layer fail-open", blurb: 'Identical policy, except the estate layer may be skipped when it cannot be reached. Take the estate PDP down with the lever and compare: fail-closed is a 503, fail-open is a permit that names what it skipped. A deny is never skipped.' },
+  { key: 'resource', name: "the API's PDP alone", blurb: 'One PDP, found by discovery.' },
+  { key: `${estate},resource`, name: "the estate PDP first, then the API's", blurb: 'A generic PDP that judges the token and the client, in front of the one that knows the API. Every layer must permit; the first that does not is the answer. Both layers are handed the same document.' },
+  { key: `${estate} fail-open,resource`, name: 'the same, estate layer fail-open', blurb: 'Identical, except the estate layer may be skipped when it cannot be reached. Take it down with the lever and compare: fail-closed is a 503, fail-open is a permit that names what it skipped.' },
 ];
 const ACRS = [
-  { key: 'urn:idp:loa:password', name: 'password', blurb: 'Enough for plain and impostor. Not for bank-b, and not for member once the federation has had its say.' },
-  { key: 'urn:idp:loa:mfa', name: 'MFA', blurb: 'Satisfies every resource here.' },
+  { key: 'urn:idp:loa:password', name: 'password', blurb: 'What plain, impostor and member accept on their own word. Not bank-b, and not member once the federation has set the floor.' },
+  { key: 'urn:idp:loa:mfa', name: 'MFA', blurb: 'Satisfies every API here.' },
 ];
 const SCOPES = [
-  { key: 'accounts:read payments:write', name: 'read + payments', blurb: 'Everything the resources list in scopes_supported.' },
-  { key: 'accounts:read', name: 'read only', blurb: 'A payment will come back as a step-up for payments:write — decided by the PDP, from what the resource published.' },
+  { key: 'accounts:read', name: 'read only', blurb: 'A payment will come back as a step-up for payments:write, decided by the PDP from the scopes the API published.' },
+  { key: 'accounts:read payments:write', name: 'read + payments', blurb: 'Everything the APIs list in scopes_supported.' },
 ];
 const FORWARDS = [
-  { key: 'yes', name: 'yes', blurb: 'The route sets forward_access_token. The PDP examines the token itself: its acr, its scope, its client.' },
-  { key: 'no', name: 'no', blurb: 'The PDP gets only what the PEP decoded. Watch a resource that requires an acr: the PDP cannot check it and says so.' },
+  { key: 'yes', name: 'yes', blurb: 'The route sets forward_access_token. The PDP examines the token itself.' },
+  { key: 'no', name: 'no', blurb: 'The PDP gets only what the PEP decoded. Watch an API that requires an acr: the PDP cannot check it and says so.' },
 ];
 let config = null;
+let controlState = {};
+const docCache = new Map();
 
 function radios(container, items, name, checkedKey, onPick) {
   container.innerHTML = '';
@@ -170,10 +191,7 @@ function radios(container, items, name, checkedKey, onPick) {
     const label = document.createElement('label');
     label.className = 'opt';
     const input = document.createElement('input');
-    input.type = 'radio';
-    input.name = name;
-    input.value = item.key;
-    input.checked = item.key === checkedKey;
+    input.type = 'radio'; input.name = name; input.value = item.key; input.checked = item.key === checkedKey;
     input.addEventListener('change', () => onPick(item));
     const span = document.createElement('span');
     span.textContent = item.name;
@@ -181,19 +199,238 @@ function radios(container, items, name, checkedKey, onPick) {
     container.append(label);
   }
 }
-
-function selected(name) {
-  const el = document.querySelector(`input[name="${name}"]:checked`);
-  return el ? el.value : null;
-}
+const selected = (name) => { const el = document.querySelector(`input[name="${name}"]:checked`); return el ? el.value : null; };
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function describe() {
   const res = config.resources.find((r) => r.key === selected('resource'));
   const act = config.actions.find((a) => a.key === selected('action'));
   const acr = ACRS.find((a) => a.key === selected('acr'));
   const sc = SCOPES.find((s) => s.key === selected('scope'));
-  const layered = selected('layers') !== 'resource';
-  $('what').innerHTML = `<b>${selected('client')}</b> asks to <b>${act.name}</b> on <b>${res.name}</b> with a <b>${acr.name}</b> token carrying <b>${sc.name}</b>${layered ? ', through the <b>estate PDP</b> first' : ''}.`;
+  $('what').innerHTML = `Who decides <b>${esc(act.name)}</b> on <b>${esc(res.name)}</b>, and what will they be told the API requires?`;
+  $('exploreState').textContent = `— ${selected('client')}, ${acr.name}, ${sc.name}, token ${selected('forward') === 'yes' ? 'forwarded' : 'not forwarded'}${selected('layers') === 'resource' ? '' : ', layered'}`;
+}
+
+// ---- documents, as published now ------------------------------------------------
+async function fetchDoc(url) {
+  if (docCache.has(url)) return docCache.get(url);
+  const p = fetch('/api/fetch?url=' + encodeURIComponent(url)).then((r) => r.json()).catch(() => ({ status: 0 }));
+  docCache.set(url, p);
+  return p;
+}
+function decodeJwt(tok) {
+  try {
+    const part = tok.trim().split('.')[1];
+    return JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')));
+  } catch { return null; }
+}
+function parseJson(s) { try { return JSON.parse(s); } catch { return null; } }
+// AuthZEN §9 and RFC 9728: the well-known segment goes after the host; the identifier's
+// own path follows it.
+function wellKnown(id, name) {
+  const u = new URL(id);
+  return `${u.origin}/.well-known/${name}${u.pathname === '/' ? '' : u.pathname.replace(/\/$/, '')}`;
+}
+async function loadResourceDocs(res) {
+  const out = { rfc9728: null, ec: null, anchor: null, sub: null, policy: null };
+  if (!res.id) return out;
+  const r = await fetchDoc(wellKnown(res.id, 'oauth-protected-resource'));
+  if (r.status === 200) out.rfc9728 = parseJson(r.body);
+  const e = await fetchDoc(res.id + '/.well-known/openid-federation');
+  if (e.status === 200) {
+    out.ec = decodeJwt(e.body);
+    const anchorId = out.ec && Array.isArray(out.ec.authority_hints) ? out.ec.authority_hints[0] : null;
+    if (anchorId) {
+      const a = await fetchDoc(anchorId + '/.well-known/openid-federation');
+      if (a.status === 200) {
+        out.anchor = decodeJwt(a.body);
+        const fe = out.anchor && out.anchor.metadata && out.anchor.metadata.federation_entity && out.anchor.metadata.federation_entity.federation_fetch_endpoint;
+        if (fe) {
+          const s = await fetchDoc(`${fe}?sub=${encodeURIComponent(res.id)}&iss=${encodeURIComponent(anchorId)}`);
+          if (s.status === 200) {
+            out.sub = decodeJwt(s.body);
+            out.policy = out.sub && out.sub.metadata_policy && out.sub.metadata_policy.oauth_resource || null;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+async function loadPdpDoc(id) {
+  if (!id) return null;
+  const d = await fetchDoc(wellKnown(id, 'authzen-configuration'));
+  return d.status === 200 ? parseJson(d.body) : null;
+}
+
+// ---- rendering helpers ------------------------------------------------------------
+const list = (v) => (Array.isArray(v) ? v : v === undefined || v === null ? [] : [v]);
+function kv(k, v, cls) {
+  const vals = list(v);
+  const shown = vals.length ? vals.map((x) => `<span class="v ${cls || ''}">${esc(x)}</span>`).join(', ') : '<span class="v quiet">—</span>';
+  return `<span class="k">${esc(k)}</span><span>${shown}</span>`;
+}
+function docBox(title, rows, raw, marks) {
+  return `<div class="doc"><div class="t"><span>${esc(title)}</span><span>${marks || ''}</span></div><div class="kv">${rows.join('')}</div>${raw ? `<details><summary>the whole document</summary><pre>${esc(JSON.stringify(raw, null, 2))}</pre></details>` : ''}</div>`;
+}
+const fetchedMark = (events, entity, pathPart) => (events.some((e) => e.kind === 'metadata' && e.entity === entity && e.path.includes(pathPart)) ? '<span class="mark now">fetched</span>' : '<span class="mark">cached</span>');
+const P = 'authzen_policy_decision_points';
+const REQ = ['scopes_supported', 'acr_values_required'];
+function requirementRows(doc, resolvedFrom) {
+  // The API's requirements, and (when a policy has been applied) what changed.
+  const rows = [];
+  for (const k of REQ) {
+    if (resolvedFrom && JSON.stringify(list(resolvedFrom[k])) !== JSON.stringify(list(doc[k]))) {
+      rows.push(`<span class="k">${esc(k)}</span><span>${list(resolvedFrom[k]).map((x) => `<span class="v gone">${esc(x)}</span>`).join(', ')} <span class="arrow">→</span> ${list(doc[k]).map((x) => `<span class="v new">${esc(x)}</span>`).join(', ')}</span>`);
+    } else if (doc[k] !== undefined) {
+      rows.push(kv(k, doc[k], 'req'));
+    }
+  }
+  return rows;
+}
+function pdpRows(doc, resolvedFrom) {
+  if (resolvedFrom && JSON.stringify(list(resolvedFrom[P])) !== JSON.stringify(list(doc[P]))) {
+    const kept = new Set(list(doc[P]));
+    return [`<span class="k">${esc(P)}</span><span>${list(resolvedFrom[P]).map((x) => `<span class="v ${kept.has(x) ? 'pdp' : 'gone'}">${esc(x)}</span>`).join(', ')}</span>`];
+  }
+  return [kv(P, doc[P], 'pdp')];
+}
+function entityOf(id) {
+  for (const [name, pid] of Object.entries(config.pdps)) if (id === pid) return name;
+  return null;
+}
+
+// ---- the chain, per gateway -----------------------------------------------------
+function decisionsOf(r) {
+  // Each PDP asked, in order, with what it was sent and what it answered.
+  const out = [];
+  for (const e of r.events) {
+    if (e.kind === 'decision' && e.body) {
+      out.push({ entity: e.entity, path: e.path, status: e.status || 200, request: parseJson(e.body), verdict: null, outage: false });
+    } else if (e.kind === 'outage') {
+      out.push({ entity: e.entity, path: e.path, status: 503, request: null, verdict: null, outage: true });
+    } else if (e.kind === 'verdict' && out.length) {
+      const last = out[out.length - 1];
+      if (last.entity === e.entity) last.verdict = e.note;
+    }
+  }
+  return out;
+}
+
+function stepFind(p, res, docs, r, resolved) {
+  // 1 · the gateway finds the PDP
+  const ev = r.events;
+  if (p.mode === 'off' || !res.id) {
+    let s = `<p class="say">Told by hand: <code>AUTHZEN_URL = ${esc(config.static_pdp)}</code>. Nothing was fetched.</p>`;
+    if (res.id && docs.rfc9728) s += `<p class="quiet">${esc(res.name)} publishes a document naming its PDP and its requirements. This gateway never reads it.</p>`;
+    return s;
+  }
+  if (p.mode === 'resource') {
+    const url = wellKnown(res.id, 'oauth-protected-resource');
+    if (!docs.rfc9728) {
+      return `<p class="fetch"><b>GET</b> ${esc(url)} ${fetchedMark(ev, res.key, 'oauth-protected-resource')}</p><p class="say">404 — no document. The gateway falls back to the PDP it was configured with.</p>`;
+    }
+    const d = docs.rfc9728;
+    const box = docBox("the API's own document (RFC 9728)", [kv('resource', d.resource), ...pdpRows(d), ...requirementRows(d)], d);
+    const chosen = list(d[P])[0];
+    return `<p class="fetch"><b>GET</b> ${esc(url)} ${fetchedMark(ev, res.key, 'oauth-protected-resource')}</p>${box}<p class="say">The API says <span class="v pdp" style="font-family:var(--mono);font-size:.8em">${esc(chosen || '?')}</span> decides for it. Self-asserted: the gateway takes its word.</p>`;
+  }
+  // federation
+  const ecUrl = res.id + '/.well-known/openid-federation';
+  if (!docs.ec) {
+    return `<p class="fetch"><b>GET</b> ${esc(ecUrl)} ${fetchedMark(ev, res.key, 'openid-federation')}</p><p class="say">404 — not a member of any federation. The gateway falls back to the PDP it was configured with, and never reads the API's own document.</p>`;
+  }
+  const own = docs.ec.metadata && docs.ec.metadata.oauth_resource || {};
+  let s = `<p class="fetch"><b>GET</b> ${esc(ecUrl)} ${fetchedMark(ev, res.key, 'openid-federation')}</p>`;
+  s += docBox("what the API says about itself (entity configuration, signed by the API)", [kv('authority_hints', docs.ec.authority_hints), ...pdpRows(own), ...requirementRows(own)], docs.ec);
+  const anchorId = list(docs.ec.authority_hints)[0];
+  if (docs.sub) {
+    const pol = docs.policy || {};
+    const polRows = Object.entries(pol).map(([k, ops]) => `<span class="k">${esc(k)}</span><span class="v">${esc(Object.entries(ops).map(([op, v]) => `${op} ${JSON.stringify(v)}`).join(' · '))}</span>`);
+    s += `<p class="fetch"><b>GET</b> ${esc(anchorId)}/fetch?sub=… ${fetchedMark(ev, 'anchor', '/fetch')}</p>`;
+    s += docBox("the anchor's policy for this member (subordinate statement, signed by the anchor)", polRows.length ? polRows : [kv('metadata_policy', 'none')], docs.sub);
+  }
+  if (resolved) {
+    s += docBox('resolved: what survived the policy', [...pdpRows(resolved, own), ...requirementRows(resolved, own)], resolved);
+    const chosen = list(resolved[P])[0];
+    s += `<p class="say">The chain validates back to the anchor, and the anchor's policy is applied to the API's claim. <span class="v pdp" style="font-family:var(--mono);font-size:.8em">${esc(chosen || '?')}</span> decides. Not because the API said so: because the federation allows it.</p>`;
+  } else if (r.status === 503) {
+    s += `<p class="say">The chain did not validate. The gateway refuses, and never falls back to the API's own word.</p>`;
+  }
+  return s;
+}
+
+async function stepEndpoints(p, res, r, decisions) {
+  // 2 · the PDP says where to ask
+  const asked = [...new Set(decisions.map((d) => d.entity))];
+  if (!asked.length) {
+    if (r.status === 503) return `<p class="say">No PDP was asked.</p>`;
+    // Batch against a PDP with no batch endpoint: metadata read, nothing sent.
+    const read = r.events.filter((e) => e.kind === 'metadata' && e.entity.includes('pdp')).pop();
+    if (read) {
+      const id = config.pdps[read.entity];
+      const doc = await loadPdpDoc(id);
+      return `<p class="fetch"><b>GET</b> ${esc(wellKnown(id, 'authzen-configuration'))} <span class="mark now">fetched</span></p>${docBox(`${read.entity} publishes`, [kv('policy_decision_point', doc && doc.policy_decision_point, 'pdp'), kv('access_evaluation_endpoint', doc && doc.access_evaluation_endpoint), kv('access_evaluations_endpoint', doc && doc.access_evaluations_endpoint)], doc)}<p class="say">No batch endpoint is advertised, and this call is a batch. The gateway refused rather than guess a path.</p>`;
+    }
+    return `<p class="say">No PDP was asked.</p>`;
+  }
+  let s = '';
+  for (const name of asked) {
+    const id = config.pdps[name] || '';
+    const d = decisions.find((x) => x.entity === name);
+    const doc = await loadPdpDoc(id);
+    const posted = d.path.split('?')[0];
+    const wk = id ? wellKnown(id, 'authzen-configuration') : '';
+    if (p.mode === 'off') {
+      const published = doc && (posted.endsWith('/evaluations') ? doc.access_evaluations_endpoint : doc.access_evaluation_endpoint);
+      const publishedPath = published ? new URL(published).pathname : null;
+      const stale = publishedPath && publishedPath !== posted;
+      s += `<p class="say">Never read <code>${esc(wk)}</code>. It assumes the identifier's base and posts to <code>${esc(posted)}</code>${stale ? ` <span class="mark warn">stale</span>` : ' <span class="mark">assumed</span>'}.</p>`;
+      if (stale) s += `<p class="quiet">${esc(name)} now publishes <code>${esc(publishedPath)}</code>. This gateway did not notice; the stub still answers on the old base so nothing here breaks, but a real move would.</p>`;
+      continue;
+    }
+    s += `<p class="fetch"><b>GET</b> ${esc(wk)} ${fetchedMark(r.events, name, 'authzen-configuration')}</p>`;
+    s += docBox(`${name} publishes`, [kv('policy_decision_point', doc && doc.policy_decision_point, 'pdp'), kv('access_evaluation_endpoint', doc && doc.access_evaluation_endpoint), kv('access_evaluations_endpoint', doc && doc.access_evaluations_endpoint)], doc);
+    if (d.outage) s += `<p class="say">So the gateway posted to <code>${esc(posted)}</code> <span class="mark bad">503 — down</span></p>`;
+    else s += `<p class="say">So the gateway posted to <code>${esc(posted)}</code> <span class="mark now">advertised</span></p>`;
+  }
+  return s;
+}
+
+function tokenSummary(tok) {
+  const c = typeof tok === 'string' ? decodeJwt(tok) : null;
+  if (!c) return null;
+  return `acr=${c.acr || '?'} scope="${c.scope || ''}" client=${c.client_id || '?'}`;
+}
+function stepGiven(p, res, decisions) {
+  // 3 · the PDP learns what to enforce
+  const real = decisions.filter((d) => d.request);
+  if (!real.length) return `<p class="say">Nothing was handed to a PDP.</p>`;
+  let s = '';
+  for (const d of real) {
+    const ctx = d.request.context || {};
+    const meta = ctx.resource_metadata;
+    const rows = [kv('resource_metadata_source', ctx.resource_metadata_source || 'absent', ctx.resource_metadata_source ? '' : 'gone')];
+    if (meta) rows.push(...requirementRows(meta), ...pdpRows(meta));
+    if (ctx.request) rows.push(kv('request', `${ctx.request.method} ${ctx.request.path}`));
+    const tok = tokenSummary(ctx.access_token);
+    rows.push(kv('access_token', tok || 'not forwarded', tok ? '' : 'gone'));
+    s += docBox(`handed to ${d.entity} as context`, rows, d.request);
+    if (meta) s += `<p class="say">${esc(d.entity)} now knows what ${esc(res.name)} requires, from the API's own document${ctx.resource_metadata_source === 'federation' ? ' as the federation resolved it' : ''}. The gateway compared nothing.</p>`;
+    else s += `<p class="say">${esc(d.entity)} was told nothing about the API. It can only judge what it was configured with.</p>`;
+  }
+  return s;
+}
+function stepVerdict(r, decisions) {
+  // 4 · and so
+  const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
+  const cls = r.error ? 'deny' : rogue && r.decision ? 'alarm' : r.decision && r.fail_open ? 'open' : r.decision ? 'permit' : 'deny';
+  const text = r.error ? 'ERROR' : r.decision ? (rogue ? 'PERMIT — BY THE ROGUE PDP' : r.fail_open ? 'PERMIT — FAILED OPEN' : 'PERMIT') : `DENY · ${r.status}`;
+  let s = `<span class="chip ${cls}">${esc(text)}</span><div class="reason">${esc(r.error || r.reason || '')}</div>`;
+  const cites = decisions.filter((d) => d.verdict).map((d) => `<div class="fetch">${esc(d.entity)}: ${esc(d.verdict)}</div>`).join('');
+  if (cites) s += `<div style="margin-top:6px">${cites}</div>`;
+  s += `<div class="ms">${r.ms.toFixed(1)} ms</div>`;
+  return s;
 }
 
 function skeleton() {
@@ -203,128 +440,44 @@ function skeleton() {
     col.className = 'col';
     col.dataset.pep = p.name;
     col.innerHTML = `
-      <div class="head">
-        <div class="name">${p.name}</div>
-        <div class="mode">PDP_DISCOVERY=${p.mode}</div>
-        <div class="blurb">${p.blurb}</div>
-      </div>
-      <div class="verdict"><span class="chip idle">NOT RUN</span><div class="reason"></div><div class="ms"></div></div>
-      <div class="proof"></div>
-      <div class="trace"><h3>What the stubs saw</h3><div class="body"><p class="none">Run to see the fetches this PEP makes.</p></div></div>`;
+      <div class="head"><div class="name">${esc(p.name)}</div><div class="mode">PDP_DISCOVERY=${esc(p.mode)}</div><div class="blurb">${esc(p.blurb)}</div></div>
+      <div class="step" data-step="1"><h3><span class="n">1</span> the gateway finds the PDP</h3><p class="quiet">Press Discover.</p></div>
+      <div class="step" data-step="2"><h3><span class="n">2</span> the PDP says where to ask</h3><p class="quiet"></p></div>
+      <div class="step" data-step="3"><h3><span class="n">3</span> the PDP learns what to enforce</h3><p class="quiet"></p></div>
+      <div class="step" data-step="4"><h3><span class="n">4</span> and so</h3><span class="chip idle">NOT RUN</span></div>`;
     $('grid').append(col);
   }
 }
 
-function render(results, action) {
+async function render(results, res) {
+  const docs = await loadResourceDocs(res);
   const cols = [...document.querySelectorAll('.col')];
-  results.forEach((r, i) => {
+  await Promise.all(results.map(async (r, i) => {
+    const p = config.peps[i];
     const col = cols[i];
-    const verdict = col.querySelector('.verdict');
-    const chip = verdict.querySelector('.chip');
-    const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
-    chip.className = 'chip ' + (r.error ? 'deny' : rogue && r.decision ? 'alarm' : r.decision && r.fail_open ? 'open' : r.decision ? 'permit' : 'deny');
-    chip.textContent = r.error ? 'ERROR' : r.decision ? (rogue ? 'PERMIT — BY THE ROGUE PDP' : r.fail_open ? 'PERMIT — FAILED OPEN' : 'PERMIT') : `DENY · ${r.status}`;
-    verdict.querySelector('.reason').textContent = r.error || r.reason || '';
-    verdict.querySelector('.ms').textContent = `${r.ms.toFixed(1)} ms`;
-
-    col.querySelector('.proof').textContent = proofOf(r, action);
-
-    const body = col.querySelector('.trace .body');
-    body.innerHTML = '';
-    if (!r.events.length) {
-      const p = document.createElement('p');
-      p.className = 'none';
-      p.textContent = r.error ? 'No stub was reached.' : 'Nothing fetched — no discovery, or every document was cached.';
-      body.append(p);
+    const decisions = decisionsOf(r);
+    // What reached the PDP is the truth about what discovery resolved.
+    const first = decisions.find((d) => d.request && d.request.context && d.request.context.resource_metadata);
+    const resolved = first ? first.request.context.resource_metadata : null;
+    const step = (n) => col.querySelector(`.step[data-step="${n}"]`);
+    const put = (n, html) => { const el = step(n); el.innerHTML = el.querySelector('h3').outerHTML + html; };
+    if (r.error) {
+      put(1, `<p class="say">${esc(r.error)}</p>`); put(2, ''); put(3, ''); put(4, stepVerdict(r, decisions));
       return;
     }
-    const ol = document.createElement('ol');
-    for (const e of r.events) {
-      const li = document.createElement('li');
-      li.className = (e.kind === 'verdict' ? 'verdictline' : e.kind) + (e.entity === 'rogue-pdp' ? ' rogue' : '');
-      const ent = document.createElement('span');
-      ent.className = 'ent';
-      ent.textContent = e.entity;
-      const p = document.createElement('span');
-      p.className = 'p';
-      p.textContent = e.kind === 'verdict' || e.kind === 'outage' ? `${e.path} → ${e.note}` : e.kind === 'input' ? `was given: ${e.path}` : `${e.method} ${e.path}`;
-      li.append(ent, p);
-      // Every endpoint here is AuthZEN's own name. What tells you whether a PEP read
-      // the metadata is the BASE it posted under: the PDP's own identifier path is
-      // where a PEP would go without reading anything.
-      if (e.kind === 'decision') {
-        const home = (controlState.pdp_home || {})[e.entity];
-        if (home !== undefined) {
-          const assumed = e.path.startsWith(home + '/access/v1/');
-          const badge = document.createElement('span');
-          badge.className = 'badge' + (assumed ? '' : ' adv');
-          badge.textContent = assumed ? "the PDP's own base" : 'advertised elsewhere';
-          p.append(badge);
-        }
-      }
-      ol.append(li);
-    }
-    body.append(ol);
-  });
-}
-
-// proofOf says what this column just demonstrated, in the reader's terms.
-function proofOf(r, action) {
-  if (r.error) return r.error;
-  const decided = r.events.filter((e) => e.kind === 'decision');
-  const outage = [...new Set(r.events.filter((e) => e.kind === 'outage').map((e) => e.entity))];
-  if (r.fail_open) {
-    const who = outage.length ? outage.join(', ') : r.fail_open;
-    const others = [...new Set(decided.map((e) => e.entity))].filter((e) => !outage.includes(e));
-    const rest = others.length ? others.join(', then ') : 'nothing else in the policy';
-    return `${who} could not decide and its layer is fail-open, so it was skipped and ${rest} decided. The permit carries X-PDP-Fail-Open naming what was skipped: a permit resting on fewer opinions than the policy asked for is visible, not silent.`;
-  }
-  if (!r.decision && outage.length && r.status === 503) {
-    return `${outage.join(', ')} is down and its layer is fail-closed, so the answer is 503 and nothing further was asked. Closed is the default; a layer is skipped only if it was marked fail-open, or the PEP was.`;
-  }
-  const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
-  const fetched = r.events.filter((e) => e.kind === 'metadata').length;
-  const chain = r.events.some((e) => e.path.includes('openid-federation'));
-  if (!decided.length && !r.decision) {
-    // A PDP whose metadata was read but which was never sent anything is the batch
-    // case: it advertised no evaluations endpoint, so there was nowhere to send one.
-    const read = r.events.filter((e) => e.kind === 'metadata' && e.entity.includes('pdp')).pop();
-    if (read && action && action.style === 'mcp') {
-      return `Resolved ${read.entity}, which advertises no batch endpoint. This call is two evaluations, so the PEP refused rather than guessing a path.`;
-    }
-    return 'No PDP was reached. Discovery refused to resolve one, so the request fails closed.';
-  }
-  if (action && action.style === 'mcp' && decided.length) {
-    const path = decided[0].path;
-    if (path.endsWith('/access/v1/evaluations')) {
-      return `Two evaluations in one call to ${decided[0].entity}, on the batch endpoint its metadata advertises.`;
-    }
-  }
-  const who = decided.length ? decided[0].entity : 'no PDP';
-  const how = fetched === 0 ? 'from cache' : chain ? `after validating a trust chain (${fetched} documents)` : `after reading ${fetched} metadata document${fetched === 1 ? '' : 's'}`;
-  const layersAsked = [...new Set(decided.map((e) => e.entity))];
-  if (layersAsked.length > 1) {
-    return r.decision
-      ? `Every layer permitted, in order: ${layersAsked.join(', then ')}.`
-      : `${layersAsked[layersAsked.length - 1]} denied; the remaining layer${layersAsked.length > 2 ? 's were' : ' was'} not asked.`;
-  }
-  if (!r.decision && layersAsked.length === 1 && layersAsked[0] === 'pdp-estate') {
-    return 'The estate PDP denied before the resource\'s PDP was asked. The generic layer is a gate.';
-  }
-  if (rogue) return `Decided by the rogue PDP ${how}. The resource named its own judge and nothing overruled it.`;
-  return `Decided by ${who} ${how}.`;
+    put(1, stepFind(p, res, docs, r, p.mode === 'federation' ? resolved : null));
+    put(2, await stepEndpoints(p, res, r, decisions));
+    put(3, stepGiven(p, res, decisions));
+    put(4, stepVerdict(r, decisions));
+  }));
 }
 
 async function control(op) {
-  const res = await fetch('/api/control', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op }),
-  });
+  const res = await fetch('/api/control', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op }) });
   showState(await res.json());
+  docCache.clear();
   await run(new Event('submit'));
 }
-
-let controlState = {};
-
 function showState(state) {
   controlState = state || {};
   const evalPath = (controlState.pdp_evaluation_path || {})['pdp-a'] || '?';
@@ -342,55 +495,41 @@ async function run(ev) {
   ev.preventDefault();
   const button = $('run');
   button.disabled = true;
-  button.textContent = 'Running…';
+  button.textContent = 'Discovering…';
   try {
     const res = await fetch('/api/run', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         resource: selected('resource'), action: selected('action'), client: selected('client'),
         layers: selected('layers') === 'resource' ? '' : selected('layers'),
         acr: selected('acr'), scope: selected('scope'), forward_token: selected('forward') === 'yes',
       }),
     });
-    if (!res.ok) throw new Error(`console API returned ${res.status}`);
     const data = await res.json();
-    render(data.results, data.action);
-  } catch (err) {
-    for (const col of document.querySelectorAll('.col')) {
-      const chip = col.querySelector('.chip');
-      chip.className = 'chip deny';
-      chip.textContent = 'ERROR';
-      col.querySelector('.reason').textContent = String(err.message || err);
-    }
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    docCache.clear();
+    await render(data.results, data.resource);
+  } catch (e) {
+    for (const col of document.querySelectorAll('.col .step[data-step="1"]')) col.innerHTML = col.querySelector('h3').outerHTML + `<p class="say">${esc(e.message)}</p>`;
   } finally {
     button.disabled = false;
-    button.textContent = 'Run all three';
+    button.textContent = 'Discover';
   }
 }
 
 (async function init() {
   config = await (await fetch('/api/config')).json();
-  radios($('resources'), config.resources, 'resource', 'plain', (item) => {
-    $('resourceHint').textContent = item.blurb;
-    describe();
-  });
+  radios($('resources'), config.resources, 'resource', 'plain', (item) => { $('resourceHint').textContent = item.blurb; describe(); });
+  radios($('actions'), config.actions, 'action', 'balance', (item) => { $('actionHint').textContent = item.note || ''; describe(); });
+  radios($('clients'), CLIENTS, 'client', 'agent-1', (item) => { $('clientHint').textContent = item.blurb; describe(); });
+  radios($('acrs'), ACRS, 'acr', 'urn:idp:loa:password', (item) => { $('acrHint').textContent = item.blurb; describe(); });
+  radios($('scopes'), SCOPES, 'scope', 'accounts:read', (item) => { $('scopeHint').textContent = item.blurb; describe(); });
+  radios($('forwards'), FORWARDS, 'forward', 'yes', (item) => { $('forwardHint').textContent = item.blurb; describe(); });
   const LAYERS = layerChoices(config.estate_pdp);
   radios($('layers'), LAYERS, 'layers', 'resource', (item) => { $('layerHint').textContent = item.blurb; describe(); });
-  radios($('clients'), CLIENTS, 'client', 'agent-1', (item) => { $('clientHint').textContent = item.blurb; describe(); });
-  $('layerHint').textContent = LAYERS[0].blurb;
-  $('clientHint').textContent = CLIENTS[0].blurb;
-  radios($('actions'), config.actions, 'action', 'balance', (item) => {
-    $('actionHint').textContent = item.note || '';
-    describe();
-  });
-  radios($('acrs'), ACRS, 'acr', 'urn:idp:loa:password', (item) => { $('acrHint').textContent = item.blurb; describe(); });
-  radios($('scopes'), SCOPES, 'scope', 'accounts:read payments:write', (item) => { $('scopeHint').textContent = item.blurb; describe(); });
-  radios($('forwards'), FORWARDS, 'forward', 'yes', (item) => { $('forwardHint').textContent = item.blurb; });
-  $('acrHint').textContent = ACRS[0].blurb;
-  $('scopeHint').textContent = SCOPES[0].blurb;
-  $('forwardHint').textContent = FORWARDS[0].blurb;
   $('resourceHint').textContent = config.resources.find((r) => r.key === 'plain').blurb;
+  $('clientHint').textContent = CLIENTS[0].blurb; $('acrHint').textContent = ACRS[0].blurb; $('scopeHint').textContent = SCOPES[0].blurb;
+  $('forwardHint').textContent = FORWARDS[0].blurb; $('layerHint').textContent = LAYERS[0].blurb;
   skeleton();
   describe();
   $('form').addEventListener('submit', run);

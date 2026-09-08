@@ -65,6 +65,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -773,11 +774,15 @@ type event struct {
 	Path   string `json:"path"`
 	Kind   string `json:"kind"` // metadata | decision | verdict | control | other
 	Note   string `json:"note,omitempty"`
+	// Status and Body are the document a metadata endpoint served, or the request a
+	// PDP received: what discovery is made of, not just that it happened.
+	Status int    `json:"status,omitempty"`
+	Body   string `json:"body,omitempty"`
 }
 
 const maxEvents = 4096
 
-func (r *recorder) add(entity, method, path, kind, note string) {
+func (r *recorder) add(entity, method, path, kind, note string) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seq++
@@ -785,6 +790,19 @@ func (r *recorder) add(entity, method, path, kind, note string) {
 		Entity: entity, Method: method, Path: path, Kind: kind, Note: note})
 	if len(r.events) > maxEvents {
 		r.events = r.events[len(r.events)-maxEvents:]
+	}
+	return r.seq
+}
+
+// attach adds the document to an event once the request has been served.
+func (r *recorder) attach(seq int64, status int, body string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := len(r.events) - 1; i >= 0; i-- {
+		if r.events[i].Seq == seq {
+			r.events[i].Status, r.events[i].Body = status, body
+			return
+		}
 	}
 }
 
@@ -814,12 +832,57 @@ func kindOf(path string) string {
 	}
 }
 
+// consoleHeader marks the demo console's own document fetches, which are for display
+// and must not appear in the trace as though a PEP made them.
+const consoleHeader = "X-Demo-Console"
+
+// maxBody bounds what the trace keeps of a document or a PDP request.
+const maxBody = 256 << 10
+
 func logged(name string, rec *recorder, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" {
-			log.Printf("%-10s %s %s", name, r.Method, r.URL.RequestURI())
-			rec.add(name, r.Method, r.URL.RequestURI(), kindOf(r.URL.Path), "")
+		if r.URL.Path == "/healthz" || r.Header.Get(consoleHeader) != "" {
+			h.ServeHTTP(w, r)
+			return
 		}
-		h.ServeHTTP(w, r)
+		log.Printf("%-10s %s %s", name, r.Method, r.URL.RequestURI())
+		kind := kindOf(r.URL.Path)
+		seq := rec.add(name, r.Method, r.URL.RequestURI(), kind, "")
+		// The trace carries the documents themselves: what a metadata endpoint served,
+		// and what a PDP was sent.
+		var sent []byte
+		if kind == "decision" && r.Body != nil {
+			sent, _ = io.ReadAll(io.LimitReader(r.Body, maxBody))
+			r.Body = io.NopCloser(bytes.NewReader(sent))
+		}
+		cw := &captureWriter{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(cw, r)
+		body := ""
+		switch kind {
+		case "metadata":
+			body = cw.buf.String()
+		case "decision":
+			body = string(sent)
+		}
+		rec.attach(seq, cw.status, body)
 	})
+}
+
+// captureWriter keeps a bounded copy of what was served, and the status.
+type captureWriter struct {
+	http.ResponseWriter
+	status int
+	buf    bytes.Buffer
+}
+
+func (c *captureWriter) WriteHeader(code int) {
+	c.status = code
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *captureWriter) Write(b []byte) (int, error) {
+	if room := maxBody - c.buf.Len(); room > 0 {
+		c.buf.Write(b[:min(len(b), room)])
+	}
+	return c.ResponseWriter.Write(b)
 }

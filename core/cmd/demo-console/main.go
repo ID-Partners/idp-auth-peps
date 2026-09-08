@@ -72,6 +72,7 @@ type action struct {
 }
 
 type server struct {
+	base      string
 	peps      []pep
 	resources []resource
 	actions   []action
@@ -83,6 +84,7 @@ type server struct {
 func main() {
 	base := strings.TrimRight(env("STUBS_BASE", "http://localhost"), "/")
 	s := &server{
+		base:    base,
 		control: env("STUBS_CONTROL", base+":9099"),
 		token:   env("CHECK_API_TOKEN", "demo"),
 		client:  &http.Client{Timeout: 15 * time.Second},
@@ -130,9 +132,19 @@ func main() {
 		_, _ = w.Write(consoleHTML)
 	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, map[string]any{"peps": s.peps, "resources": s.resources, "actions": s.actions, "estate_pdp": base + ":9098"})
+		writeJSON(w, map[string]any{
+			"peps": s.peps, "resources": s.resources, "actions": s.actions,
+			"estate_pdp": base + ":9098", "static_pdp": base + ":9002/tenants/bank-a",
+			// Which stub is which PDP, so the page can find a PDP's metadata from the
+			// name the trace uses.
+			"pdps": map[string]string{
+				"pdp-a": base + ":9002/tenants/bank-a", "pdp-b": base + ":9008/tenants/bank-b",
+				"rogue-pdp": base + ":9003", "pdp-estate": base + ":9098",
+			},
+		})
 	})
 	mux.HandleFunc("/api/run", s.handleRun)
+	mux.HandleFunc("/api/fetch", s.handleFetch)
 	mux.HandleFunc("/api/control", s.handleControl)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
@@ -180,6 +192,10 @@ type event struct {
 	Path   string `json:"path"`
 	Kind   string `json:"kind"`
 	Note   string `json:"note"`
+	// Status and Body are the document a metadata endpoint served, or the request a
+	// PDP received, as the stubs recorded them.
+	Status int    `json:"status,omitempty"`
+	Body   string `json:"body,omitempty"`
 }
 
 func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +330,32 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, in 
 		}
 	}
 	return out
+}
+
+// handleFetch fetches one document from the stubs for display. The page shows the
+// documents discovery is made of even when a PEP had them cached and fetched nothing.
+// Only the stubs' origin is reachable, and the request is marked so the stubs keep it
+// out of the trace.
+func (s *server) handleFetch(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("url")
+	if !strings.HasPrefix(raw, s.base+":") && !strings.HasPrefix(raw, s.base+"/") {
+		http.Error(w, `{"error":"not a stub"}`, http.StatusBadRequest)
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, raw, nil)
+	if err != nil {
+		http.Error(w, `{"error":"bad url"}`, http.StatusBadRequest)
+		return
+	}
+	req.Header.Set("X-Demo-Console", "1")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		writeJSON(w, map[string]any{"status": 0, "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	writeJSON(w, map[string]any{"status": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "body": string(body)})
 }
 
 // handleControl relays the console's levers to the stubs: move a PDP's advertised

@@ -107,38 +107,46 @@ service.
 
 ## The console
 
-Pick a resource, a request, the route's policy layers, and the shape of the token: who it
-was issued to, how the customer authenticated, which scopes it carries, and whether the
-route forwards it to the PDP. Press Run. The same check goes to all three
-PEPs and you get three columns: the decision, a line saying what that column just proved,
-and underneath it every request the stubs saw while that PEP was deciding — which
-`.well-known` document it read, whether it climbed a trust chain, and which PDP answered
-**on which endpoint**.
+The console is about the two discoveries, not the decision. Pick an API and a request,
+press Discover, and each of the three gateways shows the chain it followed, top to
+bottom:
 
-Every endpoint in the trace is AuthZEN's own name — `/access/v1/evaluation` and
-`/access/v1/evaluations`. Nothing here invents a path, because a demo about a standard
-that shows you a made-up verb teaches the wrong thing.
+1. **The gateway finds the PDP.** What it fetched and what came back: the API's own RFC
+   9728 document, or in federation mode the API's signed entity configuration, the
+   anchor's policy for it, and what survived that policy. The PDP identifier it landed on
+   is orange; anything the federation struck out of the API's claim is struck through.
+   The static gateway shows what it was told by hand, and that it read nothing.
+2. **The PDP says where to ask.** The PDP's own `authzen-configuration`, and the endpoint
+   the gateway actually posted to: advertised, assumed, or stale after a move.
+3. **The PDP learns what to enforce.** The AuthZEN context the gateway handed the PDP,
+   verbatim: `resource_metadata` with the API's `scopes_supported` and
+   `acr_values_required` in green, where it came from, the endpoint hit, and whether the
+   raw token travelled. This is the second discovery. The PDP was configured with none of
+   it; the gateway compared none of it.
+4. **And so.** The decision, and the PDP's reason, which names the requirement it read.
 
-What differs between PDPs is the **base** those endpoints hang off. A PDP identifier may
-carry a path, and a multi-tenant deployment is the ordinary reason it does, so Bank A's
-PDP is the identifier `http://stubs:9002/tenants/bank-a`. Its metadata sits at
-`/.well-known/authzen-configuration/tenants/bank-a` — AuthZEN §9 inserts the well-known
-segment after the host and keeps the identifier's path — and it evaluates at
-`/tenants/bank-a/access/v1/evaluation`.
+Documents are shown as published now; a step marked **fetched** was read by that gateway
+during this run, otherwise it was still in its cache (the demo's TTL is 15 seconds). The
+whole document is a click away under each summary.
 
-Under each PDP's verdict is a **was given** line: the resource's declared requirements and
-their source, the endpoint hit, and what the token said — exactly what the PDP had to work
-with, and none of it judged by the PEP.
+The token and the route's policy layers are under "The token and the route's policy". The
+defaults are a read-only, password-strength token, so the PDP's reasons are visible on
+the first few clicks: `bank-b` denies for acr, a payment steps up for scope, and both
+cite the API's document rather than anything a gateway was configured with.
 
-The trace badges each evaluation as **the PDP's own base** or **advertised elsewhere**.
-Before anything moves those agree, and that is the honest picture: a correctly configured
-static PEP and a discovering one post to the same place. The difference only appears when
-something changes, which is the argument.
+Every endpoint in the chain is AuthZEN's own name, `/access/v1/evaluation` and
+`/access/v1/evaluations`. What differs between PDPs is the **base** those endpoints hang
+off: a PDP identifier may carry a path, and a multi-tenant deployment is the ordinary
+reason it does, so Bank A's PDP is the identifier `http://stubs:9002/tenants/bank-a`, its
+metadata sits at `/.well-known/authzen-configuration/tenants/bank-a` (AuthZEN §9 inserts
+the well-known segment after the host and keeps the identifier's path), and it evaluates
+at `/tenants/bank-a/access/v1/evaluation`.
 
 ### The levers
 
-Three buttons change the world while it runs. None restarts a PEP or edits a PEP's
-configuration; the PEPs pick the change up on their next metadata refresh.
+Four buttons change the world while it runs. None restarts a PEP or edits a PEP's
+configuration; the PEPs pick the change up on their next metadata refresh, and the
+documents in step 1 and 2 change under them.
 
 - **Relocate Bank A's PDP.** Its metadata starts advertising the same AuthZEN endpoints
   under a new base, `/tenants/bank-a-v2`. The identifier does not change: a name and a
