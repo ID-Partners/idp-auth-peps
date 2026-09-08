@@ -232,54 +232,84 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     <pre><code>"authzen_policy_decision_points": ["https://pdp.example"]</code></pre>
     <p class="measure">An array of PDP <em>identifiers</em>, first preferred, and the same bytes whether it sits in an RFC 9728 document or under <code>metadata.oauth_resource</code> in a federation Entity Statement. That sameness is the point, because the two places differ in who vouches for them.</p>
     <figure>
-      <svg viewBox="0 0 960 330" role="img" aria-label="In resource mode the PEP reads the resource's own well-known, which can name a rogue PDP. In federation mode the PEP resolves the resource's chain to a configured Trust Anchor whose policy strips the rogue PDP, and the rogue is never contacted.">
+      <svg viewBox="0 0 960 380" role="img" aria-label="Two panels, one resource that names a rogue PDP and says a password is enough. Resource mode: step 1, the PEP fetches the resource's own well-known document; step 2, the PEP believes it and sends the evaluation to the rogue PDP, which permits. Federation mode: step 1, the PEP fetches the resource's entity configuration, which says the same thing; step 2, the PEP fetches the trust anchor's statement about the resource, using anchor keys configured in the PEP, and its policy restricts the PDP to the good one and sets the acr to MFA; step 3, the PEP validates the chain and resolves the metadata: PDP good, acr MFA; step 4, the PEP sends the evaluation, with the resolved document, to the good PDP, which denies the password token. The rogue PDP is never contacted.">
         <defs>
           <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
-          <marker id="ah2O" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#FC6401"/></marker>
         </defs>
-        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="currentColor">
-          <text x="20" y="24" font-weight="700" font-size="12" letter-spacing="1.5">RESOURCE MODE · SELF-ASSERTED</text>
-          <rect x="20" y="40" width="130" height="50" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="85" y="70" text-anchor="middle" font-weight="700">PEP</text>
-          <line x1="150" y1="65" x2="250" y2="65" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="200" y="56" text-anchor="middle" font-size="11">GET /.well-known/…</text>
-          <rect x="252" y="40" width="180" height="50" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="342" y="60" text-anchor="middle" font-weight="700">the resource</text>
-          <text x="342" y="78" text-anchor="middle" font-size="11" opacity=".75">"my PDP is: rogue"</text>
-          <line x1="342" y1="90" x2="342" y2="130" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <rect x="262" y="132" width="160" height="40" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="342" y="157" text-anchor="middle" font-weight="700">rogue PDP: permit</text>
-          <text x="20" y="200" font-size="12" opacity=".8">The resource chose its own judge.</text>
-          <text x="20" y="218" font-size="12" opacity=".8">A document cannot protect the thing it asserts.</text>
+        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="currentColor">
 
-          <line x1="480" y1="16" x2="480" y2="310" stroke="currentColor" stroke-width="1" stroke-dasharray="3 5" opacity=".5"/>
+          <text x="20" y="22" font-weight="700" font-size="12" letter-spacing="1.5">RESOURCE MODE · THE PEP BELIEVES THE RESOURCE</text>
 
-          <text x="510" y="24" font-weight="700" font-size="12" letter-spacing="1.5" fill="#FC6401">FEDERATION MODE · RESOLVED</text>
-          <rect x="510" y="40" width="130" height="50" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="575" y="70" text-anchor="middle" font-weight="700">PEP</text>
-          <line x1="640" y1="65" x2="740" y2="65" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="690" y="56" text-anchor="middle" font-size="11">entity configuration</text>
-          <rect x="742" y="40" width="190" height="50" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="837" y="60" text-anchor="middle" font-weight="700">the resource</text>
-          <text x="837" y="78" text-anchor="middle" font-size="11" opacity=".75">"my PDPs: [rogue, good]"</text>
-          <line x1="837" y1="90" x2="837" y2="130" stroke="#FC6401" stroke-width="1.6" marker-end="url(#ah2O)"/>
-          <text x="849" y="114" font-size="11" fill="#FC6401">chain climbs to</text>
-          <rect x="742" y="132" width="190" height="64" fill="none" stroke="#FC6401" stroke-width="2"/>
-          <text x="837" y="152" text-anchor="middle" font-weight="700">Trust Anchor</text>
-          <text x="837" y="169" text-anchor="middle" font-size="11" opacity=".9">keys configured out of band</text>
-          <text x="837" y="186" text-anchor="middle" font-size="11" fill="#FC6401">policy: subset_of [good]</text>
-          <path d="M742 164 H575 V210" fill="none" stroke="#FC6401" stroke-width="1.6" marker-end="url(#ah2O)"/>
-          <text x="600" y="156" font-size="11" fill="#FC6401">resolved metadata: [good]</text>
-          <rect x="510" y="212" width="160" height="40" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="590" y="237" text-anchor="middle" font-weight="700">good PDP: deny</text>
-          <rect x="742" y="212" width="160" height="40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="4 3" opacity=".55"/>
-          <text x="822" y="237" text-anchor="middle" opacity=".55">rogue PDP</text>
-          <line x1="746" y1="216" x2="898" y2="248" stroke="#FC6401" stroke-width="1.6"/>
-          <text x="510" y="290" font-size="12" opacity=".8">The federation's word survives every superior's policy and is signed back to an anchor</text>
-          <text x="510" y="308" font-size="12" opacity=".8">the operator chose. The rogue PDP is never contacted; an invalid chain is a 503.</text>
+          <rect x="20" y="44" width="90" height="46" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <text x="65" y="72" text-anchor="middle" font-weight="700" font-size="13">PEP</text>
+
+          <line x1="110" y1="67" x2="248" y2="67" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
+          <text x="118" y="58" font-size="11">1&#8202; GET /.well-known/oauth-protected-resource</text>
+
+          <rect x="250" y="44" width="200" height="72" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <text x="350" y="64" text-anchor="middle" font-weight="700" font-size="13">the resource</text>
+          <text x="350" y="82" text-anchor="middle" font-size="11">says about itself, over TLS:</text>
+          <text x="350" y="100" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace">PDP: rogue · acr: password</text>
+
+          <line x1="65" y1="90" x2="65" y2="178" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
+          <text x="74" y="130" font-size="11">2&#8202; evaluation, carrying</text>
+          <text x="74" y="146" font-size="11">that document</text>
+
+          <rect x="20" y="180" width="200" height="46" fill="none" stroke="#FC6401" stroke-width="1.8"/>
+          <text x="120" y="200" text-anchor="middle" font-weight="700" font-size="13" fill="#FC6401">rogue PDP</text>
+          <text x="120" y="216" text-anchor="middle" font-size="11" fill="#FC6401">permits a password token</text>
+
+          <text x="20" y="266" font-size="12">Nobody vouched for the document but the resource itself.</text>
+          <text x="20" y="284" font-size="12">It chose its own judge, and set its own bar.</text>
+
+          <line x1="470" y1="14" x2="470" y2="366" stroke="currentColor" stroke-width="1" stroke-dasharray="3 5" opacity=".5"/>
+
+          <text x="490" y="22" font-weight="700" font-size="12" letter-spacing="1.5" fill="#FC6401">FEDERATION MODE · THE PEP BELIEVES THE ANCHOR</text>
+
+          <rect x="490" y="44" width="90" height="46" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <text x="535" y="72" text-anchor="middle" font-weight="700" font-size="13">PEP</text>
+
+          <line x1="580" y1="60" x2="718" y2="60" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
+          <text x="588" y="51" font-size="11">1&#8202; GET /.well-known/openid-federation</text>
+
+          <rect x="720" y="40" width="220" height="64" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <text x="830" y="59" text-anchor="middle" font-weight="700" font-size="13">the same resource</text>
+          <text x="830" y="76" text-anchor="middle" font-size="11">its entity configuration, signed by it:</text>
+          <text x="830" y="93" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace">PDP: rogue · acr: password</text>
+
+          <path d="M580 84 L718 148" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
+          <text x="600" y="128" font-size="11">2&#8202; fetch its statement about the resource</text>
+
+          <rect x="720" y="122" width="220" height="82" fill="none" stroke="#FC6401" stroke-width="2"/>
+          <text x="830" y="141" text-anchor="middle" font-weight="700" font-size="13">Trust Anchor</text>
+          <text x="830" y="158" text-anchor="middle" font-size="11">keys configured in the PEP, not fetched</text>
+          <text x="830" y="176" text-anchor="middle" font-size="11">its policy for members:</text>
+          <text x="830" y="193" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace" fill="#FC6401">PDP ⊆ [good] · acr = MFA</text>
+
+          <line x1="535" y1="90" x2="535" y2="228" stroke="currentColor" stroke-width="1.4"/>
+          <rect x="490" y="230" width="200" height="58" fill="none" stroke="#FC6401" stroke-width="1.8"/>
+          <text x="590" y="248" text-anchor="middle" font-size="11">3&#8202; the PEP validates the chain</text>
+          <text x="590" y="263" text-anchor="middle" font-size="11">and applies the policy. Resolved:</text>
+          <text x="590" y="281" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace" fill="#FC6401">PDP: good · acr: MFA</text>
+
+          <line x1="590" y1="288" x2="590" y2="326" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
+          <text x="600" y="312" font-size="11">4&#8202; evaluation, carrying the resolved document</text>
+
+          <rect x="490" y="328" width="200" height="40" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <text x="590" y="346" text-anchor="middle" font-weight="700" font-size="13">good PDP</text>
+          <text x="590" y="361" text-anchor="middle" font-size="11">denies a password token</text>
+
+          <rect x="740" y="328" width="200" height="40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="4 3" opacity=".5"/>
+          <text x="840" y="346" text-anchor="middle" font-weight="700" font-size="13" opacity=".5">rogue PDP</text>
+          <text x="840" y="361" text-anchor="middle" font-size="11" opacity=".5">never contacted</text>
+
+          <text x="720" y="242" font-size="12">The resource said the same thing in both modes.</text>
+          <text x="720" y="260" font-size="12">What changed is who the PEP believed: the anchor's</text>
+          <text x="720" y="278" font-size="12">policy overrode the resource's document, and the</text>
+          <text x="720" y="296" font-size="12">PDP received the resolved one.</text>
         </g>
       </svg>
-      <figcaption>The same parameter, two different vouchers. Federation mode never reads the resource's own well-known: the two documents can legitimately differ, and when they do the PEP does not merge them.</figcaption>
+      <figcaption>The same resource, the same self-assertion, two outcomes. In resource mode the PEP does one fetch and believes it. In federation mode the PEP does the climbing itself — resource, then anchor, with anchor keys it was configured with — and hands the PDP what survived the anchor's policy, not what the resource wrote. The rogue PDP is never contacted; a chain that fails validation is a 503, never a fallback.</figcaption>
     </figure>
     <div class="wide">
     <table>
