@@ -307,16 +307,17 @@ a `sources` seam) and get federation by delegating to `coaz-pep`.
 
 ## Seeing it work
 
-`demo/` stands up a stub Trust Anchor, resources that are and are not members, a
-well-behaved PDP and a rogue one that permits everything, and `coaz-pep` three times in
-three discovery modes. `demo.sh` walks the security cases in the terminal, and a console on
-:8088 adds the operational ones: the impostor resource choosing its own judge under
-`resource` mode, the federation's policy stripping the rogue PDP under `federation` mode,
-a broken chain failing closed, and a step-up challenge surviving discovery — each shown
-beside the documents that PEP actually fetched and the endpoint it used. The console also
-shows what discovery is *for*: a PDP that moves without a PEP being touched, two business
-units answering to two PDPs through one gateway, and a batch that is only ever sent to a
-PDP that advertises a batch endpoint. See [`demo/README.md`](../demo/README.md).
+`demo/` stands up a stub Trust Anchor, resources that are and are not members, two banks'
+PDPs, an estate PDP and a rogue one that permits everything, and `coaz-pep` three times in
+three discovery modes. `demo.sh` walks the security cases in the terminal. The console on
+:8088 is about the two discoveries themselves: for one request, each of the three PEPs
+shows the chain it followed, top to bottom — the document it read to find the PDP (the
+resource's own, or the entity configuration with the anchor's policy applied and the
+rogue struck out), the PDP's own metadata and the endpoint actually used, then the
+context it handed the PDP with `scopes_supported` and `acr_values_required` picked out,
+and last the decision, whose reason names the requirement the PDP read. Levers move a
+PDP, hand a resource to another bank, and take the estate PDP down while it runs. See
+[`demo/README.md`](../demo/README.md).
 
 ## Standards
 
