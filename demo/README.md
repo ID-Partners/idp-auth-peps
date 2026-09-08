@@ -86,6 +86,25 @@ Watch the stubs while it runs: `docker compose logs -f stubs` (or `stubs.log` un
 `$TMPDIR/idp-auth-peps-demo` for the local runner). Every PDP decision and every metadata
 fetch is one line, and the rogue PDP announces itself.
 
+## Host it
+
+One container is the whole demo: [`railway/Dockerfile`](railway/Dockerfile) builds the
+stubs, the three PEPs and the console into one image, and
+[`railway/entrypoint.sh`](railway/entrypoint.sh) runs them on localhost with the console
+on `$PORT`. It is `run-local.sh` without the Go toolchain, and the same wiring as
+`docker-compose.yml`.
+
+```bash
+docker build -f demo/railway/Dockerfile -t idp-auth-peps-demo .
+docker run --rm -p 8088:8088 idp-auth-peps-demo
+```
+
+On Railway, a service pointed at this repository with the Dockerfile path set to
+`demo/railway/Dockerfile` and the healthcheck at `/healthz` is all it takes; Railway
+sets `PORT`. The levers are shared state, so two people clicking at once will surprise
+each other, and nothing in it is authenticated - it is a demo of PDP discovery, not a
+service.
+
 ## The console
 
 Pick a resource, a request, the route's policy layers, and the shape of the token: who it
