@@ -237,7 +237,7 @@ func TestEngineAsksEveryLayerAndStopsAtTheFirstDeny(t *testing.T) {
 		},
 	}
 	e := NewEngine(Options{Resolver: fr})
-	layers := []string{estate.URL, "resource"}
+	layers := []discovery.LayerSpec{{Name: estate.URL}, {Name: "resource"}}
 
 	v := e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: layers})
 	if !v.Decision || !reflect.DeepEqual(order, []string{"estate", "resource"}) {
@@ -250,7 +250,7 @@ func TestEngineAsksEveryLayerAndStopsAtTheFirstDeny(t *testing.T) {
 	}
 	// A duplicate layer is one call, and the resource's document still travels.
 	order = nil
-	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: []string{"resource", own.URL}})
+	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: []discovery.LayerSpec{{Name: "resource"}, {Name: own.URL}}})
 	if !v.Decision || !reflect.DeepEqual(order, []string{"resource"}) {
 		t.Fatalf("duplicates collapse: %v", order)
 	}
@@ -265,6 +265,71 @@ func TestEngineAsksEveryLayerAndStopsAtTheFirstDeny(t *testing.T) {
 	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: layers})
 	if v.Decision || !hasCode(v, CodePDPError) {
 		t.Fatalf("a PDP error in any layer must fail closed: %+v", v)
+	}
+}
+
+func TestEngineFailsOpenOnlyWhereTold(t *testing.T) {
+	deny := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision":false,"context":{"reason":"no"}}`))
+	}))
+	t.Cleanup(deny.Close)
+	own := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision":true}`))
+	}))
+	t.Cleanup(own.Close)
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
+	t.Cleanup(down.Close)
+	mcp := mcpServing(t, singleTool)
+	fr := &fakeResolver{
+		ep: discovery.PDPEndpoints{Identifier: own.URL, Evaluation: own.URL + "/e"},
+		layerEP: func(pdp string) discovery.PDPEndpoints {
+			return discovery.PDPEndpoints{Identifier: pdp, Evaluation: pdp + "/e", Source: "layer"}
+		},
+	}
+	e := NewEngine(Options{Resolver: fr})
+	claims := map[string]any{"sub": "alice", "client_id": "c"}
+	open, closed := true, false
+	call := func(opts CallOptions) Verdict {
+		return e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), claims, nil, opts)
+	}
+
+	// Closed by default: a failing layer is a PDP error.
+	if v := call(CallOptions{Layers: []discovery.LayerSpec{{Name: down.URL}, {Name: "resource"}}}); v.Decision || !hasCode(v, CodePDPError) {
+		t.Fatalf("%+v", v)
+	}
+	// Fail-open on the layer: skipped, named, and the rest of the policy decides.
+	v := call(CallOptions{Layers: []discovery.LayerSpec{{Name: down.URL, FailOpen: &open}, {Name: "resource"}}})
+	if !v.Decision || len(v.FailedOpen) != 1 || !strings.HasPrefix(v.FailedOpen[0], down.URL) {
+		t.Fatalf("%+v", v)
+	}
+	// Fail-open on the call: same, unless the layer says closed for itself.
+	if v := call(CallOptions{FailOpen: true, Layers: []discovery.LayerSpec{{Name: down.URL}, {Name: "resource"}}}); !v.Decision || len(v.FailedOpen) != 1 {
+		t.Fatalf("%+v", v)
+	}
+	if v := call(CallOptions{FailOpen: true, Layers: []discovery.LayerSpec{{Name: down.URL, FailOpen: &closed}, {Name: "resource"}}}); v.Decision {
+		t.Fatalf("fail-closed on the layer must win: %+v", v)
+	}
+	// Every layer skipped is a permit that says so.
+	v = call(CallOptions{FailOpen: true, Layers: []discovery.LayerSpec{{Name: down.URL}}})
+	if !v.Decision || len(v.FailedOpen) != 1 || !strings.HasPrefix(v.Reason, "fail-open:") {
+		t.Fatalf("%+v", v)
+	}
+	// A deny is a decision: never skipped, whatever the mode.
+	if v := call(CallOptions{FailOpen: true, Layers: []discovery.LayerSpec{{Name: deny.URL, FailOpen: &open}, {Name: "resource"}}}); v.Decision || !strings.HasSuffix(v.Reason, "no") {
+		t.Fatalf("a deny must never fail open: %+v", v)
+	}
+	// A permit with nothing skipped carries no marker.
+	if v := call(CallOptions{FailOpen: true, Layers: []discovery.LayerSpec{{Name: "resource"}}}); !v.Decision || v.FailedOpen != nil {
+		t.Fatalf("%+v", v)
+	}
+	// The default-mapping path folds the same way.
+	v = e.CheckToolCall(context.Background(), mcp.URL, "", []byte(`{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}}`),
+		map[string]any{"sub": "alice", "aud": "https://m"}, nil,
+		CallOptions{ApplyDefaultMappings: true, FailOpen: true, Layers: []discovery.LayerSpec{{Name: down.URL}, {Name: "resource"}}})
+	if !v.Decision || len(v.FailedOpen) != 1 {
+		t.Fatalf("default mappings: %+v", v)
 	}
 }
 

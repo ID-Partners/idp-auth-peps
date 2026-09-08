@@ -173,6 +173,9 @@ type state struct {
 	// console compares against it to say whether a call went to the advertised
 	// endpoint or to the one a PEP would have assumed.
 	home map[string]string
+	// down names PDPs whose evaluation endpoints answer 503 — the fail-open lever. The
+	// metadata stays up: a PDP that can say where it is but cannot decide.
+	down map[string]bool
 	// defaults, for reset.
 	defEval map[string]string
 	defRes  map[string][]string
@@ -182,6 +185,12 @@ func (s *state) eval(pdp string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pdpEval[pdp]
+}
+
+func (s *state) isDown(pdp string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.down[pdp]
 }
 
 // requirements is what a resource declares about itself. scopes_supported is RFC 9728's
@@ -217,7 +226,13 @@ func (s *state) snapshot() map[string]any {
 	for k, v := range s.resourcePDPs {
 		res[k] = append([]string{}, v...)
 	}
-	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res}
+	down := []string{}
+	for k, v := range s.down {
+		if v {
+			down = append(down, k)
+		}
+	}
+	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res, "pdp_down": down}
 }
 
 func main() {
@@ -247,6 +262,7 @@ func main() {
 	st := &state{
 		home:    map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
 		pdpEval: map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
+		down:    map[string]bool{},
 		// The member's OWN document names Bank A's PDP and says a password is enough.
 		// Its entity configuration (below) names the rogue PDP first. The anchor's
 		// policy strips the rogue AND raises the acr floor to MFA — so the same PDP
@@ -490,7 +506,14 @@ func main() {
 			case "repoint_plain":
 				// The plain resource is handed over to Bank B's PDP. No PEP is touched.
 				st.resourcePDPs[plain.name] = []string{pdpB.id}
+			case "estate_down":
+				// The estate PDP stops deciding. A fail-closed layer turns that into a
+				// 503; a fail-open one is skipped, and the permit says so.
+				st.down[estate.name] = true
+			case "estate_up":
+				delete(st.down, estate.name)
 			case "reset":
+				st.down = map[string]bool{}
 				for k, v := range st.defEval {
 					st.pdpEval[k] = v
 				}
@@ -612,7 +635,19 @@ func pdp(e *entity, rec *recorder, st *state, batching bool, serve func(*entity,
 		writeJSON(w, doc)
 	})
 
+	outage := func(w http.ResponseWriter, r *http.Request) bool {
+		if !st.isDown(e.name) {
+			return false
+		}
+		log.Printf("%-10s DOWN — %s answered 503", e.name, r.URL.Path)
+		rec.add(e.name, "POST", r.URL.Path, "outage", "503 — the PDP is down")
+		http.Error(w, `{"error":"pdp unavailable"}`, http.StatusServiceUnavailable)
+		return true
+	}
 	evaluate := func(w http.ResponseWriter, r *http.Request) {
+		if outage(w, r) {
+			return
+		}
 		var req authzenRequest
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &req)
@@ -625,6 +660,9 @@ func pdp(e *entity, rec *recorder, st *state, batching bool, serve func(*entity,
 		writeJSON(w, out)
 	}
 	batch := func(w http.ResponseWriter, r *http.Request) {
+		if outage(w, r) {
+			return
+		}
 		var body struct {
 			Evaluations []authzenRequest `json:"evaluations"`
 		}

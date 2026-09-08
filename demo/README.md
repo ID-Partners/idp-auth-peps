@@ -19,6 +19,10 @@ must permit. The demo's estate PDP judges the token and the client and knows not
 any resource; put first, it gates every request before the resource's own PDP is asked.
 That is the layers picker, and section 4.
 
+**What if a layer's PDP is down?** Deny, unless that layer (or the PEP) was told to fail
+open, in which case it is skipped and the permit says so. The third layers option and the
+"Take the estate PDP down" lever show both; section 5 of `demo.sh` does the same.
+
 Nothing here turns on who the customer is. The variables are which PDP was consulted,
 what document it was given, what the token carries, and which layers ran. One subject,
 `customer`, throughout.
@@ -187,7 +191,12 @@ denies. With the token not forwarded, the PDP says it could not examine it.
 both PDPs in order, and `agent-risky` is stopped by the estate PDP before Bank A's is
 asked.
 
-**5. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
+**5. Failing open.** The estate PDP is taken down. With the layers as before, every PEP
+answers 503: closed is the default. With the estate entry marked ` fail-open`, Bank A's
+PDP alone decides and the permit carries `X-PDP-Fail-Open` naming what was skipped. Bring
+the estate back and the same policy permits with no marker.
+
+**6. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="payments:approve"` and an
 `authz_challenge` body. Discovery changed where the decision came from, not what a deny
 looks like.

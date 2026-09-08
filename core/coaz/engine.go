@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
@@ -102,7 +103,10 @@ type CallOptions struct {
 	Method, Path string
 	// Layers is the ordered list of PDPs to ask — see discovery.ResolveLayers. Empty
 	// means the resource's PDP alone.
-	Layers []string
+	Layers []discovery.LayerSpec
+	// FailOpen is the route's default failure mode; a layer's own setting overrides
+	// it. Off, a PDP that cannot be reached denies the request. On, it is skipped.
+	FailOpen bool
 }
 
 // forwardedContext is what every PDP call carries beyond the mapped subject, action and
@@ -181,12 +185,13 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 	// The PDPs are resolved before the request is built, because part of what they get
 	// asked is what the resource's metadata said. Resolved once, so one decision cannot
 	// straddle a PDP that moved.
-	eps, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers)
+	layers, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers, opts.FailOpen)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
 	}
+	eps := layers.PDPs
 	extraContext = forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts)
 
 	// Both dialects produce the same BuiltRequest; only how they get there differs.
@@ -202,7 +207,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
 	}
 
-	out, err := e.evaluateLayers(ctx, eps, built)
+	out, err := e.evaluateLayers(ctx, eps, built, layers.Skipped)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
@@ -255,7 +260,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 	if reason == "" {
 		reason = "Permitted by policy."
 	}
-	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason}
+	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason, FailedOpen: out.FailedOpen}
 }
 
 // pdpOutcome carries the PDP decision plus the policy's challenge advice: the RFC 9470
@@ -267,23 +272,42 @@ type pdpOutcome struct {
 	StepUpScope     string
 	IdentityReq     bool
 	IdentityDoctype string
+	// FailedOpen names the layers that were skipped because they failed and were
+	// allowed to. Non-empty on a permit means the permit rests on fewer opinions than
+	// the policy asked for — worth a header and a log line.
+	FailedOpen []string
 }
 
 // evaluateLayers asks each PDP in order with the same request. Every layer must
 // permit; the first that does not is the answer, advice and all, and later layers are
-// not consulted — a generic layer is a gate in front of a specific one. A PDP error in
-// any layer is an error: fail closed, never skip.
-func (e *Engine) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, built *BuiltRequest) (pdpOutcome, error) {
+// not consulted — a generic layer is a gate in front of a specific one.
+//
+// A PDP error in a layer fails closed, unless the layer is fail-open, in which case it
+// is skipped and named. If every layer was skipped the request is permitted — that is
+// what fail-open means, and the operator chose it per layer — with the permit marked so
+// it can be seen and counted. A deny is never skipped: it is a decision, not a failure.
+func (e *Engine) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, built *BuiltRequest, skipped []string) (pdpOutcome, error) {
 	var out pdpOutcome
+	decided := false
 	for _, ep := range eps {
 		o, err := e.evaluate(ctx, ep, built)
 		if err != nil {
-			return out, fmt.Errorf("%s: %w", ep.Identifier, err)
+			if !ep.FailOpen {
+				return out, fmt.Errorf("%s: %w", ep.Identifier, err)
+			}
+			skipped = append(skipped, fmt.Sprintf("%s (%v)", ep.Identifier, err))
+			continue
 		}
+		decided = true
 		if !o.Decision {
 			return o, nil
 		}
 		out = o
+	}
+	out.FailedOpen = skipped
+	if !decided {
+		out.Decision = true
+		out.Reason = "fail-open: no policy layer could be reached (" + strings.Join(skipped, "; ") + ")"
 	}
 	return out, nil
 }
@@ -401,19 +425,20 @@ func (e *Engine) checkByDefaultMapping(
 			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
 	}
 
-	eps, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers)
+	layers, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers, opts.FailOpen)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
 			JSONRPCError: jsonRPCError(id, CodePDPError, "Authorization service unavailable")}
 	}
+	eps := layers.PDPs
 	built, err := cm.Build(params, tokenClaims, forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts))
 	if err != nil {
 		msg := fmt.Sprintf("COAZ mapping error: %v", err)
 		return Verdict{CoazTool: true, Decision: false, Reason: msg,
 			JSONRPCError: jsonRPCError(id, CodeMappingError, msg)}
 	}
-	out, err := e.evaluateLayers(ctx, eps, built)
+	out, err := e.evaluateLayers(ctx, eps, built, layers.Skipped)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
@@ -431,5 +456,5 @@ func (e *Engine) checkByDefaultMapping(
 	if reason == "" {
 		reason = "Permitted by policy."
 	}
-	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason}
+	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason, FailedOpen: out.FailedOpen}
 }

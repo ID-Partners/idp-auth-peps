@@ -278,6 +278,8 @@ function AuthzenPDP:access(conf)
             -- explicit resource identifier is passed so both PEPs key off the same one.
             resource = (conf.resource and conf.resource ~= "") and conf.resource or nil,
             forward_access_token = conf.forward_access_token and "true" or nil,
+            pdp_layers = conf.pdp_layers and #conf.pdp_layers > 0 and table.concat(conf.pdp_layers, ",") or nil,
+            fail_mode = conf.fail_mode ~= "closed" and conf.fail_mode or nil,
           },
           method = kong.request.get_method(),
           path = kong.request.get_path(),
@@ -380,11 +382,12 @@ function AuthzenPDP:access(conf)
   -- 3b) which PDP, and where. Off by default (authzen_url + the AuthZEN paths, no
   --     fetch). A discovery failure is a 503, like an unreachable PDP: a request whose
   --     decider cannot be found is not one to let through.
-  local eps, derr, meta = discovery.resolve_layers(conf, discovery.resource_id(conf), conf.pdp_layers)
-  if not eps then
+  local layers, derr = discovery.resolve_layers(conf, discovery.resource_id(conf), conf.pdp_layers, conf.fail_mode == "open")
+  if not layers then
     kong.log.err("PDP discovery failed: ", derr.msg)
     return deny(pep, 503, "Authorization service could not be resolved; denying (fail-closed).")
   end
+  local eps, meta, skipped = layers.pdps, layers.meta, layers.skipped
 
   -- 3c) What the PDP gets to reason with, beyond the mapped action and resource:
   --   resource_metadata   the resource's declared posture (scopes, acr, sender-constraint
@@ -408,9 +411,12 @@ function AuthzenPDP:access(conf)
 
   -- 4) ask each layer in order. Every layer must permit; the first that does not is
   --    the answer, advice and all, and later layers are not consulted — a generic
-  --    layer is a gate in front of a specific one. A PDP error anywhere fails closed.
+  --    layer is a gate in front of a specific one. A PDP error fails closed unless the
+  --    layer is fail-open, in which case it is skipped and named; if every layer was
+  --    skipped the request is permitted and marked. A deny is never skipped.
   local body = cjson.encode(authzen_req)
   local data, decision, dctx, reason
+  local decided = false
   for _, ep in ipairs(eps) do
     local httpc = http.new()
     httpc:set_timeout(10000)
@@ -424,15 +430,30 @@ function AuthzenPDP:access(conf)
       },
       ssl_verify = conf.pdp_ssl_verify ~= false,
     })
-    if not res then
-      kong.log.err("PDP call failed (", ep.identifier, "): ", err)
-      return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).")
+    local failure = (not res and tostring(err)) or (res.status and (res.status < 200 or res.status >= 300) and ("returned " .. res.status)) or nil
+    if failure then
+      if not ep.fail_open then
+        kong.log.err("PDP call failed (", ep.identifier, "): ", failure)
+        return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).")
+      end
+      kong.log.warn("PDP layer ", ep.identifier, " failed open: ", failure)
+      skipped[#skipped + 1] = ep.identifier .. " (" .. failure .. ")"
+    else
+      decided = true
+      data = cjson.decode(res.body) or {}
+      decision = data.decision == true
+      dctx = (type(data.context) == "table" and data.context) or {}
+      reason = dctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
+      if not decision then break end
     end
-    data = cjson.decode(res.body) or {}
-    decision = data.decision == true
-    dctx = (type(data.context) == "table" and data.context) or {}
-    reason = dctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
-    if not decision then break end
+  end
+  if not decided then
+    decision, dctx = true, {}
+    reason = "fail-open: no policy layer could be reached (" .. table.concat(skipped, "; ") .. ")"
+  end
+  if #skipped > 0 then
+    kong.log.warn("permit failed open past: ", table.concat(skipped, ", "))
+    kong.ctx.plugin.fail_open = table.concat(skipped, ", ")
   end
 
   -- surface the decision on the response for the demo transcript
@@ -497,6 +518,7 @@ function AuthzenPDP:header_filter(conf)
   if c and c.decision then
     kong.response.set_header("X-PDP-PEP", c.pep or "")
     kong.response.set_header("X-PDP-Decision", c.decision)
+    if c.fail_open then kong.response.set_header("X-PDP-Fail-Open", c.fail_open) end
     kong.response.set_header("X-PDP-Action", c.action or "")
     if c.reason then kong.response.set_header("X-PDP-Reason", c.reason) end
   end

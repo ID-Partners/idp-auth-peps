@@ -62,6 +62,8 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 .chip.deny{color:var(--deny)}
 .chip.alarm{color:var(--alarm);background:var(--alarm-bg)}
 .chip.idle{color:var(--muted)}
+.chip.open{color:var(--orange);background:var(--tint)}
+.trace li.outage .ent,.trace li.outage .p{color:var(--deny)}
 .reason{font-size:.9rem}
 .ms{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:auto}
 .trace{padding:12px 16px 16px}
@@ -119,6 +121,7 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
     <div class="row">
       <button type="button" id="movePdp" aria-pressed="false">Relocate Bank A's PDP</button>
       <button type="button" id="repoint" aria-pressed="false">Hand plain over to Bank B's PDP</button>
+      <button type="button" id="estateDown" aria-pressed="false">Take the estate PDP down</button>
       <button type="button" id="reset">Put it back</button>
     </div>
     <div class="state" id="state"></div>
@@ -145,6 +148,7 @@ const CLIENTS = [
 const layerChoices = (estate) => [
   { key: 'resource', name: "the resource's PDP alone", blurb: 'One PDP, found by discovery. Today\'s single behaviour.' },
   { key: `${estate},resource`, name: "estate PDP first, then the resource's", blurb: 'A generic PDP that judges the token and the client, in front of the one that knows the resource. Every layer must permit; the first that does not is the answer.' },
+  { key: `${estate} fail-open,resource`, name: "the same, with the estate layer fail-open", blurb: 'Identical policy, except the estate layer may be skipped when it cannot be reached. Take the estate PDP down with the lever and compare: fail-closed is a 503, fail-open is a permit that names what it skipped. A deny is never skipped.' },
 ];
 const ACRS = [
   { key: 'urn:idp:loa:password', name: 'password', blurb: 'Enough for plain and impostor. Not for bank-b, and not for member once the federation has had its say.' },
@@ -218,8 +222,8 @@ function render(results, action) {
     const verdict = col.querySelector('.verdict');
     const chip = verdict.querySelector('.chip');
     const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
-    chip.className = 'chip ' + (r.error ? 'deny' : rogue && r.decision ? 'alarm' : r.decision ? 'permit' : 'deny');
-    chip.textContent = r.error ? 'ERROR' : r.decision ? (rogue ? 'PERMIT — BY THE ROGUE PDP' : 'PERMIT') : `DENY · ${r.status}`;
+    chip.className = 'chip ' + (r.error ? 'deny' : rogue && r.decision ? 'alarm' : r.decision && r.fail_open ? 'open' : r.decision ? 'permit' : 'deny');
+    chip.textContent = r.error ? 'ERROR' : r.decision ? (rogue ? 'PERMIT — BY THE ROGUE PDP' : r.fail_open ? 'PERMIT — FAILED OPEN' : 'PERMIT') : `DENY · ${r.status}`;
     verdict.querySelector('.reason').textContent = r.error || r.reason || '';
     verdict.querySelector('.ms').textContent = `${r.ms.toFixed(1)} ms`;
 
@@ -243,7 +247,7 @@ function render(results, action) {
       ent.textContent = e.entity;
       const p = document.createElement('span');
       p.className = 'p';
-      p.textContent = e.kind === 'verdict' ? `${e.path} → ${e.note}` : e.kind === 'input' ? `was given: ${e.path}` : `${e.method} ${e.path}`;
+      p.textContent = e.kind === 'verdict' || e.kind === 'outage' ? `${e.path} → ${e.note}` : e.kind === 'input' ? `was given: ${e.path}` : `${e.method} ${e.path}`;
       li.append(ent, p);
       // Every endpoint here is AuthZEN's own name. What tells you whether a PEP read
       // the metadata is the BASE it posted under: the PDP's own identifier path is
@@ -268,6 +272,16 @@ function render(results, action) {
 function proofOf(r, action) {
   if (r.error) return r.error;
   const decided = r.events.filter((e) => e.kind === 'decision');
+  const outage = [...new Set(r.events.filter((e) => e.kind === 'outage').map((e) => e.entity))];
+  if (r.fail_open) {
+    const who = outage.length ? outage.join(', ') : r.fail_open;
+    const others = [...new Set(decided.map((e) => e.entity))].filter((e) => !outage.includes(e));
+    const rest = others.length ? others.join(', then ') : 'nothing else in the policy';
+    return `${who} could not decide and its layer is fail-open, so it was skipped and ${rest} decided. The permit carries X-PDP-Fail-Open naming what was skipped: a permit resting on fewer opinions than the policy asked for is visible, not silent.`;
+  }
+  if (!r.decision && outage.length && r.status === 503) {
+    return `${outage.join(', ')} is down and its layer is fail-closed, so the answer is 503 and nothing further was asked. Closed is the default; a layer is skipped only if it was marked fail-open, or the PEP was.`;
+  }
   const rogue = r.events.some((e) => e.entity === 'rogue-pdp');
   const fetched = r.events.filter((e) => e.kind === 'metadata').length;
   const chain = r.events.some((e) => e.path.includes('openid-federation'));
@@ -316,9 +330,12 @@ function showState(state) {
   const evalPath = (controlState.pdp_evaluation_path || {})['pdp-a'] || '?';
   const home = (controlState.pdp_home || {})['pdp-a'] || '';
   const plain = ((controlState.resource_pdps || {})['plain'] || []).join(', ');
-  $('state').textContent = `pdp-a evaluates at ${evalPath} · plain names ${plain}`;
+  const down = (controlState.pdp_down || []).includes('pdp-estate');
+  $('state').textContent = `pdp-a evaluates at ${evalPath} · plain names ${plain} · the estate PDP is ${down ? 'DOWN' : 'up'}`;
   $('movePdp').setAttribute('aria-pressed', String(!evalPath.startsWith(home + '/access/v1/')));
   $('repoint').setAttribute('aria-pressed', String(plain.includes(':9008')));
+  $('estateDown').setAttribute('aria-pressed', String(down));
+  $('estateDown').textContent = down ? 'Bring the estate PDP back' : 'Take the estate PDP down';
 }
 
 async function run(ev) {
@@ -379,6 +396,7 @@ async function run(ev) {
   $('form').addEventListener('submit', run);
   $('movePdp').addEventListener('click', () => control('move_pdp'));
   $('repoint').addEventListener('click', () => control('repoint_plain'));
+  $('estateDown').addEventListener('click', () => control((controlState.pdp_down || []).includes('pdp-estate') ? 'estate_up' : 'estate_down'));
   $('reset').addEventListener('click', () => control('reset'));
   showState(await (await fetch('/api/control')).json());
   run(new Event('submit'));

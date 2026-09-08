@@ -22,6 +22,7 @@ export {
   Rfc9728Source,
   allowedByPrefix,
   defaultEndpoints,
+  parseLayer,
   resolveLayers,
   resourceMetadataOf,
   wellKnownUrl,
@@ -29,10 +30,12 @@ export {
 export type {
   DiscoveryErrorKind,
   DiscoveryMode,
+  LayerSpec,
   MetadataSource,
   PdpDiscoveryOptions,
   PdpEndpoints,
   PdpResolver,
+  ResolvedLayers,
   ResourceMetadata,
 } from './discovery.js';
 

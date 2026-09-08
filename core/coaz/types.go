@@ -59,6 +59,10 @@ type Verdict struct {
 	Reason string
 	// PDPRequest is the AuthZEN request that was sent (for transcripts/tests).
 	PDPRequest json.RawMessage
+	// FailedOpen names the policy layers that failed and were skipped because they
+	// were allowed to. Non-empty on a permit means fewer PDPs judged this call than
+	// the policy asked for.
+	FailedOpen []string
 }
 
 // jsonRPCError renders a JSON-RPC 2.0 error response with the request's id.

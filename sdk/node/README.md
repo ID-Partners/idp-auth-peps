@@ -235,6 +235,14 @@ what a resource requires is the PDP's to match. See
 verdict. A generic estate PDP that judges the token and the client goes first; the
 resource's own PDP after. Default `['resource']`.
 
+An entry may carry its own failure mode (`'https://estate.example fail-open'`, or
+`{ name, failOpen }`); `failMode: 'open'` on the client, the middleware, the guard or a
+call is the default for entries that say nothing. A fail-open layer whose PDP cannot be
+reached — or cannot take a batch — is skipped, and the verdict's `failedOpen` names it;
+the middleware also sets `X-PDP-Fail-Open`. If every layer was skipped the verdict is a
+permit that says so. A deny is never skipped, nor is a refusal, and an entry the SDK
+cannot read throws. The guard passes `fail_mode` to `coaz-pep` in delegate mode.
+
 There is no federation mode in the SDK; `sources` is the seam for one, and `discovery`
 also accepts a resolver of your own (`{ resolve(resource) }`). In `delegate` mode the
 Go engine runs its own discovery, federation included, and an explicit `resource` is

@@ -284,26 +284,62 @@ function D.resolve_pdp(conf, pdp)
   }
 end
 
---- Resolve every layer of a route's policy, in order, duplicates collapsed. Returns a
---- list of endpoints and the one resource document any layer read, or nil, err. See the
---- Go engine's ResolveLayers: layering is what lets a generic PDP that judges the token
---- and the client sit in front of the resource's own.
-function D.resolve_layers(conf, resource, layers)
+--- Parse one layer entry: a name, optionally followed by "fail-open" or "fail-closed".
+--- Returns {name, fail_open = true|false|nil} or nil, err. An unknown modifier is an
+--- error: a policy that cannot be read must not be silently narrowed.
+function D.parse_layer(entry)
+  local fields = {}
+  for f in tostring(entry):gmatch("%S+") do fields[#fields + 1] = f end
+  if #fields == 0 then return nil, "empty layer" end
+  local spec = { name = trim_slash(fields[1]) }
+  if spec.name ~= "resource" and spec.name ~= "static" and not spec.name:find("://", 1, true) then
+    return nil, "layer " .. spec.name .. " is neither static, resource nor a PDP identifier"
+  end
+  for i = 2, #fields do
+    local m = fields[i]:lower()
+    if m == "fail-open" then spec.fail_open = true
+    elseif m == "fail-closed" then spec.fail_open = false
+    else return nil, "layer " .. spec.name .. ": unknown modifier " .. fields[i] end
+  end
+  return spec
+end
+
+--- Resolve every layer of a route's policy, in order, duplicates collapsed. Returns
+--- {pdps, skipped, meta} or nil, err. See the Go engine's ResolveLayers: layering is what
+--- lets a generic PDP that judges the token and the client sit in front of the
+--- resource's own. default_open is the route's fail_mode; a layer's own setting wins.
+--- A layer that cannot be resolved fails the request unless it is fail-open, in which
+--- case it is skipped and named. A refusal is never skipped.
+function D.resolve_layers(conf, resource, layers, default_open)
   if not layers or #layers == 0 then layers = { "resource" } end
-  local out, seen, meta = {}, {}, nil
-  for _, layer in ipairs(layers) do
+  local out, seen, meta, skipped = {}, {}, nil, {}
+  for _, entry in ipairs(layers) do
+    local spec, perr = D.parse_layer(entry)
+    if not spec then return fail(INVALID, perr) end
+    local open = default_open == true
+    if spec.fail_open ~= nil then open = spec.fail_open end
     local ep, err
-    if layer == "resource" then ep, err = D.resolve(conf, resource)
-    elseif layer == "static" then ep, err = D.resolve(conf, "")
-    else ep, err = D.resolve_pdp(conf, layer) end
-    if not ep then return nil, { kind = err.kind, msg = "layer " .. layer .. ": " .. err.msg } end
-    if ep.resource and not meta then meta = ep.resource end
-    if not seen[ep.identifier] then
-      seen[ep.identifier] = true
-      out[#out + 1] = ep
+    if spec.name == "resource" then ep, err = D.resolve(conf, resource)
+    elseif spec.name == "static" then ep, err = D.resolve(conf, "")
+    else ep, err = D.resolve_pdp(conf, spec.name) end
+    if not ep then
+      if err.kind == NOT_ALLOWED or not open then
+        return nil, { kind = err.kind, msg = "layer " .. spec.name .. ": " .. err.msg }
+      end
+      skipped[#skipped + 1] = spec.name .. " (" .. err.msg .. ")"
+    else
+      ep.fail_open = open
+      if ep.resource and not meta then meta = ep.resource end
+      local at = seen[ep.identifier]
+      if at then
+        out[at].fail_open = out[at].fail_open and open -- the stricter mode wins
+      else
+        seen[ep.identifier] = #out + 1
+        out[#out + 1] = ep
+      end
     end
   end
-  return out, nil, meta
+  return { pdps = out, skipped = skipped, meta = meta }
 end
 
 --- Resolve the PDP endpoints for `resource` under `conf`. Returns

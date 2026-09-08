@@ -225,9 +225,10 @@ same request and the same context:
 
 Every layer must permit. The first that does not is the answer, advice and all, and the
 remaining layers are not asked — a generic layer is a gate in front of a specific one. A
-PDP error in any layer fails closed. Two layers that resolve to the same PDP are one call.
-The same forwarded context goes to every layer, so an estate PDP can read the resource's
-requirements if it wants to and ignore them if it does not.
+PDP error in any layer fails closed unless that layer was told otherwise (next section).
+Two layers that resolve to the same PDP are one call. The same forwarded context goes to
+every layer, so an estate PDP can read the resource's requirements if it wants to and
+ignore them if it does not.
 
 The service default is `PDP_LAYERS` (default `resource`); a route overrides it with
 `pdp_layers`. A PDP named in the service's own configuration is allowlisted by that; one
@@ -237,12 +238,45 @@ must be on `PDP_ALLOWLIST`.
 The demo's estate PDP denies a client on its watch list and permits everything else. Put
 it first and the resource's PDP never hears about the risky client at all.
 
+### Failing open, deliberately
+
+A PDP that cannot be reached is an outage, and the answer to an outage is deny: that is
+the default everywhere here, and the only behaviour a PEP had until layers. But not every
+layer carries the same weight. An estate PDP that adds a risk score in front of the PDP
+that actually owns the resource is advice worth having and not worth an outage; whether
+that is true is a judgement about that layer, and it belongs with the policy.
+
+So a layer may say for itself what happens when it fails, and a PEP may set the default
+for layers that do not:
+
+| Where | Setting | Meaning |
+| --- | --- | --- |
+| a layer | `<layer> fail-open` / `<layer> fail-closed` — a suffix on the entry, in `PDP_LAYERS`, `pdp_layers`, the Kong array or the SDK's `layers` | This layer's own failure mode. It wins. |
+| the PEP | `PDP_FAIL_MODE` (service), `fail_mode` (route), Kong `fail_mode`, SDK `failMode` (client, middleware, guard, or per call) | The default for layers that say nothing. `closed` unless set. |
+
+Fail-open covers **availability** and nothing else: the PDP is unreachable, answers with
+an error, returns something that is not a decision, cannot be resolved at all, or is asked
+for a batch it advertises no endpoint for. A fail-open layer that fails is skipped and the
+remaining layers decide. If every layer was skipped the request is permitted, because that
+is what the operator asked for, and the permit is marked: `X-PDP-Fail-Open` on the
+response names every layer that was skipped, the SDK's verdict carries `failedOpen`, and
+the PEP logs it. A permit that rests on fewer opinions than the policy asked for is always
+visible, never silent.
+
+Two things never fail open, whatever the setting says. A **deny** is a decision, not a
+failure. A **refusal** — a PDP off the allowlist, a resource whose federation chain does
+not validate — is the PEP's own rule being enforced, and an outage does not lift it. And
+a policy the PEP cannot read, an unknown modifier say, fails the route closed rather than
+running a narrower policy than it was given.
+
 ### The rules that never relax
 
 - A URL outside an allowlist, or a chain that fails validation, **fails closed**. It never
   falls through to a weaker source. Everything else degrades: a stale cache, then the
   operator's own static PDP, and only when nothing is left is the request a 503.
 - A discovered PDP never receives the static API key. The key is bound to `AUTHZEN_URL`.
+- Fail-open covers outages only, and only where a layer or the PEP asked for it. A deny
+  never opens, a refusal never opens, and a permit that skipped anything is marked.
 - A batch is never sent to a guessed path: a boxcar mapping needs the PDP to advertise
   `access_evaluations_endpoint`.
 - Metadata is cached per identifier with stale-while-failing, refresh throttling and

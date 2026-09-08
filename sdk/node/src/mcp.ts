@@ -262,6 +262,8 @@ export interface McpGuardOptions {
    * authenticated. In delegate mode the flag is passed to coaz-pep instead.
    */
   forwardAccessToken?: boolean;
+  /** Overrides the client's `failMode` for this guard. In delegate mode it is passed to coaz-pep. */
+  failMode?: 'open' | 'closed';
 }
 
 export class McpGuard {
@@ -452,6 +454,7 @@ export class McpGuard {
     return {
       resource: this.resource,
       ...(this.opts.forwardAccessToken && accessToken ? { accessToken } : {}),
+      ...(this.opts.failMode ? { failMode: this.opts.failMode } : {}),
     };
   }
 
@@ -531,6 +534,7 @@ export class McpGuard {
             style: 'mcp',
             ...(this.opts.resource ? { resource: this.opts.resource } : {}),
             ...(this.opts.forwardAccessToken ? { forward_access_token: 'true' } : {}),
+            ...(this.opts.failMode ? { fail_mode: this.opts.failMode } : {}),
             ...d.config,
           },
           method: raw.method ?? 'POST',

@@ -85,7 +85,14 @@ return {
           -- estate-wide PDP that judges the token and the client), "resource" (what
           -- discovery finds for this route's resource), or a PDP identifier. The first
           -- that does not permit is the answer. Default: the resource's PDP alone.
+          -- Each entry may carry its own failure mode: "http://estate.example fail-open".
           { pdp_layers = { type = "array", elements = { type = "string" }, default = { "resource" } } },
+          -- What a layer does when its PDP cannot be reached, unless the layer says for
+          -- itself. "closed" denies the request. "open" skips the layer; if every layer
+          -- was skipped the request is permitted, with X-PDP-Fail-Open naming what was
+          -- skipped. A refusal (allowlist, invalid chain) never opens, and a deny is a
+          -- decision, not a failure.
+          { fail_mode = { type = "string", default = "closed", one_of = { "closed", "open" } } },
         },
         -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
         -- is no JOSE verifier available to it, so on its own it can compare the proof's

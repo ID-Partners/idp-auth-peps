@@ -159,12 +159,14 @@ type runRequest struct {
 }
 
 type runResult struct {
-	PEP      string  `json:"pep"`
-	Mode     string  `json:"mode"`
-	Decision bool    `json:"decision"`
-	Status   int     `json:"status"`
-	Reason   string  `json:"reason"`
-	Error    string  `json:"error,omitempty"`
+	PEP      string `json:"pep"`
+	Mode     string `json:"mode"`
+	Decision bool   `json:"decision"`
+	Status   int    `json:"status"`
+	Reason   string `json:"reason"`
+	Error    string `json:"error,omitempty"`
+	// FailOpen is X-PDP-Fail-Open from the PEP: the layers it skipped, if any.
+	FailOpen string  `json:"fail_open,omitempty"`
 	Events   []event `json:"events"`
 	// Fractional: a cached localhost round trip is well under a millisecond, and an
 	// integer would round every column to zero.
@@ -270,8 +272,9 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, in 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	var checked struct {
-		Decision bool `json:"decision"`
-		Response *struct {
+		Decision        bool              `json:"decision"`
+		ResponseHeaders map[string]string `json:"response_headers"`
+		Response        *struct {
 			Status int    `json:"status"`
 			Body   string `json:"body"`
 		} `json:"response"`
@@ -281,9 +284,13 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, in 
 		return out
 	}
 	out.Decision = checked.Decision
+	out.FailOpen = checked.ResponseHeaders["X-PDP-Fail-Open"]
 	if checked.Decision {
 		out.Status = 200
 		out.Reason = "permitted"
+		if out.FailOpen != "" {
+			out.Reason = "permitted — failed open past " + out.FailOpen
+		}
 		return out
 	}
 	if checked.Response != nil {

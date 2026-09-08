@@ -355,7 +355,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     <h2>A generic PDP first, the resource's after</h2>
     <div class="measure">
       <p>One PDP per resource is not the only shape. An estate has questions every endpoint shares — is this client in good standing, is this token sender-constrained, does the risk score allow anything at all — and a PDP that answers them knows nothing about any particular resource. It should not have to.</p>
-      <p>So a route names an ordered list of <em>layers</em>, and the PEP asks each in turn with the same request and the same forwarded context. Every layer must permit. The first that does not is the answer, advice and all, and the rest are not asked: a generic layer is a gate in front of a specific one. A PDP error in any layer fails closed. Two layers that resolve to the same PDP are one call.</p>
+      <p>So a route names an ordered list of <em>layers</em>, and the PEP asks each in turn with the same request and the same forwarded context. Every layer must permit. The first that does not is the answer, advice and all, and the rest are not asked: a generic layer is a gate in front of a specific one. A PDP error in any layer fails closed unless that layer was told otherwise. Two layers that resolve to the same PDP are one call.</p>
     </div>
     <div class="wide">
     <table>
@@ -368,6 +368,11 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     </table>
     </div>
     <p class="small measure">In the demo an estate PDP denies a client on its watch list and permits everything else. Put first in <code>pdp_layers</code>, it stops a risky client before Bank A's PDP ever hears about the request.</p>
+    <div class="measure">
+      <h3>Failing open, deliberately</h3>
+      <p>A PDP that cannot be reached is an outage, and the answer to an outage is deny. That is the default everywhere. But an estate PDP that adds a risk score in front of the PDP that owns the resource is advice worth having and not worth an outage, and whether that is true is a judgement about that layer. So a layer may say for itself what happens when it fails, as a suffix on its entry (<code>https://estate.example fail-open</code>), and a PEP may set the default for layers that say nothing (<code>PDP_FAIL_MODE</code>, a route's <code>fail_mode</code>, Kong's <code>fail_mode</code>, the SDK's <code>failMode</code>). The layer's own word wins.</p>
+      <p>Fail-open covers availability and nothing else: unreachable, erroring, unresolvable, or asked for a batch it cannot take. A fail-open layer that fails is skipped and the rest decide; if every layer was skipped the request is permitted, and the permit is marked. <code>X-PDP-Fail-Open</code> names what was skipped, the SDK's verdict carries <code>failedOpen</code>, and the PEP logs it. A deny is a decision, never skipped. A refusal, an off-list PDP or a chain that does not validate, is the PEP's own rule, and an outage does not lift it.</p>
+    </div>
   </div>
 </section>
 
@@ -408,6 +413,8 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
           <dt>pay 500 on plain vs bank-b</dt><dd class="ok">permit / 401</dd>
           <dt>member, password token</dt><dd class="ok">permit</dd>
           <dt>agent-risky, estate layer first</dt><dd class="bad">403 by the estate</dd>
+          <dt>estate PDP down, layers fail-closed</dt><dd class="bad">503</dd>
+          <dt>estate PDP down, estate layer fail-open</dt><dd class="warn">permit, marked</dd>
         </dl>
       </div>
       <div>

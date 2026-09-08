@@ -62,6 +62,12 @@ export interface PdpEndpoints {
   /** The bearer bound to this identifier; undefined for a discovered PDP. */
   apiKey?: string;
   source: string;
+  /**
+   * This layer's effective failure mode. When true an AVAILABILITY failure — unreachable,
+   * erroring, unresolvable — skips the layer instead of failing the call. A refusal
+   * (allowlist, invalid chain) is never skipped; a deny is a decision, not a failure.
+   */
+  failOpen?: boolean;
   /** The resource's own metadata, when a document named this PDP. Forwarded, never read. */
   resource?: ResourceMetadata;
 }
@@ -77,31 +83,79 @@ export interface PdpResolver {
 export const LAYER_RESOURCE = 'resource';
 export const LAYER_STATIC = 'static';
 
+/** One entry of a route's policy. `failOpen` undefined inherits the caller's default. */
+export interface LayerSpec {
+  name: string;
+  failOpen?: boolean;
+}
+
+/**
+ * Parse a layer entry: a name, optionally followed by `fail-open` or `fail-closed`
+ * (`'https://estate.example fail-open'`). An unknown modifier throws: a policy that
+ * cannot be read must not be silently narrowed.
+ */
+export function parseLayer(entry: string | LayerSpec): LayerSpec {
+  if (typeof entry !== 'string') return entry;
+  const [name = '', ...mods] = entry.trim().split(/\s+/);
+  const spec: LayerSpec = { name: name.replace(/\/+$/, '') };
+  if (spec.name !== LAYER_RESOURCE && spec.name !== LAYER_STATIC && !spec.name.includes('://')) {
+    throw new DiscoveryError('invalid', `layer ${JSON.stringify(spec.name)} is neither static, resource nor a PDP identifier`);
+  }
+  for (const mod of mods) {
+    if (mod.toLowerCase() === 'fail-open') spec.failOpen = true;
+    else if (mod.toLowerCase() === 'fail-closed') spec.failOpen = false;
+    else throw new DiscoveryError('invalid', `layer ${spec.name}: unknown modifier ${JSON.stringify(mod)} (fail-open, fail-closed)`);
+  }
+  return spec;
+}
+
+/** What resolving a layer list produced: the PDPs to ask, and the fail-open layers that were skipped. */
+export interface ResolvedLayers {
+  pdps: PdpEndpoints[];
+  skipped: string[];
+}
+
 /**
  * Resolve every layer of a route's policy, in order, duplicates collapsed. Layering is
  * what lets a generic PDP that judges the token and the client sit in front of the
  * resource's own: every layer must permit, the first that does not is the answer.
+ *
+ * `failOpen` is the caller's default; a layer's own setting wins. A layer that cannot
+ * be resolved fails the call unless it is fail-open, in which case it is skipped and
+ * named. A refusal (`not_allowed`, which also carries an invalid federation chain) is
+ * never skipped: fail-open is about availability, and a refusal is not an outage.
  */
-export async function resolveLayers(r: PdpResolver, resource: string | undefined, layers: string[] | undefined): Promise<PdpEndpoints[]> {
-  const names = layers && layers.length > 0 ? layers : [LAYER_RESOURCE];
+export async function resolveLayers(
+  r: PdpResolver,
+  resource: string | undefined,
+  layers: Array<string | LayerSpec> | undefined,
+  failOpen = false,
+): Promise<ResolvedLayers> {
+  const specs = (layers && layers.length > 0 ? layers : [LAYER_RESOURCE]).map(parseLayer);
   const out: PdpEndpoints[] = [];
+  const skipped: string[] = [];
   const seen = new Map<string, number>();
-  for (const layer of names) {
+  for (const spec of specs) {
+    const open = spec.failOpen ?? failOpen;
     let ep: PdpEndpoints;
     try {
-      ep = layer === LAYER_RESOURCE ? await r.resolve(resource) : layer === LAYER_STATIC ? await r.resolve() : await r.resolvePdp(layer);
+      ep = spec.name === LAYER_RESOURCE ? await r.resolve(resource) : spec.name === LAYER_STATIC ? await r.resolve() : await r.resolvePdp(spec.name);
     } catch (err) {
-      throw new DiscoveryError(asDiscoveryError(err).kind, `layer ${layer}: ${asDiscoveryError(err).message}`);
+      const derr = asDiscoveryError(err);
+      if (derr.kind === 'not_allowed' || !open) throw new DiscoveryError(derr.kind, `layer ${spec.name}: ${derr.message}`);
+      skipped.push(`${spec.name} (${derr.message})`);
+      continue;
     }
     const at = seen.get(ep.identifier);
     if (at !== undefined) {
-      if (!out[at]!.resource && ep.resource) out[at] = { ...out[at]!, resource: ep.resource };
+      const prev = out[at]!;
+      out[at] = { ...prev, ...(prev.resource ? {} : ep.resource ? { resource: ep.resource } : {}), failOpen: Boolean(prev.failOpen) && open };
       continue;
     }
     seen.set(ep.identifier, out.length);
-    out.push(ep);
+    out.push({ ...ep, failOpen: open });
   }
-  return out;
+  return { pdps: out, skipped };
 }
 
 /** The one resource document to forward for a layered call: whichever layer read it. */

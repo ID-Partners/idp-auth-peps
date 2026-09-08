@@ -621,10 +621,11 @@ func TestResolveLayers(t *testing.T) {
 	})
 	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL, APIKeys: map[string]string{static.URL: "k", estate.URL: "ek"}})
 
-	eps, err := ResolveLayers(ctx(), c, res.URL, []string{estate.URL, LayerStatic, LayerResource})
+	layers, err := ResolveLayers(ctx(), c, res.URL, specs(estate.URL, LayerStatic, LayerResource), false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	eps := layers.PDPs
 	ids := []string{}
 	for _, e := range eps {
 		ids = append(ids, e.Identifier)
@@ -642,20 +643,20 @@ func TestResolveLayers(t *testing.T) {
 		t.Fatal("ResourceMetadataOf")
 	}
 	// Empty means [resource]; duplicates collapse and keep the document.
-	eps, _ = ResolveLayers(ctx(), c, res.URL, nil)
-	if len(eps) != 1 || eps[0].Identifier != good.URL {
-		t.Fatalf("%+v", eps)
+	one, _ := ResolveLayers(ctx(), c, res.URL, nil, false)
+	if len(one.PDPs) != 1 || one.PDPs[0].Identifier != good.URL {
+		t.Fatalf("%+v", one)
 	}
-	eps, _ = ResolveLayers(ctx(), c, res.URL, []string{good.URL, LayerResource})
-	if len(eps) != 1 || eps[0].Resource == nil {
-		t.Fatalf("duplicate should collapse and keep the document: %+v", eps)
+	dup, _ := ResolveLayers(ctx(), c, res.URL, specs(good.URL, LayerResource), false)
+	if len(dup.PDPs) != 1 || dup.PDPs[0].Resource == nil {
+		t.Fatalf("duplicate should collapse and keep the document: %+v", dup)
 	}
 	// An unreachable explicit layer falls back to the AuthZEN default paths, like any
 	// PDP without metadata; an invalid identifier is an error that names the layer.
-	if eps, err := ResolveLayers(ctx(), c, res.URL, []string{"http://127.0.0.1:1"}); err != nil || eps[0].Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
-		t.Fatalf("%+v %v", eps, err)
+	if r, err := ResolveLayers(ctx(), c, res.URL, specs("http://127.0.0.1:1"), false); err != nil || r.PDPs[0].Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
+		t.Fatalf("%+v %v", r, err)
 	}
-	if _, err := ResolveLayers(ctx(), c, res.URL, []string{"http://p.example/?x=1"}); err == nil || !strings.Contains(err.Error(), "layer") {
+	if _, err := ResolveLayers(ctx(), c, res.URL, specs("http://p.example/?x=1"), false); err == nil || !strings.Contains(err.Error(), "layer") {
 		t.Fatalf("%v", err)
 	}
 	// Explicit layers obey the PDP allowlist, and off mode reads nothing.
@@ -668,8 +669,82 @@ func TestResolveLayers(t *testing.T) {
 	if err != nil || ep.Evaluation != estate.URL+"/access/v1/evaluation" || ep.Source != "layer" {
 		t.Fatalf("%+v %v", ep, err)
 	}
-	if got := ParseLayers(" static, resource\nhttps://p.example/ "); !reflect.DeepEqual(got, []string{"static", "resource", "https://p.example"}) {
-		t.Fatalf("%v", got)
+	got, err := ParseLayers(" static, resource\nhttps://p.example/ ")
+	if err != nil || !reflect.DeepEqual(got, specs("static", "resource", "https://p.example")) {
+		t.Fatalf("%v %v", got, err)
+	}
+}
+
+func specs(names ...string) []LayerSpec {
+	out := make([]LayerSpec, 0, len(names))
+	for _, n := range names {
+		out = append(out, LayerSpec{Name: n})
+	}
+	return out
+}
+
+func TestParseLayersModifiers(t *testing.T) {
+	got, err := ParseLayers("https://estate.example/ fail-open, resource FAIL-CLOSED, static")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Name != "https://estate.example" || got[0].FailOpen == nil || !*got[0].FailOpen ||
+		got[1].Name != "resource" || got[1].FailOpen == nil || *got[1].FailOpen || got[2].FailOpen != nil {
+		t.Fatalf("%+v", got)
+	}
+	if !reflect.DeepEqual(LayerNames(got), []string{"https://estate.example fail-open", "resource fail-closed", "static"}) {
+		t.Fatalf("%v", LayerNames(got))
+	}
+	for _, bad := range []string{"resource maybe", "bogus", "https://p.example fail-open extra"} {
+		if _, err := ParseLayers(bad); err == nil {
+			t.Fatalf("%q must not parse", bad)
+		}
+	}
+	if got, err := ParseLayers(" , "); err != nil || len(got) != 0 {
+		t.Fatalf("%v %v", got, err)
+	}
+}
+
+func TestResolveLayersFailOpen(t *testing.T) {
+	static := newPDP(t, nil)
+	good := newPDP(t, fullConfig)
+	res := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}}
+	})
+	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL})
+	open, closed := true, false
+	bad := "http://p.example/?x=1" // an invalid identifier: fails at resolution, not at the PDP
+
+	// A fail-open layer that cannot be resolved is skipped and named; the others stand.
+	r, err := ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: bad, FailOpen: &open}, {Name: LayerResource}}, false)
+	if err != nil || len(r.PDPs) != 1 || r.PDPs[0].Identifier != good.URL || len(r.Skipped) != 1 || !strings.HasPrefix(r.Skipped[0], bad) {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if r.PDPs[0].FailOpen {
+		t.Fatal("the resource layer inherited the closed default")
+	}
+	// The default applies to layers that say nothing; a layer's own setting wins.
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: bad}, {Name: LayerResource, FailOpen: &closed}}, true)
+	if err != nil || len(r.Skipped) != 1 || r.PDPs[0].FailOpen {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if _, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: bad, FailOpen: &closed}}, true); err == nil {
+		t.Fatal("fail-closed on the layer must beat an open default")
+	}
+	// Every layer skipped is still a resolution, with nothing to ask.
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: bad}}, true)
+	if err != nil || len(r.PDPs) != 0 || len(r.Skipped) != 1 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	// A refusal is never skipped, whatever the mode says.
+	strict := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL, PDPAllowed: func(u string) bool { return u == static.URL }})
+	if _, err = ResolveLayers(ctx(), strict, res.URL, []LayerSpec{{Name: good.URL, FailOpen: &open}}, true); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("allowlist refusal must not fail open: %v", err)
+	}
+	// A duplicate takes the stricter mode.
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: good.URL, FailOpen: &open}, {Name: LayerResource, FailOpen: &closed}}, false)
+	if err != nil || len(r.PDPs) != 1 || r.PDPs[0].FailOpen {
+		t.Fatalf("%+v %v", r, err)
 	}
 }
 

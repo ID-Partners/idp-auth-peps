@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+
 	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
@@ -201,7 +203,7 @@ func TestLayersOnTheService(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(srv.defaultLayers, []string{"static", estate.URL}) {
+		if !reflect.DeepEqual(srv.defaultLayers, []discovery.LayerSpec{{Name: "static"}, {Name: estate.URL}}) {
 			t.Fatalf("%v", srv.defaultLayers)
 		}
 		before := len(estate.paths)
@@ -236,6 +238,119 @@ func TestLayersOnTheService(t *testing.T) {
 		resp := s.check(context.Background(), restConf(map[string]string{"pdp_layers": "static," + estate.URL}), "GET", "/accounts/a1/balance", headers, "")
 		if resp.GetDeniedResponse() != nil || atomic.LoadInt32(&estate.hits) != before+1 || estate.paths[len(estate.paths)-1] != "/access/v1/evaluation" {
 			t.Fatalf("off mode: default path, no metadata fetch: %v", estate.paths)
+		}
+	})
+}
+
+func TestFailOpenOnTheService(t *testing.T) {
+	static := newDiscoPDP(t, false)
+	own := newDiscoPDP(t, true)
+	resource := newDiscoResource(t, own.URL, false)
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
+	t.Cleanup(down.Close)
+	headers := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}
+	newS := func() *server {
+		s := newServer(t, static.URL)
+		s.resolver = resourceChain(t, static.URL, discovery.ModeResource)
+		return s
+	}
+	failOpenHeader := func(resp *authv3.CheckResponse) string {
+		for _, h := range resp.GetOkResponse().GetResponseHeadersToAdd() {
+			if h.GetHeader().GetKey() == "X-PDP-Fail-Open" {
+				return h.GetHeader().GetValue()
+			}
+		}
+		return ""
+	}
+
+	t.Run("closed by default, open per layer, marked on the wire", func(t *testing.T) {
+		s := newS()
+		resp := s.check(context.Background(), restConf(map[string]string{"resource": resource.URL, "pdp_layers": down.URL + ", resource"}), "GET", "/accounts/a1/balance", headers, "")
+		if deniedStatus(resp) != 503 {
+			t.Fatalf("want 503 for a failing closed layer, got %d", deniedStatus(resp))
+		}
+		before := len(own.paths)
+		resp = s.check(context.Background(), restConf(map[string]string{"resource": resource.URL, "pdp_layers": down.URL + " fail-open, resource"}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || len(own.paths) != before+1 {
+			t.Fatalf("the resource's PDP should decide: %v", resp.GetDeniedResponse())
+		}
+		if h := failOpenHeader(resp); !strings.HasPrefix(h, down.URL) {
+			t.Fatalf("X-PDP-Fail-Open should name the skipped layer: %q", h)
+		}
+		// A permit with nothing skipped carries no marker.
+		resp = s.check(context.Background(), restConf(map[string]string{"resource": resource.URL}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || failOpenHeader(resp) != "" {
+			t.Fatalf("%v %q", resp.GetDeniedResponse(), failOpenHeader(resp))
+		}
+	})
+	t.Run("a route's fail_mode is the default for its layers; the layer's own word wins", func(t *testing.T) {
+		s := newS()
+		resp := s.check(context.Background(), restConf(map[string]string{"resource": resource.URL, "fail_mode": "open", "pdp_layers": down.URL + ", resource"}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || failOpenHeader(resp) == "" {
+			t.Fatalf("%v", resp.GetDeniedResponse())
+		}
+		resp = s.check(context.Background(), restConf(map[string]string{"resource": resource.URL, "fail_mode": "open", "pdp_layers": down.URL + " fail-closed, resource"}), "GET", "/accounts/a1/balance", headers, "")
+		if deniedStatus(resp) != 503 {
+			t.Fatalf("fail-closed on the layer must win: %d", deniedStatus(resp))
+		}
+		// Every layer skipped: a permit, marked.
+		resp = s.check(context.Background(), restConf(map[string]string{"fail_mode": "open", "pdp_layers": down.URL}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || failOpenHeader(resp) == "" {
+			t.Fatalf("%v", resp.GetDeniedResponse())
+		}
+	})
+	t.Run("a policy that cannot be read fails closed, not narrower", func(t *testing.T) {
+		s := newS()
+		for _, ext := range []map[string]string{{"pdp_layers": "resource maybe"}, {"fail_mode": "sometimes"}} {
+			if resp := s.check(context.Background(), restConf(ext), "GET", "/accounts/a1/balance", headers, ""); deniedStatus(resp) != 503 {
+				t.Fatalf("%v: want 503, got %d", ext, deniedStatus(resp))
+			}
+		}
+	})
+	t.Run("a refusal never opens", func(t *testing.T) {
+		c, err := discovery.New(discovery.Options{Mode: discovery.ModeResource, StaticPDP: static.URL, AllowInsecure: true, Logf: func(string, ...any) {},
+			PDPAllowed: func(u string) bool { return strings.HasPrefix(u, static.URL) }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := newServer(t, static.URL)
+		s.resolver = c
+		resp := s.check(context.Background(), restConf(map[string]string{"fail_mode": "open", "pdp_layers": own.URL + " fail-open"}), "GET", "/accounts/a1/balance", headers, "")
+		if deniedStatus(resp) != 503 {
+			t.Fatalf("an off-list layer is a refusal, not an outage: %d", deniedStatus(resp))
+		}
+	})
+	t.Run("PDP_FAIL_MODE is the service default", func(t *testing.T) {
+		env := map[string]string{"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "resource", "PDP_DISCOVERY_INSECURE": "true",
+			"PDP_FAIL_MODE": "open", "PDP_LAYERS": down.URL + ", static fail-closed"}
+		srv, _, _, err := buildServer(func(k string) string { return env[k] })
+		if err != nil || !srv.failOpen {
+			t.Fatalf("%v %+v", err, srv)
+		}
+		resp := srv.check(context.Background(), restConf(nil), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || failOpenHeader(resp) == "" {
+			t.Fatalf("%v", resp.GetDeniedResponse())
+		}
+		env["PDP_FAIL_MODE"] = "sometimes"
+		if _, _, _, err := buildServer(func(k string) string { return env[k] }); err == nil {
+			t.Fatal("an unknown fail mode must fail startup")
+		}
+	})
+	t.Run("the MCP path folds the same way", func(t *testing.T) {
+		chain := resourceChain(t, static.URL, discovery.ModeResource)
+		mcp := newDiscoResource(t, own.URL, true)
+		s := newServer(t, static.URL)
+		s.resolver = chain
+		s.coaz = coaz.NewEngine(coaz.Options{Resolver: chain})
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}`
+		conf := configFrom(map[string]string{"style": "mcp", "require_token": "true", "mcp_upstream_url": mcp.URL, "pdp_layers": down.URL + " fail-open, resource"})
+		resp := s.check(context.Background(), conf, "POST", "/mcp", headers, body)
+		if resp.GetDeniedResponse() != nil || failOpenHeader(resp) == "" {
+			t.Fatalf("%s", resp.GetDeniedResponse().GetBody())
+		}
+		conf = configFrom(map[string]string{"style": "mcp", "require_token": "true", "mcp_upstream_url": mcp.URL, "pdp_layers": "resource nope"})
+		if resp := s.check(context.Background(), conf, "POST", "/mcp", headers, body); deniedStatus(resp) != 503 {
+			t.Fatalf("unreadable policy on an MCP route: %d", deniedStatus(resp))
 		}
 	})
 }

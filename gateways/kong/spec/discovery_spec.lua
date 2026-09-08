@@ -403,17 +403,58 @@ describe('discovery: layers', function()
 
   it('resolves every layer in order, duplicates collapsed, with the resource document', function()
     local D = load({ pdp = router(routes()) })
-    local eps, err, meta = D.resolve_layers(conf(), RES, { ESTATE, 'static', 'resource' })
+    local r, err = D.resolve_layers(conf(), RES, { ESTATE, 'static', 'resource' })
     assert.is_nil(err)
+    local eps, meta = r.pdps, r.meta
     assert.equal(3, #eps)
     assert.equal(ESTATE, eps[1].identifier); assert.equal('layer', eps[1].source); assert.is_nil(eps[1].api_key)
     assert.equal(STATIC, eps[2].identifier); assert.equal('static-key', eps[2].api_key)
     assert.equal(GOOD, eps[3].identifier)
     assert.equal('rfc9728', meta.source)
+    assert.same({}, r.skipped)
+    assert.is_false(eps[1].fail_open)
     local one = D.resolve_layers(conf(), RES, nil)
-    assert.equal(1, #one); assert.equal(GOOD, one[1].identifier)
+    assert.equal(1, #one.pdps); assert.equal(GOOD, one.pdps[1].identifier)
     local dup = D.resolve_layers(conf(), RES, { GOOD, 'resource' })
-    assert.equal(1, #dup)
+    assert.equal(1, #dup.pdps)
+  end)
+
+  it('parses a layer entry with its failure mode, and refuses what it cannot read', function()
+    local D = load({ pdp = router({}) })
+    assert.same({ name = ESTATE, fail_open = true }, D.parse_layer(ESTATE .. '/ fail-open'))
+    assert.same({ name = 'resource', fail_open = false }, D.parse_layer('resource FAIL-CLOSED'))
+    assert.same({ name = 'static' }, D.parse_layer(' static '))
+    for _, bad in ipairs({ 'resource maybe', 'bogus', '' }) do
+      local spec, err = D.parse_layer(bad)
+      assert.is_nil(spec, bad); assert.is_string(err)
+    end
+    local r, err = D.resolve_layers(conf(), RES, { 'resource maybe' })
+    assert.is_nil(r); assert.equal('invalid', err.kind)
+  end)
+
+  it('a fail-open layer that cannot be resolved is skipped; a refusal never is', function()
+    local D = load({ pdp = router(routes()) })
+    local bad = 'https://p.example/?x=1' -- invalid identifier: fails at resolution
+    local r, err = D.resolve_layers(conf(), RES, { bad, 'resource' })
+    assert.is_nil(r); assert.matches('layer', err.msg)
+    r, err = D.resolve_layers(conf(), RES, { bad .. ' fail-open', 'resource' })
+    assert.is_nil(err)
+    assert.equal(1, #r.pdps); assert.equal(GOOD, r.pdps[1].identifier); assert.is_false(r.pdps[1].fail_open)
+    assert.equal(1, #r.skipped); assert.matches('^' .. bad:gsub('%p', '%%%0'), r.skipped[1])
+    -- The route default applies to layers that say nothing; the layer's own word wins.
+    r, err = D.resolve_layers(conf(), RES, { bad, 'resource fail-closed' }, true)
+    assert.is_nil(err); assert.equal(1, #r.skipped); assert.is_false(r.pdps[1].fail_open)
+    r, err = D.resolve_layers(conf(), RES, { bad .. ' fail-closed' }, true)
+    assert.is_nil(r); assert.is_table(err)
+    -- Everything skipped is still a resolution, with nothing to ask.
+    r = D.resolve_layers(conf(), RES, { bad }, true)
+    assert.same({}, r.pdps); assert.equal(1, #r.skipped)
+    -- A duplicate takes the stricter mode.
+    r = D.resolve_layers(conf(), RES, { GOOD .. ' fail-open', 'resource fail-closed' })
+    assert.equal(1, #r.pdps); assert.is_false(r.pdps[1].fail_open)
+    -- The allowlist is a refusal, not an outage.
+    r, err = D.resolve_layers(conf({ pdp_allowlist = { 'https://pdp.example' } }), RES, { ESTATE .. ' fail-open' }, true)
+    assert.is_nil(r); assert.equal('not_allowed', err.kind)
   end)
 
   it('an explicit layer obeys the allowlist, names itself on failure, and reads nothing in off mode', function()
@@ -460,6 +501,83 @@ describe('discovery: layers', function()
     assert.equal(403, denied.exited.status)
     assert.matches('watch list', denied.exited.body.reason)
     assert.same({ 'estate' }, calls)
+  end)
+end)
+
+describe('discovery: fail-open through access()', function()
+  local DOWN = 'https://down.example'
+  local function drive(over, pdp_fn)
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a1/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = pdp_fn,
+    })
+    local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES }
+    for k, v in pairs(over or {}) do c[k] = v end
+    mock.run_access(plugin, c)
+    plugin:header_filter(c)
+    return state
+  end
+  local function fn()
+    return router({
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [GOOD .. '/custom/eval'] = { decision = true },
+      [DOWN .. '/.well-known/authzen-configuration'] = 404,
+      [DOWN .. '/access/v1/evaluation'] = 503,
+    })
+  end
+
+  it('closed by default: a failing layer is a 503', function()
+    local state = drive({ pdp_layers = { DOWN, 'resource' } }, fn())
+    assert.equal(503, state.exited.status)
+  end)
+
+  it('open on the layer: skipped, the rest decides, and the permit is marked', function()
+    local state = drive({ pdp_layers = { DOWN .. ' fail-open', 'resource' } }, fn())
+    assert.is_nil(state.exited)
+    assert.equal(GOOD .. '/custom/eval', state.pdp_requests[#state.pdp_requests].url)
+    assert.matches('^' .. DOWN:gsub('%p', '%%%0'), state.response_headers['X-PDP-Fail-Open'])
+    assert.equal('PERMIT', state.response_headers['X-PDP-Decision'])
+    -- Nothing skipped, no marker.
+    local clean = drive({ pdp_layers = { 'resource' } }, fn())
+    assert.is_nil(clean.exited); assert.is_nil(clean.response_headers['X-PDP-Fail-Open'])
+  end)
+
+  it('fail_mode on the route is the default; the layer\'s own word wins; everything skipped is a marked permit', function()
+    local state = drive({ fail_mode = 'open', pdp_layers = { DOWN, 'resource' } }, fn())
+    assert.is_nil(state.exited); assert.is_string(state.response_headers['X-PDP-Fail-Open'])
+    local strict = drive({ fail_mode = 'open', pdp_layers = { DOWN .. ' fail-closed', 'resource' } }, fn())
+    assert.equal(503, strict.exited.status)
+    local all = drive({ fail_mode = 'open', pdp_layers = { DOWN } }, fn())
+    assert.is_nil(all.exited); assert.matches('fail%-open', all.response_headers['X-PDP-Reason'])
+  end)
+
+  it('a deny is a decision, never skipped; an unreadable policy fails closed', function()
+    local f = fn()
+    local denying = router({
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [GOOD .. '/custom/eval'] = { decision = false, context = { reason = 'no' } },
+    })
+    local state = drive({ fail_mode = 'open', pdp_layers = { 'resource fail-open' } }, denying)
+    assert.equal(403, state.exited.status); assert.equal('no', state.exited.body.reason)
+    local bad = drive({ fail_mode = 'open', pdp_layers = { 'resource maybe' } }, f)
+    assert.equal(503, bad.exited.status)
+  end)
+
+  it('passes the policy and fail mode to the COAZ engine on MCP routes', function()
+    local sent
+    local f = router({ ['http://coaz-pep:9192/v1/mcp/check'] = function(_, req) sent = mock.json_decode(req.body); return { status = 200, body = json({ decision = true, upstream_headers = {} }) } end })
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/mcp', body = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{}}}',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }), ['content-type'] = 'application/json' }, pdp = f,
+    })
+    mock.run_access(plugin, { authzen_url = STATIC, pep_label = 'test-pep', style = 'mcp', require_token = true, pdp_ssl_verify = true,
+      coaz_url = 'http://coaz-pep:9192', mcp_upstream_url = 'http://mcp:8090/mcp', pdp_layers = { DOWN .. ' fail-open', 'resource' }, fail_mode = 'open' })
+    assert.is_nil(state.exited)
+    assert.equal(DOWN .. ' fail-open,resource', sent.config.pdp_layers)
+    assert.equal('open', sent.config.fail_mode)
   end)
 end)
 

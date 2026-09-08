@@ -92,6 +92,9 @@ export interface AuthzenMiddlewareOptions {
    * and authenticated.
    */
   forwardAccessToken?: boolean;
+
+  /** Overrides the client's `failMode` on this route. */
+  failMode?: 'open' | 'closed';
 }
 
 /**
@@ -158,11 +161,15 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
         resource,
         request: { method: req.method, path: requestPath(req) },
         ...(opts.forwardAccessToken && token ? { accessToken: token } : {}),
+        ...(opts.failMode ? { failMode: opts.failMode } : {}),
       });
       report(opts, req, verdict, claims);
       if (!verdict.allow) return respond(res, verdict, pep);
 
       req.authz = { claims, verdict, request };
+      // A permit that skipped a failed layer is marked on the wire, so it can be seen
+      // and counted downstream.
+      if (verdict.failedOpen?.length) res.set('X-PDP-Fail-Open', verdict.failedOpen.join(', '));
       if (opts.forwardHeaders) {
         res.set('X-Auth-Principal', claims.sub);
         res.set('X-Auth-Agent', claims.actor);

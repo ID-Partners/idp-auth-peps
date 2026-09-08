@@ -103,6 +103,11 @@ type PDPEndpoints struct {
 	APIKey string
 	// Source names which MetadataSource produced the identifier.
 	Source string
+	// FailOpen is this layer's effective failure mode: when true, an AVAILABILITY
+	// failure — unreachable, erroring, unresolvable — skips the layer instead of
+	// failing the request. A refusal (allowlist, invalid chain) is never skipped, and a
+	// deny is a decision, not a failure.
+	FailOpen bool
 	// Resource is what the resource's own metadata said, verbatim, and where it came
 	// from. Nil when the PDP came from static configuration. The PEP reads the PDP list
 	// out of it and forwards the rest to the PDP as context — it decides nothing from
@@ -148,45 +153,76 @@ const (
 	LayerStatic = "static"
 )
 
-// ResolveLayers resolves each named layer in order and returns the PDPs to ask, in that
-// order, with duplicates collapsed to one call. An empty list means [resource].
+// LayerSpec is one entry of a route's policy: a layer name and, optionally, its own
+// failure mode. FailOpen nil inherits the PEP's default.
+type LayerSpec struct {
+	Name     string
+	FailOpen *bool
+}
+
+// Resolved is the outcome of resolving a layer list: the PDPs to ask, in order, and
+// the fail-open layers that could not be resolved and were skipped.
+type Resolved struct {
+	PDPs    []PDPEndpoints
+	Skipped []string
+}
+
+// ResolveLayers resolves each layer in order and returns the PDPs to ask, in that order,
+// with duplicates collapsed to one call. An empty list means [resource]. failOpen is
+// the PEP's default; a layer's own setting overrides it.
 //
 // Layering is what lets a generic PDP service every endpoint — one that looks at the
 // token, the client and risk signals — and a resource-specific PDP apply the resource's
 // own metadata after it. Every layer must permit; the first that does not is the answer.
 // The PEP does the ordering and the folding, nothing else.
-func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []string) ([]PDPEndpoints, error) {
+//
+// A layer that cannot be resolved fails the request, unless it is fail-open, in which
+// case it is skipped and named in Skipped. A refusal — ErrNotAllowed, which also wraps
+// an invalid federation chain — is never skipped: fail-open is about availability, and a
+// refusal is not an outage.
+func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []LayerSpec, failOpen bool) (Resolved, error) {
 	if len(layers) == 0 {
-		layers = []string{LayerResource}
+		layers = []LayerSpec{{Name: LayerResource}}
 	}
-	out := make([]PDPEndpoints, 0, len(layers))
+	var res Resolved
 	seen := map[string]int{}
 	for _, layer := range layers {
+		open := failOpen
+		if layer.FailOpen != nil {
+			open = *layer.FailOpen
+		}
 		var ep PDPEndpoints
 		var err error
-		switch layer {
+		switch layer.Name {
 		case LayerResource:
 			ep, err = r.Resolve(ctx, resource)
 		case LayerStatic:
 			ep, err = r.Resolve(ctx, "")
 		default:
-			ep, err = r.ResolvePDP(ctx, layer)
+			ep, err = r.ResolvePDP(ctx, layer.Name)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("layer %q: %w", layer, err)
-		}
-		if i, dup := seen[ep.Identifier]; dup {
-			// The same PDP twice is one call. Keep the resource metadata if this
-			// occurrence carried it and the earlier one did not.
-			if out[i].Resource == nil && ep.Resource != nil {
-				out[i].Resource = ep.Resource
+			if errors.Is(err, ErrNotAllowed) || !open {
+				return Resolved{}, fmt.Errorf("layer %q: %w", layer.Name, err)
 			}
+			res.Skipped = append(res.Skipped, fmt.Sprintf("%s (%v)", layer.Name, err))
 			continue
 		}
-		seen[ep.Identifier] = len(out)
-		out = append(out, ep)
+		ep.FailOpen = open
+		if i, dup := seen[ep.Identifier]; dup {
+			// The same PDP twice is one call. Keep the resource metadata if this
+			// occurrence carried it and the earlier one did not; the stricter failure
+			// mode wins.
+			if res.PDPs[i].Resource == nil && ep.Resource != nil {
+				res.PDPs[i].Resource = ep.Resource
+			}
+			res.PDPs[i].FailOpen = res.PDPs[i].FailOpen && open
+			continue
+		}
+		seen[ep.Identifier] = len(res.PDPs)
+		res.PDPs = append(res.PDPs, ep)
 	}
-	return out, nil
+	return res, nil
 }
 
 // ResourceMetadataOf is the one document to forward for a layered call: whichever layer
@@ -200,13 +236,54 @@ func ResourceMetadataOf(eps []PDPEndpoints) *ResourceMetadata {
 	return nil
 }
 
-// ParseLayers splits a comma- or space-separated layer list.
-func ParseLayers(raw string) []string {
-	var out []string
-	for _, f := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' }) {
-		if f = strings.TrimSpace(f); f != "" {
-			out = append(out, strings.TrimRight(f, "/"))
+// ParseLayers reads a layer list, one entry per comma or line. Each entry is a layer
+// name — static, resource, or a PDP identifier — optionally followed by a failure mode:
+//
+//	http://estate.example fail-open, resource
+//
+// An unknown modifier or an unrecognisable name is an error: a policy that cannot be
+// read must not be silently narrowed.
+func ParseLayers(raw string) ([]LayerSpec, error) {
+	var out []LayerSpec
+	for _, entry := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' }) {
+		fields := strings.Fields(entry)
+		if len(fields) == 0 {
+			continue
 		}
+		spec := LayerSpec{Name: strings.TrimRight(fields[0], "/")}
+		if spec.Name != LayerResource && spec.Name != LayerStatic && !strings.Contains(spec.Name, "://") {
+			return nil, fmt.Errorf("layer %q is neither static, resource nor a PDP identifier", spec.Name)
+		}
+		for _, mod := range fields[1:] {
+			switch strings.ToLower(mod) {
+			case "fail-open":
+				t := true
+				spec.FailOpen = &t
+			case "fail-closed":
+				f := false
+				spec.FailOpen = &f
+			default:
+				return nil, fmt.Errorf("layer %q: unknown modifier %q (fail-open, fail-closed)", spec.Name, mod)
+			}
+		}
+		out = append(out, spec)
+	}
+	return out, nil
+}
+
+// LayerNames renders specs for logs.
+func LayerNames(layers []LayerSpec) []string {
+	out := make([]string, 0, len(layers))
+	for _, l := range layers {
+		s := l.Name
+		if l.FailOpen != nil {
+			if *l.FailOpen {
+				s += " fail-open"
+			} else {
+				s += " fail-closed"
+			}
+		}
+		out = append(out, s)
 	}
 	return out
 }

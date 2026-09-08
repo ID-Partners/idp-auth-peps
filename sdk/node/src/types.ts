@@ -136,6 +136,11 @@ export interface Verdict {
   context?: DecisionContext;
   /** The request that was sent to the PDP — for transcripts and tests. */
   request?: EvaluationRequest | EvaluationsRequest;
+  /**
+   * The policy layers that failed and were skipped because they were allowed to.
+   * Non-empty on a permit means fewer PDPs judged this call than the policy asked for.
+   */
+  failedOpen?: string[];
 }
 
 /**

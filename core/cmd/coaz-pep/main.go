@@ -28,9 +28,14 @@ package main
 //                                (the subject's own is governed by RESOURCE_METADATA_ALLOWLIST)
 //   FEDERATION_MAX_PATH_LENGTH   intermediates allowed between resource and anchor (default 4)
 //   PDP_LAYERS                   ordered PDPs to ask, every one of which must permit: `static`,
-//                                `resource`, or a PDP identifier (default: resource). Routes may
+//                                `resource`, or a PDP identifier, each optionally followed by
+//                                `fail-open` or `fail-closed` (default: resource). Routes may
 //                                override with `pdp_layers`; explicit identifiers there must be
 //                                on PDP_ALLOWLIST, ones named here are allowlisted automatically.
+//   PDP_FAIL_MODE                `closed` (default) or `open`: what a layer does when its PDP
+//                                cannot be reached, unless the layer says for itself. Open skips
+//                                the layer; a permit that skipped anything carries
+//                                X-PDP-Fail-Open. Refusals (allowlist, invalid chain) never open.
 
 import (
 	"context"
@@ -85,10 +90,23 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		httpc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
-	layers := discovery.ParseLayers(getenv("PDP_LAYERS"))
+	layers, err := discovery.ParseLayers(getenv("PDP_LAYERS"))
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("PDP_LAYERS: %w", err)
+	}
+	failOpen := false
+	switch strings.ToLower(getenv("PDP_FAIL_MODE")) {
+	case "", "closed":
+	case "open":
+		failOpen = true
+		log.Printf("WARNING: PDP_FAIL_MODE=open — a PDP that cannot be reached is SKIPPED and the request " +
+			"may be permitted with X-PDP-Fail-Open set. Refusals still fail closed. Make sure that is the intent.")
+	default:
+		return nil, nil, "", fmt.Errorf("PDP_FAIL_MODE %q is neither open nor closed", getenv("PDP_FAIL_MODE"))
+	}
 	for _, l := range layers {
-		if l != discovery.LayerResource && l != discovery.LayerStatic && !strings.Contains(l, "://") {
-			return nil, nil, "", fmt.Errorf("PDP_LAYERS: %q is neither static, resource nor a PDP identifier", l)
+		if l.FailOpen != nil && *l.FailOpen {
+			log.Printf("WARNING: PDP_LAYERS: %s is fail-open — when it cannot be reached it is skipped.", l.Name)
 		}
 	}
 	resolver, err := buildResolver(getenv, authzenURL, httpc, layers)
@@ -102,6 +120,7 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		httpc:         httpc,
 		resolver:      resolver,
 		defaultLayers: layers,
+		failOpen:      failOpen,
 		coaz: coaz.NewEngine(coaz.Options{
 			PDP:          coaz.PDPConfig{URL: authzenURL, APIKey: getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
 			Resolver:     resolver,
@@ -172,7 +191,7 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 // behaviour. Warm-up failures are logged, not fatal: the resolver degrades to the
 // default paths, and a PDP that is down at boot is a runtime condition, not a config
 // error.
-func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client, layers []string) (*discovery.Chain, error) {
+func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client, layers []discovery.LayerSpec) (*discovery.Chain, error) {
 	mode, err := discovery.ParseMode(getenv("PDP_DISCOVERY"))
 	if err != nil {
 		return nil, err
@@ -202,8 +221,8 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 	if pdpAllow := parseAllowlist(getenv("PDP_ALLOWLIST")); len(pdpAllow) > 0 {
 		pdpAllow = append(pdpAllow, authzenURL)
 		for _, l := range layers {
-			if strings.Contains(l, "://") {
-				pdpAllow = append(pdpAllow, l)
+			if strings.Contains(l.Name, "://") {
+				pdpAllow = append(pdpAllow, l.Name)
 			}
 		}
 		opts.PDPAllowed = func(u string) bool { return upstreamAllowed(pdpAllow, u) }

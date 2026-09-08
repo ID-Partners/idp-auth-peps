@@ -89,7 +89,12 @@ else the PDP knows. See [docs/architecture.md](../../docs/architecture.md#what-t
 `pdp_layers` is the ordered list of PDPs to ask — `static`, `resource`, or a PDP
 identifier — every one of which must permit; the first deny is the answer. It is how a
 generic estate PDP that judges the token and the client sits in front of the resource's
-own. Default `["resource"]`.
+own. Default `["resource"]`. An entry may carry its own failure mode
+(`"https://estate.example fail-open"`); `fail_mode` (`closed`, the default, or `open`)
+is the route's default for entries that say nothing. A fail-open layer whose PDP cannot
+be reached is skipped and the permit carries `X-PDP-Fail-Open`; a deny or a refusal never
+opens, and an entry the plugin cannot read fails the route closed. Both settings are
+passed to `coaz-pep` on MCP routes.
 
 The rules are the Go PEP's: the resource's echoed `resource` must be byte-identical
 (RFC 9728 §3.3), the PDP's `policy_decision_point` must equal the identifier it was

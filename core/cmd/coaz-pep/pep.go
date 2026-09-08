@@ -76,8 +76,14 @@ type pepConfig struct {
 	// and authenticated, and that is the operator's call.
 	forwardAccessToken bool
 	// layers is the ordered list of PDPs to ask (see discovery.ResolveLayers). Empty
-	// means the service default, which is the resource's PDP alone.
-	layers []string
+	// means the service default, which is the resource's PDP alone. layersErr is a
+	// policy that could not be read: such a route fails closed rather than run a
+	// narrower policy than it was given.
+	layers    []discovery.LayerSpec
+	layersErr error
+	// failOpen is the route's failure mode, when it sets one: nil inherits the
+	// service's PDP_FAIL_MODE.
+	failOpen *bool
 }
 
 // resourceID is the identifier handed to PDP discovery for this route.
@@ -99,7 +105,7 @@ func configFrom(ext map[string]string) pepConfig {
 		return def
 	}
 	isTrue := func(k string) bool { return strings.EqualFold(ext[k], "true") }
-	return pepConfig{
+	c := pepConfig{
 		pepLabel:         get("pep_label", "coaz-pep"),
 		style:            get("style", "rest"),
 		requireToken:     isTrue("require_token"),
@@ -114,8 +120,20 @@ func configFrom(ext map[string]string) pepConfig {
 		legacySubjectIdentity: !strings.EqualFold(ext["legacy_subject_identity"], "false"),
 		resource:              strings.TrimRight(ext["resource"], "/"),
 		forwardAccessToken:    isTrue("forward_access_token"),
-		layers:                discovery.ParseLayers(ext["pdp_layers"]),
 	}
+	c.layers, c.layersErr = discovery.ParseLayers(ext["pdp_layers"])
+	switch strings.ToLower(ext["fail_mode"]) {
+	case "open":
+		t := true
+		c.failOpen = &t
+	case "closed":
+		f := false
+		c.failOpen = &f
+	case "":
+	default:
+		c.layersErr = fmt.Errorf("fail_mode %q is neither open nor closed", ext["fail_mode"])
+	}
+	return c
 }
 
 type server struct {
@@ -126,8 +144,9 @@ type server struct {
 	// resolver finds the PDP for a route's resource. Nil means the static PDP.
 	resolver discovery.Resolver
 	// defaultLayers is the service-wide layer list (PDP_LAYERS), used by routes that
-	// name none.
-	defaultLayers []string
+	// name none; failOpen is the service-wide failure mode (PDP_FAIL_MODE).
+	defaultLayers []discovery.LayerSpec
+	failOpen      bool
 	// upstreamAllowlist bounds which MCP servers a caller may point the PEP at.
 	// Empty means unrestricted — main() warns when that is so.
 	upstreamAllowlist []string
@@ -212,6 +231,22 @@ func denySimple(pep string, httpStatus typev3.StatusCode, rpcCode codes.Code, re
 // permit lets the request through, tagging the upstream request with the
 // delegation identity and the response with the PDP decision.
 func permit(pep, action, reason, sub, act, scope string) *authv3.CheckResponse {
+	return permitWith(pep, action, reason, sub, act, scope, nil)
+}
+
+// permitWith is permit with the fail-open marker: X-PDP-Fail-Open names the layers that
+// were skipped, so a permit that rests on fewer opinions than the policy asked for is
+// visible on the wire and countable downstream.
+func permitWith(pep, action, reason, sub, act, scope string, failedOpen []string) *authv3.CheckResponse {
+	responseHeaders := map[string]string{
+		"X-PDP-PEP":      pep,
+		"X-PDP-Decision": "PERMIT",
+		"X-PDP-Action":   action,
+		"X-PDP-Reason":   reason,
+	}
+	if len(failedOpen) > 0 {
+		responseHeaders["X-PDP-Fail-Open"] = sanitizeHeader(strings.Join(failedOpen, ", "))
+	}
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{Code: int32(codes.OK)},
 		HttpResponse: &authv3.CheckResponse_OkResponse{
@@ -221,12 +256,7 @@ func permit(pep, action, reason, sub, act, scope string) *authv3.CheckResponse {
 					"X-Auth-Agent":     act,
 					"X-Auth-Scope":     scope,
 				}),
-				ResponseHeadersToAdd: headerOpts(map[string]string{
-					"X-PDP-PEP":      pep,
-					"X-PDP-Decision": "PERMIT",
-					"X-PDP-Action":   action,
-					"X-PDP-Reason":   reason,
-				}),
+				ResponseHeadersToAdd: headerOpts(responseHeaders),
 			},
 		},
 	}
@@ -356,7 +386,13 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 				extraContext["consented_creditor"] = cred
 			}
 		}
-		callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path, Layers: s.layersFor(conf)}
+		if conf.layersErr != nil {
+			log.Printf("[%s] route policy unreadable: %v", pep, conf.layersErr)
+			return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
+				"Authorization policy for this route could not be read; denying (fail-closed).", nil)
+		}
+		callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path,
+			Layers: s.layersFor(conf), FailOpen: s.failOpenFor(conf)}
 		if conf.forwardAccessToken {
 			callOpts.AccessToken = token
 		}
@@ -377,8 +413,11 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 						"X-PDP-Reason":   sanitizeHeader(v.Reason),
 					})
 			}
+			if len(v.FailedOpen) > 0 {
+				log.Printf("[%s] COAZ PERMIT tools/call %s FAILED OPEN past %v", pep, toolName, v.FailedOpen)
+			}
 			log.Printf("[%s] COAZ PERMIT tools/call %s (principal=%s agent=%s)", pep, toolName, sub, act)
-			return permit(pep, "tools/call:"+toolName, v.Reason, sub, act, scope)
+			return permitWith(pep, "tools/call:"+toolName, v.Reason, sub, act, scope, v.FailedOpen)
 		}
 		// non-COAZ tool: fall through to the legacy MCP-edge behaviour
 	}
@@ -447,12 +486,18 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	//     resource requires is a policy decision, and policy is offloaded to the PDP,
 	//     where it can weigh them alongside risk, consent and history — things a gateway
 	//     never sees. Resolved once, so one decision cannot straddle a PDP that moved.
-	eps, err := discovery.ResolveLayers(ctx, s.resolverOrStatic(), conf.resourceID(), s.layersFor(conf))
+	if conf.layersErr != nil {
+		log.Printf("[%s] route policy unreadable: %v", pep, conf.layersErr)
+		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
+			"Authorization policy for this route could not be read; denying (fail-closed).", nil)
+	}
+	layers, err := discovery.ResolveLayers(ctx, s.resolverOrStatic(), conf.resourceID(), s.layersFor(conf), s.failOpenFor(conf))
 	if err != nil {
 		log.Printf("[%s] PDP call failed: PDP discovery: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
 			"Authorization service unreachable; denying (fail-closed).", nil)
 	}
+	eps := layers.PDPs
 	if meta := discovery.ResourceMetadataOf(eps); meta != nil {
 		m.ctx["resource_metadata"] = meta.Document
 		m.ctx["resource_metadata_source"] = meta.Source
@@ -469,11 +514,14 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"context":  m.ctx,
 	}
 
-	out, err := s.evaluateLayers(ctx, eps, authzenReq)
+	out, err := s.evaluateLayers(ctx, eps, authzenReq, layers.Skipped)
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
 			"Authorization service unreachable; denying (fail-closed).", nil)
+	}
+	if len(out.FailedOpen) > 0 {
+		log.Printf("[%s] %s %s FAILED OPEN past %v", pep, m.action, m.rid, out.FailedOpen)
 	}
 	decision, reason, stepUp, stepUpScope := out.Decision, out.Reason, out.StepUp, out.StepUpScope
 
@@ -527,7 +575,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	}
 
 	log.Printf("[%s] PERMIT %s %s (principal=%s agent=%s)", pep, m.action, m.rid, sub, agent)
-	return permit(pep, m.action, reason, sub, act, scope)
+	return permitWith(pep, m.action, reason, sub, act, scope, out.FailedOpen)
 }
 
 // isToolsCall cheaply detects a tools/call JSON-RPC body.
@@ -693,6 +741,8 @@ type pepOutcome struct {
 	StepUpScope     string
 	IdentityReq     bool
 	IdentityDoctype string
+	// FailedOpen names the layers skipped because they failed and were allowed to.
+	FailedOpen []string
 }
 
 // resolverOrStatic: a server built without a resolver (tests, mostly) behaves as the
@@ -705,11 +755,19 @@ func (s *server) resolverOrStatic() discovery.Resolver {
 }
 
 // layersFor is the route's layer list, else the service default.
-func (s *server) layersFor(conf pepConfig) []string {
+func (s *server) layersFor(conf pepConfig) []discovery.LayerSpec {
 	if len(conf.layers) > 0 {
 		return conf.layers
 	}
 	return s.defaultLayers
+}
+
+// failOpenFor is the route's failure mode, else the service default.
+func (s *server) failOpenFor(conf pepConfig) bool {
+	if conf.failOpen != nil {
+		return *conf.failOpen
+	}
+	return s.failOpen
 }
 
 // resolveFor finds the PDP for a route's resource.
@@ -722,18 +780,31 @@ func (s *server) resolveFor(ctx context.Context, resource string) (discovery.PDP
 }
 
 // evaluateLayers asks each PDP in order; every layer must permit, the first that does
-// not is the answer, and a PDP error anywhere fails closed. See the engine's twin.
-func (s *server) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, authzenReq map[string]any) (pepOutcome, error) {
+// not is the answer. A PDP error fails closed unless the layer is fail-open, in which
+// case it is skipped and named; if every layer was skipped the request is permitted and
+// marked. A deny is never skipped. See the engine's twin.
+func (s *server) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, authzenReq map[string]any, skipped []string) (pepOutcome, error) {
 	var out pepOutcome
+	decided := false
 	for _, ep := range eps {
 		o, err := s.evaluateAt(ctx, ep, authzenReq)
 		if err != nil {
-			return out, fmt.Errorf("%s: %w", ep.Identifier, err)
+			if !ep.FailOpen {
+				return out, fmt.Errorf("%s: %w", ep.Identifier, err)
+			}
+			skipped = append(skipped, fmt.Sprintf("%s (%v)", ep.Identifier, err))
+			continue
 		}
+		decided = true
 		if !o.Decision {
 			return o, nil
 		}
 		out = o
+	}
+	out.FailedOpen = skipped
+	if !decided {
+		out.Decision = true
+		out.Reason = "fail-open: no policy layer could be reached (" + strings.Join(skipped, "; ") + ")"
 	}
 	return out, nil
 }
@@ -767,6 +838,11 @@ func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, auth
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return out, err
+	}
+	// AuthZEN answers 200 with a decision, permit or deny. Anything else is not a decision:
+	// a PDP that is down and says so in JSON must not be read as a deny.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, fmt.Errorf("PDP returned %d", resp.StatusCode)
 	}
 	var data struct {
 		Decision bool `json:"decision"`

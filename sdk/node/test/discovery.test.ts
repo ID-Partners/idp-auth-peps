@@ -8,6 +8,7 @@ import {
   Rfc9728Source,
   allowedByPrefix,
   defaultEndpoints,
+  parseLayer,
   resolveLayers,
   resourceMetadataOf,
   wellKnownUrl,
@@ -551,14 +552,15 @@ describe('discovery: through the client, middleware and guard', () => {
   it('resolves layers and explicit PDPs at the discovery level', async () => {
     const ESTATE = 'https://estate.example';
     const { d } = disco({ ...routes(), [`${ESTATE}/.well-known/authzen-configuration`]: pdpConfig(ESTATE) }, { apiKeys: { [STATIC]: 'static-key', [ESTATE]: 'ek' } });
-    const eps = await resolveLayers(d, RES, [ESTATE, 'static', 'resource']);
+    const { pdps: eps, skipped } = await resolveLayers(d, RES, [ESTATE, 'static', 'resource']);
     expect(eps.map((e) => e.identifier)).toEqual([ESTATE, STATIC, GOOD]);
-    expect(eps[0]).toMatchObject({ source: 'layer', apiKey: 'ek', evaluation: `${ESTATE}/custom/eval` });
+    expect(eps[0]).toMatchObject({ source: 'layer', apiKey: 'ek', evaluation: `${ESTATE}/custom/eval`, failOpen: false });
     expect(eps[1]?.apiKey).toBe('static-key');
+    expect(skipped).toEqual([]);
     expect(resourceMetadataOf(eps)?.source).toBe('rfc9728');
     expect(resourceMetadataOf([])).toBeUndefined();
-    expect((await resolveLayers(d, RES, undefined)).map((e) => e.identifier)).toEqual([GOOD]);
-    const dup = await resolveLayers(d, RES, [GOOD, 'resource']);
+    expect((await resolveLayers(d, RES, undefined)).pdps.map((e) => e.identifier)).toEqual([GOOD]);
+    const dup = (await resolveLayers(d, RES, [GOOD, 'resource'])).pdps;
     expect(dup).toHaveLength(1);
     expect(dup[0]?.resource).toBeDefined();
     // Explicit layers obey the PDP allowlist; off mode reads nothing.
@@ -566,6 +568,114 @@ describe('discovery: through the client, middleware and guard', () => {
     await expect(strict.resolvePdp(ESTATE)).rejects.toThrow(DiscoveryError);
     const off = new PdpDiscovery({ staticPdp: STATIC, ...quiet });
     expect(await off.resolvePdp(`${ESTATE}/`)).toMatchObject({ evaluation: `${ESTATE}/access/v1/evaluation`, source: 'layer' });
+  });
+
+  it('parses a layer entry with its failure mode, and refuses what it cannot read', () => {
+    expect(parseLayer('https://estate.example/ fail-open')).toEqual({ name: 'https://estate.example', failOpen: true });
+    expect(parseLayer('resource FAIL-CLOSED')).toEqual({ name: 'resource', failOpen: false });
+    expect(parseLayer(' static ')).toEqual({ name: 'static' });
+    expect(parseLayer({ name: 'resource', failOpen: true })).toEqual({ name: 'resource', failOpen: true });
+    for (const bad of ['resource maybe', 'bogus', '']) expect(() => parseLayer(bad)).toThrow(DiscoveryError);
+  });
+
+  it('a fail-open layer that cannot be resolved is skipped; a refusal never is', async () => {
+    const { d } = disco(routes());
+    const bad = 'https://p.example/?x=1'; // invalid identifier: fails at resolution
+    await expect(resolveLayers(d, RES, [bad, 'resource'])).rejects.toThrow(/layer/);
+    const r = await resolveLayers(d, RES, [`${bad} fail-open`, 'resource']);
+    expect(r.pdps.map((e) => e.identifier)).toEqual([GOOD]);
+    expect(r.pdps[0]?.failOpen).toBe(false);
+    expect(r.skipped).toHaveLength(1);
+    expect(r.skipped[0]).toMatch(new RegExp(`^${bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    // The default applies to layers that say nothing; the layer's own word wins.
+    const dflt = await resolveLayers(d, RES, [bad, { name: 'resource', failOpen: false }], true);
+    expect(dflt.skipped).toHaveLength(1);
+    expect(dflt.pdps[0]?.failOpen).toBe(false);
+    await expect(resolveLayers(d, RES, [`${bad} fail-closed`], true)).rejects.toThrow(DiscoveryError);
+    // Everything skipped is still a resolution, with nothing to ask.
+    expect(await resolveLayers(d, RES, [bad], true)).toEqual({ pdps: [], skipped: [expect.stringContaining(bad)] });
+    // A duplicate takes the stricter mode.
+    const dup = await resolveLayers(d, RES, [`${GOOD} fail-open`, 'resource fail-closed']);
+    expect(dup.pdps).toHaveLength(1);
+    expect(dup.pdps[0]?.failOpen).toBe(false);
+    // The allowlist is a refusal, not an outage.
+    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router(routes()).fetch, pdpAllowlist: ['https://pdp.example'], ...quiet });
+    await expect(resolveLayers(strict, RES, [`${GOOD} fail-open`], true)).rejects.toMatchObject({ kind: 'not_allowed' });
+  });
+
+  it('the client fails open only where told, and marks the verdict', async () => {
+    const DOWN = 'https://down.example';
+    const DENY = 'https://deny.example';
+    const { fetch, hits } = router({
+      ...routes(),
+      [`${DOWN}/.well-known/authzen-configuration`]: 404,
+      [`${DOWN}/access/v1/evaluation`]: 503,
+      [`${DENY}/.well-known/authzen-configuration`]: 404,
+      [`${DENY}/access/v1/evaluation`]: { decision: false, context: { reason: 'no' } },
+    });
+    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...quiet } });
+    // Closed by default.
+    expect(await client.evaluate(req, { resource: RES, layers: [DOWN, 'resource'] })).toMatchObject({ allow: false, kind: 'pdp_error' });
+    // Open on the layer: skipped, named, the rest decides.
+    const v = await client.evaluate(req, { resource: RES, layers: [`${DOWN} fail-open`, 'resource'] });
+    expect(v).toMatchObject({ allow: true, kind: 'ok', failedOpen: [expect.stringContaining(DOWN)] });
+    expect(hits.some((h) => h.url === `${GOOD}/custom/eval` && h.method === 'POST')).toBe(true);
+    // Open on the call, unless the layer says closed for itself.
+    expect(await client.evaluate(req, { resource: RES, layers: [DOWN, 'resource'], failMode: 'open' })).toMatchObject({ allow: true, failedOpen: [expect.any(String)] });
+    expect(await client.evaluate(req, { resource: RES, layers: [`${DOWN} fail-closed`, 'resource'], failMode: 'open' })).toMatchObject({ allow: false, kind: 'pdp_error' });
+    // Open on the client; everything skipped is a permit that says so.
+    const lax = new AuthzenClient({ url: STATIC, fetch, failMode: 'open', layers: [DOWN], discovery: { mode: 'resource', ...quiet } });
+    const all = await lax.evaluate(req, { resource: RES });
+    expect(all).toMatchObject({ allow: true, reason: expect.stringMatching(/^fail-open:/), failedOpen: [expect.stringContaining(DOWN)] });
+    // A deny is a decision: never skipped.
+    expect(await lax.evaluate(req, { resource: RES, layers: [`${DENY} fail-open`, 'resource'] })).toMatchObject({ allow: false, reason: 'no' });
+    // Nothing skipped, no marker.
+    expect(await lax.evaluate(req, { resource: RES, layers: ['resource'] })).not.toHaveProperty('failedOpen');
+  });
+
+  it('a batch fails open past a layer that cannot take one, or that fails, only when told', async () => {
+    const NOBATCH = 'https://nobatch.example';
+    const DOWN = 'https://down.example';
+    const { fetch, hits } = router({
+      [`${STATIC}/.well-known/authzen-configuration`]: { policy_decision_point: STATIC, access_evaluation_endpoint: `${STATIC}/e`, access_evaluations_endpoint: `${STATIC}/es` },
+      [`${STATIC}/es`]: { evaluations: [{ decision: true }] },
+      [`${NOBATCH}/.well-known/authzen-configuration`]: { policy_decision_point: NOBATCH, access_evaluation_endpoint: `${NOBATCH}/e` },
+      [`${DOWN}/.well-known/authzen-configuration`]: 404,
+      [`${DOWN}/access/v1/evaluations`]: 503,
+    });
+    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'authzen', ...quiet } });
+    const batch = { evaluations: [req] };
+    expect(await client.evaluateAll(batch, { layers: [NOBATCH, 'static'] })).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('access_evaluations_endpoint') });
+    expect(hits.filter((h) => h.method === 'POST')).toHaveLength(0);
+    expect(await client.evaluateAll(batch, { layers: [`${NOBATCH} fail-open`, 'static'] })).toMatchObject({ allow: true, failedOpen: [expect.stringContaining(NOBATCH)] });
+    expect(hits.filter((h) => h.method === 'POST')).toHaveLength(1);
+    expect(await client.evaluateAll(batch, { layers: [DOWN, 'static'], failMode: 'open' })).toMatchObject({ allow: true, failedOpen: [expect.stringContaining(DOWN)] });
+    expect(await client.evaluateAll(batch, { layers: [DOWN], failMode: 'open' })).toMatchObject({ allow: true, reason: expect.stringMatching(/^fail-open:/) });
+    expect(await client.evaluateAll(batch, { layers: [DOWN], failMode: 'closed' })).toMatchObject({ allow: false, kind: 'pdp_error' });
+  });
+
+  it('the middleware marks a fail-open permit on the wire; the guard tells the delegate', async () => {
+    const DOWN = 'https://down.example';
+    const { fetch } = router({ ...routes(), [`${DOWN}/.well-known/authzen-configuration`]: 404, [`${DOWN}/access/v1/evaluation`]: 503 });
+    const client = new AuthzenClient({ url: STATIC, fetch, layers: [DOWN, 'resource'], discovery: { mode: 'resource', ...quiet } });
+    const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
+    const next = vi.fn();
+    const r: PepRequest = { method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'u1' })}` } };
+    await authzenMiddleware({ client, map: () => req, resource: RES })(r, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(502);
+    await authzenMiddleware({ client, map: () => req, resource: RES, failMode: 'open' })(r, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.set).toHaveBeenCalledWith('X-PDP-Fail-Open', expect.stringContaining(DOWN));
+
+    const delegated = router({ ['http://coaz-pep:9192/v1/mcp/check']: { decision: true, upstream_headers: {} } });
+    const rpc = { jsonrpc: '2.0' as const, id: 1, method: 'tools/call', params: { name: 't', arguments: {} } };
+    await new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192' }, failMode: 'open', fetch: delegated.fetch }).checkToolCall({ rpc, claims: { sub: 'u1' }, raw: { headers: {}, body: '{}' } });
+    const sent = JSON.parse(String((delegated.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls[0]?.[1]?.body)) as { config: Record<string, string> };
+    expect(sent.config.fail_mode).toBe('open');
+    // In-process, the guard folds the same way.
+    const guard = new McpGuard({ client, tools: [{ name: 't', inputSchema: { 'x-authzen-mapping': { evaluation: { subject: { type: 'user', id: '$token.sub' }, action: { name: 't' }, resource: { type: 'x', id: '1' } } } } }], resource: RES, failMode: 'open' });
+    expect(await guard.checkToolCall({ rpc, claims: { sub: 'u1' } })).toMatchObject({ allow: true, verdict: { failedOpen: [expect.stringContaining(DOWN)] } });
   });
 
   it('without discovery the client is byte-for-byte static', async () => {

@@ -33,11 +33,14 @@ jwt() {
 
 pretty() {
   if command -v jq >/dev/null 2>&1; then
-    jq -c '{decision, status: .response.status, body: ((.response.body // "") | if . == "" then null else (try fromjson catch .) end)}'
+    jq -c '{decision, status: .response.status, body: ((.response.body // "") | if . == "" then null else (try fromjson catch .) end)} + (if (.response_headers // {})["X-PDP-Fail-Open"] then {failed_open: .response_headers["X-PDP-Fail-Open"]} else {} end)'
   else python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("response") or {}; b=r.get("body") or None
 try: b=json.loads(b) if b else None
 except Exception: pass
-print(json.dumps({"decision": d.get("decision"), "status": r.get("status"), "body": b}))'; fi
+o={"decision": d.get("decision"), "status": r.get("status"), "body": b}
+fo=(d.get("response_headers") or {}).get("X-PDP-Fail-Open")
+if fo: o["failed_open"]=fo
+print(json.dumps(o))'; fi
 }
 
 # check PEP RESOURCE METHOD PATH [BODY] — route knobs via FORWARD (yes|no) and LAYERS env
@@ -53,6 +56,11 @@ check() {
     -H "Authorization: Bearer $CHECK_TOKEN" -H 'Content-Type: application/json' \
     -d "$(printf '{"config":%s,"method":"%s","path":"%s","headers":{"authorization":"Bearer %s","content-type":"application/json"},"body":"%s"}' \
       "$cfg" "$method" "$path" "$(jwt)" "$esc_body")" | pretty
+}
+
+# ctl OP — a lever on the stubs (move_pdp, repoint_plain, estate_down, estate_up, reset)
+ctl() {
+  curl -sS -o /dev/null -X POST -H 'Content-Type: application/json' -d "{\"op\":\"$1\"}" "http://${PEP_HOST}:${CONTROL_PORT:-9099}/control"
 }
 
 PAY50='{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
@@ -108,12 +116,22 @@ step "agent-1 pays 50 on plain: estate, then Bank A"; LAYERS="$ESTATE,resource" 
 step "agent-risky pays 50 on plain: the estate PDP stops it"; LAYERS="$ESTATE,resource" CLIENT=agent-risky check "$RESOURCE" "$PLAIN" POST /payments "$PAY50"
 echo "  ^ Bank A's PDP was never asked. The generic layer is a gate; the specific one only sees what gets through."
 
-say "5. The challenge contract survives discovery"
+say "5. Failing open, deliberately: the estate PDP goes down"
+echo "  Closed is the default: a layer whose PDP cannot be reached denies. A layer marked fail-open is skipped instead,"
+echo "  and the permit says so in X-PDP-Fail-Open. A deny is never skipped, and neither is a refusal."
+ctl estate_down
+step "estate DOWN, layers as before (fail-closed): 503"; LAYERS="$ESTATE,resource" check "$RESOURCE" "$PLAIN" GET /accounts/a1/balance
+step "estate DOWN, estate layer marked fail-open: Bank A decides"; LAYERS="$ESTATE fail-open,resource" check "$RESOURCE" "$PLAIN" GET /accounts/a1/balance
+echo "  ^ permitted by Bank A's PDP alone, and marked: failed_open names the layer that was skipped."
+ctl estate_up
+step "estate back up, same fail-open policy: no marker"; LAYERS="$ESTATE fail-open,resource" check "$RESOURCE" "$PLAIN" GET /accounts/a1/balance
+
+say "6. The challenge contract survives discovery"
 step "pay 50 on member (federation mode)"; ACR=urn:idp:loa:mfa check "$FEDERATION" "$MEMBER" POST /payments "$PAY50"
 step "pay 5000 -> step-up challenge"; ACR=urn:idp:loa:mfa check "$FEDERATION" "$MEMBER" POST /payments "$PAY5000"
 
 if curl -s -o /dev/null -w '%{http_code}' "http://${PEP_HOST}:8000/bank/accounts/a1/balance" 2>/dev/null | grep -q '^[0-9]'; then
-  say "6. Kong, doing the same discovery in Lua (profile kong)"
+  say "7. Kong, doing the same discovery in Lua (profile kong)"
   step "read a balance via Kong"; curl -s -H "Authorization: Bearer $(jwt)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
   step "read-only token pays via Kong"; curl -s -X POST -H "Authorization: Bearer $(SCOPE='accounts:read' jwt)" -H 'Content-Type: application/json' -d "$PAY50" "http://${PEP_HOST}:8000/bank/payments"; echo
 fi
