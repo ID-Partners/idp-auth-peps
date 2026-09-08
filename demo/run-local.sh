@@ -37,7 +37,7 @@ env "${common[@]}" PORT=9292 HTTP_PORT=9193 PDP_DISCOVERY=resource PDP_DISCOVERY
   RESOURCE_METADATA_ALLOWLIST="$resources" "$OUT/coaz-pep" >"$OUT/pep-resource.log" 2>&1 &
 pids+=($!)
 env "${common[@]}" PORT=9293 HTTP_PORT=9194 PDP_DISCOVERY=federation PDP_DISCOVERY_INSECURE=true \
-  RESOURCE_METADATA_ALLOWLIST="$resources" PDP_ALLOWLIST=http://localhost:9002,http://localhost:9008 \
+  RESOURCE_METADATA_ALLOWLIST="$resources" PDP_ALLOWLIST=http://localhost:9002,http://localhost:9008,http://localhost:9098 \
   FEDERATION_TRUST_ANCHORS_FILE="$OUT/anchors.json" \
   FEDERATION_FETCH_ALLOWLIST=http://localhost:9000 \
   "$OUT/coaz-pep" >"$OUT/pep-federation.log" 2>&1 &

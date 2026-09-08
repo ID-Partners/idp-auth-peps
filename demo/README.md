@@ -12,7 +12,16 @@ are the levers and the MCP request in the console.
 **Who enforces what a resource requires?** Not the gateway. Each resource publishes the
 scopes it uses and the acr it expects; the PEP forwards that document to the PDP verbatim,
 with the endpoint hit and the raw token, and the PDP does the matching. That is the
-token, scope and acr pickers in the console, and section 5 of `demo.sh`.
+token, scope and acr pickers in the console, and section 3 of `demo.sh`.
+
+**Can policy be layered?** Yes: a route names an ordered list of PDPs, every one of which
+must permit. The demo's estate PDP judges the token and the client and knows nothing about
+any resource; put first, it gates every request before the resource's own PDP is asked.
+That is the layers picker, and section 4.
+
+Nothing here turns on who the customer is. The variables are which PDP was consulted,
+what document it was given, what the token carries, and which layers ran. One subject,
+`customer`, throughout.
 
 ## The cast
 
@@ -20,15 +29,18 @@ token, scope and acr pickers in the console, and section 5 of `demo.sh`.
 | --- | --- | --- |
 | `anchor` | 9000 | A federation Trust Anchor. Its policy for members: `authzen_policy_decision_points` must be a subset of `[pdp-a]`, and `acr_values_required` **is** `[MFA]`, whatever the member says. |
 | `member` | 9001 | A federated resource. Its **own** RFC 9728 document names Bank A's PDP and says a password is enough; its entity configuration names the rogue PDP first. The anchor's policy strips the rogue **and raises the acr floor to MFA**. |
-| `pdp-a` | 9002 | Bank A's PDP, identifier `…:9002/tenants/bank-a`. Denies *mallory*; steps up payments over 1000. Advertises a batch endpoint. |
+| `pdp-a` | 9002 | Bank A's PDP, identifier `…:9002/tenants/bank-a`. Holds the token to what the resource published; steps up payments over 1000. Advertises a batch endpoint. |
 | `rogue-pdp` | 9003 | Permits everything, logs loudly when asked, and advertises **no** batch endpoint. Bare identifier, no tenant path. |
 | `plain` | 9004 | Not federated. RFC 9728 metadata names Bank A's PDP; requires a password. |
 | `impostor` | 9005 | Not federated. RFC 9728 metadata names the rogue PDP. |
 | `broken` | 9006 | Federated, but signs with a key the anchor never vouched for. |
 | `stray` | 9007 | No metadata of any kind. |
 | `pdp-b` | 9008 | Bank B's PDP, identifier `…:9008/tenants/bank-b`. Same product, stricter threshold: steps up payments over 100. |
+| `pdp-estate` | 9098 | A generic PDP for the whole estate: judges the token and the client (`agent-risky` is on its watch list), knows nothing about any resource. The first layer. |
 | `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP; requires MFA. |
 | `control` | 9099 | The event feed the console traces, and the levers it pulls. Not part of any spec. |
+
+The three PEPs' allowlists name the estate PDP so a route may add it as a layer.
 
 Every resource also answers MCP `tools/list` at `/mcp` with one tool whose mapping is a
 boxcar: a transfer is a debit and a credit, evaluated in one call.
@@ -72,9 +84,9 @@ fetch is one line, and the rogue PDP announces itself.
 
 ## The console
 
-Pick a resource, a user and a request — and the shape of the token: how the user
-authenticated, which scopes it carries, and whether the route forwards it to the PDP. Press
-Run. The same check goes to all three
+Pick a resource, a request, the route's policy layers, and the shape of the token: who it
+was issued to, how the customer authenticated, which scopes it carries, and whether the
+route forwards it to the PDP. Press Run. The same check goes to all three
 PEPs and you get three columns: the decision, a line saying what that column just proved,
 and underneath it every request the stubs saw while that PEP was deciding — which
 `.well-known` document it read, whether it climbed a trust chain, and which PDP answered
@@ -118,14 +130,17 @@ configuration; the PEPs pick the change up on their next metadata refresh.
 
 ### Requests worth trying
 
-- **impostor + mallory + read a balance.** Static denies her, federation denies her, and
-  the middle column permits her, because the resource named its own judge.
-- **member + mallory.** Watch the federation column climb `member → anchor → fetch` and
-  come back with Bank A's PDP, while the resource column takes the member's own word and
-  reaches the rogue one.
+- **A read-only token paying 50 on plain, then on impostor.** Static permits: its PDP
+  was told nothing about the resource. Resource mode on `plain` comes back as a step-up for
+  `payments:write`, decided from the resource's own `scopes_supported`. Resource mode on
+  `impostor` permits, because the impostor named the rogue PDP as its judge.
+- **member with a read-only token.** Watch the federation column climb
+  `member → anchor → fetch` and come back with Bank A's PDP and the resolved document.
 - **plain, then bank-b, paying 500.** Same request, two answers, because two resources
   answer to two PDPs with different thresholds. The static column cannot tell them apart:
   it has one PDP for everything.
+- **agent-risky with "estate PDP first" on any resource.** The estate PDP denies and the
+  resource's PDP is never asked. Switch to agent-1 and both layers permit, in order.
 - **member, password token, read a balance — resource mode then federation mode.** The
   resource column permits: the member's own document says a password is enough, and Bank
   A's PDP believes it. The federation column denies, from the *same* PDP with the *same*
@@ -151,35 +166,28 @@ legitimately shows nothing fetched. The console reads the stubs' event feed at
 
 ## What `demo.sh` walks
 
-**1. Static.** The PEP is told its PDP is `http://stubs:9002/tenants/bank-a`, and posts
-to `/access/v1/evaluation` under it — the path AuthZEN says to assume when you have no
-metadata. Alice is permitted, mallory is not. Nothing was discovered.
+**1. Where the PDP comes from, and what it was told.** A read-only token tries to pay.
+The static PEP's PDP permits: it was told nothing about the resource. The resource-mode
+PEP on `plain` comes back as a step-up for `payments:write`: the PDP read the resource's
+`scopes_supported` out of what the PEP forwarded. On `impostor` the rogue PDP permits — the
+resource chose its own judge. The federation-mode PEP never reads a resource's own
+document: the impostor gets the static PDP, the `member` gets Bank A's after a validated
+chain, `broken` is a **503** and never a fallback, `stray` gets the static PDP.
 
-**2. Resource mode.** The `plain` resource's well-known names Bank A's PDP; the PEP
-derives that PDP's metadata URL by the insertion rule, reads it, and calls the endpoint it
-advertises. Then the `impostor` resource
-names the rogue PDP — and **mallory is permitted**. A self-asserted document cannot
-protect the thing it asserts. (A `PDP_ALLOWLIST` would have stopped this; `pep-resource`
-deliberately has none, and warns about it at boot.)
-
-**3. Federation mode.** The impostor is not a member, so its own document is never read:
-it gets the operator's static PDP, and mallory is denied. The `member` names
-`[rogue, pdp-a]` in its Entity Configuration, but the anchor's `subset_of` leaves only
-`pdp-a` in the resolved metadata — mallory is denied, and the stubs log shows the rogue
-PDP was never consulted. The `broken` resource's chain does not validate: **503**, never a
-fallback. The `stray` resource has nothing: static PDP.
-
-**4. Two banks, one gateway.** A payment of 500 is permitted on `plain` and step-up
+**2. Two banks, one gateway.** A payment of 500 is permitted on `plain` and step-up
 challenged on `bank-b`, because the resource decides whose policy applies.
 
-**5. What the resource requires is the PDP's to enforce.** Bank B requires MFA and a
-password token is denied with the reason. The `member` says a password is enough about
-itself and the resource-mode PEP's PDP agrees; the federation-mode PEP forwards the
-resolved document, the anchor set MFA, and the same PDP denies. A read-only token trying
-to pay gets a step-up for `payments:write`, decided from the resource's own
-`scopes_supported`. With the token not forwarded, the PDP says it could not examine it.
+**3. What the resource requires is the PDP's to enforce, and the federation sets the
+floor.** Bank B requires MFA and a password token is denied with the reason. The `member`
+says a password is enough about itself and the resource-mode PEP's PDP agrees; the
+federation-mode PEP forwards the resolved document, the anchor set MFA, and the same PDP
+denies. With the token not forwarded, the PDP says it could not examine it.
 
-**6. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
+**4. Layers.** With `pdp_layers` naming the estate PDP first, `agent-1` is permitted by
+both PDPs in order, and `agent-risky` is stopped by the estate PDP before Bank A's is
+asked.
+
+**5. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="payments:approve"` and an
 `authz_challenge` body. Discovery changed where the decision came from, not what a deny
 looks like.

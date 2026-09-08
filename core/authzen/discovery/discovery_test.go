@@ -612,6 +612,67 @@ func TestFederationMode(t *testing.T) {
 	})
 }
 
+func TestResolveLayers(t *testing.T) {
+	good := newPDP(t, fullConfig)
+	estate := newPDP(t, fullConfig)
+	static := newPDP(t, nil)
+	res := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, "scopes_supported": []string{"a"}}
+	})
+	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL, APIKeys: map[string]string{static.URL: "k", estate.URL: "ek"}})
+
+	eps, err := ResolveLayers(ctx(), c, res.URL, []string{estate.URL, LayerStatic, LayerResource})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{}
+	for _, e := range eps {
+		ids = append(ids, e.Identifier)
+	}
+	if !reflect.DeepEqual(ids, []string{estate.URL, static.URL, good.URL}) {
+		t.Fatalf("order and identity: %v", ids)
+	}
+	if eps[0].Source != "layer" || eps[0].APIKey != "ek" || eps[0].Evaluation != estate.URL+"/custom/eval" {
+		t.Fatalf("explicit layer: %+v", eps[0])
+	}
+	if eps[1].APIKey != "k" || eps[2].Resource == nil || eps[2].Resource.Document["scopes_supported"] == nil {
+		t.Fatalf("static key and resource document: %+v %+v", eps[1], eps[2])
+	}
+	if ResourceMetadataOf(eps) == nil || ResourceMetadataOf(nil) != nil {
+		t.Fatal("ResourceMetadataOf")
+	}
+	// Empty means [resource]; duplicates collapse and keep the document.
+	eps, _ = ResolveLayers(ctx(), c, res.URL, nil)
+	if len(eps) != 1 || eps[0].Identifier != good.URL {
+		t.Fatalf("%+v", eps)
+	}
+	eps, _ = ResolveLayers(ctx(), c, res.URL, []string{good.URL, LayerResource})
+	if len(eps) != 1 || eps[0].Resource == nil {
+		t.Fatalf("duplicate should collapse and keep the document: %+v", eps)
+	}
+	// An unreachable explicit layer falls back to the AuthZEN default paths, like any
+	// PDP without metadata; an invalid identifier is an error that names the layer.
+	if eps, err := ResolveLayers(ctx(), c, res.URL, []string{"http://127.0.0.1:1"}); err != nil || eps[0].Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
+		t.Fatalf("%+v %v", eps, err)
+	}
+	if _, err := ResolveLayers(ctx(), c, res.URL, []string{"http://p.example/?x=1"}); err == nil || !strings.Contains(err.Error(), "layer") {
+		t.Fatalf("%v", err)
+	}
+	// Explicit layers obey the PDP allowlist, and off mode reads nothing.
+	strict := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL, PDPAllowed: func(u string) bool { return u == static.URL }})
+	if _, err := strict.ResolvePDP(ctx(), estate.URL); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("%v", err)
+	}
+	off := Static(static.URL, "k")
+	ep, err := off.ResolvePDP(ctx(), estate.URL+"/")
+	if err != nil || ep.Evaluation != estate.URL+"/access/v1/evaluation" || ep.Source != "layer" {
+		t.Fatalf("%+v %v", ep, err)
+	}
+	if got := ParseLayers(" static, resource\nhttps://p.example/ "); !reflect.DeepEqual(got, []string{"static", "resource", "https://p.example"}) {
+		t.Fatalf("%v", got)
+	}
+}
+
 func TestSourcesOverride(t *testing.T) {
 	pdp := newPDP(t, nil)
 	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: "http://static.example", Sources: []MetadataSource{&fakeSource{pdps: []string{pdp.URL}}}})

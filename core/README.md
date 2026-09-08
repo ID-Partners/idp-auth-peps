@@ -82,6 +82,7 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
 | `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for the climb to the anchor (Superiors' Entity Configurations and fetch endpoints); the resource's own is governed by `RESOURCE_METADATA_ALLOWLIST` | unset — **warns** |
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
+| `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier; every layer must permit | `resource` |
 
 Per-route knobs are not env — they arrive as ext_authz `context_extensions` or in the
 `config` object of an HTTP check. See [`../gateways/envoy/README.md`](../gateways/envoy/README.md).
@@ -148,6 +149,12 @@ as `context.request`, and the raw token as `context.access_token` when the route
 resource requires — `scopes_supported`, an acr, sender-constrained tokens — is policy
 input, and matching a token to it is the PDP's decision. The reasoning is in
 [docs/architecture.md](../docs/architecture.md#what-the-pep-forwards-and-what-it-does-not-decide).
+
+A route may ask more than one PDP: `pdp_layers` (or the service's `PDP_LAYERS`) is an
+ordered list of `static`, `resource` or PDP identifiers, every one of which must permit,
+the first deny being the answer. That is how a generic estate PDP that judges the token
+and the client sits in front of the one that knows the resource; see
+[docs/architecture.md](../docs/architecture.md#layers-a-generic-pdp-first-the-resources-after).
 
 ## A note on `mapping.go`
 

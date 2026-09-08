@@ -27,6 +27,10 @@ package main
 //   FEDERATION_FETCH_ALLOWLIST   permitted prefixes for the climb: superiors' entity configurations and fetch endpoints
 //                                (the subject's own is governed by RESOURCE_METADATA_ALLOWLIST)
 //   FEDERATION_MAX_PATH_LENGTH   intermediates allowed between resource and anchor (default 4)
+//   PDP_LAYERS                   ordered PDPs to ask, every one of which must permit: `static`,
+//                                `resource`, or a PDP identifier (default: resource). Routes may
+//                                override with `pdp_layers`; explicit identifiers there must be
+//                                on PDP_ALLOWLIST, ones named here are allowlisted automatically.
 
 import (
 	"context"
@@ -81,7 +85,13 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		httpc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
-	resolver, err := buildResolver(getenv, authzenURL, httpc)
+	layers := discovery.ParseLayers(getenv("PDP_LAYERS"))
+	for _, l := range layers {
+		if l != discovery.LayerResource && l != discovery.LayerStatic && !strings.Contains(l, "://") {
+			return nil, nil, "", fmt.Errorf("PDP_LAYERS: %q is neither static, resource nor a PDP identifier", l)
+		}
+	}
+	resolver, err := buildResolver(getenv, authzenURL, httpc, layers)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -91,6 +101,7 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		authzenAPIKey: getenv("AUTHZEN_API_KEY"),
 		httpc:         httpc,
 		resolver:      resolver,
+		defaultLayers: layers,
 		coaz: coaz.NewEngine(coaz.Options{
 			PDP:          coaz.PDPConfig{URL: authzenURL, APIKey: getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
 			Resolver:     resolver,
@@ -161,7 +172,7 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 // behaviour. Warm-up failures are logged, not fatal: the resolver degrades to the
 // default paths, and a PDP that is down at boot is a runtime condition, not a config
 // error.
-func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client) (*discovery.Chain, error) {
+func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client, layers []string) (*discovery.Chain, error) {
 	mode, err := discovery.ParseMode(getenv("PDP_DISCOVERY"))
 	if err != nil {
 		return nil, err
@@ -185,10 +196,16 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 		TTL:           metaTTL,
 		AllowInsecure: insecure,
 	}
-	// The static PDP is the operator's own and is always permitted; the allowlist
-	// bounds what a resource's metadata may add to it.
+	// The static PDP is the operator's own and is always permitted, and so is any PDP
+	// the operator named as a layer in this service's own configuration; the allowlist
+	// bounds what a resource's metadata or a route's config may add.
 	if pdpAllow := parseAllowlist(getenv("PDP_ALLOWLIST")); len(pdpAllow) > 0 {
 		pdpAllow = append(pdpAllow, authzenURL)
+		for _, l := range layers {
+			if strings.Contains(l, "://") {
+				pdpAllow = append(pdpAllow, l)
+			}
+		}
 		opts.PDPAllowed = func(u string) bool { return upstreamAllowed(pdpAllow, u) }
 	}
 	if mode == discovery.ModeResource || mode == discovery.ModeFederation {

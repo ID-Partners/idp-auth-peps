@@ -258,6 +258,54 @@ local function options(conf)
   }
 end
 
+--- Resolve an explicitly named PDP — an operator-configured layer. The PDP allowlist
+--- applies: a layer URL in route config is as caller-supplied as anything else there.
+function D.resolve_pdp(conf, pdp)
+  local o = options(conf)
+  pdp = trim_slash(pdp)
+  if (conf.pdp_discovery or "off") == "off" then
+    local ep = D.default_endpoints(pdp)
+    ep.api_key = (pdp == o.static and conf.authzen_api_key ~= "" and conf.authzen_api_key) or nil
+    ep.source = "layer"
+    return ep
+  end
+  local pok, pwhy = D.check_url(pdp, o.pdp_policy)
+  if not pok then return fail(NOT_ALLOWED, pwhy) end
+  local ep, err = cache_get(caches.pdps, pdp, o.ttl, nil, function(key) return fetch_config(key, o) end)
+  if not ep then return nil, err end
+  for _, u in ipairs({ ep.evaluation, ep.evaluations }) do
+    local eok, ewhy = D.check_url(u, o.pdp_policy)
+    if not eok then return fail(NOT_ALLOWED, ewhy) end
+  end
+  return {
+    identifier = ep.identifier, evaluation = ep.evaluation, evaluations = ep.evaluations,
+    capabilities = ep.capabilities, source = "layer",
+    api_key = (ep.identifier == o.static and conf.authzen_api_key ~= "" and conf.authzen_api_key) or nil,
+  }
+end
+
+--- Resolve every layer of a route's policy, in order, duplicates collapsed. Returns a
+--- list of endpoints and the one resource document any layer read, or nil, err. See the
+--- Go engine's ResolveLayers: layering is what lets a generic PDP that judges the token
+--- and the client sit in front of the resource's own.
+function D.resolve_layers(conf, resource, layers)
+  if not layers or #layers == 0 then layers = { "resource" } end
+  local out, seen, meta = {}, {}, nil
+  for _, layer in ipairs(layers) do
+    local ep, err
+    if layer == "resource" then ep, err = D.resolve(conf, resource)
+    elseif layer == "static" then ep, err = D.resolve(conf, "")
+    else ep, err = D.resolve_pdp(conf, layer) end
+    if not ep then return nil, { kind = err.kind, msg = "layer " .. layer .. ": " .. err.msg } end
+    if ep.resource and not meta then meta = ep.resource end
+    if not seen[ep.identifier] then
+      seen[ep.identifier] = true
+      out[#out + 1] = ep
+    end
+  end
+  return out, nil, meta
+end
+
 --- Resolve the PDP endpoints for `resource` under `conf`. Returns
 --- ep{identifier, evaluation, evaluations, api_key, source, resource} | nil, err{kind,msg}.
 --- ep.resource is {source, document}: the resource's metadata as published, when a

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -99,6 +100,10 @@ func (e errResolver) Resolve(context.Context, string) (discovery.PDPEndpoints, e
 	return discovery.PDPEndpoints{}, e.err
 }
 
+func (e errResolver) ResolvePDP(context.Context, string) (discovery.PDPEndpoints, error) {
+	return discovery.PDPEndpoints{}, e.err
+}
+
 func TestCheckForwardsTheResourceDocumentEndpointAndToken(t *testing.T) {
 	static := newDiscoPDP(t, false)
 	discovered := newDiscoPDP(t, true)
@@ -160,6 +165,79 @@ func TestCheckForwardsTheResourceDocumentEndpointAndToken(t *testing.T) {
 	if req, _ := c["request"].(map[string]any); req == nil || req["path"] != "/mcp" {
 		t.Fatalf("mcp endpoint not forwarded: %v", c)
 	}
+}
+
+func TestLayersOnTheService(t *testing.T) {
+	static := newDiscoPDP(t, false)
+	estate := newDiscoPDP(t, true)
+	own := newDiscoPDP(t, true)
+	resource := newDiscoResource(t, own.URL, false)
+	headers := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}
+
+	t.Run("a route's pdp_layers asks each in order", func(t *testing.T) {
+		s := newServer(t, static.URL)
+		s.resolver = resourceChain(t, static.URL, discovery.ModeResource)
+		conf := restConf(map[string]string{"resource": resource.URL, "pdp_layers": estate.URL + ", resource"})
+		resp := s.check(context.Background(), conf, "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil {
+			t.Fatalf("should permit: %s", resp.GetDeniedResponse().GetBody())
+		}
+		if len(estate.paths) != 1 || len(own.paths) != 1 || len(static.paths) != 0 {
+			t.Fatalf("estate=%v own=%v static=%v", estate.paths, own.paths, static.paths)
+		}
+		// Both layers received the resource's document.
+		for _, b := range []map[string]any{estate.bodies[0], own.bodies[0]} {
+			if c, _ := b["context"].(map[string]any); c["resource_metadata_source"] != "rfc9728" {
+				t.Fatalf("every layer gets the same context: %v", c)
+			}
+		}
+	})
+	t.Run("PDP_LAYERS is the service default, and names itself onto the allowlist", func(t *testing.T) {
+		env := map[string]string{
+			"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "resource", "PDP_DISCOVERY_INSECURE": "true",
+			"PDP_LAYERS": "static," + estate.URL, "PDP_ALLOWLIST": "https://nowhere.example",
+		}
+		srv, _, _, err := buildServer(func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(srv.defaultLayers, []string{"static", estate.URL}) {
+			t.Fatalf("%v", srv.defaultLayers)
+		}
+		before := len(estate.paths)
+		resp := srv.check(context.Background(), restConf(nil), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || len(estate.paths) != before+1 {
+			t.Fatalf("the estate layer should be asked by default and be allowlisted: %v", resp.GetDeniedResponse())
+		}
+		if _, _, _, err := buildServer(func(k string) string {
+			m := map[string]string{"AUTHZEN_URL": static.URL, "PDP_LAYERS": "bogus"}
+			return m[k]
+		}); err == nil {
+			t.Fatal("an unknown layer name must fail startup")
+		}
+	})
+	t.Run("a per-route explicit layer must be on the allowlist", func(t *testing.T) {
+		c, err := discovery.New(discovery.Options{Mode: discovery.ModeResource, StaticPDP: static.URL, AllowInsecure: true, Logf: func(string, ...any) {},
+			PDPAllowed: func(u string) bool { return strings.HasPrefix(u, static.URL) }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := newServer(t, static.URL)
+		s.resolver = c
+		resp := s.check(context.Background(), restConf(map[string]string{"pdp_layers": estate.URL}), "GET", "/accounts/a1/balance", headers, "")
+		if deniedStatus(resp) != 503 {
+			t.Fatalf("want 503 for an off-list layer, got %d", deniedStatus(resp))
+		}
+	})
+	t.Run("off mode never fetches, even for an explicit layer", func(t *testing.T) {
+		s := newServer(t, static.URL)
+		s.resolver = discovery.Static(static.URL, "k")
+		before := atomic.LoadInt32(&estate.hits)
+		resp := s.check(context.Background(), restConf(map[string]string{"pdp_layers": "static," + estate.URL}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetDeniedResponse() != nil || atomic.LoadInt32(&estate.hits) != before+1 || estate.paths[len(estate.paths)-1] != "/access/v1/evaluation" {
+			t.Fatalf("off mode: default path, no metadata fetch: %v", estate.paths)
+		}
+	})
 }
 
 func TestResourceIDFallbacks(t *testing.T) {

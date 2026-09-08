@@ -1,7 +1,7 @@
 # The PDP discovery demo. `docker compose up --build`, then `./demo.sh`.
 #
 #   stubs           a Trust Anchor, federated and non-federated resources, two banks'
-#                   PDPs and a rogue one — see ../core/cmd/demo-stubs/main.go for the cast
+#                   PDPs, an estate-wide PDP and a rogue one — see ../core/cmd/demo-stubs
 #   pep-static      coaz-pep as shipped: told where its PDP is, no discovery    :9192
 #   pep-resource    PDP_DISCOVERY=resource — trusts each resource's own well-known :9193
 #   pep-federation  PDP_DISCOVERY=federation — trusts the federation's word        :9194
@@ -23,7 +23,7 @@ services:
       - shared:/shared
     ports:
       - "9000-9009:9000-9009"
-      - "9099:9099"
+      - "9098-9099:9098-9099"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9099/healthz"]
       interval: 2s
@@ -75,7 +75,7 @@ services:
       PDP_DISCOVERY: federation
       PDP_DISCOVERY_INSECURE: "true"
       RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009
-      PDP_ALLOWLIST: http://stubs:9002,http://stubs:9008
+      PDP_ALLOWLIST: http://stubs:9002,http://stubs:9008,http://stubs:9098
       FEDERATION_TRUST_ANCHORS_FILE: /shared/anchors.json
       # Which resources may be looked up is RESOURCE_METADATA_ALLOWLIST's call, in every
       # mode; this one governs the climb from a resource to the anchor.

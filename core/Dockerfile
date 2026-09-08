@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 go build -o /coaz-pep ./cmd/coaz-pep && \
 
 FROM alpine:3.20 AS demo-stubs
 COPY --from=build /demo-stubs /usr/local/bin/demo-stubs
-EXPOSE 9000-9009 9099
+EXPOSE 9000-9009 9098 9099
 ENTRYPOINT ["/usr/local/bin/demo-stubs"]
 
 FROM alpine:3.20 AS demo-console

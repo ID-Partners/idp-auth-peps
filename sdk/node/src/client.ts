@@ -19,7 +19,7 @@ import type {
   Verdict,
 } from './types.js';
 import { foldDecision } from './challenge.js';
-import { PdpDiscovery, type PdpDiscoveryOptions, type PdpEndpoints, type PdpResolver } from './discovery.js';
+import { PdpDiscovery, resolveLayers, resourceMetadataOf, type PdpDiscoveryOptions, type PdpEndpoints, type PdpResolver, type ResourceMetadata } from './discovery.js';
 
 /** Discovery knobs a client accepts; the static PDP, its key and fetch come from the client. */
 export type ClientDiscoveryOptions = Omit<PdpDiscoveryOptions, 'staticPdp' | 'apiKeys' | 'fetch'>;
@@ -36,6 +36,11 @@ export interface EvaluateOptions {
   accessToken?: string;
   /** The endpoint actually hit, forwarded as `context.request` so the PDP can match a resource's requirements to it. */
   request?: { method: string; path: string };
+  /**
+   * The ordered PDPs to ask, every one of which must permit: `'static'`, `'resource'`,
+   * or a PDP identifier. Overrides the client's `layers`. Default: the resource's PDP.
+   */
+  layers?: string[];
 }
 
 export interface AuthzenClientOptions {
@@ -54,6 +59,14 @@ export interface AuthzenClientOptions {
    * resolver of your own. Absent means off: today's behaviour, no HTTP.
    */
   discovery?: ClientDiscoveryOptions | PdpResolver;
+  /**
+   * The ordered PDPs every call asks, unless a call overrides it: `'static'` (this
+   * client's `url`, regardless of discovery — the slot for an estate-wide PDP that
+   * judges the token and the client), `'resource'` (what discovery finds for the
+   * call's resource), or a PDP identifier. Every layer must permit; the first that does
+   * not is the verdict. Default `['resource']`.
+   */
+  layers?: string[];
   /** Per-request timeout. Default 1500ms — a PEP sits in the request path. */
   timeoutMs?: number;
   /** Extra headers on every PDP call (tracing, tenant routing). */
@@ -111,10 +124,16 @@ export class AuthzenClient {
    */
   async evaluate(request: EvaluationRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
-      const ep = await this.resolve(options.resource);
-      request = withForwardedContext(request, ep, options);
-      const res = await this.postTo<EvaluationResponse>(ep.evaluation, request, ep.apiKey);
-      return { ...foldDecision(res), request };
+      const eps = await this.resolveAll(options);
+      request = withForwardedContext(request, resourceMetadataOf(eps), options);
+      // Every layer must permit; the first that does not is the verdict, advice and all.
+      let verdict: Verdict = { allow: true, kind: 'ok', reason: 'permit', request };
+      for (const ep of eps) {
+        const res = await this.postTo<EvaluationResponse>(ep.evaluation, request, ep.apiKey);
+        verdict = { ...foldDecision(res), request };
+        if (!verdict.allow) break;
+      }
+      return verdict;
     } catch (err) {
       return {
         allow: false,
@@ -133,16 +152,23 @@ export class AuthzenClient {
    */
   async evaluateAll(request: EvaluationsRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
-      const ep = await this.resolve(options.resource);
-      if (!ep.evaluations) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
-      request = withForwardedContext(request, ep, options);
-      const res = await this.postTo<EvaluationsResponse>(ep.evaluations, request, ep.apiKey);
-      const list = Array.isArray(res?.evaluations) ? res.evaluations : [];
-      if (list.length === 0) {
-        return { allow: false, kind: 'pdp_error', reason: 'PDP evaluations response was empty', request };
-      }
-      for (const d of list) {
-        if (!d?.decision) return { ...foldDecision(d), request };
+      const eps = await this.resolveAll(options);
+      // Checked before anything is sent: a batch is never split across a layer that
+      // can take one and a layer that cannot.
+      const batchUrls = eps.map((ep) => {
+        if (!ep.evaluations) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
+        return ep.evaluations;
+      });
+      request = withForwardedContext(request, resourceMetadataOf(eps), options);
+      for (const [i, ep] of eps.entries()) {
+        const res = await this.postTo<EvaluationsResponse>(batchUrls[i]!, request, ep.apiKey);
+        const list = Array.isArray(res?.evaluations) ? res.evaluations : [];
+        if (list.length === 0) {
+          return { allow: false, kind: 'pdp_error', reason: 'PDP evaluations response was empty', request };
+        }
+        for (const d of list) {
+          if (!d?.decision) return { ...foldDecision(d), request };
+        }
       }
       return { allow: true, kind: 'ok', reason: 'permit', request };
     } catch (err) {
@@ -165,9 +191,9 @@ export class AuthzenClient {
     return this.post<ResourceSearchResponse>('/access/v1/search/resource', request);
   }
 
-  private async resolve(resource?: string) {
+  private async resolveAll(options: EvaluateOptions): Promise<PdpEndpoints[]> {
     try {
-      return await this.resolver.resolve(resource);
+      return await resolveLayers(this.resolver, options.resource, options.layers ?? this.opts.layers);
     } catch (err) {
       throw new PdpError(`PDP discovery: ${describe(err)}`);
     }
@@ -245,13 +271,13 @@ export class AuthzenClient {
  */
 function withForwardedContext<T extends { context?: Record<string, unknown> }>(
   request: T,
-  ep: PdpEndpoints,
+  meta: ResourceMetadata | undefined,
   options: EvaluateOptions,
 ): T {
   const extra: Record<string, unknown> = {};
-  if (ep.resource) {
-    extra['resource_metadata'] = ep.resource.document;
-    extra['resource_metadata_source'] = ep.resource.source;
+  if (meta) {
+    extra['resource_metadata'] = meta.document;
+    extra['resource_metadata_source'] = meta.source;
   }
   if (options.request) extra['request'] = options.request;
   if (options.accessToken) extra['access_token'] = options.accessToken;

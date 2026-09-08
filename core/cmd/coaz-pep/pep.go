@@ -75,6 +75,9 @@ type pepConfig struct {
 	// by default: a bearer token should only travel over a PDP connection that is TLS
 	// and authenticated, and that is the operator's call.
 	forwardAccessToken bool
+	// layers is the ordered list of PDPs to ask (see discovery.ResolveLayers). Empty
+	// means the service default, which is the resource's PDP alone.
+	layers []string
 }
 
 // resourceID is the identifier handed to PDP discovery for this route.
@@ -111,6 +114,7 @@ func configFrom(ext map[string]string) pepConfig {
 		legacySubjectIdentity: !strings.EqualFold(ext["legacy_subject_identity"], "false"),
 		resource:              strings.TrimRight(ext["resource"], "/"),
 		forwardAccessToken:    isTrue("forward_access_token"),
+		layers:                discovery.ParseLayers(ext["pdp_layers"]),
 	}
 }
 
@@ -121,6 +125,9 @@ type server struct {
 	coaz          *coaz.Engine
 	// resolver finds the PDP for a route's resource. Nil means the static PDP.
 	resolver discovery.Resolver
+	// defaultLayers is the service-wide layer list (PDP_LAYERS), used by routes that
+	// name none.
+	defaultLayers []string
 	// upstreamAllowlist bounds which MCP servers a caller may point the PEP at.
 	// Empty means unrestricted — main() warns when that is so.
 	upstreamAllowlist []string
@@ -349,7 +356,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 				extraContext["consented_creditor"] = cred
 			}
 		}
-		callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path}
+		callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path, Layers: s.layersFor(conf)}
 		if conf.forwardAccessToken {
 			callOpts.AccessToken = token
 		}
@@ -440,15 +447,15 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	//     resource requires is a policy decision, and policy is offloaded to the PDP,
 	//     where it can weigh them alongside risk, consent and history — things a gateway
 	//     never sees. Resolved once, so one decision cannot straddle a PDP that moved.
-	ep, err := s.resolveFor(ctx, conf.resourceID())
+	eps, err := discovery.ResolveLayers(ctx, s.resolverOrStatic(), conf.resourceID(), s.layersFor(conf))
 	if err != nil {
-		log.Printf("[%s] PDP call failed: %v", pep, err)
+		log.Printf("[%s] PDP call failed: PDP discovery: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
 			"Authorization service unreachable; denying (fail-closed).", nil)
 	}
-	if ep.Resource != nil {
-		m.ctx["resource_metadata"] = ep.Resource.Document
-		m.ctx["resource_metadata_source"] = ep.Resource.Source
+	if meta := discovery.ResourceMetadataOf(eps); meta != nil {
+		m.ctx["resource_metadata"] = meta.Document
+		m.ctx["resource_metadata_source"] = meta.Source
 	}
 	m.ctx["request"] = map[string]any{"method": method, "path": path}
 	if conf.forwardAccessToken && token != "" {
@@ -462,7 +469,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"context":  m.ctx,
 	}
 
-	out, err := s.evaluateAt(ctx, ep, authzenReq)
+	out, err := s.evaluateLayers(ctx, eps, authzenReq)
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
@@ -688,18 +695,47 @@ type pepOutcome struct {
 	IdentityDoctype string
 }
 
-// resolveFor finds the PDP for a route's resource. A server built without a resolver
-// (tests, mostly) behaves as the static one.
-func (s *server) resolveFor(ctx context.Context, resource string) (discovery.PDPEndpoints, error) {
-	resolver := s.resolver
-	if resolver == nil {
-		resolver = discovery.Static(s.authzenURL, s.authzenAPIKey)
+// resolverOrStatic: a server built without a resolver (tests, mostly) behaves as the
+// static one.
+func (s *server) resolverOrStatic() discovery.Resolver {
+	if s.resolver != nil {
+		return s.resolver
 	}
-	ep, err := resolver.Resolve(ctx, resource)
+	return discovery.Static(s.authzenURL, s.authzenAPIKey)
+}
+
+// layersFor is the route's layer list, else the service default.
+func (s *server) layersFor(conf pepConfig) []string {
+	if len(conf.layers) > 0 {
+		return conf.layers
+	}
+	return s.defaultLayers
+}
+
+// resolveFor finds the PDP for a route's resource.
+func (s *server) resolveFor(ctx context.Context, resource string) (discovery.PDPEndpoints, error) {
+	ep, err := s.resolverOrStatic().Resolve(ctx, resource)
 	if err != nil {
 		return ep, fmt.Errorf("PDP discovery: %w", err)
 	}
 	return ep, nil
+}
+
+// evaluateLayers asks each PDP in order; every layer must permit, the first that does
+// not is the answer, and a PDP error anywhere fails closed. See the engine's twin.
+func (s *server) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, authzenReq map[string]any) (pepOutcome, error) {
+	var out pepOutcome
+	for _, ep := range eps {
+		o, err := s.evaluateAt(ctx, ep, authzenReq)
+		if err != nil {
+			return out, fmt.Errorf("%s: %w", ep.Identifier, err)
+		}
+		if !o.Decision {
+			return o, nil
+		}
+		out = o
+	}
+	return out, nil
 }
 
 // evaluate resolves the PDP for resource and asks it. Kept for callers that have only

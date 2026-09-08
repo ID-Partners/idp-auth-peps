@@ -230,6 +230,11 @@ itself takes `accessToken` and `request` in `EvaluateOptions`. The SDK enforces 
 what a resource requires is the PDP's to match. See
 [docs/architecture.md](../../docs/architecture.md#what-the-pep-forwards-and-what-it-does-not-decide).
 
+`layers` on the client (or per call) is the ordered list of PDPs to ask — `'static'`,
+`'resource'`, or a PDP identifier — every one of which must permit; the first deny is the
+verdict. A generic estate PDP that judges the token and the client goes first; the
+resource's own PDP after. Default `['resource']`.
+
 There is no federation mode in the SDK; `sources` is the seam for one, and `discovery`
 also accepts a resolver of your own (`{ resolve(resource) }`). In `delegate` mode the
 Go engine runs its own discovery, federation included, and an explicit `resource` is

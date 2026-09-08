@@ -130,7 +130,85 @@ func DefaultEndpoints(pdp string) PDPEndpoints {
 
 // Resolver is what the engine and the service depend on.
 type Resolver interface {
+	// Resolve finds the PDP that decides for resource ("" means the static one).
 	Resolve(ctx context.Context, resource string) (PDPEndpoints, error)
+	// ResolvePDP reads the metadata of an explicitly named PDP — an operator-configured
+	// layer rather than a discovered one.
+	ResolvePDP(ctx context.Context, pdp string) (PDPEndpoints, error)
+}
+
+// Layer names. A route's policy is an ordered list of these; anything else in the list
+// is taken as a PDP identifier.
+const (
+	// LayerResource is the PDP discovery finds for the route's resource — federation,
+	// then RFC 9728, then static. The default, and today's single behaviour.
+	LayerResource = "resource"
+	// LayerStatic is the operator's configured PDP, asked regardless of what discovery
+	// finds: the slot for an estate-wide PDP that judges the token and the client.
+	LayerStatic = "static"
+)
+
+// ResolveLayers resolves each named layer in order and returns the PDPs to ask, in that
+// order, with duplicates collapsed to one call. An empty list means [resource].
+//
+// Layering is what lets a generic PDP service every endpoint — one that looks at the
+// token, the client and risk signals — and a resource-specific PDP apply the resource's
+// own metadata after it. Every layer must permit; the first that does not is the answer.
+// The PEP does the ordering and the folding, nothing else.
+func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []string) ([]PDPEndpoints, error) {
+	if len(layers) == 0 {
+		layers = []string{LayerResource}
+	}
+	out := make([]PDPEndpoints, 0, len(layers))
+	seen := map[string]int{}
+	for _, layer := range layers {
+		var ep PDPEndpoints
+		var err error
+		switch layer {
+		case LayerResource:
+			ep, err = r.Resolve(ctx, resource)
+		case LayerStatic:
+			ep, err = r.Resolve(ctx, "")
+		default:
+			ep, err = r.ResolvePDP(ctx, layer)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("layer %q: %w", layer, err)
+		}
+		if i, dup := seen[ep.Identifier]; dup {
+			// The same PDP twice is one call. Keep the resource metadata if this
+			// occurrence carried it and the earlier one did not.
+			if out[i].Resource == nil && ep.Resource != nil {
+				out[i].Resource = ep.Resource
+			}
+			continue
+		}
+		seen[ep.Identifier] = len(out)
+		out = append(out, ep)
+	}
+	return out, nil
+}
+
+// ResourceMetadataOf is the one document to forward for a layered call: whichever layer
+// read the resource's metadata. Nil when none did.
+func ResourceMetadataOf(eps []PDPEndpoints) *ResourceMetadata {
+	for _, ep := range eps {
+		if ep.Resource != nil {
+			return ep.Resource
+		}
+	}
+	return nil
+}
+
+// ParseLayers splits a comma- or space-separated layer list.
+func ParseLayers(raw string) []string {
+	var out []string
+	for _, f := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' }) {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, strings.TrimRight(f, "/"))
+		}
+	}
+	return out
 }
 
 // MetadataSource yields a resource's metadata: the PDPs that decide for it, and the
@@ -365,6 +443,28 @@ func (c *Chain) fetchConfig(ctx context.Context, pdp string) (PDPEndpoints, time
 		}
 	}
 	return PDPEndpoints{Identifier: strings.TrimRight(pdp, "/"), Evaluation: doc.Evaluation, Evaluations: doc.Evaluations, Capabilities: doc.Capabilities}, time.Time{}, nil
+}
+
+// ResolvePDP reads the metadata of an explicitly named PDP. Off mode reads nothing, as
+// everywhere else. The PDP allowlist applies: a layer URL that arrived in per-route
+// config is caller-supplied over the check API, exactly like mcp_upstream_url, and gets
+// the same treatment; ones from the service's own configuration are allowlisted by it.
+func (c *Chain) ResolvePDP(ctx context.Context, pdp string) (PDPEndpoints, error) {
+	pdp = strings.TrimRight(pdp, "/")
+	if c.opts.Mode == ModeOff {
+		ep := DefaultEndpoints(pdp)
+		ep.APIKey, ep.Source = c.opts.APIKeys[pdp], "layer"
+		return ep, nil
+	}
+	ep, err := c.pdps.Get(ctx, pdp, c.fetchConfig)
+	if err != nil {
+		if errors.Is(err, ErrNotAllowed) {
+			return PDPEndpoints{}, err
+		}
+		return PDPEndpoints{}, fmt.Errorf("%w: %s: %v", ErrNoPDP, pdp, err)
+	}
+	ep.APIKey, ep.Source = c.opts.APIKeys[ep.Identifier], "layer"
+	return ep, nil
 }
 
 // Warm resolves the static PDP so a bad configuration is loud at boot rather than on

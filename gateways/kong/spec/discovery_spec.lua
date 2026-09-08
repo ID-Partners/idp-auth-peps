@@ -389,6 +389,80 @@ describe('discovery: resource mode', function()
   end)
 end)
 
+describe('discovery: layers', function()
+  local ESTATE = 'https://estate.example'
+  local function routes(over)
+    local r = {
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [ESTATE .. '/.well-known/authzen-configuration'] = pdp_config(ESTATE),
+    }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+
+  it('resolves every layer in order, duplicates collapsed, with the resource document', function()
+    local D = load({ pdp = router(routes()) })
+    local eps, err, meta = D.resolve_layers(conf(), RES, { ESTATE, 'static', 'resource' })
+    assert.is_nil(err)
+    assert.equal(3, #eps)
+    assert.equal(ESTATE, eps[1].identifier); assert.equal('layer', eps[1].source); assert.is_nil(eps[1].api_key)
+    assert.equal(STATIC, eps[2].identifier); assert.equal('static-key', eps[2].api_key)
+    assert.equal(GOOD, eps[3].identifier)
+    assert.equal('rfc9728', meta.source)
+    local one = D.resolve_layers(conf(), RES, nil)
+    assert.equal(1, #one); assert.equal(GOOD, one[1].identifier)
+    local dup = D.resolve_layers(conf(), RES, { GOOD, 'resource' })
+    assert.equal(1, #dup)
+  end)
+
+  it('an explicit layer obeys the allowlist, names itself on failure, and reads nothing in off mode', function()
+    local D = load({ pdp = router(routes()) })
+    local eps, err = D.resolve_layers(conf({ pdp_allowlist = { 'https://pdp.example' } }), RES, { ESTATE })
+    assert.is_nil(eps); assert.equal('not_allowed', err.kind); assert.matches('layer', err.msg)
+    local D2 = load({ pdp = router({}) })
+    local ep = D2.resolve_pdp(conf({ pdp_discovery = 'off' }), ESTATE .. '/')
+    assert.equal(ESTATE .. '/access/v1/evaluation', ep.evaluation); assert.equal('layer', ep.source)
+    local sk = D2.resolve_pdp(conf({ pdp_discovery = 'off' }), STATIC)
+    assert.equal('static-key', sk.api_key)
+  end)
+
+  it('through access(): every layer is asked in order and the first deny is the answer', function()
+    local calls = {}
+    local fn = router({
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [ESTATE .. '/.well-known/authzen-configuration'] = pdp_config(ESTATE),
+      [ESTATE .. '/custom/eval'] = function(url, req)
+        calls[#calls + 1] = 'estate'
+        local body = mock.json_decode(req.body)
+        if body.subject.properties.client_id == 'risky' then
+          return { status = 200, body = json({ decision = false, context = { reason = 'client on the watch list' } }) }
+        end
+        return { status = 200, body = json({ decision = true }) }
+      end,
+      [GOOD .. '/custom/eval'] = function() calls[#calls + 1] = 'resource'; return { status = 200, body = json({ decision = true }) } end,
+    })
+    local drive = function(claims)
+      local plugin, state = load_plugin({
+        method = 'GET', path = '/accounts/a1/balance',
+        headers = { authorization = 'Bearer ' .. mock.jwt(claims) }, pdp = fn,
+      })
+      mock.run_access(plugin, { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest', require_token = true,
+        pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES, pdp_layers = { ESTATE, 'resource' } })
+      return state
+    end
+    local state = drive({ sub = 'alice', client_id = 'good-client' })
+    assert.is_nil(state.exited)
+    assert.same({ 'estate', 'resource' }, calls)
+    calls = {}
+    local denied = drive({ sub = 'alice', client_id = 'risky' })
+    assert.equal(403, denied.exited.status)
+    assert.matches('watch list', denied.exited.body.reason)
+    assert.same({ 'estate' }, calls)
+  end)
+end)
+
 describe('discovery: through access()', function()
   local function drive(over, pdp_fn, body, method, path)
     local plugin, state = load_plugin({

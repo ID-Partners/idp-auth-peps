@@ -80,6 +80,12 @@ return {
           -- Off by default: the PDP call must be TLS + authenticated before a bearer
           -- token travels over it, and that is the operator's call to make.
           { forward_access_token = { type = "boolean", default = false } },
+          -- The ordered PDPs to ask, every one of which must permit: "static" (the
+          -- configured authzen_url, regardless of discovery — the slot for an
+          -- estate-wide PDP that judges the token and the client), "resource" (what
+          -- discovery finds for this route's resource), or a PDP identifier. The first
+          -- that does not permit is the answer. Default: the resource's PDP alone.
+          { pdp_layers = { type = "array", elements = { type = "string" }, default = { "resource" } } },
         },
         -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
         -- is no JOSE verifier available to it, so on its own it can compare the proof's

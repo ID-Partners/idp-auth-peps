@@ -8,6 +8,8 @@ import {
   Rfc9728Source,
   allowedByPrefix,
   defaultEndpoints,
+  resolveLayers,
+  resourceMetadataOf,
   wellKnownUrl,
   type MetadataSource,
   type PdpEndpoints,
@@ -509,6 +511,63 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(sent.config.forward_access_token).toBe('true');
   });
 
+  it('asks every layer in order and stops at the first deny', async () => {
+    const order: string[] = [];
+    const ESTATE = 'https://estate.example';
+    const r = router({
+      ...routes(),
+      [`${ESTATE}/.well-known/authzen-configuration`]: pdpConfig(ESTATE, `${ESTATE}/e`, `${ESTATE}/evals`),
+      [`${ESTATE}/e`]: (_u: string, init?: RequestInit) => {
+        order.push('estate');
+        const body = JSON.parse(String(init?.body)) as { subject: { id: string } };
+        return new Response(body.subject.id === 'risky' ? '{"decision":false,"context":{"reason":"client on the watch list"}}' : '{"decision":true}', { status: 200 });
+      },
+      [`${ESTATE}/evals`]: { evaluations: [{ decision: true }] },
+      [`${GOOD}/custom/eval`]: () => { order.push('resource'); return new Response('{"decision":true}', { status: 200 }); },
+    });
+    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch, discovery: { mode: 'resource', ...quiet }, layers: [ESTATE, 'resource'] });
+    expect((await client.evaluate(req, { resource: RES })).allow).toBe(true);
+    expect(order).toEqual(['estate', 'resource']);
+    order.length = 0;
+    const v = await client.evaluate({ ...req, subject: { type: 'user', id: 'risky' } }, { resource: RES });
+    expect(v).toMatchObject({ allow: false, reason: 'client on the watch list' });
+    expect(order).toEqual(['estate']);
+    // A per-call override; a duplicate collapses to one call.
+    order.length = 0;
+    expect((await client.evaluate(req, { resource: RES, layers: ['resource', GOOD] })).allow).toBe(true);
+    expect(order).toEqual(['resource']);
+    // Batch: every layer must advertise a batch endpoint, checked before anything is sent.
+    expect((await client.evaluateAll({ evaluations: [req] }, { resource: RES })).allow).toBe(true);
+    const rogueRes = router({ ...routes(), [`${GOOD}/.well-known/authzen-configuration`]: { policy_decision_point: GOOD, access_evaluation_endpoint: `${GOOD}/e` } });
+    const c2 = new AuthzenClient({ url: STATIC, fetch: rogueRes.fetch, discovery: { mode: 'resource', ...quiet }, layers: [STATIC, 'resource'] });
+    const b = await c2.evaluateAll({ evaluations: [req] }, { resource: RES });
+    expect(b).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('access_evaluations_endpoint') });
+    expect(rogueRes.hits.filter((h) => h.method === 'POST')).toHaveLength(0);
+    // A layer that cannot be resolved is a pdp_error.
+    const v3 = await client.evaluate(req, { resource: RES, layers: ['http://127.0.0.1:1'] });
+    expect(v3).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('layer') });
+  });
+
+  it('resolves layers and explicit PDPs at the discovery level', async () => {
+    const ESTATE = 'https://estate.example';
+    const { d } = disco({ ...routes(), [`${ESTATE}/.well-known/authzen-configuration`]: pdpConfig(ESTATE) }, { apiKeys: { [STATIC]: 'static-key', [ESTATE]: 'ek' } });
+    const eps = await resolveLayers(d, RES, [ESTATE, 'static', 'resource']);
+    expect(eps.map((e) => e.identifier)).toEqual([ESTATE, STATIC, GOOD]);
+    expect(eps[0]).toMatchObject({ source: 'layer', apiKey: 'ek', evaluation: `${ESTATE}/custom/eval` });
+    expect(eps[1]?.apiKey).toBe('static-key');
+    expect(resourceMetadataOf(eps)?.source).toBe('rfc9728');
+    expect(resourceMetadataOf([])).toBeUndefined();
+    expect((await resolveLayers(d, RES, undefined)).map((e) => e.identifier)).toEqual([GOOD]);
+    const dup = await resolveLayers(d, RES, [GOOD, 'resource']);
+    expect(dup).toHaveLength(1);
+    expect(dup[0]?.resource).toBeDefined();
+    // Explicit layers obey the PDP allowlist; off mode reads nothing.
+    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router({}).fetch, pdpAllowlist: ['https://pdp.example'], ...quiet });
+    await expect(strict.resolvePdp(ESTATE)).rejects.toThrow(DiscoveryError);
+    const off = new PdpDiscovery({ staticPdp: STATIC, ...quiet });
+    expect(await off.resolvePdp(`${ESTATE}/`)).toMatchObject({ evaluation: `${ESTATE}/access/v1/evaluation`, source: 'layer' });
+  });
+
   it('without discovery the client is byte-for-byte static', async () => {
     const { fetch, hits } = router(routes());
     const client = new AuthzenClient({ url: `${STATIC}/`, apiKey: 'k', fetch });
@@ -535,7 +594,8 @@ describe('discovery: through the client, middleware and guard', () => {
 
   it('accepts a resolver of its own', async () => {
     const { fetch, hits } = router({ 'https://mine.example/eval': { decision: true } });
-    const resolver = { resolve: async (): Promise<PdpEndpoints> => ({ identifier: 'https://mine.example', evaluation: 'https://mine.example/eval', apiKey: 'mine', source: 'custom' }) };
+    const mine: PdpEndpoints = { identifier: 'https://mine.example', evaluation: 'https://mine.example/eval', apiKey: 'mine', source: 'custom' };
+    const resolver = { resolve: async () => mine, resolvePdp: async () => mine };
     const client = new AuthzenClient({ url: STATIC, fetch, discovery: resolver });
     expect(client.resolver).toBe(resolver);
     expect((await client.evaluate(req)).allow).toBe(true);

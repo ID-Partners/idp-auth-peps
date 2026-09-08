@@ -15,11 +15,15 @@ export type { AuthzenClientOptions, ClientDiscoveryOptions, EvaluateOptions, Pdp
 
 export {
   DiscoveryError,
+  LAYER_RESOURCE,
+  LAYER_STATIC,
   PARAM_POLICY_DECISION_POINTS,
   PdpDiscovery,
   Rfc9728Source,
   allowedByPrefix,
   defaultEndpoints,
+  resolveLayers,
+  resourceMetadataOf,
   wellKnownUrl,
 } from './discovery.js';
 export type {
@@ -29,6 +33,7 @@ export type {
   PdpDiscoveryOptions,
   PdpEndpoints,
   PdpResolver,
+  ResourceMetadata,
 } from './discovery.js';
 
 export { foldDecision, toChallenge, toHttpChallenge } from './challenge.js';

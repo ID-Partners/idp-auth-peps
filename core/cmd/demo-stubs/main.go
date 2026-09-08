@@ -21,12 +21,18 @@
 //	:9007  stray       no metadata of any kind
 //	:9008  pdp-b       Bank B's PDP, at /tenants/bank-b. Same denials, steps up over 100
 //	:9009  bank-b      not federated; RFC 9728 metadata names Bank B's PDP
+//	:9098  pdp-estate  a generic PDP for the whole estate: judges the token and the
+//	                   client, knows nothing about any resource. The first layer.
 //	:9099  control     the event feed the console traces, and the levers it pulls
 //	                   (clear of the entity block, and of the ports desktop apps squat on)
 //
 // Every resource also answers MCP `tools/list` at /mcp, declaring one tool whose
 // mapping is a boxcar — two evaluations in one call. That is what exercises a PDP's
 // advertised batch endpoint, and what fails closed against a PDP with none.
+//
+// Nothing here turns on WHO the subject is. The demo is about which PDP decides, what
+// it was given, and what the token carries; a named customer would only be noise. One
+// subject, "customer", everywhere.
 //
 // Every resource also publishes what it REQUIRES — the scopes it uses and the acr it
 // expects — as ordinary members of its metadata. No PEP here reads them. They travel
@@ -229,6 +235,7 @@ func main() {
 	stray := newEntity("stray", base+7, host)
 	pdpB := newEntity("pdp-b", base+8, host).atBase("/tenants/bank-b")
 	bankB := newEntity("bank-b", base+9, host)
+	estate := newEntity("pdp-estate", base+98, host)
 	// The key the anchor vouches for `broken` is not the one it signs with.
 	brokenAsserted := newEntity("broken-asserted", base+6, host)
 
@@ -238,19 +245,22 @@ func main() {
 	)
 	allScopes := []string{"accounts:read", "payments:write"}
 	st := &state{
-		home:    map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
-		pdpEval: map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base},
+		home:    map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
+		pdpEval: map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
 		// The member's OWN document names Bank A's PDP and says a password is enough.
 		// Its entity configuration (below) names the rogue PDP first. The anchor's
 		// policy strips the rogue AND raises the acr floor to MFA — so the same PDP
 		// gives different answers depending on which document the PEP forwarded.
 		resourcePDPs: map[string][]string{plain.name: {pdpA.id}, impostor.name: {rogue.id}, bankB.name: {pdpB.id}, member.name: {pdpA.id}, broken.name: {rogue.id}},
+		// acr_values_required lists every acr the resource ACCEPTS — "one of these" —
+		// so a resource content with a password lists MFA as well, and only the strict
+		// ones list MFA alone. The demo PDPs check membership, nothing cleverer.
 		requires: map[string]requirements{
-			plain.name:    {Scopes: allScopes, ACR: []string{acrPassword}},
+			plain.name:    {Scopes: allScopes, ACR: []string{acrPassword, acrMFA}},
 			bankB.name:    {Scopes: allScopes, ACR: []string{acrMFA}},
-			impostor.name: {Scopes: allScopes, ACR: []string{acrPassword}},
-			member.name:   {Scopes: allScopes, ACR: []string{acrPassword}},
-			broken.name:   {Scopes: allScopes, ACR: []string{acrPassword}},
+			impostor.name: {Scopes: allScopes, ACR: []string{acrPassword, acrMFA}},
+			member.name:   {Scopes: allScopes, ACR: []string{acrPassword, acrMFA}},
+			broken.name:   {Scopes: allScopes, ACR: []string{acrPassword, acrMFA}},
 		},
 	}
 	st.defEval = map[string]string{}
@@ -379,9 +389,6 @@ func main() {
 			if who == "" || who == "<nil>" {
 				who = req.Subject.ID
 			}
-			if strings.HasPrefix(strings.ToLower(who), "mallory") {
-				return deny(fmt.Sprintf("%s is not a customer of this bank", who))
-			}
 
 			// What the resource said it requires, as forwarded. Absent means the PEP
 			// resolved the PDP without reading a document (static mode), and this
@@ -425,6 +432,25 @@ func main() {
 	}
 	pdp(pdpA, rec, st, true, serve, customerPolicy(1000))
 	pdp(pdpB, rec, st, true, serve, customerPolicy(100))
+	// The estate PDP is the generic layer: it judges the token and the client and knows
+	// nothing about any resource. Put first in a route's pdp_layers, it gates every
+	// request before the resource's own PDP is consulted — which is the point of
+	// layering: one PDP for the things every endpoint shares, then the specific one.
+	pdp(estate, rec, st, true, serve, func(req authzenRequest) map[string]any {
+		tok := examineToken(req.Context["access_token"])
+		client := tok.clientID
+		if client == "" {
+			client, _ = req.Subject.Properties["client_id"].(string) // what the PEP decoded
+		}
+		if client == "agent-risky" {
+			return deny(fmt.Sprintf("estate: client %s is on the watch list; nothing further is asked", client))
+		}
+		how := "as decoded by the PEP"
+		if tok.raw != "" {
+			how = "from the token itself"
+		}
+		return map[string]any{"decision": true, "context": map[string]any{"reason": fmt.Sprintf("estate: client %s is in good standing (%s)", client, how)}}
+	})
 	// The rogue PDP advertises NO batch endpoint, so a PEP asked to boxcar against it
 	// has nothing to send to and must refuse rather than guess a path.
 	pdp(rogue, rec, st, false, serve, func(req authzenRequest) map[string]any {

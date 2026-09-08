@@ -130,7 +130,7 @@ func main() {
 		_, _ = w.Write(consoleHTML)
 	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, map[string]any{"peps": s.peps, "resources": s.resources, "actions": s.actions})
+		writeJSON(w, map[string]any{"peps": s.peps, "resources": s.resources, "actions": s.actions, "estate_pdp": base + ":9098"})
 	})
 	mux.HandleFunc("/api/run", s.handleRun)
 	mux.HandleFunc("/api/control", s.handleControl)
@@ -145,8 +145,11 @@ func main() {
 // against every PEP.
 type runRequest struct {
 	Resource string `json:"resource"`
-	Human    string `json:"human"`
 	Action   string `json:"action"`
+	// Client is who the token was issued to — the agent. The estate PDP judges it.
+	Client string `json:"client"`
+	// Layers is the route's pdp_layers, comma-separated. Empty: the resource's PDP alone.
+	Layers string `json:"layers"`
 	// ACR is how the human authenticated, as the token will claim it.
 	ACR string `json:"acr"`
 	// Scope is what the token carries.
@@ -193,25 +196,20 @@ func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unknown action"}`, http.StatusBadRequest)
 		return
 	}
-	human := req.Human
-	if human == "" {
-		human = "alice"
-	}
-
 	out := make([]runResult, 0, len(s.peps))
 	for _, p := range s.peps {
 		// Each PEP's run gets its own window on the stubs' event feed, so the trace
 		// shown under a column is only what that column caused.
 		before := s.seq(r.Context())
-		result := s.check(r.Context(), p, res, act, human, req)
+		result := s.check(r.Context(), p, res, act, req)
 		result.Events = s.eventsSince(r.Context(), before)
 		out = append(out, result)
 	}
-	writeJSON(w, map[string]any{"results": out, "resource": res, "action": act, "human": human})
+	writeJSON(w, map[string]any{"results": out, "resource": res, "action": act})
 }
 
 // The return value is named so the deferred timing lands in the value the caller gets.
-func (s *server) check(ctx context.Context, p pep, res resource, act action, human string, in runRequest) (out runResult) {
+func (s *server) check(ctx context.Context, p pep, res resource, act action, in runRequest) (out runResult) {
 	out = runResult{PEP: p.Name, Mode: p.Mode}
 	started := time.Now()
 	defer func() { out.MS = float64(time.Since(started).Microseconds()) / 1000 }()
@@ -233,6 +231,9 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, hum
 		// a PDP over a connection the operator has decided is fit for it.
 		cfg["forward_access_token"] = "true"
 	}
+	if in.Layers != "" {
+		cfg["pdp_layers"] = in.Layers
+	}
 	body := ""
 	switch {
 	case style == "mcp":
@@ -249,7 +250,7 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, hum
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"config": cfg, "method": act.Method, "path": act.Path,
-		"headers": map[string]string{"authorization": "Bearer " + mintToken(human, in.ACR, in.Scope), "content-type": "application/json"},
+		"headers": map[string]string{"authorization": "Bearer " + mintToken(in.Client, in.ACR, in.Scope), "content-type": "application/json"},
 		"body":    body,
 	})
 
@@ -371,13 +372,17 @@ func (s *server) fetchEvents(ctx context.Context, since int64) (int64, []event) 
 	return doc.Seq, doc.Events
 }
 
-// mintToken builds the unsigned delegation token the demo uses: an agent acting for a
-// human. The PEPs decode without verifying (no JWKS is configured) and warn about it at
-// startup — this demo is about discovery, not token validation.
-func mintToken(human, acr, scope string) string {
+// mintToken builds the unsigned delegation token the demo uses: an agent (the client)
+// acting for one fixed customer. Who the customer is never matters here — the demo is
+// about which PDP decides and what it was given — so it is always "customer". The PEPs
+// decode without verifying (no JWKS is configured) and warn about it at startup.
+func mintToken(client, acr, scope string) string {
 	seg := func(v any) string {
 		raw, _ := json.Marshal(v)
 		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	if client == "" {
+		client = "agent-1"
 	}
 	if acr == "" {
 		acr = "urn:idp:loa:password"
@@ -387,7 +392,7 @@ func mintToken(human, acr, scope string) string {
 	}
 	header := seg(map[string]any{"alg": "none", "typ": "JWT"})
 	claims := seg(map[string]any{
-		"sub": human, "client_id": "agent-1", "act": map[string]any{"sub": "agent-1"},
+		"sub": "customer", "client_id": client, "act": map[string]any{"sub": client},
 		"scope": scope, "acr": acr,
 	})
 	return header + "." + claims + "."

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,11 +21,22 @@ type fakeResolver struct {
 	ep        discovery.PDPEndpoints
 	err       error
 	resources []string
+	layerEP   func(pdp string) discovery.PDPEndpoints
 }
 
 func (f *fakeResolver) Resolve(_ context.Context, resource string) (discovery.PDPEndpoints, error) {
 	f.resources = append(f.resources, resource)
 	return f.ep, f.err
+}
+
+// ResolvePDP answers an explicit layer with a PDP at that identifier; tests that need a
+// different endpoint per layer set `layerEP`.
+func (f *fakeResolver) ResolvePDP(_ context.Context, pdp string) (discovery.PDPEndpoints, error) {
+	f.resources = append(f.resources, "pdp:"+pdp)
+	if f.layerEP != nil {
+		return f.layerEP(pdp), f.err
+	}
+	return discovery.PDPEndpoints{Identifier: pdp, Evaluation: pdp + "/access/v1/evaluation", Source: "layer"}, f.err
 }
 
 // singleTool is one COAZ v1 tool: a single evaluation, so it takes the evaluation
@@ -194,6 +206,65 @@ func TestEngineForwardsWhatTheResolverFound(t *testing.T) {
 	_ = json.Unmarshal(bodies[0], &viaDefault)
 	if viaDefault.Context["access_token"] != "t2" || viaDefault.Context["resource_metadata_source"] != "federation" {
 		t.Fatalf("default-mapping path did not forward: %v", viaDefault.Context)
+	}
+}
+
+func TestEngineAsksEveryLayerAndStopsAtTheFirstDeny(t *testing.T) {
+	// Two PDPs: an estate one that denies a flagged client, and the resource's own.
+	var order []string
+	estate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, "estate")
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(raw), `"agent":"risky"`) {
+			_, _ = w.Write([]byte(`{"decision":false,"context":{"reason":"client on the watch list"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"decision":true}`))
+	}))
+	t.Cleanup(estate.Close)
+	own := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		order = append(order, "resource")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision":true}`))
+	}))
+	t.Cleanup(own.Close)
+	mcp := mcpServing(t, singleTool)
+	fr := &fakeResolver{
+		ep: discovery.PDPEndpoints{Identifier: own.URL, Evaluation: own.URL + "/e", Resource: &discovery.ResourceMetadata{Source: "rfc9728", Document: map[string]any{"x": 1}}},
+		layerEP: func(pdp string) discovery.PDPEndpoints {
+			return discovery.PDPEndpoints{Identifier: pdp, Evaluation: pdp + "/e", Source: "layer"}
+		},
+	}
+	e := NewEngine(Options{Resolver: fr})
+	layers := []string{estate.URL, "resource"}
+
+	v := e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: layers})
+	if !v.Decision || !reflect.DeepEqual(order, []string{"estate", "resource"}) {
+		t.Fatalf("both layers, in order, should be asked and permit: %+v %v", v, order)
+	}
+	order = nil
+	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "risky"}, nil, CallOptions{Layers: layers})
+	if v.Decision || !strings.Contains(v.Reason, "watch list") || !reflect.DeepEqual(order, []string{"estate"}) {
+		t.Fatalf("the estate layer's deny must be the answer and stop the chain: %+v %v", v, order)
+	}
+	// A duplicate layer is one call, and the resource's document still travels.
+	order = nil
+	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: []string{"resource", own.URL}})
+	if !v.Decision || !reflect.DeepEqual(order, []string{"resource"}) {
+		t.Fatalf("duplicates collapse: %v", order)
+	}
+	// A failing layer fails closed.
+	fr.err = errors.New("layer down")
+	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: layers})
+	if v.Decision || !hasCode(v, CodePDPError) {
+		t.Fatalf("resolution failure must fail closed: %+v", v)
+	}
+	fr.err = nil
+	own.Close()
+	v = e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{Layers: layers})
+	if v.Decision || !hasCode(v, CodePDPError) {
+		t.Fatalf("a PDP error in any layer must fail closed: %+v", v)
 	}
 }
 

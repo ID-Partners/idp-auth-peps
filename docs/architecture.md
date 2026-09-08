@@ -174,6 +174,8 @@ call carries, in `context`:
 | `request` | `{method, path}`, the endpoint actually hit | The request |
 | `access_token` | The raw token, when the route sets `forward_access_token` | The request |
 
+Every layer of a route's policy receives the same context; see [Layers](#layers-a-generic-pdp-first-the-resources-after).
+
 The PEP does not compare the token's scope to `scopes_supported`. It does not compare
 the token's `acr` to a requirement. It does not know the names of those members; it
 forwards the document it read and the endpoint it mapped, and the PDP does the matching.
@@ -204,6 +206,36 @@ has set it for every PDP that reads the resolved metadata, and a member cannot l
 by editing its own well-known. The demo's `member` publishes "password is enough" about
 itself; through the federation-mode PEP the same PDP denies a password token and says
 which document it was reading.
+
+### Layers: a generic PDP first, the resource's after
+
+One PDP per resource is not the only shape. An estate usually has questions every
+endpoint shares — is this client in good standing, is this token sender-constrained, does
+the risk score allow anything at all — and a PDP that answers them knows nothing about any
+particular resource. It should not have to.
+
+So a route names an ordered list of **layers**, and the PEP asks each in turn with the
+same request and the same context:
+
+| Layer | What it is |
+| --- | --- |
+| `static` | The configured PDP (`AUTHZEN_URL`), regardless of what discovery finds. The slot for an estate-wide PDP. |
+| `resource` | Whatever discovery resolves for the route's resource: federation, then RFC 9728, then static. The default, and the whole of today's behaviour when it is the only layer. |
+| a PDP identifier | An explicit PDP. Its metadata is read like any other. |
+
+Every layer must permit. The first that does not is the answer, advice and all, and the
+remaining layers are not asked — a generic layer is a gate in front of a specific one. A
+PDP error in any layer fails closed. Two layers that resolve to the same PDP are one call.
+The same forwarded context goes to every layer, so an estate PDP can read the resource's
+requirements if it wants to and ignore them if it does not.
+
+The service default is `PDP_LAYERS` (default `resource`); a route overrides it with
+`pdp_layers`. A PDP named in the service's own configuration is allowlisted by that; one
+named in a route's configuration arrives over the check API like anything else there and
+must be on `PDP_ALLOWLIST`.
+
+The demo's estate PDP denies a client on its watch list and permits everything else. Put
+it first and the resource's PDP never hears about the risky client at all.
 
 ### The rules that never relax
 

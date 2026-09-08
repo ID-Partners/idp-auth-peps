@@ -349,6 +349,28 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
   </div>
 </section>
 
+<section class="band">
+  <div class="wrap">
+    <span class="eyebrow">Layers</span>
+    <h2>A generic PDP first, the resource's after</h2>
+    <div class="measure">
+      <p>One PDP per resource is not the only shape. An estate has questions every endpoint shares — is this client in good standing, is this token sender-constrained, does the risk score allow anything at all — and a PDP that answers them knows nothing about any particular resource. It should not have to.</p>
+      <p>So a route names an ordered list of <em>layers</em>, and the PEP asks each in turn with the same request and the same forwarded context. Every layer must permit. The first that does not is the answer, advice and all, and the rest are not asked: a generic layer is a gate in front of a specific one. A PDP error in any layer fails closed. Two layers that resolve to the same PDP are one call.</p>
+    </div>
+    <div class="wide">
+    <table>
+      <thead><tr><th>Layer</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><code>static</code></td><td>The configured PDP, regardless of what discovery finds. The slot for an estate-wide PDP.</td></tr>
+        <tr><td><code>resource</code></td><td>Whatever discovery resolves for the route's resource: federation, then RFC 9728, then static. The default, and the whole of today's behaviour when it is the only layer.</td></tr>
+        <tr><td>a PDP identifier</td><td>An explicit PDP, its metadata read like any other. From the service's own configuration it is trusted; from a route's configuration it must be on the allowlist, like anything else that arrives over the check API.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="small measure">In the demo an estate PDP denies a client on its watch list and permits everything else. Put first in <code>pdp_layers</code>, it stops a risky client before Bank A's PDP ever hears about the request.</p>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
     <span class="eyebrow">The rules that never relax</span>
@@ -368,37 +390,38 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     <span class="eyebrow">Seeing it work</span>
     <h2>One <code style="text-transform:none">docker compose up</code>, three PEPs, one rogue PDP</h2>
     <div class="measure">
-      <p><code>demo/</code> stands up a stub Trust Anchor, resources that are and are not members, a well-behaved PDP (denies <em>mallory</em>, steps up payments over 1000) and a rogue one that permits everything, plus <code>coaz-pep</code> three times. These are the results of the run on 6 September 2026; the columns are the argument.</p>
+      <p><code>demo/</code> stands up a stub Trust Anchor, resources that are and are not members, two banks' PDPs that hold a token to what the resource published, an estate PDP that judges the client, and a rogue one that permits everything, plus <code>coaz-pep</code> three times. Nothing turns on who the customer is: the variables are which PDP was consulted, what it was given, what the token carries, and which layers ran. These are the results of the run on 8 September 2026; the columns are the argument.</p>
     </div>
     <div class="demo" aria-label="Demo outcomes by PEP mode">
       <div>
-        <h4>pep-static</h4><div class="port">:9192 · told where the PDP is</div>
+        <h4>pep-static</h4><div class="port">:9192 · told where its PDP is</div>
         <dl>
-          <dt>alice reads a balance</dt><dd class="ok">permit</dd>
-          <dt>mallory reads a balance</dt><dd class="bad">403</dd>
+          <dt>read-only token pays 50 on plain</dt><dd class="ok">permit</dd>
+          <dt>the PDP was told nothing about the resource</dt><dd></dd>
         </dl>
       </div>
       <div>
         <h4>pep-resource</h4><div class="port">:9193 · trusts each resource's own word</div>
         <dl>
-          <dt>plain resource → good PDP, alice</dt><dd class="ok">permit</dd>
-          <dt>plain resource → good PDP, mallory</dt><dd class="bad">403</dd>
-          <dt>impostor → rogue PDP, mallory</dt><dd class="warn">permit (!)</dd>
+          <dt>read-only token pays on plain → Bank A</dt><dd class="warn">401 step-up</dd>
+          <dt>read-only token pays on impostor → rogue</dt><dd class="warn">permit (!)</dd>
+          <dt>pay 500 on plain vs bank-b</dt><dd class="ok">permit / 401</dd>
+          <dt>member, password token</dt><dd class="ok">permit</dd>
+          <dt>agent-risky, estate layer first</dt><dd class="bad">403 by the estate</dd>
         </dl>
       </div>
       <div>
         <h4>pep-federation</h4><div class="port">:9194 · trusts the federation's word</div>
         <dl>
-          <dt>impostor, not a member → static PDP</dt><dd class="bad">403</dd>
-          <dt>member names [rogue, good]; policy keeps good</dt><dd class="bad">403</dd>
-          <dt>member, alice</dt><dd class="ok">permit</dd>
+          <dt>impostor, not a member → static PDP</dt><dd class="ok">permit</dd>
+          <dt>member, password token → resolved doc</dt><dd class="bad">403, MFA floor</dd>
           <dt>broken chain</dt><dd class="bad">503, never static</dd>
           <dt>stray, no metadata → static PDP</dt><dd class="ok">permit</dd>
-          <dt>alice pays 5000</dt><dd class="warn">401 step-up</dd>
+          <dt>pay 5000</dt><dd class="warn">401 step-up</dd>
         </dl>
       </div>
     </div>
-    <p class="small" style="margin-top:14px">Across the whole run the rogue PDP's log line appears exactly once: the impostor case under resource mode. A Kong profile does the same discovery in Lua in front of the plain resource, and <code>node demo/node-sdk.mjs</code> does it from the SDK. No Docker? <code>demo/run-local.sh</code> builds and runs everything on the host.</p>
+    <p class="small" style="margin-top:14px">Across the whole run the rogue PDP's log line appears only for the impostor under resource mode. A Kong profile does the same discovery in Lua in front of the plain resource, and <code>node demo/node-sdk.mjs</code> does it from the SDK. No Docker? <code>demo/run-local.sh</code> builds and runs everything on the host.</p>
   </div>
 </section>
 

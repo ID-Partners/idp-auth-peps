@@ -100,6 +100,9 @@ type CallOptions struct {
 	// Method and Path are the endpoint actually hit, forwarded as context.request so
 	// the PDP can match a resource's declared requirements to it.
 	Method, Path string
+	// Layers is the ordered list of PDPs to ask — see discovery.ResolveLayers. Empty
+	// means the resource's PDP alone.
+	Layers []string
 }
 
 // forwardedContext is what every PDP call carries beyond the mapped subject, action and
@@ -109,11 +112,11 @@ type CallOptions struct {
 // scope or acr to what a resource requires is a policy decision, and policy is offloaded
 // to the PDP, where it can weigh them alongside things a PEP never sees. Keys the caller
 // already set win: explicit context is never overwritten.
-func forwardedContext(base map[string]any, ep discovery.PDPEndpoints, opts CallOptions) map[string]any {
+func forwardedContext(base map[string]any, meta *discovery.ResourceMetadata, opts CallOptions) map[string]any {
 	out := make(map[string]any, len(base)+4)
-	if ep.Resource != nil {
-		out["resource_metadata"] = ep.Resource.Document
-		out["resource_metadata_source"] = ep.Resource.Source
+	if meta != nil {
+		out["resource_metadata"] = meta.Document
+		out["resource_metadata_source"] = meta.Source
 	}
 	if opts.Method != "" || opts.Path != "" {
 		out["request"] = map[string]any{"method": opts.Method, "path": opts.Path}
@@ -175,16 +178,16 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr))}
 	}
 
-	// The PDP is resolved before the request is built, because part of what it gets
+	// The PDPs are resolved before the request is built, because part of what they get
 	// asked is what the resource's metadata said. Resolved once, so one decision cannot
 	// straddle a PDP that moved.
-	ep, err := e.resolver.Resolve(ctx, opts.Resource)
+	eps, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
 	}
-	extraContext = forwardedContext(extraContext, ep, opts)
+	extraContext = forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts)
 
 	// Both dialects produce the same BuiltRequest; only how they get there differs.
 	var built *BuiltRequest
@@ -199,7 +202,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
 	}
 
-	out, err := e.evaluate(ctx, ep, built)
+	out, err := e.evaluateLayers(ctx, eps, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
@@ -264,6 +267,25 @@ type pdpOutcome struct {
 	StepUpScope     string
 	IdentityReq     bool
 	IdentityDoctype string
+}
+
+// evaluateLayers asks each PDP in order with the same request. Every layer must
+// permit; the first that does not is the answer, advice and all, and later layers are
+// not consulted — a generic layer is a gate in front of a specific one. A PDP error in
+// any layer is an error: fail closed, never skip.
+func (e *Engine) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, built *BuiltRequest) (pdpOutcome, error) {
+	var out pdpOutcome
+	for _, ep := range eps {
+		o, err := e.evaluate(ctx, ep, built)
+		if err != nil {
+			return out, fmt.Errorf("%s: %w", ep.Identifier, err)
+		}
+		if !o.Decision {
+			return o, nil
+		}
+		out = o
+	}
+	return out, nil
 }
 
 // evaluate POSTs the built request to the resolved PDP and folds the decision(s):
@@ -379,19 +401,19 @@ func (e *Engine) checkByDefaultMapping(
 			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
 	}
 
-	ep, err := e.resolver.Resolve(ctx, opts.Resource)
+	eps, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
 			JSONRPCError: jsonRPCError(id, CodePDPError, "Authorization service unavailable")}
 	}
-	built, err := cm.Build(params, tokenClaims, forwardedContext(extraContext, ep, opts))
+	built, err := cm.Build(params, tokenClaims, forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts))
 	if err != nil {
 		msg := fmt.Sprintf("COAZ mapping error: %v", err)
 		return Verdict{CoazTool: true, Decision: false, Reason: msg,
 			JSONRPCError: jsonRPCError(id, CodeMappingError, msg)}
 	}
-	out, err := e.evaluate(ctx, ep, built)
+	out, err := e.evaluateLayers(ctx, eps, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),

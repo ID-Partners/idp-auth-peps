@@ -86,6 +86,11 @@ raw token as `context.access_token` when the route sets `forward_access_token`. 
 enforces none of it: what a resource requires is the PDP's to match, next to everything
 else the PDP knows. See [docs/architecture.md](../../docs/architecture.md#what-the-pep-forwards-and-what-it-does-not-decide).
 
+`pdp_layers` is the ordered list of PDPs to ask — `static`, `resource`, or a PDP
+identifier — every one of which must permit; the first deny is the answer. It is how a
+generic estate PDP that judges the token and the client sits in front of the resource's
+own. Default `["resource"]`.
+
 The rules are the Go PEP's: the resource's echoed `resource` must be byte-identical
 (RFC 9728 §3.3), the PDP's `policy_decision_point` must equal the identifier it was
 fetched from, a PDP without metadata gets the spec's default paths, and metadata is

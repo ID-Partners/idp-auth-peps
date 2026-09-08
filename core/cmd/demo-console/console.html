@@ -102,8 +102,9 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 <main class="wrap">
   <form id="form">
     <fieldset><legend>Protected resource</legend><div class="opts" id="resources"></div><p class="hint" id="resourceHint"></p></fieldset>
-    <fieldset><legend>Acting for</legend><div class="opts" id="humans"></div><p class="hint" id="humanHint"></p></fieldset>
-    <fieldset><legend>The token says they authenticated with</legend><div class="opts" id="acrs"></div><p class="hint" id="acrHint"></p></fieldset>
+    <fieldset><legend>Policy layers on the route</legend><div class="opts" id="layers"></div><p class="hint" id="layerHint"></p></fieldset>
+    <fieldset><legend>The token was issued to</legend><div class="opts" id="clients"></div><p class="hint" id="clientHint"></p></fieldset>
+    <fieldset><legend>The token says the customer authenticated with</legend><div class="opts" id="acrs"></div><p class="hint" id="acrHint"></p></fieldset>
     <fieldset><legend>The token carries scopes</legend><div class="opts" id="scopes"></div><p class="hint" id="scopeHint"></p></fieldset>
     <fieldset><legend>Forward the raw token to the PDP</legend><div class="opts" id="forwards"></div><p class="hint" id="forwardHint"></p></fieldset>
     <fieldset><legend>Request</legend><div class="opts" id="actions"></div><p class="hint" id="actionHint"></p></fieldset>
@@ -137,9 +138,13 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 
 <script>
 const $ = (id) => document.getElementById(id);
-const HUMANS = [
-  { key: 'alice', name: 'alice', blurb: 'A customer of the bank. The good PDP permits her.' },
-  { key: 'mallory', name: 'mallory', blurb: 'Not a customer. The good PDP denies her; the rogue PDP does not.' },
+const CLIENTS = [
+  { key: 'agent-1', name: 'agent-1', blurb: 'An agent in good standing. Every PDP is fine with it.' },
+  { key: 'agent-risky', name: 'agent-risky', blurb: "On the estate PDP's watch list. With the estate layer in front, nothing further is asked." },
+];
+const layerChoices = (estate) => [
+  { key: 'resource', name: "the resource's PDP alone", blurb: 'One PDP, found by discovery. Today\'s single behaviour.' },
+  { key: `${estate},resource`, name: "estate PDP first, then the resource's", blurb: 'A generic PDP that judges the token and the client, in front of the one that knows the resource. Every layer must permit; the first that does not is the answer.' },
 ];
 const ACRS = [
   { key: 'urn:idp:loa:password', name: 'password', blurb: 'Enough for plain and impostor. Not for bank-b, and not for member once the federation has had its say.' },
@@ -183,7 +188,8 @@ function describe() {
   const act = config.actions.find((a) => a.key === selected('action'));
   const acr = ACRS.find((a) => a.key === selected('acr'));
   const sc = SCOPES.find((s) => s.key === selected('scope'));
-  $('what').innerHTML = `<b>${selected('human')}</b>’s agent asks to <b>${act.name}</b> on <b>${res.name}</b>, with a <b>${acr.name}</b> token carrying <b>${sc.name}</b>.`;
+  const layered = selected('layers') !== 'resource';
+  $('what').innerHTML = `<b>${selected('client')}</b> asks to <b>${act.name}</b> on <b>${res.name}</b> with a <b>${acr.name}</b> token carrying <b>${sc.name}</b>${layered ? ', through the <b>estate PDP</b> first' : ''}.`;
 }
 
 function skeleton() {
@@ -282,6 +288,15 @@ function proofOf(r, action) {
   }
   const who = decided.length ? decided[0].entity : 'no PDP';
   const how = fetched === 0 ? 'from cache' : chain ? `after validating a trust chain (${fetched} documents)` : `after reading ${fetched} metadata document${fetched === 1 ? '' : 's'}`;
+  const layersAsked = [...new Set(decided.map((e) => e.entity))];
+  if (layersAsked.length > 1) {
+    return r.decision
+      ? `Every layer permitted, in order: ${layersAsked.join(', then ')}.`
+      : `${layersAsked[layersAsked.length - 1]} denied; the remaining layer${layersAsked.length > 2 ? 's were' : ' was'} not asked.`;
+  }
+  if (!r.decision && layersAsked.length === 1 && layersAsked[0] === 'pdp-estate') {
+    return 'The estate PDP denied before the resource\'s PDP was asked. The generic layer is a gate.';
+  }
   if (rogue) return `Decided by the rogue PDP ${how}. The resource named its own judge and nothing overruled it.`;
   return `Decided by ${who} ${how}.`;
 }
@@ -316,7 +331,8 @@ async function run(ev) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        resource: selected('resource'), human: selected('human'), action: selected('action'),
+        resource: selected('resource'), action: selected('action'), client: selected('client'),
+        layers: selected('layers') === 'resource' ? '' : selected('layers'),
         acr: selected('acr'), scope: selected('scope'), forward_token: selected('forward') === 'yes',
       }),
     });
@@ -338,14 +354,15 @@ async function run(ev) {
 
 (async function init() {
   config = await (await fetch('/api/config')).json();
-  radios($('resources'), config.resources, 'resource', 'impostor', (item) => {
+  radios($('resources'), config.resources, 'resource', 'plain', (item) => {
     $('resourceHint').textContent = item.blurb;
     describe();
   });
-  radios($('humans'), HUMANS, 'human', 'mallory', (item) => {
-    $('humanHint').textContent = item.blurb;
-    describe();
-  });
+  const LAYERS = layerChoices(config.estate_pdp);
+  radios($('layers'), LAYERS, 'layers', 'resource', (item) => { $('layerHint').textContent = item.blurb; describe(); });
+  radios($('clients'), CLIENTS, 'client', 'agent-1', (item) => { $('clientHint').textContent = item.blurb; describe(); });
+  $('layerHint').textContent = LAYERS[0].blurb;
+  $('clientHint').textContent = CLIENTS[0].blurb;
   radios($('actions'), config.actions, 'action', 'balance', (item) => {
     $('actionHint').textContent = item.note || '';
     describe();
@@ -356,8 +373,7 @@ async function run(ev) {
   $('acrHint').textContent = ACRS[0].blurb;
   $('scopeHint').textContent = SCOPES[0].blurb;
   $('forwardHint').textContent = FORWARDS[0].blurb;
-  $('resourceHint').textContent = config.resources.find((r) => r.key === 'impostor').blurb;
-  $('humanHint').textContent = HUMANS.find((h) => h.key === 'mallory').blurb;
+  $('resourceHint').textContent = config.resources.find((r) => r.key === 'plain').blurb;
   skeleton();
   describe();
   $('form').addEventListener('submit', run);

@@ -67,7 +67,46 @@ export interface PdpEndpoints {
 }
 
 export interface PdpResolver {
+  /** The PDP that decides for a resource (undefined: the static one). */
   resolve(resource?: string): Promise<PdpEndpoints>;
+  /** The metadata of an explicitly named PDP — a configured layer rather than a discovered one. */
+  resolvePdp(pdp: string): Promise<PdpEndpoints>;
+}
+
+/** Layer names; anything else in a layer list is a PDP identifier. */
+export const LAYER_RESOURCE = 'resource';
+export const LAYER_STATIC = 'static';
+
+/**
+ * Resolve every layer of a route's policy, in order, duplicates collapsed. Layering is
+ * what lets a generic PDP that judges the token and the client sit in front of the
+ * resource's own: every layer must permit, the first that does not is the answer.
+ */
+export async function resolveLayers(r: PdpResolver, resource: string | undefined, layers: string[] | undefined): Promise<PdpEndpoints[]> {
+  const names = layers && layers.length > 0 ? layers : [LAYER_RESOURCE];
+  const out: PdpEndpoints[] = [];
+  const seen = new Map<string, number>();
+  for (const layer of names) {
+    let ep: PdpEndpoints;
+    try {
+      ep = layer === LAYER_RESOURCE ? await r.resolve(resource) : layer === LAYER_STATIC ? await r.resolve() : await r.resolvePdp(layer);
+    } catch (err) {
+      throw new DiscoveryError(asDiscoveryError(err).kind, `layer ${layer}: ${asDiscoveryError(err).message}`);
+    }
+    const at = seen.get(ep.identifier);
+    if (at !== undefined) {
+      if (!out[at]!.resource && ep.resource) out[at] = { ...out[at]!, resource: ep.resource };
+      continue;
+    }
+    seen.set(ep.identifier, out.length);
+    out.push(ep);
+  }
+  return out;
+}
+
+/** The one resource document to forward for a layered call: whichever layer read it. */
+export function resourceMetadataOf(eps: PdpEndpoints[]): ResourceMetadata | undefined {
+  return eps.find((e) => e.resource)?.resource;
 }
 
 /** Yields a resource's metadata: the PDPs that decide for it, and the document that named them. */
@@ -383,6 +422,16 @@ export class PdpDiscovery implements PdpResolver {
       }
     }
     throw new DiscoveryError('transient', `no PDP could be resolved${last ? `: ${last.message}` : ''}`);
+  }
+
+  /** An explicitly named PDP. Off mode reads nothing; otherwise the PDP allowlist applies. */
+  async resolvePdp(pdp: string): Promise<PdpEndpoints> {
+    pdp = pdp.replace(/\/+$/, '');
+    if (this.mode === 'off') return this.withKey({ ...defaultEndpoints(pdp), source: 'layer' });
+    checkUrl(pdp, this.pdpPolicy);
+    const ep = await this.pdps.get(pdp, (key) => this.fetchConfig(key));
+    for (const u of [ep.evaluation, ep.evaluations]) if (u) checkUrl(u, this.pdpPolicy);
+    return this.withKey({ ...ep, source: 'layer' });
   }
 
   /** Resolve the static PDP so a bad configuration is loud early. */

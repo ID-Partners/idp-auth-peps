@@ -2,6 +2,9 @@
 # Walk through PDP discovery against the three PEPs docker-compose (or run-local.sh)
 # stands up. Needs curl; uses jq or python3 to pretty-print.
 #
+# Nothing here turns on who the customer is: the demo is about which PDP decides, what it
+# was given, and what the token carries. One subject, "customer", throughout.
+#
 #   STUBS_HOST  how the PEPs reach the stubs (default: stubs — the compose network name)
 #   PEP_HOST    how this script reaches the PEPs (default: localhost)
 set -euo pipefail
@@ -14,15 +17,17 @@ FEDERATION="http://${PEP_HOST}:${PEP_FEDERATION_PORT:-9194}"
 CHECK_TOKEN="${CHECK_API_TOKEN:-demo}"
 
 S="http://${STUBS_HOST}"
-MEMBER="$S:9001"; GOOD="$S:9002/tenants/bank-a"; ROGUE="$S:9003"; PLAIN="$S:9004"; IMPOSTOR="$S:9005"; BROKEN="$S:9006"; STRAY="$S:9007"; BANKB="$S:9009"
+MEMBER="$S:9001"; GOOD="$S:9002/tenants/bank-a"; ROGUE="$S:9003"; PLAIN="$S:9004"; IMPOSTOR="$S:9005"; BROKEN="$S:9006"; STRAY="$S:9007"; BANKB="$S:9009"; ESTATE="$S:9098"
 
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 # An UNSIGNED token: coaz-pep decodes without verifying when no JWKS is configured, and
 # says so loudly at startup. The demo is about discovery, not token validation.
-jwt() { # $1 human, $2 agent, [$3 acr], [$4 scope]
-  local h c acr="${3:-urn:idp:loa:password}" scope="${4:-accounts:read payments:write}"
+# Shape it with CLIENT / ACR / SCOPE env: who it was issued to, how the customer
+# authenticated, what it carries.
+jwt() {
+  local h c client="${CLIENT:-agent-1}" acr="${ACR:-urn:idp:loa:password}" scope="${SCOPE:-accounts:read payments:write}"
   h=$(printf '{"alg":"none","typ":"JWT"}' | b64url)
-  c=$(printf '{"sub":"%s","client_id":"%s","act":{"sub":"%s"},"scope":"%s","acr":"%s","aud":"%s"}' "$1" "$2" "$2" "$scope" "$acr" "$PLAIN" | b64url)
+  c=$(printf '{"sub":"customer","client_id":"%s","act":{"sub":"%s"},"scope":"%s","acr":"%s","aud":"%s"}' "$client" "$client" "$scope" "$acr" "$PLAIN" | b64url)
   printf '%s.%s.' "$h" "$c"
 }
 
@@ -35,76 +40,81 @@ except Exception: pass
 print(json.dumps({"decision": d.get("decision"), "status": r.get("status"), "body": b}))'; fi
 }
 
-# check PEP RESOURCE HUMAN METHOD PATH [BODY] — token shape via ACR / SCOPE / FORWARD env
+# check PEP RESOURCE METHOD PATH [BODY] — route knobs via FORWARD (yes|no) and LAYERS env
 check() {
-  local pep="$1" resource="$2" human="$3" method="$4" path="$5" body="${6:-}"
-  local cfg fwd
+  local pep="$1" resource="$2" method="$3" path="$4" body="${5:-}"
+  local cfg fwd layers
   fwd=$([ "${FORWARD:-yes}" = "yes" ] && printf ',"forward_access_token":"true"' || printf '')
-  if [ -n "$resource" ]; then cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true","resource":"%s"%s}' "$resource" "$fwd")
-  else cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true"%s}' "$fwd"); fi
+  layers=$([ -n "${LAYERS:-}" ] && printf ',"pdp_layers":"%s"' "$LAYERS" || printf '')
+  if [ -n "$resource" ]; then cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true","resource":"%s"%s%s}' "$resource" "$fwd" "$layers")
+  else cfg=$(printf '{"pep_label":"demo","style":"rest","require_token":"true"%s%s}' "$fwd" "$layers"); fi
   local esc_body; esc_body=$(printf '%s' "$body" | sed 's/"/\\"/g')
   curl -sS -X POST "$pep/v1/mcp/check" \
     -H "Authorization: Bearer $CHECK_TOKEN" -H 'Content-Type: application/json' \
     -d "$(printf '{"config":%s,"method":"%s","path":"%s","headers":{"authorization":"Bearer %s","content-type":"application/json"},"body":"%s"}' \
-      "$cfg" "$method" "$path" "$(jwt "$human" agent-1 "${ACR:-}" "${SCOPE:-}")" "$esc_body")" | pretty
+      "$cfg" "$method" "$path" "$(jwt)" "$esc_body")" | pretty
 }
 
+PAY50='{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
+PAY500='{"from_account":"a1","to_account":"b2","amount":500,"currency":"AUD"}'
+PAY5000='{"from_account":"a1","to_account":"b2","amount":5000,"currency":"AUD"}'
+
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
-step() { printf '  %-58s ' "$1"; }
+step() { printf '  %-62s ' "$1"; }
 
 say "0. What the metadata says"
-echo "  Bank A's PDP metadata:        $(curl -s "http://${PEP_HOST}:9002/.well-known/authzen-configuration/tenants/bank-a")"
-echo "  Bank B's PDP metadata:        $(curl -s "http://${PEP_HOST}:9008/.well-known/authzen-configuration/tenants/bank-b")"
-echo "  the rogue PDP's metadata:     $(curl -s "http://${PEP_HOST}:9003/.well-known/authzen-configuration")"
-echo "  plain resource (RFC 9728):    $(curl -s "http://${PEP_HOST}:9004/.well-known/oauth-protected-resource")"
-echo "  impostor resource (RFC 9728): $(curl -s "http://${PEP_HOST}:9005/.well-known/oauth-protected-resource")"
-echo "  member's OWN well-known:      $(curl -s "http://${PEP_HOST}:9001/.well-known/oauth-protected-resource")"
-echo "  member's entity configuration is a signed JWT; the anchor's policy for it is:"
-echo '      {"oauth_resource":{"authzen_policy_decision_points":{"subset_of":["'"$GOOD"'"],"essential":true}}}'
+echo "  Bank A's PDP:        $(curl -s "http://${PEP_HOST}:9002/.well-known/authzen-configuration/tenants/bank-a")"
+echo "  Bank B's PDP:        $(curl -s "http://${PEP_HOST}:9008/.well-known/authzen-configuration/tenants/bank-b")"
+echo "  the estate PDP:      $(curl -s "http://${PEP_HOST}:9098/.well-known/authzen-configuration")"
+echo "  the rogue PDP:       $(curl -s "http://${PEP_HOST}:9003/.well-known/authzen-configuration")"
+echo "  plain (RFC 9728):    $(curl -s "http://${PEP_HOST}:9004/.well-known/oauth-protected-resource")"
+echo "  impostor (RFC 9728): $(curl -s "http://${PEP_HOST}:9005/.well-known/oauth-protected-resource")"
+echo "  member's OWN doc:    $(curl -s "http://${PEP_HOST}:9001/.well-known/oauth-protected-resource")"
+echo "  member's entity configuration is a signed JWT; the anchor's policy for members is:"
+echo '      {"oauth_resource":{"authzen_policy_decision_points":{"subset_of":["'"$GOOD"'"]},"acr_values_required":{"value":["urn:idp:loa:mfa"]}}}'
 
-say "1. pep-static: told where the PDP is, no discovery (today's behaviour)"
-step "alice reads a balance"; check "$STATIC" "" alice GET /accounts/a1/balance
-step "mallory reads a balance"; check "$STATIC" "" mallory GET /accounts/a1/balance
+say "1. Where the PDP comes from, and what it was told — a read-only token trying to pay"
+step "pep-static: told its PDP, reads no metadata"; SCOPE="accounts:read" check "$STATIC" "$PLAIN" POST /payments "$PAY50"
+echo "  ^ permitted: the PDP was told nothing about the resource, so it had nothing to hold the scope to."
+step "pep-resource: plain names Bank A's PDP, and its scopes"; SCOPE="accounts:read" check "$RESOURCE" "$PLAIN" POST /payments "$PAY50"
+echo "  ^ step-up for payments:write: the PDP read the resource's scopes_supported out of what the PEP forwarded."
+step "pep-resource: IMPOSTOR names the rogue PDP (!)"; SCOPE="accounts:read" check "$RESOURCE" "$IMPOSTOR" POST /payments "$PAY50"
+echo "  ^ permitted by the rogue. A self-asserted document cannot protect the thing it asserts: the resource chose its own judge."
+step "pep-federation: impostor is not a member -> static PDP"; SCOPE="accounts:read" check "$FEDERATION" "$IMPOSTOR" POST /payments "$PAY50"
+step "pep-federation: member -> chain -> Bank A's PDP, resolved document"; SCOPE="accounts:read" check "$FEDERATION" "$MEMBER" POST /payments "$PAY50"
+echo "  ^ denied on the acr the federation set, before the scope was even considered: the resolved document travelled."
+step "pep-federation: broken chain -> 503, never static"; check "$FEDERATION" "$BROKEN" GET /accounts/a1/balance
+step "pep-federation: stray (no metadata) -> static PDP"; check "$FEDERATION" "$STRAY" GET /accounts/a1/balance
+echo "  ^ watch the stubs log: the rogue PDP is never consulted by pep-federation."
 
-say "2. pep-resource: each resource's own well-known names its PDP"
-step "plain resource -> good PDP: alice"; check "$RESOURCE" "$PLAIN" alice GET /accounts/a1/balance
-step "plain resource -> good PDP: mallory"; check "$RESOURCE" "$PLAIN" mallory GET /accounts/a1/balance
-step "IMPOSTOR resource -> ROGUE PDP: mallory (!)"; check "$RESOURCE" "$IMPOSTOR" mallory GET /accounts/a1/balance
-echo "  ^ a self-asserted document cannot protect the thing it asserts: the resource chose its own judge."
-
-say "3. pep-federation: the federation's word, never the resource's own"
-step "impostor is not a member -> static (good) PDP: mallory"; check "$FEDERATION" "$IMPOSTOR" mallory GET /accounts/a1/balance
-step "member names [rogue, good]; policy keeps good: mallory"; check "$FEDERATION" "$MEMBER" mallory GET /accounts/a1/balance
-step "member: alice"; check "$FEDERATION" "$MEMBER" alice GET /accounts/a1/balance
-step "broken chain -> 503, never falls to static"; check "$FEDERATION" "$BROKEN" alice GET /accounts/a1/balance
-step "stray (no metadata at all) -> static PDP"; check "$FEDERATION" "$STRAY" alice GET /accounts/a1/balance
-echo "  ^ watch the stubs log: rogue-pdp is never consulted by pep-federation."
-
-say "4. Two banks, one gateway: the resource decides whose policy applies"
-step "pay 500 on plain (Bank A steps up over 1000)"; check "$RESOURCE" "$PLAIN" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":500,"currency":"AUD"}'
-step "pay 500 on bank-b (Bank B steps up over 100)"; check "$RESOURCE" "$BANKB" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":500,"currency":"AUD"}'
+say "2. Two banks, one gateway: the resource decides whose policy applies"
+echo "  (an MFA token, so only the threshold differs between the two banks)"
+step "pay 500 on plain (Bank A steps up over 1000)"; ACR=urn:idp:loa:mfa check "$RESOURCE" "$PLAIN" POST /payments "$PAY500"
+step "pay 500 on bank-b (Bank B steps up over 100)"; ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" POST /payments "$PAY500"
 echo "  ^ same request, two answers. The static PEP cannot tell them apart: it has one PDP for everything."
-echo "  For a PDP that MOVES, and for the batch-capability case, use the console on :8088."
 
-say "5. What the resource requires is the PDP's to enforce, not the gateway's"
-echo "  Each resource publishes scopes_supported and an example acr_values_required. No PEP reads them;"
-echo "  they reach the PDP verbatim with the endpoint hit and the raw token, and the PDP does the matching."
-step "bank-b requires MFA; alice arrives with a password token"; check "$RESOURCE" "$BANKB" alice GET /accounts/a1/balance
-step "same, with an MFA token"; ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" alice GET /accounts/a1/balance
-step "member's OWN metadata says password is enough (resource mode)"; check "$RESOURCE" "$MEMBER" alice GET /accounts/a1/balance
-step "the federation raised member's floor to MFA (federation mode)"; check "$FEDERATION" "$MEMBER" alice GET /accounts/a1/balance
+say "3. What the resource requires is the PDP's to enforce — and the federation sets the floor"
+step "bank-b requires MFA; a password token"; check "$RESOURCE" "$BANKB" GET /accounts/a1/balance
+step "same, with an MFA token"; ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" GET /accounts/a1/balance
+step "member's OWN metadata says a password is enough (resource mode)"; check "$RESOURCE" "$MEMBER" GET /accounts/a1/balance
+step "the federation raised member's floor to MFA (federation mode)"; check "$FEDERATION" "$MEMBER" GET /accounts/a1/balance
 echo "  ^ same PDP, same policy, same token. The PEP forwarded a different document, and said which one."
-step "read-only token tries to pay -> step-up for payments:write"; SCOPE="accounts:read" check "$RESOURCE" "$PLAIN" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
-step "bank-b, MFA required, but the token is NOT forwarded"; FORWARD=no ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" alice GET /accounts/a1/balance
+step "bank-b, MFA required, but the token is NOT forwarded"; FORWARD=no ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" GET /accounts/a1/balance
 echo "  ^ the PDP could not examine what it was not given, and says so rather than guessing."
 
-say "6. The challenge contract survives discovery"
-step "alice pays 50"; check "$FEDERATION" "$MEMBER" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":50,"currency":"AUD"}'
-step "alice pays 5000 -> step-up challenge"; check "$FEDERATION" "$MEMBER" alice POST /payments '{"from_account":"a1","to_account":"b2","amount":5000,"currency":"AUD"}'
+say "4. Layers: a generic PDP for the estate first, the resource's PDP after"
+echo "  pdp_layers = $ESTATE, resource. Every layer must permit; the first that does not is the answer."
+step "agent-1 pays 50 on plain: estate, then Bank A"; LAYERS="$ESTATE,resource" check "$RESOURCE" "$PLAIN" POST /payments "$PAY50"
+step "agent-risky pays 50 on plain: the estate PDP stops it"; LAYERS="$ESTATE,resource" CLIENT=agent-risky check "$RESOURCE" "$PLAIN" POST /payments "$PAY50"
+echo "  ^ Bank A's PDP was never asked. The generic layer is a gate; the specific one only sees what gets through."
+
+say "5. The challenge contract survives discovery"
+step "pay 50 on member (federation mode)"; ACR=urn:idp:loa:mfa check "$FEDERATION" "$MEMBER" POST /payments "$PAY50"
+step "pay 5000 -> step-up challenge"; ACR=urn:idp:loa:mfa check "$FEDERATION" "$MEMBER" POST /payments "$PAY5000"
 
 if curl -s -o /dev/null -w '%{http_code}' "http://${PEP_HOST}:8000/bank/accounts/a1/balance" 2>/dev/null | grep -q '^[0-9]'; then
-  say "7. Kong, doing the same discovery in Lua (profile kong)"
-  step "alice via Kong"; curl -s -H "Authorization: Bearer $(jwt alice agent-1)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
-  step "mallory via Kong"; curl -s -H "Authorization: Bearer $(jwt mallory agent-1)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
+  say "6. Kong, doing the same discovery in Lua (profile kong)"
+  step "read a balance via Kong"; curl -s -H "Authorization: Bearer $(jwt)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
+  step "read-only token pays via Kong"; curl -s -X POST -H "Authorization: Bearer $(SCOPE='accounts:read' jwt)" -H 'Content-Type: application/json' -d "$PAY50" "http://${PEP_HOST}:8000/bank/payments"; echo
 fi
 echo

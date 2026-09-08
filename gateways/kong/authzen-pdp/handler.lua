@@ -380,8 +380,8 @@ function AuthzenPDP:access(conf)
   -- 3b) which PDP, and where. Off by default (authzen_url + the AuthZEN paths, no
   --     fetch). A discovery failure is a 503, like an unreachable PDP: a request whose
   --     decider cannot be found is not one to let through.
-  local ep, derr = discovery.resolve(conf, discovery.resource_id(conf))
-  if not ep then
+  local eps, derr, meta = discovery.resolve_layers(conf, discovery.resource_id(conf), conf.pdp_layers)
+  if not eps then
     kong.log.err("PDP discovery failed: ", derr.msg)
     return deny(pep, 503, "Authorization service could not be resolved; denying (fail-closed).")
   end
@@ -397,37 +397,43 @@ function AuthzenPDP:access(conf)
   -- The plugin enforces none of these. Comparing a token's scope or acr to what a
   -- resource requires is a policy decision, and policy is offloaded to the PDP, where it
   -- can weigh them alongside things a gateway never sees.
-  if ep.resource then
-    ctx.resource_metadata = ep.resource.document
-    ctx.resource_metadata_source = ep.resource.source
+  if meta then
+    ctx.resource_metadata = meta.document
+    ctx.resource_metadata_source = meta.source
   end
   ctx.request = { method = kong.request.get_method(), path = kong.request.get_path() }
   if conf.forward_access_token and token then
     ctx.access_token = token
   end
 
-  local httpc = http.new()
-  httpc:set_timeout(10000)
-  local res, err = httpc:request_uri(ep.evaluation, {
-    method = "POST",
-    body = cjson.encode(authzen_req),
-    headers = {
-      ["Content-Type"] = "application/json",
-      -- Bound to the PDP it was configured for; a discovered PDP gets no key.
-      ["Authorization"] = ep.api_key and ("Bearer " .. ep.api_key) or nil,
-    },
-    ssl_verify = conf.pdp_ssl_verify ~= false,
-  })
-
-  -- 4) enforce (fail closed on PDP error)
-  if not res then
-    kong.log.err("PDP call failed: ", err)
-    return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).")
+  -- 4) ask each layer in order. Every layer must permit; the first that does not is
+  --    the answer, advice and all, and later layers are not consulted — a generic
+  --    layer is a gate in front of a specific one. A PDP error anywhere fails closed.
+  local body = cjson.encode(authzen_req)
+  local data, decision, dctx, reason
+  for _, ep in ipairs(eps) do
+    local httpc = http.new()
+    httpc:set_timeout(10000)
+    local res, err = httpc:request_uri(ep.evaluation, {
+      method = "POST",
+      body = body,
+      headers = {
+        ["Content-Type"] = "application/json",
+        -- Bound to the PDP it was configured for; a discovered PDP gets no key.
+        ["Authorization"] = ep.api_key and ("Bearer " .. ep.api_key) or nil,
+      },
+      ssl_verify = conf.pdp_ssl_verify ~= false,
+    })
+    if not res then
+      kong.log.err("PDP call failed (", ep.identifier, "): ", err)
+      return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).")
+    end
+    data = cjson.decode(res.body) or {}
+    decision = data.decision == true
+    dctx = (type(data.context) == "table" and data.context) or {}
+    reason = dctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
+    if not decision then break end
   end
-  local data = cjson.decode(res.body) or {}
-  local decision = data.decision == true
-  local dctx = (type(data.context) == "table" and data.context) or {}
-  local reason = dctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
 
   -- surface the decision on the response for the demo transcript
   local pdp_ctx = kong.ctx.plugin
