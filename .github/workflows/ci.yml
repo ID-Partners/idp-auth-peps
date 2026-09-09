@@ -56,11 +56,22 @@ jobs:
         # built against (5.1), and luacov attributes lines differently across versions —
         # so an unpinned runner measures a different number than a developer does, and
         # the coverage floor becomes unmeetable on one of them.
+        # lua-sec gives luarocks native HTTPS, so a rockspec fetch does not fall back to
+        # wget against mirrors that time out; the retry covers luarocks.org itself
+        # having a bad minute, which is the only reason this job has ever failed.
         run: |
           sudo apt-get update
-          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks
-          sudo luarocks --lua-version=5.4 install busted
-          sudo luarocks --lua-version=5.4 install luacov
+          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks lua-sec
+          rocks() {
+            for attempt in 1 2 3 4; do
+              sudo luarocks --lua-version=5.4 install "$1" && return 0
+              echo "luarocks install $1 failed (attempt $attempt); retrying"
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
+          rocks busted
+          rocks luacov
           lua5.4 -v
           busted --version
       - name: Check the plugin parses
