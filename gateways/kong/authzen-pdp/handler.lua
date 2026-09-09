@@ -144,8 +144,41 @@ end
 
 -- ---------- main phase ----------
 
+-- The resource's two well-known documents: OpenID Federation appends its segment to the
+-- identifier's path, RFC 9728 inserts its own after the host.
+local FED_WK, RES_WK = "/.well-known/openid-federation", "/.well-known/oauth-protected-resource"
+local function is_well_known(path)
+  return path == FED_WK or path == RES_WK
+    or path:sub(-#FED_WK) == FED_WK
+    or path:sub(1, #RES_WK + 1) == RES_WK .. "/"
+end
+
+-- relay_well_known serves the resource's federation face from coaz-pep, which holds the
+-- key: the entity configuration a trust controller onboards, and the RFC 9728 document
+-- that republishes what the federation resolved. Kong cannot sign, so it relays.
+local function relay_well_known(conf, path)
+  local httpc = http.new()
+  httpc:set_timeout(5000)
+  local res, err = httpc:request_uri(conf.federation_entity_url .. path, {
+    method = "GET", ssl_verify = conf.pdp_ssl_verify ~= false,
+  })
+  if not res then
+    kong.log.err("federation entity relay failed: ", err)
+    return kong.response.exit(503, { error = "federation_entity_unavailable" }, { ["Content-Type"] = "application/json" })
+  end
+  local ct = res.headers and (res.headers["Content-Type"] or res.headers["content-type"]) or "application/json"
+  return kong.response.exit(res.status, res.body, { ["Content-Type"] = ct, ["Cache-Control"] = "no-cache" })
+end
+
 function AuthzenPDP:access(conf)
   local pep = conf.pep_label or "kong-pep"
+
+  -- The resource's federation face, before any token is looked at: these documents
+  -- are public by definition.
+  if type(conf.federation_entity_url) == "string" and conf.federation_entity_url ~= "" then
+    local path = kong.request.get_path()
+    if is_well_known(path) then return relay_well_known(conf, path) end
+  end
 
   -- 0) Step-up: require a logged-in END USER (RFC 9470 step-up challenge). The
   --    principal (the customer) authenticates at PingFederate; the app forwards their PF

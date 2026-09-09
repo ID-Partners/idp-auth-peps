@@ -40,6 +40,9 @@ export type {
 } from './discovery.js';
 
 export { foldDecision, toChallenge, toHttpChallenge } from './challenge.js';
+
+export { FEDERATION_WELL_KNOWN, FederationEntity, PROTECTED_RESOURCE_WELL_KNOWN, algFor, signJwt, thumbprint } from './federation.js';
+export type { FederationEntityOptions, FederationRequest, FederationResponse } from './federation.js';
 export type { HttpChallenge } from './challenge.js';
 
 export {

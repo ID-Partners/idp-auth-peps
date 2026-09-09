@@ -488,6 +488,8 @@ type fedFixture struct {
 	pdps         []any
 	policy       map[string]any
 	breakLeaf    bool
+	// subMeta is the anchor's `metadata` for the leaf: what the controller says.
+	subMeta map[string]any
 }
 
 func newFedFixture(t *testing.T) *fedFixture {
@@ -526,6 +528,9 @@ func newFedFixture(t *testing.T) *fedFixture {
 			}
 			if f.policy != nil {
 				claims["metadata_policy"] = f.policy
+			}
+			if f.subMeta != nil {
+				claims["metadata"] = f.subMeta
 			}
 			_, _ = w.Write(sign(f.anchorKey, f.anchorJWK, claims))
 			return

@@ -72,7 +72,10 @@ type action struct {
 }
 
 type server struct {
-	base      string
+	base string
+	// gateway is the entity identifier of the API pep-federation fronts as a federation
+	// entity, when the demo runs one: the PEP publishes that API's documents itself.
+	gateway   string
 	peps      []pep
 	resources []resource
 	actions   []action
@@ -83,8 +86,10 @@ type server struct {
 
 func main() {
 	base := strings.TrimRight(env("STUBS_BASE", "http://localhost"), "/")
+	gateway := strings.TrimRight(env("GATEWAY_ENTITY", ""), "/")
 	s := &server{
 		base:    base,
+		gateway: gateway,
 		control: env("STUBS_CONTROL", base+":9099"),
 		token:   env("CHECK_API_TOKEN", "demo"),
 		client:  &http.Client{Timeout: 15 * time.Second},
@@ -119,6 +124,15 @@ func main() {
 		},
 	}
 
+	if gateway != "" {
+		// Not a stub: the API pep-federation itself fronts, holding the key. Its two
+		// documents are served by the PEP, and its metadata is the controller's to
+		// maintain — nothing about it is configured on the PEP.
+		s.resources = append(s.resources[:len(s.resources)-1], resource{
+			Key: "gateway", Name: "the gateway's own API", ID: gateway,
+			Blurb: "Fronted by pep-federation, which holds the key and publishes the entity configuration and the RFC 9728 document itself. Until the controller onboards it, that document says only which PDP the gateway is configured with.",
+		}, s.resources[len(s.resources)-1])
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -134,7 +148,7 @@ func main() {
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{
 			"peps": s.peps, "resources": s.resources, "actions": s.actions,
-			"estate_pdp": base + ":9098", "static_pdp": base + ":9002/tenants/bank-a",
+			"estate_pdp": base + ":9098", "static_pdp": base + ":9002/tenants/bank-a", "gateway_entity": gateway,
 			// Which stub is which PDP, so the page can find a PDP's metadata from the
 			// name the trace uses.
 			"pdps": map[string]string{
@@ -338,7 +352,8 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, in 
 // out of the trace.
 func (s *server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("url")
-	if !strings.HasPrefix(raw, s.base+":") && !strings.HasPrefix(raw, s.base+"/") {
+	fromGateway := s.gateway != "" && (raw == s.gateway || strings.HasPrefix(raw, s.gateway+"/") || strings.HasPrefix(strings.Replace(raw, "/.well-known/oauth-protected-resource", "", 1), s.gateway))
+	if !strings.HasPrefix(raw, s.base+":") && !strings.HasPrefix(raw, s.base+"/") && !fromGateway {
 		http.Error(w, `{"error":"not a stub"}`, http.StatusBadRequest)
 		return
 	}
@@ -355,7 +370,8 @@ func (s *server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	writeJSON(w, map[string]any{"status": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "body": string(body)})
+	writeJSON(w, map[string]any{"status": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "body": string(body),
+		"source": resp.Header.Get("X-Resource-Metadata-Source")})
 }
 
 // handleControl relays the console's levers to the stubs: move a PDP's advertised
@@ -366,6 +382,13 @@ func (s *server) handleControl(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		method = http.MethodPost
 		raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		// The onboarding levers act on the gateway's API; the page need not know its id.
+		var op struct {
+			Op string `json:"op"`
+		}
+		if json.Unmarshal(raw, &op) == nil && (op.Op == "onboard" || op.Op == "offboard") {
+			raw, _ = json.Marshal(map[string]string{"op": op.Op, "entity": s.gateway})
+		}
 		body = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequestWithContext(r.Context(), method, s.control+"/control", body)

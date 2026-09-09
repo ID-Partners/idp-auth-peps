@@ -32,7 +32,7 @@ pids+=($!)
 # Allowlists match scheme + host + port at a path boundary, so each stub is listed.
 # pep-resource deliberately has NO PDP_ALLOWLIST (it warns): the point of scenario 2 is
 # what happens when a resource's own word is the only bound. pep-federation has one.
-resources="http://localhost:9001,http://localhost:9004,http://localhost:9005,http://localhost:9006,http://localhost:9007,http://localhost:9009"
+resources="http://localhost:9001,http://localhost:9004,http://localhost:9005,http://localhost:9006,http://localhost:9007,http://localhost:9009,http://localhost:9194"
 env "${common[@]}" PORT=9292 HTTP_PORT=9193 PDP_DISCOVERY=resource PDP_DISCOVERY_INSECURE=true \
   RESOURCE_METADATA_ALLOWLIST="$resources" "$OUT/coaz-pep" >"$OUT/pep-resource.log" 2>&1 &
 pids+=($!)
@@ -40,16 +40,18 @@ env "${common[@]}" PORT=9293 HTTP_PORT=9194 PDP_DISCOVERY=federation PDP_DISCOVE
   RESOURCE_METADATA_ALLOWLIST="$resources" PDP_ALLOWLIST=http://localhost:9002,http://localhost:9008,http://localhost:9098 \
   FEDERATION_TRUST_ANCHORS_FILE="$OUT/anchors.json" \
   FEDERATION_FETCH_ALLOWLIST=http://localhost:9000 \
+  FEDERATION_ENTITY_ID=http://localhost:9194 FEDERATION_ENTITY_KEY_FILE="$OUT/entity-key.json" FEDERATION_ENTITY_KEY_GENERATE=true \
+  FEDERATION_AUTHORITY_HINTS=http://localhost:9000 \
   "$OUT/coaz-pep" >"$OUT/pep-federation.log" 2>&1 &
 pids+=($!)
 for p in 9192 9193 9194; do until curl -sf "http://localhost:$p/healthz" >/dev/null; do sleep 0.2; done; done
 
-STUBS_HOST=localhost ./demo.sh
+STUBS_HOST=localhost GATEWAY_ENTITY=http://localhost:9194 ./demo.sh
 echo "logs in $OUT (stubs.log shows which PDP was consulted)"
 
 if [ -n "$console" ]; then
   PEP_STATIC=http://localhost:9192 PEP_RESOURCE=http://localhost:9193 PEP_FEDERATION=http://localhost:9194 \
-    STUBS_BASE=http://localhost CHECK_API_TOKEN=demo "$OUT/demo-console" &
+    STUBS_BASE=http://localhost GATEWAY_ENTITY=http://localhost:9194 CHECK_API_TOKEN=demo "$OUT/demo-console" &
   pids+=($!)
   echo
   echo "console on http://localhost:8088 — ctrl-c to stop everything"

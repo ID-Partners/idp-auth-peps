@@ -96,6 +96,11 @@ be reached is skipped and the permit carries `X-PDP-Fail-Open`; a deny or a refu
 opens, and an entry the plugin cannot read fails the route closed. Both settings are
 passed to `coaz-pep` on MCP routes.
 
+`federation_entity_url` makes the route the resource's federation face: the plugin relays
+`/.well-known/openid-federation` and `/.well-known/oauth-protected-resource` (with any
+identifier path) from `coaz-pep` at that URL, which holds the key and signs both. Kong
+cannot sign, so it relays; everything else on the route is untouched.
+
 The rules are the Go PEP's: the resource's echoed `resource` must be byte-identical
 (RFC 9728 §3.3), the PDP's `policy_decision_point` must equal the identifier it was
 fetched from, a PDP without metadata gets the spec's default paths, and metadata is

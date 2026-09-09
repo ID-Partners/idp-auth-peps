@@ -57,7 +57,7 @@ services:
       PDP_DISCOVERY: resource
       PDP_DISCOVERY_INSECURE: "true"
       # Allowlists match scheme + host + port at a path boundary, so each stub is listed.
-      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009
+      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
       # Deliberately no PDP_ALLOWLIST here (it warns at boot): scenario 2 shows what
       # happens when a resource's own word is the only bound on who decides.
     ports:
@@ -74,9 +74,17 @@ services:
       <<: *pep-env
       PDP_DISCOVERY: federation
       PDP_DISCOVERY_INSECURE: "true"
-      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009
+      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
       PDP_ALLOWLIST: http://stubs:9002,http://stubs:9008,http://stubs:9098
       FEDERATION_TRUST_ANCHORS_FILE: /shared/anchors.json
+      # This PEP is also the federation face of the API it fronts: it holds a key, publishes
+      # a minimal entity configuration for the anchor to onboard, and republishes what the
+      # federation resolves as that API's RFC 9728 document. Nothing about the API's policy
+      # is configured here; the anchor maintains it.
+      FEDERATION_ENTITY_ID: http://pep-federation:9192
+      FEDERATION_ENTITY_KEY_FILE: /tmp/entity-key.json
+      FEDERATION_ENTITY_KEY_GENERATE: "true"
+      FEDERATION_AUTHORITY_HINTS: http://stubs:9000
       # Which resources may be looked up is RESOURCE_METADATA_ALLOWLIST's call, in every
       # mode; this one governs the climb from a resource to the anchor.
       FEDERATION_FETCH_ALLOWLIST: http://stubs:9000
@@ -99,6 +107,7 @@ services:
       PEP_STATIC: http://pep-static:9192
       PEP_RESOURCE: http://pep-resource:9192
       PEP_FEDERATION: http://pep-federation:9192
+      GATEWAY_ENTITY: http://pep-federation:9192
       CHECK_API_TOKEN: demo
     ports:
       - "8088:8088"

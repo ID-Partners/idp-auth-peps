@@ -14,8 +14,11 @@ import (
 // Trust Anchors (§10.1–10.3). The returned chain is ES[0]..ES[i]: the subject's Entity
 // Configuration, the Subordinate Statements upward, and the anchor's Entity
 // Configuration, every link verified.
-func (r *Resolver) walk(ctx context.Context, entityID string) ([]*Statement, string, error) {
+func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) ([]*Statement, string, error) {
 	w := &walker{r: r, ctx: ctx, subjectID: entityID, configs: map[string]*Statement{}, budget: r.opts.MaxFetches}
+	if seed != nil {
+		w.configs[entityID] = seed
+	}
 
 	leaf, err := w.entityConfiguration(entityID)
 	if err != nil {

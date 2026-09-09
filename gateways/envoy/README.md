@@ -126,3 +126,11 @@ Read from `context_extensions` on every request:
 | `fail_mode` | `PDP_FAIL_MODE` | `closed` or `open`: what a layer does when its PDP cannot be reached, unless the layer says for itself. Open skips it and marks the permit with `X-PDP-Fail-Open`; a deny or a refusal never opens |
 | `coaz_defaults` | `false` | Apply the binding's default mappings to undeclared methods |
 | `legacy_subject_identity` | `true` | Also send the non-standard `subject.identity` beside AuthZEN's `subject.id`. Set `"false"` once policies read `subject.id` — see [core/README.md](../../core/README.md#migrating-subjectidentity---subjectid) |
+
+## The resource's well-known documents
+
+When `coaz-pep` is the federation entity for the resource it fronts (`FEDERATION_ENTITY_ID`),
+it serves `{path}/.well-known/openid-federation` and `/.well-known/oauth-protected-resource{path}`
+on its HTTP port. Route those two paths, on the resource's host, to that port as an
+ordinary upstream cluster rather than through ext_authz: they are public documents, and
+the trust controller fetches the first one to onboard the resource.

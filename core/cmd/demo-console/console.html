@@ -142,6 +142,7 @@ button.run:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
       <button type="button" id="movePdp" aria-pressed="false">Relocate Bank A's PDP</button>
       <button type="button" id="repoint" aria-pressed="false">Hand plain over to Bank B's PDP</button>
       <button type="button" id="estateDown" aria-pressed="false">Take the estate PDP down</button>
+      <button type="button" id="onboard" aria-pressed="false" hidden>Onboard the gateway's API into the federation</button>
       <button type="button" id="reset">Put it back</button>
     </div>
     <div class="state" id="state"></div>
@@ -232,10 +233,10 @@ function wellKnown(id, name) {
   return `${u.origin}/.well-known/${name}${u.pathname === '/' ? '' : u.pathname.replace(/\/$/, '')}`;
 }
 async function loadResourceDocs(res) {
-  const out = { rfc9728: null, ec: null, anchor: null, sub: null, policy: null };
+  const out = { rfc9728: null, rfc9728Source: '', ec: null, anchor: null, sub: null, policy: null };
   if (!res.id) return out;
   const r = await fetchDoc(wellKnown(res.id, 'oauth-protected-resource'));
-  if (r.status === 200) out.rfc9728 = parseJson(r.body);
+  if (r.status === 200) { out.rfc9728 = parseJson(r.body); out.rfc9728Source = r.source || ''; }
   const e = await fetchDoc(res.id + '/.well-known/openid-federation');
   if (e.status === 200) {
     out.ec = decodeJwt(e.body);
@@ -274,6 +275,9 @@ function docBox(title, rows, raw, marks) {
   return `<div class="doc"><div class="t"><span>${esc(title)}</span><span>${marks || ''}</span></div><div class="kv">${rows.join('')}</div>${raw ? `<details><summary>the whole document</summary><pre>${esc(JSON.stringify(raw, null, 2))}</pre></details>` : ''}</div>`;
 }
 const fetchedMark = (events, entity, pathPart) => (events.some((e) => e.kind === 'metadata' && e.entity === entity && e.path.includes(pathPart)) ? '<span class="mark now">fetched</span>' : '<span class="mark">cached</span>');
+// The gateway's own API is served by pep-federation, not a stub: the trace cannot say
+// whether it was fetched, only who serves it.
+const resMark = (events, res, pathPart) => (res.key === 'gateway' ? '<span class="mark warn">served by pep-federation</span>' : fetchedMark(events, res.key, pathPart));
 const P = 'authzen_policy_decision_points';
 const REQ = ['scopes_supported', 'acr_values_required'];
 function requirementRows(doc, resolvedFrom) {
@@ -295,6 +299,7 @@ function pdpRows(doc, resolvedFrom) {
   }
   return [kv(P, doc[P], 'pdp')];
 }
+const anchorIdOf = (docs) => list(docs.ec && docs.ec.authority_hints)[0] || '';
 function entityOf(id) {
   for (const [name, pid] of Object.entries(config.pdps)) if (id === pid) return name;
   return null;
@@ -328,27 +333,41 @@ function stepFind(p, res, docs, r, resolved) {
   if (p.mode === 'resource') {
     const url = wellKnown(res.id, 'oauth-protected-resource');
     if (!docs.rfc9728) {
-      return `<p class="fetch"><b>GET</b> ${esc(url)} ${fetchedMark(ev, res.key, 'oauth-protected-resource')}</p><p class="say">404 — no document. The gateway falls back to the PDP it was configured with.</p>`;
+      return `<p class="fetch"><b>GET</b> ${esc(url)} ${resMark(ev, res, 'oauth-protected-resource')}</p><p class="say">404 — no document. The gateway falls back to the PDP it was configured with.</p>`;
     }
     const d = docs.rfc9728;
-    const box = docBox("the API's own document (RFC 9728)", [kv('resource', d.resource), ...pdpRows(d), ...requirementRows(d)], d);
+    const republished = docs.rfc9728Source === 'federation';
+    const title = res.key === 'gateway' ? (republished ? 'what pep-federation publishes: the federation\'s resolved metadata, republished as RFC 9728' : 'what pep-federation publishes: self-asserted, the controller has not spoken') : "the API's own document (RFC 9728)";
+    const box = docBox(title, [kv('resource', d.resource), ...pdpRows(d), ...requirementRows(d), kv('signed_metadata', d.signed_metadata ? 'present, signed with the entity key' : 'absent')], d);
     const chosen = list(d[P])[0];
-    return `<p class="fetch"><b>GET</b> ${esc(url)} ${fetchedMark(ev, res.key, 'oauth-protected-resource')}</p>${box}<p class="say">The API says <span class="v pdp" style="font-family:var(--mono);font-size:.8em">${esc(chosen || '?')}</span> decides for it. Self-asserted: the gateway takes its word.</p>`;
+    const say = republished
+      ? `The document names <span class="v pdp" style="font-family:var(--mono);font-size:.8em">${esc(chosen || '?')}</span> and the requirements the controller maintains. This gateway reads it as any RFC 9728 document; it does not know a federation is behind it.`
+      : `The API says <span class="v pdp" style="font-family:var(--mono);font-size:.8em">${esc(chosen || '?')}</span> decides for it. Self-asserted: the gateway takes its word.`;
+    return `<p class="fetch"><b>GET</b> ${esc(url)} ${resMark(ev, res, 'oauth-protected-resource')}</p>${box}<p class="say">${say}</p>`;
   }
   // federation
   const ecUrl = res.id + '/.well-known/openid-federation';
   if (!docs.ec) {
-    return `<p class="fetch"><b>GET</b> ${esc(ecUrl)} ${fetchedMark(ev, res.key, 'openid-federation')}</p><p class="say">404 — not a member of any federation. The gateway falls back to the PDP it was configured with, and never reads the API's own document.</p>`;
+    return `<p class="fetch"><b>GET</b> ${esc(ecUrl)} ${resMark(ev, res, 'openid-federation')}</p><p class="say">404 — not a member of any federation. The gateway falls back to the PDP it was configured with, and never reads the API's own document.</p>`;
   }
   const own = docs.ec.metadata && docs.ec.metadata.oauth_resource || {};
-  let s = `<p class="fetch"><b>GET</b> ${esc(ecUrl)} ${fetchedMark(ev, res.key, 'openid-federation')}</p>`;
-  s += docBox("what the API says about itself (entity configuration, signed by the API)", [kv('authority_hints', docs.ec.authority_hints), ...pdpRows(own), ...requirementRows(own)], docs.ec);
-  const anchorId = list(docs.ec.authority_hints)[0];
-  if (docs.sub) {
+  let s = `<p class="fetch"><b>GET</b> ${esc(ecUrl)} ${resMark(ev, res, 'openid-federation')}</p>`;
+  const ownRows = [kv('authority_hints', docs.ec.authority_hints), ...(own[P] !== undefined ? pdpRows(own) : []), ...requirementRows(own)];
+  if (res.key === 'gateway') ownRows.push(kv('metadata.oauth_resource', 'only the entity type: the controller maintains the rest'));
+  s += docBox(res.key === 'gateway' ? 'what pep-federation says about itself (entity configuration, signed with the key it holds)' : 'what the API says about itself (entity configuration, signed by the API)', ownRows, docs.ec);
+  if (!docs.sub) {
+    s += `<p class="fetch"><b>GET</b> ${esc(anchorIdOf(docs))}/fetch?sub=… ${fetchedMark(ev, 'anchor', '/fetch')}</p>`;
+    s += `<p class="say">404 — the anchor has not onboarded this entity. Nothing vouches for its key, so there is no chain, and the gateway falls back to the PDP it was configured with.${res.key === 'gateway' ? ' Press the onboarding lever: the controller fetches the configuration above, checks it is self-signed, and starts vouching.' : ''}</p>`;
+    return s;
+  }
+  const anchorId = anchorIdOf(docs);
+  {
     const pol = docs.policy || {};
     const polRows = Object.entries(pol).map(([k, ops]) => `<span class="k">${esc(k)}</span><span class="v">${esc(Object.entries(ops).map(([op, v]) => `${op} ${JSON.stringify(v)}`).join(' · '))}</span>`);
+    const said = docs.sub.metadata && docs.sub.metadata.oauth_resource;
+    const saidRows = said ? [...pdpRows(said), ...requirementRows(said)] : [];
     s += `<p class="fetch"><b>GET</b> ${esc(anchorId)}/fetch?sub=… ${fetchedMark(ev, 'anchor', '/fetch')}</p>`;
-    s += docBox("the anchor's policy for this member (subordinate statement, signed by the anchor)", polRows.length ? polRows : [kv('metadata_policy', 'none')], docs.sub);
+    s += docBox("the anchor's word for this member (subordinate statement, signed by the anchor)", [...(saidRows.length ? [`<span class="k">metadata</span><span class="v">what the controller maintains for it:</span>`, ...saidRows] : []), ...(polRows.length ? [`<span class="k">metadata_policy</span><span class="v">and what it constrains:</span>`, ...polRows] : [kv('metadata_policy', 'none')])], docs.sub);
   }
   if (resolved) {
     s += docBox('resolved: what survived the policy', [...pdpRows(resolved, own), ...requirementRows(resolved, own)], resolved);
@@ -484,7 +503,11 @@ function showState(state) {
   const home = (controlState.pdp_home || {})['pdp-a'] || '';
   const plain = ((controlState.resource_pdps || {})['plain'] || []).join(', ');
   const down = (controlState.pdp_down || []).includes('pdp-estate');
-  $('state').textContent = `pdp-a evaluates at ${evalPath} · plain names ${plain} · the estate PDP is ${down ? 'DOWN' : 'up'}`;
+  const onboarded = !!config.gateway_entity && (controlState.onboarded || []).includes(config.gateway_entity);
+  $('state').textContent = `pdp-a evaluates at ${evalPath} · plain names ${plain} · the estate PDP is ${down ? 'DOWN' : 'up'}${config.gateway_entity ? ` · the gateway's API is ${onboarded ? 'ONBOARDED' : 'not onboarded'}` : ''}`;
+  $('onboard').hidden = !config.gateway_entity;
+  $('onboard').setAttribute('aria-pressed', String(onboarded));
+  $('onboard').textContent = onboarded ? "Take the gateway's API out of the federation" : "Onboard the gateway's API into the federation";
   $('movePdp').setAttribute('aria-pressed', String(!evalPath.startsWith(home + '/access/v1/')));
   $('repoint').setAttribute('aria-pressed', String(plain.includes(':9008')));
   $('estateDown').setAttribute('aria-pressed', String(down));
@@ -536,6 +559,7 @@ async function run(ev) {
   $('movePdp').addEventListener('click', () => control('move_pdp'));
   $('repoint').addEventListener('click', () => control('repoint_plain'));
   $('estateDown').addEventListener('click', () => control((controlState.pdp_down || []).includes('pdp-estate') ? 'estate_up' : 'estate_down'));
+  $('onboard').addEventListener('click', () => control((controlState.onboarded || []).includes(config.gateway_entity) ? 'offboard' : 'onboard'));
   $('reset').addEventListener('click', () => control('reset'));
   showState(await (await fetch('/api/control')).json());
   run(new Event('submit'));

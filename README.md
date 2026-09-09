@@ -106,6 +106,9 @@ docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coa
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
 | `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit | `resource` |
 | `PDP_FAIL_MODE` | what a layer does when its PDP cannot be reached, unless the layer says for itself: `closed` denies, `open` skips it and marks the permit with `X-PDP-Fail-Open`. A deny or a refusal never opens | `closed` |
+| `FEDERATION_ENTITY_ID` | make this PEP the federation entity for the resource it fronts: a minimal Entity Configuration at `{id}/.well-known/openid-federation` for the controller to onboard, and RFC 9728 metadata at `/.well-known/oauth-protected-resource{path}` republishing what the federation resolved (self-asserted until onboarded) | — |
+| `FEDERATION_ENTITY_KEY_FILE` | the private JWK the entity signs with; `FEDERATION_ENTITY_KEY_GENERATE=true` mints a P-256 key into it when absent | — |
+| `FEDERATION_AUTHORITY_HINTS` | comma-separated superiors the trust controller is reached through | — |
 
 Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url` — is
 **per route**, and arrives as ext_authz `context_extensions` or the Kong plugin's config.

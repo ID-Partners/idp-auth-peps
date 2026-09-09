@@ -58,6 +58,16 @@ check() {
       "$cfg" "$method" "$path" "$(jwt)" "$esc_body")" | pretty
 }
 
+# The API pep-federation fronts as a federation entity, as the anchor reaches it.
+GATEWAY_ENTITY="${GATEWAY_ENTITY:-http://pep-federation:9192}"
+
+decode_jwt() { cut -d. -f2 | tr '_-' '/+' | awk '{ n = length($0) % 4; if (n == 2) $0 = $0 "=="; else if (n == 3) $0 = $0 "="; print }' | base64 -d 2>/dev/null; echo; }
+
+# ctl_entity OP ENTITY — the anchor's onboarding levers
+ctl_entity() {
+  curl -sS -o /dev/null -X POST -H 'Content-Type: application/json' -d "{\"op\":\"$1\",\"entity\":\"$2\"}" "http://${PEP_HOST}:${CONTROL_PORT:-9099}/control"
+}
+
 # ctl OP — a lever on the stubs (move_pdp, repoint_plain, estate_down, estate_up, reset)
 ctl() {
   curl -sS -o /dev/null -X POST -H 'Content-Type: application/json' -d "{\"op\":\"$1\"}" "http://${PEP_HOST}:${CONTROL_PORT:-9099}/control"
@@ -126,12 +136,28 @@ echo "  ^ permitted by Bank A's PDP alone, and marked: failed_open names the lay
 ctl estate_up
 step "estate back up, same fail-open policy: no marker"; LAYERS="$ESTATE fail-open,resource" check "$RESOURCE" "$PLAIN" GET /accounts/a1/balance
 
-say "6. The challenge contract survives discovery"
+say "6. The gateway as the resource's federation face: it holds the key, the anchor holds the policy"
+echo "  pep-federation is the federation entity for $GATEWAY_ENTITY. Its entity configuration (payload):"
+echo "  $(curl -s "$FEDERATION/.well-known/openid-federation" | decode_jwt)"
+step "its RFC 9728 document before onboarding"; curl -s "$FEDERATION/.well-known/oauth-protected-resource" | jq -c 'del(.signed_metadata)'
+echo "  ^ self-asserted: only the PDP the PEP is configured with. Nothing about scopes or acr lives on the PEP."
+ctl_entity onboard "$GATEWAY_ENTITY"
+echo "  the anchor fetched that configuration, checked it is self-signed, and now vouches for the key."
+step "after onboarding (the PEP re-walks its chain when its cache lapses)"
+for i in $(seq 1 40); do
+  if curl -si "$FEDERATION/.well-known/oauth-protected-resource" | grep -qi '^X-Resource-Metadata-Source: federation'; then break; fi
+  sleep 0.5
+done
+curl -s "$FEDERATION/.well-known/oauth-protected-resource" | jq -c 'del(.signed_metadata)'
+echo "  ^ the anchor's word, republished: Bank A's PDP, the scopes, MFA. The PEP maintained a key; the anchor maintained the rest."
+ctl_entity offboard "$GATEWAY_ENTITY"
+
+say "7. The challenge contract survives discovery"
 step "pay 50 on member (federation mode)"; ACR=urn:idp:loa:mfa check "$FEDERATION" "$MEMBER" POST /payments "$PAY50"
 step "pay 5000 -> step-up challenge"; ACR=urn:idp:loa:mfa check "$FEDERATION" "$MEMBER" POST /payments "$PAY5000"
 
 if curl -s -o /dev/null -w '%{http_code}' "http://${PEP_HOST}:8000/bank/accounts/a1/balance" 2>/dev/null | grep -q '^[0-9]'; then
-  say "7. Kong, doing the same discovery in Lua (profile kong)"
+  say "8. Kong, doing the same discovery in Lua (profile kong)"
   step "read a balance via Kong"; curl -s -H "Authorization: Bearer $(jwt)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
   step "read-only token pays via Kong"; curl -s -X POST -H "Authorization: Bearer $(SCOPE='accounts:read' jwt)" -H 'Content-Type: application/json' -d "$PAY50" "http://${PEP_HOST}:8000/bank/payments"; echo
 fi

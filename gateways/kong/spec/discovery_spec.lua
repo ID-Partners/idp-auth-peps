@@ -581,6 +581,40 @@ describe('discovery: fail-open through access()', function()
   end)
 end)
 
+describe('federation entity relay', function()
+  it('serves the two well-known documents from coaz-pep, and nothing else', function()
+    local fn = router({
+      ['http://coaz-pep:9192/.well-known/openid-federation'] = function()
+        return { status = 200, body = 'eyJ.a.b', headers = { ['Content-Type'] = 'application/entity-statement+jwt' } }
+      end,
+      ['http://coaz-pep:9192/.well-known/oauth-protected-resource/bank'] = function()
+        return { status = 200, body = '{"resource":"x"}', headers = { ['content-type'] = 'application/json' } }
+      end,
+      ['http://coaz-pep:9192/.well-known/oauth-protected-resource'] = false,
+    })
+    local drive = function(path, over)
+      local plugin, state = load_plugin({ method = 'GET', path = path, headers = {}, pdp = fn })
+      local c = { authzen_url = STATIC, pep_label = 'test-pep', style = 'rest', require_token = true, pdp_ssl_verify = true,
+        federation_entity_url = 'http://coaz-pep:9192' }
+      for k, v in pairs(over or {}) do c[k] = v end
+      mock.run_access(plugin, c)
+      return state
+    end
+    local ec = drive('/.well-known/openid-federation')
+    assert.equal(200, ec.exited.status); assert.equal('eyJ.a.b', ec.exited.body)
+    assert.equal('application/entity-statement+jwt', ec.exited.headers['Content-Type'])
+    local doc = drive('/.well-known/oauth-protected-resource/bank')
+    assert.equal(200, doc.exited.status); assert.equal('{"resource":"x"}', doc.exited.body)
+    assert.equal('application/json', doc.exited.headers['Content-Type'])
+    local down = drive('/.well-known/oauth-protected-resource')
+    assert.equal(503, down.exited.status)
+    -- Any other path is the plugin's ordinary business: no token, so a 401.
+    assert.equal(401, drive('/accounts/a1/balance').exited.status)
+    -- And so is a well-known path on a route that is nobody's federation face.
+    assert.equal(401, drive('/.well-known/openid-federation', { federation_entity_url = ngx.null }).exited.status)
+  end)
+end)
+
 describe('discovery: through access()', function()
   local function drive(over, pdp_fn, body, method, path)
     local plugin, state = load_plugin({

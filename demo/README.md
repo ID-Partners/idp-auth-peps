@@ -23,6 +23,12 @@ That is the layers picker, and section 4.
 open, in which case it is skipped and the permit says so. The third layers option and the
 "Take the estate PDP down" lever show both; section 5 of `demo.sh` does the same.
 
+**Can the gateway be the resource's federation face?** Yes. `pep-federation` holds a key
+and publishes a minimal entity configuration for its own API; the anchor onboards it and
+maintains the API's metadata; the PEP republishes what the anchor resolved as the API's
+RFC 9728 document. That is "the gateway's own API" in the picker, the onboarding lever,
+and section 6.
+
 Nothing here turns on who the customer is. The variables are which PDP was consulted,
 what document it was given, what the token carries, and which layers ran. One subject,
 `customer`, throughout.
@@ -43,6 +49,7 @@ what document it was given, what the token carries, and which layers ran. One su
 | `pdp-estate` | 9098 | A generic PDP for the whole estate: judges the token and the client (`agent-risky` is on its watch list), knows nothing about any resource. The first layer. |
 | `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP; requires MFA. |
 | `control` | 9099 | The event feed the console traces, and the levers it pulls. Not part of any spec. |
+| the gateway's own API | `pep-federation:9192` | Not a stub. `pep-federation` is the federation entity for the API it fronts: it holds a key, publishes a minimal entity configuration, and republishes what the anchor resolves as that API's RFC 9728 document. The anchor maintains the API's metadata (Bank A's PDP, its scopes, MFA); the PEP maintains a key. |
 
 The three PEPs' allowlists name the estate PDP so a route may add it as a layer.
 
@@ -157,6 +164,12 @@ documents in step 1 and 2 change under them.
 - **Hand `plain` over to Bank B's PDP.** Re-run a payment of 500: permitted under Bank A's
   threshold, needs a step-up under Bank B's. A resource changed hands between two policy
   owners and no gateway was touched.
+- **Onboard the gateway's API into the federation.** The anchor fetches `pep-federation`'s
+  entity configuration and starts vouching for its key. Pick "the gateway's own API" and
+  discover again after a few seconds: the federation column resolves a chain the anchor
+  now completes, and the resource column reads an RFC 9728 document that has become the
+  anchor's word, `signed_metadata` and all. Take it out again and both revert within the
+  metadata TTL.
 - **Put it back.**
 
 ### Requests worth trying
@@ -223,7 +236,14 @@ answers 503: closed is the default. With the estate entry marked ` fail-open`, B
 PDP alone decides and the permit carries `X-PDP-Fail-Open` naming what was skipped. Bring
 the estate back and the same policy permits with no marker.
 
-**6. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
+**6. The gateway as the resource's federation face.** `pep-federation` publishes a
+minimal entity configuration for the API it fronts and, before onboarding, an RFC 9728
+document that says only which PDP it is configured with. The anchor onboards it: fetches
+the configuration, checks it is self-signed, starts vouching for the key. Within the
+metadata TTL the PEP's RFC 9728 document becomes the anchor's word: Bank A's PDP, the
+scopes, MFA. Nothing on the PEP changed.
+
+**7. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="payments:approve"` and an
 `authz_challenge` body. Discovery changed where the decision came from, not what a deny
 looks like.

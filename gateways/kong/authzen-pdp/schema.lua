@@ -35,6 +35,10 @@ return {
           -- (discovery from tools/list, CEL evaluation, JSON-RPC errors) by
           -- the shared engine — one spec implementation for every gateway.
           { coaz_url = { type = "string" } },
+          -- coaz-pep's HTTP base when this route is the resource's federation face: the
+          -- plugin relays the resource's entity configuration and RFC 9728 document from
+          -- it, since it cannot sign either itself.
+          { federation_entity_url = { type = "string" } },
           -- Shared secret for the engine's HTTP check API (its CHECK_API_TOKEN).
           { coaz_api_key = { type = "string", referenceable = true } },
           -- The MCP server whose tools/list declares the x-coaz-mapping

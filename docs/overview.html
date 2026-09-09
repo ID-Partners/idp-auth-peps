@@ -390,6 +390,18 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
   </div>
 </section>
 
+<section>
+  <div class="wrap">
+    <span class="eyebrow">The gateway as the resource's federation face</span>
+    <h2>The PEP holds a key. The controller holds the policy.</h2>
+    <div class="measure">
+      <p>A federated resource publishes two things: a signed entity configuration a trust controller fetches to onboard it, and its RFC 9728 metadata. The gateway is the resource's public face, so it is the natural place for both. <code>coaz-pep</code> holds the key and serves both documents; the Kong plugin relays them from it; the Node SDK's <code>FederationEntity</code> signs and serves its own.</p>
+      <p>The entity configuration is deliberately minimal: the public key, <code>authority_hints</code>, and the entity type. No policy lives on the PEP. Which PDP decides for the resource, which scopes it uses, which acr it requires, all of that is the controller's, in the subordinate statement it issues, and changing it there changes what every consumer sees on its next refresh without touching a gateway.</p>
+      <p>The PEP then republishes what the federation resolved for it as the resource's RFC 9728 document, <code>signed_metadata</code> included, so a plain RFC 9728 consumer reads the federation's word without knowing a federation is behind it. Until the controller has onboarded the entity the document is self-asserted, says only which PDP the PEP is configured with, and says so in a header.</p>
+    </div>
+  </div>
+</section>
+
 <section class="band">
   <div class="wrap">
     <span class="eyebrow">Seeing it work</span>
@@ -425,6 +437,8 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
           <dt>broken chain</dt><dd class="bad">503, never static</dd>
           <dt>stray, no metadata → static PDP</dt><dd class="ok">permit</dd>
           <dt>pay 5000</dt><dd class="warn">401 step-up</dd>
+          <dt>the gateway's own API, before onboarding</dt><dd>self-asserted</dd>
+          <dt>the same, onboarded by the anchor</dt><dd class="ok">the anchor's word, republished</dd>
         </dl>
       </div>
     </div>

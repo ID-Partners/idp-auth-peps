@@ -84,6 +84,9 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
 | `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit | `resource` |
 | `PDP_FAIL_MODE` | what a layer does when its PDP cannot be reached, unless the layer says for itself: `closed` denies, `open` skips it and marks the permit with `X-PDP-Fail-Open`. A deny or a refusal never opens | `closed` |
+| `FEDERATION_ENTITY_ID` | make this PEP the federation entity for the resource it fronts: a minimal Entity Configuration at `{id}/.well-known/openid-federation` for the controller to onboard, and RFC 9728 metadata at `/.well-known/oauth-protected-resource{path}` republishing what the federation resolved (self-asserted until onboarded) | — |
+| `FEDERATION_ENTITY_KEY_FILE` | the private JWK the entity signs with; `FEDERATION_ENTITY_KEY_GENERATE=true` mints a P-256 key into it when absent | — |
+| `FEDERATION_AUTHORITY_HINTS` | comma-separated superiors the trust controller is reached through | — |
 
 Per-route knobs are not env — they arrive as ext_authz `context_extensions` or in the
 `config` object of an HTTP check. See [`../gateways/envoy/README.md`](../gateways/envoy/README.md).
@@ -156,6 +159,14 @@ ordered list of `static`, `resource` or PDP identifiers, every one of which must
 the first deny being the answer. That is how a generic estate PDP that judges the token
 and the client sits in front of the one that knows the resource; see
 [docs/architecture.md](../docs/architecture.md#layers-a-generic-pdp-first-the-resources-after).
+
+The PEP can be the federation face of the resource it fronts. With `FEDERATION_ENTITY_ID`
+set it holds a key and publishes a minimal entity configuration — keys, `authority_hints`,
+the entity type, no policy — for a trust controller to onboard, and republishes what the
+federation resolved for it as the resource's RFC 9728 document, `signed_metadata`
+included. The controller maintains the resource's metadata; the PEP maintains a key. Route
+the two well-known paths to the PEP's HTTP port; see
+[docs/architecture.md](../docs/architecture.md#the-pep-as-the-resources-federation-face).
 
 A layer whose PDP cannot be reached fails closed unless it says otherwise: suffix the
 entry with ` fail-open` (`http://estate:9098 fail-open, resource`) and it is skipped

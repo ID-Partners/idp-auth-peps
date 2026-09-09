@@ -243,6 +243,29 @@ the middleware also sets `X-PDP-Fail-Open`. If every layer was skipped the verdi
 permit that says so. A deny is never skipped, nor is a refusal, and an entry the SDK
 cannot read throws. The guard passes `fail_mode` to `coaz-pep` in delegate mode.
 
+### The resource's federation face
+
+`FederationEntity` holds a private key and serves the two documents a federated resource
+publishes: a minimal entity configuration (keys, `authority_hints`, the entity type — no
+policy, the controller maintains that) for a trust controller to onboard, and RFC 9728
+metadata with `signed_metadata`.
+
+```ts
+import { FederationEntity } from '@id-partners/authzen-pep';
+
+const entity = new FederationEntity({
+  entityId: 'https://api.bank.example',
+  key: privateJwk,                                  // or a KeyObject
+  authorityHints: ['https://federation.example'],
+  asserted: { authzen_policy_decision_points: ['https://pdp.bank.example'] },
+});
+app.use(entity.handler());   // serves the two well-known paths, passes everything else on
+```
+
+The SDK has no chain resolver, so its RFC 9728 document is self-asserted from `asserted`.
+`coaz-pep` walks its own chain and republishes what the federation resolved; put it in
+front when the public document must be the controller's word.
+
 There is no federation mode in the SDK; `sources` is the seam for one, and `discovery`
 also accepts a resolver of your own (`{ resolve(resource) }`). In `delegate` mode the
 Go engine runs its own discovery, federation included, and an explicit `resource` is

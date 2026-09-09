@@ -269,6 +269,47 @@ not validate — is the PEP's own rule being enforced, and an outage does not li
 a policy the PEP cannot read, an unknown modifier say, fails the route closed rather than
 running a narrower policy than it was given.
 
+### The PEP as the resource's federation face
+
+A resource that belongs to a federation has to publish two things: a signed Entity
+Configuration at `{resource}/.well-known/openid-federation`, which is what a trust
+controller fetches to onboard it, and its RFC 9728 metadata. The gateway is the
+resource's public face, so it is the natural place for both, and every surface here can
+be that face: `coaz-pep` holds the key and serves both documents, the Kong plugin relays
+them from `coaz-pep`, and the Node SDK's `FederationEntity` signs and serves its own.
+
+The split is deliberate, and it is the whole point:
+
+- **The PEP holds a key and an identifier, and nothing else.** Its Entity Configuration
+  carries its public key, its `authority_hints`, and the entity type — `metadata.oauth_resource`
+  is just `{"resource": id}`. There is no policy to maintain on the PEP. Onboarding is the
+  controller fetching that document, checking it is self-signed, and starting to vouch for
+  the key.
+- **The controller maintains the resource's metadata.** Which PDP decides for it, which
+  scopes it uses, which acr it requires: all of it lives in the Subordinate Statement the
+  controller issues, as `metadata` (applied to the resource, §6.1.4.2) and
+  `metadata_policy` (constraining anything the resource might have said). Change it there
+  and every consumer sees it on its next refresh; no PEP is touched.
+- **The PEP republishes what the federation resolved.** `coaz-pep` walks its own chain
+  (from the configuration it minted, so no round trip to its own public address) and
+  serves the resolved `oauth_resource` metadata as its RFC 9728 document. A plain RFC 9728
+  consumer, a gateway in `resource` mode say, reads the federation's word without knowing
+  a federation is behind it. Until the controller has onboarded the entity, the document
+  is self-asserted and says only which PDP the PEP is configured with; the
+  `X-Resource-Metadata-Source` header says which it was.
+- **Both documents are signed with the same key.** The RFC 9728 document carries
+  `signed_metadata` (RFC 9728 §2.1) signed with the Federation Entity Key, so a consumer
+  that has resolved the chain can verify the plain document against the keys the
+  federation vouches for.
+
+Configuration is four variables on `coaz-pep` — `FEDERATION_ENTITY_ID`,
+`FEDERATION_ENTITY_KEY_FILE` (a private JWK; `FEDERATION_ENTITY_KEY_GENERATE=true` mints
+one on first start), `FEDERATION_AUTHORITY_HINTS`, and the trust anchors it already has
+for federation-mode discovery — plus a gateway route sending the two well-known paths to
+the PEP's HTTP port. Kong sets `federation_entity_url` to that port instead. The SDK has
+no chain resolver, so its document is self-asserted; put `coaz-pep` in front when the
+public document must be the controller's word.
+
 ### The rules that never relax
 
 - A URL outside an allowlist, or a chain that fails validation, **fails closed**. It never
@@ -277,6 +318,8 @@ running a narrower policy than it was given.
 - A discovered PDP never receives the static API key. The key is bound to `AUTHZEN_URL`.
 - Fail-open covers outages only, and only where a layer or the PEP asked for it. A deny
   never opens, a refusal never opens, and a permit that skipped anything is marked.
+- A PEP that is a federation entity publishes nothing about the resource's policy. The
+  controller says it; the PEP republishes it, and says which it is publishing.
 - A batch is never sent to a guessed path: a boxcar mapping needs the PDP to advertise
   `access_evaluations_endpoint`.
 - Metadata is cached per identifier with stale-while-failing, refresh throttling and

@@ -26,7 +26,7 @@ export AUTHZEN_URL="http://$host:9002/tenants/bank-a" AUTHZEN_API_KEY=static-pdp
 export HTTP_ADDR=127.0.0.1 PDP_METADATA_TTL=15s
 export MCP_UPSTREAM_ALLOWLIST="http://$host:9001,http://$host:9004,http://$host:9005,http://$host:9006,http://$host:9009"
 # Allowlists match scheme + host + port at a path boundary, so each stub is listed.
-resources="http://$host:9001,http://$host:9004,http://$host:9005,http://$host:9006,http://$host:9007,http://$host:9009"
+resources="http://$host:9001,http://$host:9004,http://$host:9005,http://$host:9006,http://$host:9007,http://$host:9009,http://$host:9194"
 
 # pep-static: told where its PDP is, no discovery.
 PORT=9291 HTTP_PORT=9192 coaz-pep &
@@ -37,16 +37,22 @@ pids="$pids $!"
 PORT=9292 HTTP_PORT=9193 PDP_DISCOVERY=resource PDP_DISCOVERY_INSECURE=true \
   RESOURCE_METADATA_ALLOWLIST="$resources" coaz-pep &
 pids="$pids $!"
-# pep-federation: trusts the federation's word, and only PDPs on its allowlist.
+# pep-federation: trusts the federation's word, and only PDPs on its allowlist. It is
+# also the federation face of the API it fronts (http://$host:9194): it holds a key,
+# publishes a minimal entity configuration for the anchor to onboard, and republishes
+# what the federation resolves as that API's RFC 9728 document.
 PORT=9293 HTTP_PORT=9194 PDP_DISCOVERY=federation PDP_DISCOVERY_INSECURE=true \
   RESOURCE_METADATA_ALLOWLIST="$resources" \
   PDP_ALLOWLIST="http://$host:9002,http://$host:9008,http://$host:9098" \
-  FEDERATION_TRUST_ANCHORS_FILE="$anchors" FEDERATION_FETCH_ALLOWLIST="http://$host:9000" coaz-pep &
+  FEDERATION_TRUST_ANCHORS_FILE="$anchors" FEDERATION_FETCH_ALLOWLIST="http://$host:9000" \
+  FEDERATION_ENTITY_ID="http://$host:9194" FEDERATION_ENTITY_KEY_FILE=/tmp/entity-key.json FEDERATION_ENTITY_KEY_GENERATE=true \
+  FEDERATION_AUTHORITY_HINTS="http://$host:9000" coaz-pep &
 pids="$pids $!"
 for p in 9192 9193 9194; do ready "$p"; done
 
 LISTEN=":$port" STUBS_BASE="http://$host" STUBS_CONTROL="http://$host:9099" \
   PEP_STATIC=http://127.0.0.1:9192 PEP_RESOURCE=http://127.0.0.1:9193 PEP_FEDERATION=http://127.0.0.1:9194 \
+  GATEWAY_ENTITY="http://$host:9194" \
   demo-console &
 pids="$pids $!"
 echo "demo: console on :$port (stubs at http://$host, PEPs on 9192-9194)"

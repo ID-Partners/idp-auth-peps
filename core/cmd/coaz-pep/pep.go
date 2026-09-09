@@ -43,6 +43,7 @@ import (
 
 	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
+	"github.com/ID-Partners/idp-auth-peps/core/federation"
 )
 
 // pepConfig mirrors a gateway route's PEP knobs, populated from the extAuthz
@@ -147,6 +148,8 @@ type server struct {
 	// name none; failOpen is the service-wide failure mode (PDP_FAIL_MODE).
 	defaultLayers []discovery.LayerSpec
 	failOpen      bool
+	// entity is this PEP's own federation identity, when it has one.
+	entity *federation.Entity
 	// upstreamAllowlist bounds which MCP servers a caller may point the PEP at.
 	// Empty means unrestricted — main() warns when that is so.
 	upstreamAllowlist []string

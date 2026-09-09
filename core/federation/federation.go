@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
@@ -160,7 +161,31 @@ func New(o Options) (*Resolver, error) {
 // Resolve returns the Resolved Metadata for entityID, from cache when fresh.
 func (r *Resolver) Resolve(ctx context.Context, entityID string) (Resolved, error) {
 	return r.cache.Get(ctx, entityID, func(ctx context.Context, id string) (Resolved, time.Time, error) {
-		res, err := r.resolve(ctx, id)
+		res, err := r.resolve(ctx, id, nil)
+		if err != nil {
+			return Resolved{}, time.Time{}, err
+		}
+		return res, res.ExpiresAt, nil
+	})
+}
+
+// ResolveLeaf resolves the chain of an entity whose Entity Configuration the caller
+// already holds — its own, typically: a PEP publishing that configuration need not
+// fetch it back from its public address. The statement is verified exactly as a fetched
+// ES[0] would be; only the fetch is skipped.
+func (r *Resolver) ResolveLeaf(ctx context.Context, entityConfiguration string) (Resolved, error) {
+	st, err := parseStatement(strings.TrimSpace(entityConfiguration), r.opts.Now(), r.opts.Leeway)
+	if err != nil {
+		return Resolved{}, fmt.Errorf("%w: entity configuration: %v", ErrInvalidChain, err)
+	}
+	if !st.IsEntityConfiguration() {
+		return Resolved{}, fmt.Errorf("%w: statement about %s from %s is not an entity configuration", ErrInvalidChain, st.Sub, st.Iss)
+	}
+	if err := st.verifyWith(st.JWKS); err != nil {
+		return Resolved{}, fmt.Errorf("%w: entity configuration of %s: %v", ErrInvalidChain, st.Sub, err)
+	}
+	return r.cache.Get(ctx, "leaf:"+st.Sub, func(ctx context.Context, _ string) (Resolved, time.Time, error) {
+		res, err := r.resolve(ctx, st.Sub, st)
 		if err != nil {
 			return Resolved{}, time.Time{}, err
 		}
@@ -171,8 +196,10 @@ func (r *Resolver) Resolve(ctx context.Context, entityID string) (Resolved, erro
 // Status snapshots the resolution cache.
 func (r *Resolver) Status() map[string]ttlcache.EntryStatus { return r.cache.Status() }
 
-func (r *Resolver) resolve(ctx context.Context, entityID string) (Resolved, error) {
-	chain, anchor, err := r.walk(ctx, entityID)
+// resolve walks and validates the chain for entityID. seed, when given, is the
+// subject's already-verified Entity Configuration.
+func (r *Resolver) resolve(ctx context.Context, entityID string, seed *Statement) (Resolved, error) {
+	chain, anchor, err := r.walk(ctx, entityID, seed)
 	if err != nil {
 		return Resolved{}, err
 	}

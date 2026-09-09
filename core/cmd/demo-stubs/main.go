@@ -75,6 +75,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,6 +178,10 @@ type state struct {
 	// down names PDPs whose evaluation endpoints answer 503 — the fail-open lever. The
 	// metadata stays up: a PDP that can say where it is but cannot decide.
 	down map[string]bool
+	// onboarded is the anchor's registry of entities it has taken in by fetching their
+	// entity configuration: the keys it now vouches for. The controller's side of the
+	// onboarding lever.
+	onboarded map[string][]map[string]any
 	// defaults, for reset.
 	defEval map[string]string
 	defRes  map[string][]string
@@ -186,6 +191,12 @@ func (s *state) eval(pdp string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pdpEval[pdp]
+}
+
+func (s *state) keysOf(entity string) []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onboarded[entity]
 }
 
 func (s *state) isDown(pdp string) bool {
@@ -233,7 +244,12 @@ func (s *state) snapshot() map[string]any {
 			down = append(down, k)
 		}
 	}
-	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res, "pdp_down": down}
+	onboarded := []string{}
+	for k := range s.onboarded {
+		onboarded = append(onboarded, k)
+	}
+	sort.Strings(onboarded)
+	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res, "pdp_down": down, "onboarded": onboarded}
 }
 
 func main() {
@@ -261,9 +277,10 @@ func main() {
 	)
 	allScopes := []string{"accounts:read", "payments:write"}
 	st := &state{
-		home:    map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
-		pdpEval: map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
-		down:    map[string]bool{},
+		home:      map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
+		pdpEval:   map[string]string{pdpA.name: pdpA.base, pdpB.name: pdpB.base, rogue.name: rogue.base, estate.name: estate.base},
+		down:      map[string]bool{},
+		onboarded: map[string][]map[string]any{},
 		// The member's OWN document names Bank A's PDP and says a password is enough.
 		// Its entity configuration (below) names the rogue PDP first. The anchor's
 		// policy strips the rogue AND raises the acr floor to MFA — so the same PDP
@@ -326,23 +343,37 @@ func main() {
 			param:                 map[string]any{"subset_of": []any{pdpA.id}, "essential": true},
 			"acr_values_required": map[string]any{"value": []any{acrMFA}, "essential": true},
 		}}
+		// What the controller says about an onboarded resource — its PDP, its scopes,
+		// its acr — maintained here, never on the PEP that fronts it (§6.1.4.2: a
+		// subordinate statement's metadata applies to the subject before policy).
+		controllerSays := map[string]any{"oauth_resource": map[string]any{
+			param:                 []any{pdpA.id},
+			"scopes_supported":    []any{"accounts:read", "payments:write"},
+			"acr_values_required": []any{acrMFA},
+		}}
 		mux.HandleFunc("/fetch", func(w http.ResponseWriter, r *http.Request) {
 			sub := r.URL.Query().Get("sub")
 			iat, exp := times()
-			var keys []any
+			claims := map[string]any{"iss": anchor.id, "sub": sub, "iat": iat, "exp": exp, "metadata_policy": policy}
 			switch sub {
 			case member.id:
-				keys = []any{member.jwk}
+				claims["jwks"] = map[string]any{"keys": []any{member.jwk}}
 			case broken.id:
-				keys = []any{brokenAsserted.jwk} // not the key `broken` actually signs with
+				claims["jwks"] = map[string]any{"keys": []any{brokenAsserted.jwk}} // not the key `broken` actually signs with
 			default:
-				http.NotFound(w, r)
-				return
+				keys := st.keysOf(sub)
+				if keys == nil {
+					http.NotFound(w, r)
+					return
+				}
+				ks := make([]any, 0, len(keys))
+				for _, k := range keys {
+					ks = append(ks, k)
+				}
+				claims["jwks"] = map[string]any{"keys": ks}
+				claims["metadata"] = controllerSays
 			}
-			writeStatement(w, anchor.sign(map[string]any{
-				"iss": anchor.id, "sub": sub, "iat": iat, "exp": exp,
-				"jwks": map[string]any{"keys": keys}, "metadata_policy": policy,
-			}))
+			writeStatement(w, anchor.sign(claims))
 		})
 		serve(anchor, mux)
 	}
@@ -494,11 +525,28 @@ func main() {
 				return
 			}
 			var body struct {
-				Op string `json:"op"`
+				Op     string `json:"op"`
+				Entity string `json:"entity"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			// Onboarding is the controller's act: fetch the entity's configuration from
+			// where it says it lives, check it is self-signed, and start vouching for
+			// its keys. Done outside the lock: it is an HTTP call.
+			var onboardKeys []map[string]any
+			if body.Op == "onboard" {
+				keys, err := fetchEntityKeys(strings.TrimRight(body.Entity, "/"))
+				if err != nil {
+					http.Error(w, fmt.Sprintf(`{"error":%q}`, "onboarding failed: "+err.Error()), http.StatusBadGateway)
+					return
+				}
+				onboardKeys = keys
+			}
 			st.mu.Lock()
 			switch body.Op {
+			case "onboard":
+				st.onboarded[strings.TrimRight(body.Entity, "/")] = onboardKeys
+			case "offboard":
+				delete(st.onboarded, strings.TrimRight(body.Entity, "/"))
 			case "move_pdp":
 				// Bank A's PDP relocates: same identifier, same AuthZEN endpoint names,
 				// new base. It still answers on the old base, so nothing breaks
@@ -515,6 +563,7 @@ func main() {
 				delete(st.down, estate.name)
 			case "reset":
 				st.down = map[string]bool{}
+				st.onboarded = map[string][]map[string]any{}
 				for k, v := range st.defEval {
 					st.pdpEval[k] = v
 				}
@@ -692,6 +741,49 @@ func pdp(e *entity, rec *recorder, st *state, batching bool, serve func(*entity,
 		}
 	}
 	serve(e, mux)
+}
+
+// fetchEntityKeys does the controller's part of onboarding: read the entity
+// configuration an entity publishes about itself and, if it is self-signed as the spec
+// requires, return the keys the controller will now vouch for.
+func fetchEntityKeys(entity string) ([]map[string]any, error) {
+	if entity == "" {
+		return nil, fmt.Errorf("no entity")
+	}
+	resp, err := http.Get(entity + "/.well-known/openid-federation")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s answered %d", entity, resp.StatusCode)
+	}
+	tok := strings.TrimSpace(string(raw))
+	hdr, claims := jose.Header(tok), jose.Claims(tok)
+	if hdr == nil || claims == nil || claims["iss"] != entity || claims["sub"] != entity {
+		return nil, fmt.Errorf("not an entity configuration for %s", entity)
+	}
+	jwks, _ := claims["jwks"].(map[string]any)
+	list, _ := jwks["keys"].([]any)
+	var keys []map[string]any
+	for _, k := range list {
+		if jwk, ok := k.(map[string]any); ok {
+			keys = append(keys, jwk)
+		}
+	}
+	kid, _ := hdr["kid"].(string)
+	alg, _ := hdr["alg"].(string)
+	for _, k := range keys {
+		if k["kid"] == kid {
+			if err := jose.VerifyJWS(tok, k, alg); err != nil {
+				return nil, fmt.Errorf("entity configuration is not self-signed: %v", err)
+			}
+			log.Printf("anchor     onboarded %s (kid %s)", entity, kid)
+			return keys, nil
+		}
+	}
+	return nil, fmt.Errorf("entity configuration signed with a key it does not publish")
 }
 
 // describeContext is one line on what the PDP was given to reason with, for the trace.
