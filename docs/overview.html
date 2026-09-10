@@ -98,6 +98,34 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
   body{font-size:16px}
 }
 @media (prefers-reduced-motion: no-preference){ a{transition:border-color .15s} }
+
+/* ---- discovery explainer ---- */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:0;border-top:3px solid var(--orange);margin-top:30px}
+.two > div{padding:22px 26px 22px 0}
+.two > div + div{border-left:1px solid var(--rule);padding-left:26px;padding-right:0}
+.two .n{font-family:var(--mono);font-size:.78rem;color:var(--orange);display:block;margin-bottom:8px}
+.two h3{margin:0 0 10px;font-size:1.25rem;letter-spacing:-.01em}
+.two p{margin:0;font-size:1rem}
+.docs{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin:22px 0 6px}
+.docrow{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin:22px 0 6px}
+.doc{margin:0;border:1px solid var(--rule);background:var(--surface)}
+.doc .t{font-family:var(--sans);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:8px 14px;border-bottom:1px solid var(--rule)}
+.doc pre{margin:0;border-left:0;background:var(--code-bg);font-size:.8rem;padding:12px 14px}
+.doc pre code{font-size:.8rem}
+.hl{color:var(--orange);font-weight:600}
+.req{color:var(--ok);font-weight:600}
+.gone{color:var(--muted);text-decoration:line-through}
+.q{font-size:1.15rem;font-weight:700;margin:0 0 10px;letter-spacing:-.01em;text-wrap:balance}
+.clicks{margin:0;padding:0;list-style:none;display:grid;gap:12px;counter-reset:c}
+.clicks li{counter-increment:c;position:relative;padding-left:34px;max-width:72ch}
+.clicks li::before{content:counter(c);position:absolute;left:0;top:.05em;width:22px;height:22px;background:var(--orange);color:#fff;font-family:var(--mono);font-size:.78rem;font-weight:600;display:grid;place-items:center}
+.cta{display:inline-block;background:var(--orange);color:#fff;font-weight:700;padding:12px 22px;border-bottom:0;margin:6px 0 18px}
+.cta:hover{filter:brightness(1.07);border-bottom:0}
+@media (max-width:820px){
+  .two,.docrow{grid-template-columns:1fr}
+  .two > div{padding:20px 0}
+  .two > div + div{border-left:0;border-top:1px solid var(--rule);padding-left:0}
+}
 </style>
 </head>
 <body>
@@ -111,364 +139,292 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
 
 <section class="hero">
   <div class="wrap">
-    <span class="eyebrow">idp-auth-peps · an overview</span>
-    <h1>One decision, <em>three</em> enforcement points</h1>
-    <p class="lede">Policy Enforcement Points that speak OpenID AuthZEN 1.0 to a Policy Decision Point and enforce the answer at whatever sits in front of your traffic: a Kong plugin, an Envoy <code>ext_authz</code> service, and a Node SDK. They share one engine, so an agent gets the same answer, and the same <em>resolvable</em> challenge on a deny, whichever one said no.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <span class="eyebrow">The problem</span>
-    <div class="measure">
-      <p>An AI agent calling a tool is one agent, acting for one human, touching one resource, right now. Whether that is allowed depends on all three, and it belongs in policy, not in tool code. AuthZEN gives a PEP a standard way to ask a PDP that question. This repository is the enforcement side: it never decides, it asks, and it makes sure the asking is done the same way everywhere.</p>
-      <p>The interesting part is the deny. A flat 403 tells an agent nothing it can act on. So when the policy says <em>how</em> a deny could be resolved, every PEP here renders that the same three ways: an HTTP <code>WWW-Authenticate</code> header, a JSON body, and an MCP JSON-RPC error's <code>data.authz_challenge</code>.</p>
-    </div>
-    <div class="surfaces" aria-label="The three enforcement surfaces">
-      <div><span class="k">gateways/kong</span><span class="n">Kong plugin</span><p><b>Native Lua</b> for claims, REST mapping, challenges and PDP discovery. <b>Delegates</b> DPoP verification and COAZ tool-call checks to the engine: a plugin has no JOSE verifier and no CEL.</p></div>
-      <div><span class="k">gateways/envoy · core/</span><span class="n">Envoy family</span><p>agentgateway, Istio and plain Envoy attach <code>ext_authz</code> to <b>coaz-pep</b>, the Go engine. No gateway code at all; per-route knobs travel as <code>context_extensions</code>.</p></div>
-      <div><span class="k">sdk/node</span><span class="n">Node SDK</span><p><b>In-process</b>: an AuthZEN client, Express middleware, an MCP guard. Evaluates a deliberately narrow CEL subset itself and delegates the rest, exactly as Kong does.</p></div>
+    <span class="eyebrow">idp-auth-peps</span>
+    <h1>Nobody tells the gateway <em>where the PDP is</em></h1>
+    <p class="lede">Or what the API behind it requires. The API publishes both. A gateway that reads them finds its Policy Decision Point and hands it the API's own requirements, and a federation decides whether the API is to be believed. These are OpenID AuthZEN enforcement points for Envoy, Istio and agentgateway, for Kong, and for Node, built around that.</p>
+    <div class="two">
+      <div>
+        <span class="n">discovery 1</span>
+        <h3>The gateway finds the PDP</h3>
+        <p>It asks the API. The API's RFC 9728 metadata names the PDP that decides for it; the PDP's own AuthZEN metadata names its endpoints. Nothing about either is configured on the gateway.</p>
+      </div>
+      <div>
+        <span class="n">discovery 2</span>
+        <h3>The PDP finds what to enforce</h3>
+        <p>The gateway hands the PDP the API's document as published, with the endpoint hit and the token. The PDP reads the scopes and the acr the API requires out of it. The gateway compares nothing.</p>
+      </div>
     </div>
   </div>
 </section>
 
 <section class="band">
   <div class="wrap">
-    <span class="eyebrow">What is in the box</span>
-    <h2>Everything with a spec behind it lives once, in Go</h2>
+    <h2>What stops being configured</h2>
+    <p class="measure">Per API, per gateway, today's enforcement point is told five things by hand. With discovery it is told one, and the other four are read from where they are published, so a change is made once, by whoever owns it.</p>
+    <div class="wide">
+    <table>
+      <thead><tr><th>The gateway needs to know</th><th>Today</th><th>With discovery</th></tr></thead>
+      <tbody>
+        <tr><td>Which API it is protecting</td><td>configured</td><td><b>configured</b> — the API's identifier is the one thing it is told</td></tr>
+        <tr><td>Which PDP decides for that API</td><td>configured (<code>AUTHZEN_URL</code>)</td><td>read from the API's metadata, or from the federation</td></tr>
+        <tr><td>Where the PDP's endpoints are</td><td>assumed (<code>/access/v1/evaluation</code>)</td><td>read from the PDP's metadata</td></tr>
+        <tr><td>Which scopes and acr each route requires</td><td>configured on the gateway, compared by the gateway</td><td>published by the API, enforced by the PDP</td></tr>
+        <tr><td>Who is allowed to say any of the above</td><td>whoever edits the gateway</td><td>the federation's policy, when the API is a member</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="eyebrow">discovery 1</span>
+    <h2>The gateway finds the PDP</h2>
+    <p class="measure">Two documents, each at a well-known address, each published by the party that owns the fact. The gateway reads them in order and caches them; a PDP that publishes no metadata gets AuthZEN's default paths.</p>
     <figure>
-      <svg viewBox="0 0 960 400" role="img" aria-label="Kong, Envoy-family gateways and the Node SDK all reach the coaz-pep engine, which evaluates against the PDP; Kong and Node delegate what they cannot do natively">
-        <defs>
-          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
-          <marker id="ahO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#FC6401"/></marker>
-        </defs>
-        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="currentColor">
-          <text x="480" y="26" text-anchor="middle" font-weight="700">agent / MCP client</text>
-          <line x1="180" y1="40" x2="180" y2="80" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah)"/>
-          <line x1="480" y1="40" x2="480" y2="80" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah)"/>
-          <line x1="780" y1="40" x2="780" y2="80" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah)"/>
-          <line x1="180" y1="40" x2="780" y2="40" stroke="currentColor" stroke-width="1.4"/>
-
-          <rect x="70" y="82" width="220" height="64" fill="none" stroke="currentColor" stroke-width="1.4"/>
-          <text x="180" y="108" text-anchor="middle" font-weight="700">Kong Gateway</text>
-          <text x="180" y="128" text-anchor="middle" font-size="12" opacity=".75">authzen-pdp plugin (Lua)</text>
-
-          <rect x="370" y="82" width="220" height="64" fill="none" stroke="currentColor" stroke-width="1.4"/>
-          <text x="480" y="108" text-anchor="middle" font-weight="700">Envoy · Istio · agentgateway</text>
-          <text x="480" y="128" text-anchor="middle" font-size="12" opacity=".75">ext_authz gRPC</text>
-
-          <rect x="670" y="82" width="220" height="64" fill="none" stroke="currentColor" stroke-width="1.4"/>
-          <text x="780" y="108" text-anchor="middle" font-weight="700">Node process</text>
-          <text x="780" y="128" text-anchor="middle" font-size="12" opacity=".75">@id-partners/authzen-pep</text>
-
-          <path d="M180 146 V196 H340" fill="none" stroke="#FC6401" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#ahO)"/>
-          <text x="196" y="184" font-size="12" fill="#FC6401">delegates DPoP + tool calls</text>
-          <line x1="480" y1="146" x2="480" y2="196" stroke="currentColor" stroke-width="1.6" marker-end="url(#ah)"/>
-          <text x="492" y="176" font-size="12" opacity=".75">every request</text>
-          <path d="M780 146 V196 H620" fill="none" stroke="#FC6401" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#ahO)"/>
-          <text x="768" y="184" font-size="12" fill="#FC6401" text-anchor="end">delegates beyond its CEL subset</text>
-
-          <rect x="340" y="198" width="280" height="118" fill="none" stroke="currentColor" stroke-width="2"/>
-          <text x="480" y="222" text-anchor="middle" font-weight="700" font-size="14">coaz-pep (Go)</text>
-          <text x="352" y="244" font-size="12">COAZ engine · tools/list, CEL mapping</text>
-          <text x="352" y="262" font-size="12">token + DPoP verification</text>
-          <text x="352" y="280" font-size="12">PDP discovery · RFC 9728 / AuthZEN / Federation</text>
-          <text x="352" y="298" font-size="12">challenge rendering</text>
-
-          <line x1="480" y1="316" x2="480" y2="356" stroke="currentColor" stroke-width="1.6" marker-end="url(#ah)"/>
-          <text x="492" y="341" font-size="12" opacity=".75">AuthZEN 1.0 · POST access/v1/evaluation(s)</text>
-          <rect x="340" y="358" width="280" height="34" fill="none" stroke="currentColor" stroke-width="1.4"/>
-          <text x="480" y="380" text-anchor="middle" font-weight="700">the PDP (Ping Authorize, or any conformant PDP)</text>
+      <svg viewBox="0 0 880 330" role="img" aria-label="The gateway asks the API for its metadata, learns the PDP identifier, asks that PDP for its metadata, learns the evaluation endpoint, and posts the evaluation there with the API's document in the context.">
+        <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" font-weight="700" fill="currentColor" text-anchor="middle">
+          <rect x="30" y="20" width="160" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="110" y="45">gateway</text>
+          <rect x="360" y="20" width="160" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="440" y="45">the API</text>
+          <rect x="690" y="20" width="160" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="770" y="45">the PDP</text>
+        </g>
+        <g stroke="currentColor" stroke-width="1" stroke-dasharray="3 4" opacity=".55">
+          <line x1="110" y1="60" x2="110" y2="310"/><line x1="440" y1="60" x2="440" y2="310"/><line x1="770" y1="60" x2="770" y2="310"/>
+        </g>
+        <g font-family="JetBrains Mono,ui-monospace,monospace" font-size="11.5" fill="currentColor" stroke="currentColor" stroke-width="1.5">
+          <line x1="112" y1="95" x2="437" y2="95" marker-end="url(#ar)"/>
+          <text x="275" y="88" text-anchor="middle" stroke="none">GET /.well-known/oauth-protected-resource</text>
+          <line x1="438" y1="135" x2="113" y2="135" marker-end="url(#ar)"/>
+          <text x="275" y="128" text-anchor="middle" stroke="none" fill="#FC6401" font-weight="600">authzen_policy_decision_points: [pdp]</text>
+          <line x1="112" y1="185" x2="767" y2="185" marker-end="url(#ar)"/>
+          <text x="440" y="178" text-anchor="middle" stroke="none">GET /.well-known/authzen-configuration</text>
+          <line x1="768" y1="225" x2="113" y2="225" marker-end="url(#ar)"/>
+          <text x="440" y="218" text-anchor="middle" stroke="none" fill="#FC6401" font-weight="600">access_evaluation_endpoint</text>
+          <line x1="112" y1="280" x2="767" y2="280" marker-end="url(#ar)"/>
+          <text x="440" y="273" text-anchor="middle" stroke="none">POST evaluation  { context: resource_metadata, request, access_token }</text>
+        </g>
+        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="currentColor" opacity=".7">
+          <text x="30" y="118">1</text><text x="30" y="158">2</text><text x="30" y="208">3</text><text x="30" y="248">4</text><text x="30" y="303">5</text>
         </g>
       </svg>
-      <figcaption>The rule for what lives where: a surface does natively what is safe for it to do, and delegates the rest to the engine. Two renderings of one decision would drift, so there is one engine, not three.</figcaption>
+      <figcaption>The chain, in order. Orange is what was discovered: first the PDP's identifier, then its endpoint. Step 5 is where the second discovery happens.</figcaption>
     </figure>
-    <div class="wide">
-    <table>
-      <thead><tr><th>Package in <code>core/</code></th><th>Role</th></tr></thead>
-      <tbody>
-        <tr><td><code>cmd/coaz-pep</code></td><td>The service: request mapping, token and DPoP checks, the gRPC and HTTP front doors, configuration from the environment.</td></tr>
-        <tr><td><code>coaz</code></td><td>The COAZ engine: <code>tools/list</code> discovery, the v1 and v2 mapping dialects, CEL evaluation, PDP calls, JSON-RPC error semantics.</td></tr>
-        <tr><td><code>authzen/discovery</code></td><td>Resource → PDP identifier → PDP metadata → endpoints. Four modes.</td></tr>
-        <tr><td><code>federation</code></td><td>An OpenID Federation 1.0 Trust Chain resolver: fetching, the §3.2 validation rules, the §4 invariants, §6.1 metadata policy, §6.2 constraints.</td></tr>
-        <tr><td><code>jose</code></td><td>Compact JWS verification (ES/RS/PS), JWK parsing, RFC 7638 thumbprints. Shared by token validation, DPoP and federation.</td></tr>
-        <tr><td><code>internal/ttlcache</code>, <code>internal/metafetch</code></td><td>The one cache shape and the one bounded, policy-checked GET that every metadata fetch uses.</td></tr>
-      </tbody>
-    </table>
+    <div class="docs">
+      <figure class="doc">
+        <div class="t">what the API publishes · RFC 9728</div>
+        <pre><code>{
+  "resource": "https://api.bank-a.example",
+  "<span class="hl">authzen_policy_decision_points</span>": [
+    "https://pdp.bank-a.example/tenants/bank-a"
+  ],
+  "<span class="req">scopes_supported</span>": ["accounts:read", "payments:write"],
+  "<span class="req">acr_values_required</span>": ["urn:idp:loa:mfa"]
+}</code></pre>
+      </figure>
+      <figure class="doc">
+        <div class="t">what the PDP publishes · AuthZEN §9</div>
+        <pre><code>{
+  "policy_decision_point":
+    "https://pdp.bank-a.example/tenants/bank-a",
+  "<span class="hl">access_evaluation_endpoint</span>":
+    "https://pdp.bank-a.example/tenants/bank-a/access/v1/evaluation",
+  "access_evaluations_endpoint":
+    "https://pdp.bank-a.example/tenants/bank-a/access/v1/evaluations"
+}</code></pre>
+      </figure>
+    </div>
+    <p class="small measure">Every endpoint is AuthZEN's own name. What differs between PDPs is the base it hangs off: an identifier may carry a path, and <code>/tenants/bank-a</code> is what a multi-tenant deployment looks like. A gateway told a URL by hand assumes the identifier's base; a gateway that read the metadata follows the PDP when it moves. <code>authzen_policy_decision_points</code> is a parameter this project mints, since neither RFC 9728 nor AuthZEN defines one; it is a single constant in each codebase.</p>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <span class="eyebrow">discovery 2</span>
+    <h2>The PDP finds what to enforce</h2>
+    <p class="measure">The gateway does not read <code>scopes_supported</code> and compare it to the token. It forwards the API's document verbatim, says where it came from, adds the endpoint hit, and, when the route allows, the raw token. The PDP does the matching, next to everything else it knows about the client and the risk.</p>
+    <div class="docs">
+      <figure class="doc">
+        <div class="t">what the gateway hands the PDP · AuthZEN context</div>
+        <pre><code>"context": {
+  "resource_metadata_source": "rfc9728",
+  "resource_metadata": {
+    "resource": "https://api.bank-a.example",
+    "<span class="req">scopes_supported</span>": ["accounts:read", "payments:write"],
+    "<span class="req">acr_values_required</span>": ["urn:idp:loa:mfa"],
+    "authzen_policy_decision_points": [ … ]
+  },
+  "request": { "method": "POST", "path": "/payments" },
+  "access_token": "eyJ…"
+}</code></pre>
+      </figure>
+      <figure class="doc">
+        <div class="t">what the PDP answers</div>
+        <pre><code>{
+  "decision": false,
+  "context": {
+    "reason": "this resource requires acr [urn:idp:loa:mfa]
+      (per its rfc9728 metadata); the token was
+      authenticated at urn:idp:loa:password"
+  }
+}</code></pre>
+      </figure>
+    </div>
+    <div class="callout">
+      <p><b>The gateway judges nothing.</b> A gateway that compared scopes would be policy in two places, and the dumber one would win. The PDP's reason names the requirement it read and the document it read it from, so an operator can see the second discovery in every deny.</p>
     </div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <span class="eyebrow">The decision contract</span>
-    <h2>Same words in a header, a body and an MCP error</h2>
-    <div class="measure">
-      <p>Every PEP sends the PDP the same shape: the <em>agent</em> is the subject, the human it acts for is <code>subject.properties.on_behalf_of</code>, and the context carries what the policy needs to reason about the delegation: the user token's scope, <code>acr</code>, any RFC 9396 <code>authorization_details</code>, and the token audience.</p>
-    </div>
-    <div class="wide">
-    <table>
-      <thead><tr><th>The policy says</th><th>HTTP</th><th><code>WWW-Authenticate</code></th><th>JSON-RPC <code>authz_challenge.type</code></th></tr></thead>
-      <tbody>
-        <tr><td><code>identity_proofing_required</code></td><td>401</td><td><code>identity_verification_required</code></td><td><code>identity_proofing</code></td></tr>
-        <tr><td><code>step_up_required</code> (RFC 9470)</td><td>401</td><td><code>insufficient_scope</code></td><td><code>resource_authorisation</code></td></tr>
-        <tr><td>no authenticated user</td><td>401</td><td><code>login_required</code></td><td><code>authn</code></td></tr>
-        <tr><td>denied</td><td>403</td><td>—</td><td>—</td></tr>
-      </tbody>
-    </table>
-    </div>
-    <p class="small measure">The context also carries what the PEP found rather than decided: the resource's metadata document, the endpoint hit and, per route, the raw token. That is the next section.</p>
-    <p class="small measure">For MCP the PEP does not authorise “POST /mcp”. It reads the JSON-RPC body, finds the tool, and authorises <em>that call</em> under the AuthZEN MCP profile (COAZ): the server's <code>tools/list</code> declares, per tool, how to map arguments and claims into an AuthZEN request. Deny and error semantics are JSON-RPC errors over HTTP 200, as the profile requires.</p>
-  </div>
-</section>
-
-<section class="band">
-  <div class="wrap">
-    <span class="eyebrow">Finding the PDP</span>
-    <h2>Who decides for this resource, and who gets to say so</h2>
-    <div class="measure">
-      <p>Every PEP used to be <em>told</em> where the PDP is and assumed the AuthZEN paths under it. Discovery replaces both assumptions with metadata: the resource names its PDP, the PDP publishes its endpoints. No standard names a PDP from a protected resource (not RFC 9728, not AuthZEN 1.0, not the MCP profile, not Federation 1.0), so this repository mints one parameter and uses it everywhere:</p>
-    </div>
-    <pre><code>"authzen_policy_decision_points": ["https://pdp.example"]</code></pre>
-    <p class="measure">An array of PDP <em>identifiers</em>, first preferred, and the same bytes whether it sits in an RFC 9728 document or under <code>metadata.oauth_resource</code> in a federation Entity Statement. That sameness is the point, because the two places differ in who vouches for them.</p>
+    <h2>Who gets to say who decides</h2>
+    <p class="measure">The value being discovered is <em>who may decide access to this API</em>. An API that names its own PDP can name a permissive one, and a document over TLS cannot protect the thing it asserts. So there are two sources, and one outranks the other.</p>
     <figure>
-      <svg viewBox="0 0 960 380" role="img" aria-label="Two panels, one resource that names a rogue PDP and says a password is enough. Resource mode: step 1, the PEP fetches the resource's own well-known document; step 2, the PEP believes it and sends the evaluation to the rogue PDP, which permits. Federation mode: step 1, the PEP fetches the resource's entity configuration, which says the same thing; step 2, the PEP fetches the trust anchor's statement about the resource, using anchor keys configured in the PEP, and its policy restricts the PDP to the good one and sets the acr to MFA; step 3, the PEP validates the chain and resolves the metadata: PDP good, acr MFA; step 4, the PEP sends the evaluation, with the resolved document, to the good PDP, which denies the password token. The rogue PDP is never contacted.">
-        <defs>
-          <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
-        </defs>
-        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="currentColor">
+      <svg viewBox="0 0 900 300" role="img" aria-label="Self-asserted: the gateway reads the API's own document and takes its word. Federation: the gateway reads the API's signed entity configuration, fetches the anchor's statement about it, and applies the anchor's policy, which removes the rogue PDP the API named.">
+        <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="currentColor" font-weight="700" letter-spacing=".08em">
+          <text x="20" y="28">SELF-ASSERTED</text>
+          <text x="470" y="28">FEDERATION</text>
+        </g>
+        <line x1="440" y1="12" x2="440" y2="290" stroke="currentColor" stroke-width="1" opacity=".3"/>
+        <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" font-weight="700" fill="currentColor" text-anchor="middle">
+          <rect x="20" y="50" width="120" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="80" y="75">the API</text>
+          <rect x="280" y="50" width="120" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="340" y="75">gateway</text>
+          <rect x="470" y="50" width="120" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="530" y="75">the API</text>
+          <rect x="650" y="50" width="120" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="710" y="75">the anchor</text>
+          <rect x="760" y="230" width="120" height="40" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="820" y="255">gateway</text>
+        </g>
+        <g font-family="JetBrains Mono,ui-monospace,monospace" font-size="11" fill="currentColor" stroke="currentColor" stroke-width="1.5">
+          <line x1="142" y1="70" x2="277" y2="70" marker-end="url(#ar2)"/>
+          <text x="210" y="62" text-anchor="middle" stroke="none">its own document</text>
+          <text x="20" y="130" stroke="none">pdps: [<tspan fill="#FC6401" font-weight="600">rogue</tspan>, bank-a]</text>
+          <text x="20" y="150" stroke="none">acr: [password]</text>
+          <text x="20" y="190" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" opacity=".8">signed by nobody. TLS says which host</text>
+          <text x="20" y="207" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" opacity=".8">sent it; nothing says it may say it.</text>
+          <text x="20" y="250" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">the gateway takes the API's word</text>
+          <text x="20" y="268" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700" fill="#FC6401">the rogue decides</text>
 
-          <text x="20" y="22" font-weight="700" font-size="12" letter-spacing="1.5">RESOURCE MODE · THE PEP BELIEVES THE RESOURCE</text>
-
-          <rect x="20" y="44" width="90" height="46" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="65" y="72" text-anchor="middle" font-weight="700" font-size="13">PEP</text>
-
-          <line x1="110" y1="67" x2="248" y2="67" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="118" y="58" font-size="11">1&#8202; GET /.well-known/oauth-protected-resource</text>
-
-          <rect x="250" y="44" width="200" height="72" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="350" y="64" text-anchor="middle" font-weight="700" font-size="13">the resource</text>
-          <text x="350" y="82" text-anchor="middle" font-size="11">says about itself, over TLS:</text>
-          <text x="350" y="100" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace">PDP: rogue · acr: password</text>
-
-          <line x1="65" y1="90" x2="65" y2="178" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="74" y="130" font-size="11">2&#8202; evaluation, carrying</text>
-          <text x="74" y="146" font-size="11">that document</text>
-
-          <rect x="20" y="180" width="200" height="46" fill="none" stroke="#FC6401" stroke-width="1.8"/>
-          <text x="120" y="200" text-anchor="middle" font-weight="700" font-size="13" fill="#FC6401">rogue PDP</text>
-          <text x="120" y="216" text-anchor="middle" font-size="11" fill="#FC6401">permits a password token</text>
-
-          <text x="20" y="266" font-size="12">Nobody vouched for the document but the resource itself.</text>
-          <text x="20" y="284" font-size="12">It chose its own judge, and set its own bar.</text>
-
-          <line x1="470" y1="14" x2="470" y2="366" stroke="currentColor" stroke-width="1" stroke-dasharray="3 5" opacity=".5"/>
-
-          <text x="490" y="22" font-weight="700" font-size="12" letter-spacing="1.5" fill="#FC6401">FEDERATION MODE · THE PEP BELIEVES THE ANCHOR</text>
-
-          <rect x="490" y="44" width="90" height="46" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="535" y="72" text-anchor="middle" font-weight="700" font-size="13">PEP</text>
-
-          <line x1="580" y1="60" x2="718" y2="60" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="588" y="51" font-size="11">1&#8202; GET /.well-known/openid-federation</text>
-
-          <rect x="720" y="40" width="220" height="64" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="830" y="59" text-anchor="middle" font-weight="700" font-size="13">the same resource</text>
-          <text x="830" y="76" text-anchor="middle" font-size="11">its entity configuration, signed by it:</text>
-          <text x="830" y="93" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace">PDP: rogue · acr: password</text>
-
-          <path d="M580 84 L718 148" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="600" y="128" font-size="11">2&#8202; fetch its statement about the resource</text>
-
-          <rect x="720" y="122" width="220" height="82" fill="none" stroke="#FC6401" stroke-width="2"/>
-          <text x="830" y="141" text-anchor="middle" font-weight="700" font-size="13">Trust Anchor</text>
-          <text x="830" y="158" text-anchor="middle" font-size="11">keys configured in the PEP, not fetched</text>
-          <text x="830" y="176" text-anchor="middle" font-size="11">its policy for members:</text>
-          <text x="830" y="193" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace" fill="#FC6401">PDP ⊆ [good] · acr = MFA</text>
-
-          <line x1="535" y1="90" x2="535" y2="228" stroke="currentColor" stroke-width="1.4"/>
-          <rect x="490" y="230" width="200" height="58" fill="none" stroke="#FC6401" stroke-width="1.8"/>
-          <text x="590" y="248" text-anchor="middle" font-size="11">3&#8202; the PEP validates the chain</text>
-          <text x="590" y="263" text-anchor="middle" font-size="11">and applies the policy. Resolved:</text>
-          <text x="590" y="281" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,monospace" fill="#FC6401">PDP: good · acr: MFA</text>
-
-          <line x1="590" y1="288" x2="590" y2="326" stroke="currentColor" stroke-width="1.4" marker-end="url(#ah2)"/>
-          <text x="600" y="312" font-size="11">4&#8202; evaluation, carrying the resolved document</text>
-
-          <rect x="490" y="328" width="200" height="40" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <text x="590" y="346" text-anchor="middle" font-weight="700" font-size="13">good PDP</text>
-          <text x="590" y="361" text-anchor="middle" font-size="11">denies a password token</text>
-
-          <rect x="740" y="328" width="200" height="40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="4 3" opacity=".5"/>
-          <text x="840" y="346" text-anchor="middle" font-weight="700" font-size="13" opacity=".5">rogue PDP</text>
-          <text x="840" y="361" text-anchor="middle" font-size="11" opacity=".5">never contacted</text>
-
-          <text x="720" y="242" font-size="12">The resource said the same thing in both modes.</text>
-          <text x="720" y="260" font-size="12">What changed is who the PEP believed: the anchor's</text>
-          <text x="720" y="278" font-size="12">policy overrode the resource's document, and the</text>
-          <text x="720" y="296" font-size="12">PDP received the resolved one.</text>
+          <line x1="592" y1="70" x2="647" y2="70" marker-end="url(#ar2)"/>
+          <text x="620" y="62" text-anchor="middle" stroke="none" font-size="10">onboarded</text>
+          <text x="470" y="115" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" opacity=".8">entity configuration, signed by the API:</text>
+          <text x="470" y="135" stroke="none">pdps: [<tspan fill="#FC6401" font-weight="600">rogue</tspan>, bank-a]  acr: [password]</text>
+          <text x="650" y="115" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" opacity=".8">the anchor's statement about it:</text>
+          <text x="650" y="135" stroke="none">pdps subset_of [bank-a]</text>
+          <text x="650" y="152" stroke="none">acr value [mfa]</text>
+          <line x1="530" y1="160" x2="530" y2="205" marker-end="url(#ar2)"/>
+          <line x1="710" y1="162" x2="710" y2="205" marker-end="url(#ar2)"/>
+          <rect x="470" y="208" width="270" height="62" fill="none" stroke="#FC6401" stroke-width="1.5"/>
+          <text x="484" y="228" stroke="none" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">resolved: what survived the policy</text>
+          <text x="484" y="248" stroke="none">pdps: [<tspan opacity=".45" text-decoration="line-through">rogue</tspan>, <tspan fill="#FC6401" font-weight="600">bank-a</tspan>]</text>
+          <text x="484" y="264" stroke="none">acr: [<tspan opacity=".45" text-decoration="line-through">password</tspan> <tspan fill="#FC6401" font-weight="600">mfa</tspan>]</text>
+          <line x1="742" y1="250" x2="757" y2="250" marker-end="url(#ar2)"/>
         </g>
       </svg>
-      <figcaption>The same resource, the same self-assertion, two outcomes. In resource mode the PEP does one fetch and believes it. In federation mode the PEP does the climbing itself — resource, then anchor, with anchor keys it was configured with — and hands the PDP what survived the anchor's policy, not what the resource wrote. The rogue PDP is never contacted; a chain that fails validation is a 503, never a fallback.</figcaption>
+      <figcaption>Same API, same claim about itself. On the left the gateway believes it. On the right the anchor's policy strips the rogue PDP and raises the acr floor before the gateway ever sees a PDP name, and the chain is signed all the way back to keys the operator installed by hand.</figcaption>
     </figure>
-    <div class="wide">
-    <table>
-      <thead><tr><th>Mode</th><th>What the PEP reads</th><th>Falls back to</th></tr></thead>
-      <tbody>
-        <tr><td><code>off</code></td><td>nothing: static PDP, default paths, no HTTP</td><td>—</td></tr>
-        <tr><td><code>authzen</code></td><td>the static PDP's <code>/.well-known/authzen-configuration</code></td><td>the AuthZEN default paths</td></tr>
-        <tr><td><code>resource</code></td><td>the resource's RFC 9728 document, then the named PDP's metadata</td><td>the static PDP</td></tr>
-        <tr><td><code>federation</code></td><td>the resource's <em>resolved</em> <code>oauth_resource</code> metadata, then the named PDP's metadata</td><td>the static PDP, never the resource's own document</td></tr>
-      </tbody>
-    </table>
-    </div>
-    <p class="small measure">Federation resolution lives only in the Go engine. Kong and the Node SDK implement the <code>resource</code> and <code>authzen</code> modes natively and get federation by delegating.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <span class="eyebrow">What the PEP forwards, and what it does not decide</span>
-    <h2>The gateway carries the requirement. The PDP enforces it.</h2>
-    <div class="measure">
-      <p>A resource's metadata says more than who decides for it. RFC 9728 gives it <code>scopes_supported</code>, <code>dpop_bound_access_tokens_required</code> and friends; a federation can constrain any of them and add its own. A resource that wants MFA for everything it serves has somewhere to say so.</p>
-      <p>The design choice is what the PEP does with that: <em>nothing but carry it.</em> Every PDP call carries the resource's document verbatim as <code>context.resource_metadata</code>, tagged with whether it is a self-assertion or the federation-resolved one; the endpoint hit as <code>context.request</code>; and, when the route allows, the raw token as <code>context.access_token</code>. The PEP does not compare a token's scope or <code>acr</code> to anything. It does not know the names of those members.</p>
-    </div>
-    <div class="wide">
-    <table>
-      <thead><tr><th>Why offload it</th><th>What it buys</th></tr></thead>
-      <tbody>
-        <tr><td>Policy in one place</td><td>A gateway comparing strings is policy in two places, and the gateway's copy is the dumber one: it cannot see risk, consent history, velocity or device posture. The PDP weighs a resource's requirement against all of that.</td></tr>
-        <tr><td>Changeable without a deploy</td><td>The resource publishes what it requires; the PDP enforces it. Neither needs the gateway redeployed when it changes.</td></tr>
-        <tr><td>The deny stays resolvable</td><td>A PDP that knows the requirement can say what would satisfy it, and the PEP renders that as a challenge. A gateway enforcing the same thing could only 403.</td></tr>
-        <tr><td>The PDP examines the token itself</td><td>With the raw token forwarded it can verify the signature, read <code>cnf</code>, score the client. Off by default per route: whether a PDP is trusted with the token is a separate choice from whether it is trusted with the decision.</td></tr>
-      </tbody>
-    </table>
-    </div>
-    <p class="small measure">In federation mode the forwarded document is the <em>resolved</em> one, so an anchor that sets <code>acr_values_required</code> to MFA has set it for every PDP that reads it, and a member cannot lower it by editing its own well-known. In the demo, the same PDP with the same policy and the same token permits through the resource-mode PEP and denies through the federation-mode one, and its reason names which document it was reading.</p>
-  </div>
-</section>
-
-<section class="band">
-  <div class="wrap">
-    <span class="eyebrow">Layers</span>
-    <h2>A generic PDP first, the resource's after</h2>
-    <div class="measure">
-      <p>One PDP per resource is not the only shape. An estate has questions every endpoint shares — is this client in good standing, is this token sender-constrained, does the risk score allow anything at all — and a PDP that answers them knows nothing about any particular resource. It should not have to.</p>
-      <p>So a route names an ordered list of <em>layers</em>, and the PEP asks each in turn with the same request and the same forwarded context. Every layer must permit. The first that does not is the answer, advice and all, and the rest are not asked: a generic layer is a gate in front of a specific one. A PDP error in any layer fails closed unless that layer was told otherwise. Two layers that resolve to the same PDP are one call.</p>
-    </div>
-    <div class="wide">
-    <table>
-      <thead><tr><th>Layer</th><th>What it is</th></tr></thead>
-      <tbody>
-        <tr><td><code>static</code></td><td>The configured PDP, regardless of what discovery finds. The slot for an estate-wide PDP.</td></tr>
-        <tr><td><code>resource</code></td><td>Whatever discovery resolves for the route's resource: federation, then RFC 9728, then static. The default, and the whole of today's behaviour when it is the only layer.</td></tr>
-        <tr><td>a PDP identifier</td><td>An explicit PDP, its metadata read like any other. From the service's own configuration it is trusted; from a route's configuration it must be on the allowlist, like anything else that arrives over the check API.</td></tr>
-      </tbody>
-    </table>
-    </div>
-    <p class="small measure">In the demo an estate PDP denies a client on its watch list and permits everything else. Put first in <code>pdp_layers</code>, it stops a risky client before Bank A's PDP ever hears about the request.</p>
-    <div class="measure">
-      <h3>Failing open, deliberately</h3>
-      <p>A PDP that cannot be reached is an outage, and the answer to an outage is deny. That is the default everywhere. But an estate PDP that adds a risk score in front of the PDP that owns the resource is advice worth having and not worth an outage, and whether that is true is a judgement about that layer. So a layer may say for itself what happens when it fails, as a suffix on its entry (<code>https://estate.example fail-open</code>), and a PEP may set the default for layers that say nothing (<code>PDP_FAIL_MODE</code>, a route's <code>fail_mode</code>, Kong's <code>fail_mode</code>, the SDK's <code>failMode</code>). The layer's own word wins.</p>
-      <p>Fail-open covers availability and nothing else: unreachable, erroring, unresolvable, or asked for a batch it cannot take. A fail-open layer that fails is skipped and the rest decide; if every layer was skipped the request is permitted, and the permit is marked. <code>X-PDP-Fail-Open</code> names what was skipped, the SDK's verdict carries <code>failedOpen</code>, and the PEP logs it. A deny is a decision, never skipped. A refusal, an off-list PDP or a chain that does not validate, is the PEP's own rule, and an outage does not lift it.</p>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <span class="eyebrow">The rules that never relax</span>
-    <h2>Fail closed where it matters, degrade everywhere else</h2>
     <ul class="rules">
-      <li><b>A URL outside an allowlist, or a chain that fails validation, is a 503.</b> It never falls through to a weaker source. Everything else degrades: a stale cache, then the operator's own static PDP, and only when nothing is left is the request denied.</li>
-      <li><b>A discovered PDP never receives the static API key.</b> The key is bound to the configured PDP alone.</li>
-      <li><b>A batch is never sent to a guessed path.</b> A boxcar mapping needs the PDP to advertise <code>access_evaluations_endpoint</code>.</li>
-      <li><b>Metadata is cached per identifier</b> with stale-while-failing, refresh throttling and negative caching, so a metadata outage is not an authorisation outage and a down resource does not put a fetch in every request's path.</li>
-      <li><b>Allowlists are re-applied on every call</b>, not only when a document is fetched: a cache is shared, a policy is per route. Which resources may be looked up is one allowlist; which hosts a chain may climb through is another.</li>
+      <li><b>The federation's word wins.</b> When a trust anchor is configured, the gateway resolves the API's chain and never reads the API's own document.</li>
+      <li><b>An invalid chain fails closed.</b> An API that claims membership and cannot prove it gets a 503, never a fall-back to its own word or to the static PDP.</li>
+      <li><b>An API with no metadata at all gets the configured PDP.</b> Discovery adds nothing to a deployment that has nothing to discover, and a PDP off the operator's allowlist is refused whatever named it.</li>
     </ul>
   </div>
 </section>
 
+<section class="band">
+  <div class="wrap">
+    <h2>The gateway is the API's federation face</h2>
+    <p class="measure">A federated API has to publish two things: a signed entity configuration that the trust controller fetches to onboard it, and its RFC 9728 metadata. The gateway is the API's public face, so it publishes both, and the split is deliberate: the gateway holds a key, the controller holds the policy.</p>
+    <div class="docrow">
+      <figure class="doc">
+        <div class="t">the gateway publishes · minimal</div>
+        <pre><code>{
+  "iss": "https://api.bank-a.example",
+  "sub": "https://api.bank-a.example",
+  "jwks": { "keys": [ … ] },
+  "authority_hints": ["https://federation.example"],
+  "metadata": { "oauth_resource": {
+    "resource": "https://api.bank-a.example" } }
+}</code></pre>
+      </figure>
+      <figure class="doc">
+        <div class="t">the controller maintains</div>
+        <pre><code>"metadata": { "oauth_resource": {
+  "<span class="hl">authzen_policy_decision_points</span>":
+    ["https://pdp.bank-a.example/tenants/bank-a"],
+  "<span class="req">scopes_supported</span>": [ … ],
+  "<span class="req">acr_values_required</span>": ["urn:idp:loa:mfa"]
+} },
+"metadata_policy": { … }</code></pre>
+      </figure>
+      <figure class="doc">
+        <div class="t">the gateway republishes · RFC 9728</div>
+        <pre><code>{
+  "resource": "https://api.bank-a.example",
+  "<span class="hl">authzen_policy_decision_points</span>": [ … ],
+  "<span class="req">scopes_supported</span>": [ … ],
+  "<span class="req">acr_values_required</span>": ["urn:idp:loa:mfa"],
+  "signed_metadata": "eyJ…"
+}</code></pre>
+      </figure>
+    </div>
+    <p class="measure">Nothing about the API's policy is configured on the gateway. The gateway walks its own chain and serves what the federation resolved as the API's RFC 9728 document, signed with the same key, so a plain RFC 9728 consumer reads the federation's word without knowing a federation is behind it. Until the controller has onboarded the entity, the document is self-asserted and says only which PDP the gateway is configured with.</p>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
-    <span class="eyebrow">The gateway as the resource's federation face</span>
-    <h2>The PEP holds a key. The controller holds the policy.</h2>
-    <div class="measure">
-      <p>A federated resource publishes two things: a signed entity configuration a trust controller fetches to onboard it, and its RFC 9728 metadata. The gateway is the resource's public face, so it is the natural place for both. <code>coaz-pep</code> holds the key and serves both documents; the Kong plugin relays them from it; the Node SDK's <code>FederationEntity</code> signs and serves its own.</p>
-      <p>The entity configuration is deliberately minimal: the public key, <code>authority_hints</code>, and the entity type. No policy lives on the PEP. Which PDP decides for the resource, which scopes it uses, which acr it requires, all of that is the controller's, in the subordinate statement it issues, and changing it there changes what every consumer sees on its next refresh without touching a gateway.</p>
-      <p>The PEP then republishes what the federation resolved for it as the resource's RFC 9728 document, <code>signed_metadata</code> included, so a plain RFC 9728 consumer reads the federation's word without knowing a federation is behind it. Until the controller has onboarded the entity the document is self-asserted, says only which PDP the PEP is configured with, and says so in a header.</p>
-    </div>
+    <h2>What it buys you</h2>
+    <ul class="rules">
+      <li><b>A PDP moves and no gateway is touched.</b> Its metadata advertises the new base; every gateway that read it follows on its next refresh. The one told a URL by hand keeps posting to the old address.</li>
+      <li><b>Many APIs, many PDPs, one gateway.</b> Two business units answer to two PDPs with different rules through the same enforcement point, because each API says whose policy applies.</li>
+      <li><b>A common PDP in front, the API's PDP after.</b> A route names an ordered list of layers. An estate-wide PDP that judges the token and the client goes first; every layer must permit; the first that does not is the answer. A layer may be marked fail-open, for the advisory PDP that is not worth an outage, and a permit that skipped one says so in a header.</li>
+      <li><b>Capabilities, not guesses.</b> A batch is only sent to a PDP that advertises a batch endpoint; against one that does not, the gateway refuses rather than invent a path.</li>
+    </ul>
   </div>
 </section>
 
 <section class="band">
   <div class="wrap">
-    <span class="eyebrow">Seeing it work</span>
-    <h2>One <code style="text-transform:none">docker compose up</code>, three PEPs, one rogue PDP</h2>
-    <div class="measure">
-      <p><code>demo/</code> stands up a stub Trust Anchor, resources that are and are not members, two banks' PDPs that hold a token to what the resource published, an estate PDP that judges the client, and a rogue one that permits everything, plus <code>coaz-pep</code> three times. Nothing turns on who the customer is: the variables are which PDP was consulted, what it was given, what the token carries, and which layers ran. These are the results of the run on 8 September 2026; the columns are the argument.</p>
+    <h2>Three surfaces, one set of rules</h2>
+    <p class="measure">Everything with a specification behind it lives once, in Go. The Kong plugin does the two plain-JSON discoveries natively in Lua and delegates what needs a JOSE library; the Node SDK does the same in TypeScript.</p>
+    <div class="wide">
+    <table>
+      <thead><tr><th>Surface</th><th>Sits in front of</th><th>Finds the PDP</th><th>Federation</th><th>Federation face</th></tr></thead>
+      <tbody>
+        <tr><td><code>coaz-pep</code> (Go)</td><td>Envoy, Istio, agentgateway, and Kong's MCP routes</td><td>RFC 9728 and AuthZEN metadata</td><td>resolves trust chains to configured anchors</td><td>holds the key, republishes the resolved document</td></tr>
+        <tr><td>Kong plugin (Lua)</td><td>Kong routes</td><td>RFC 9728 and AuthZEN metadata, in Lua</td><td>delegated to <code>coaz-pep</code></td><td>relayed from <code>coaz-pep</code></td></tr>
+        <tr><td>Node SDK (TypeScript)</td><td>Express, and MCP servers in process</td><td>RFC 9728 and AuthZEN metadata</td><td>no resolver; a seam for one</td><td>signs and serves its own, self-asserted</td></tr>
+      </tbody>
+    </table>
     </div>
-    <div class="demo" aria-label="Demo outcomes by PEP mode">
-      <div>
-        <h4>pep-static</h4><div class="port">:9192 · told where its PDP is</div>
-        <dl>
-          <dt>read-only token pays 50 on plain</dt><dd class="ok">permit</dd>
-          <dt>the PDP was told nothing about the resource</dt><dd></dd>
-        </dl>
-      </div>
-      <div>
-        <h4>pep-resource</h4><div class="port">:9193 · trusts each resource's own word</div>
-        <dl>
-          <dt>read-only token pays on plain → Bank A</dt><dd class="warn">401 step-up</dd>
-          <dt>read-only token pays on impostor → rogue</dt><dd class="warn">permit (!)</dd>
-          <dt>pay 500 on plain vs bank-b</dt><dd class="ok">permit / 401</dd>
-          <dt>member, password token</dt><dd class="ok">permit</dd>
-          <dt>agent-risky, estate layer first</dt><dd class="bad">403 by the estate</dd>
-          <dt>estate PDP down, layers fail-closed</dt><dd class="bad">503</dd>
-          <dt>estate PDP down, estate layer fail-open</dt><dd class="warn">permit, marked</dd>
-        </dl>
-      </div>
-      <div>
-        <h4>pep-federation</h4><div class="port">:9194 · trusts the federation's word</div>
-        <dl>
-          <dt>impostor, not a member → static PDP</dt><dd class="ok">permit</dd>
-          <dt>member, password token → resolved doc</dt><dd class="bad">403, MFA floor</dd>
-          <dt>broken chain</dt><dd class="bad">503, never static</dd>
-          <dt>stray, no metadata → static PDP</dt><dd class="ok">permit</dd>
-          <dt>pay 5000</dt><dd class="warn">401 step-up</dd>
-          <dt>the gateway's own API, before onboarding</dt><dd>self-asserted</dd>
-          <dt>the same, onboarded by the anchor</dt><dd class="ok">the anchor's word, republished</dd>
-        </dl>
-      </div>
-    </div>
-    <p class="small" style="margin-top:14px">Across the whole run the rogue PDP's log line appears only for the impostor under resource mode. A Kong profile does the same discovery in Lua in front of the plain resource, and <code>node demo/node-sdk.mjs</code> does it from the SDK. No Docker? <code>demo/run-local.sh</code> builds and runs everything on the host.</p>
+    <p class="small measure">Every surface forwards the same context, orders layers the same way, applies the same allowlists, and fails closed on the same refusals. A client sees one behaviour whichever enforcement point said no.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <div class="cols">
-      <div>
-        <span class="eyebrow">Deliberately not here</span>
-        <ul class="notlist">
-          <li><b>A PDP.</b> These are enforcement points. In our deployments the PDP is Ping Authorize behind its AuthZEN adapter; any conformant PDP works.</li>
-          <li><b>A general path-to-resource mapper in the SDK.</b> Guessing a resource from a URL is how a PEP authorises the wrong thing. You write the mapping.</li>
-          <li><b>Trust Marks, the resolve endpoint, historical keys, client auth at federation endpoints.</b> Chain resolution and metadata policy answer the question at hand.</li>
-          <li><b>An AuthZEN entity type for the PDP.</b> No spec defines one yet; the seam is there for when one does.</li>
-        </ul>
-      </div>
-      <div>
-        <span class="eyebrow">Standards in play</span>
-        <ul class="notlist">
-          <li><b>AuthZEN Authorization API 1.0</b> and the AuthZEN MCP profile (COAZ)</li>
-          <li><b>RFC 9728</b> OAuth 2.0 Protected Resource Metadata · <b>OpenID Federation 1.0</b></li>
-          <li><b>RFC 9449</b> DPoP · <b>RFC 9470</b> step-up authentication</li>
-          <li><b>RFC 8693</b> token exchange (<code>act</code>) · <b>RFC 9396</b> RAR · <b>RFC 8707</b> resource indicators</li>
-        </ul>
-        <p class="small" style="margin-top:22px">Read on: <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/docs/architecture.md">docs/architecture.md</a> · <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/demo/README.md">demo/README.md</a> · <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/core/README.md">core/README.md</a></p>
-      </div>
-    </div>
+    <h2>See it</h2>
+    <p class="measure">The demo is a stub federation, two banks' PDPs, an estate PDP and a rogue one, and the Go enforcement point three times in three discovery modes. For one request, each gateway shows the chain it followed, top to bottom, with the documents it read.</p>
+    <a class="cta" href="https://demo-production-6ee6.up.railway.app">Open the demo</a>
+    <ol class="clicks">
+      <li><b>Press Discover.</b> Read the three columns top to bottom: the document each gateway read, the PDP it landed on, and what it handed the PDP. The static gateway read nothing.</li>
+      <li><b>Pick <code>member</code>.</b> The resource column believes the API's own word and permits. The federation column resolves the anchor's policy, hands the PDP an MFA floor the API never mentioned, and the same PDP denies.</li>
+      <li><b>Pick <code>the gateway's own API</code>, press the onboarding lever, discover again.</b> The gateway's RFC 9728 document flips from self-asserted to the controller's word. Nothing on the gateway changed.</li>
+    </ol>
+    <p class="small measure" style="margin-top:22px">Or run it yourself: <code>cd demo &amp;&amp; docker compose up --build -d &amp;&amp; ./demo.sh</code>. The scripted walk and the console are described in <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/demo/README.md">demo/README.md</a>; the reasoning is in <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/docs/architecture.md">docs/architecture.md</a>.</p>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <h2>Standards in play</h2>
+    <ul class="rules">
+      <li><b>OpenID AuthZEN 1.0</b> — the evaluation contract and, in §9, the PDP metadata at <code>/.well-known/authzen-configuration</code>.</li>
+      <li><b>RFC 9728</b> — protected resource metadata at <code>/.well-known/oauth-protected-resource</code>, including <code>scopes_supported</code> and <code>signed_metadata</code>. The PDP parameter is this project's own, provisional pending a working-group profile.</li>
+      <li><b>OpenID Federation 1.0</b> — entity configurations, subordinate statements, trust chains and metadata policy; <code>oauth_resource</code> is the entity type an API resolves as.</li>
+      <li><b>AuthZEN MCP profile, RFC 9470, RFC 9449</b> — tool-call authorisation, step-up challenges and sender-constrained tokens, unchanged by any of the above.</li>
+    </ul>
   </div>
 </section>
 
@@ -478,7 +434,6 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     <span><a href="https://github.com/ID-Partners/idp-auth-peps">ID-Partners/idp-auth-peps</a> on GitHub</span>
   </div>
 </footer>
-
 
 </body>
 </html>
