@@ -141,7 +141,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
   <div class="wrap">
     <span class="eyebrow">idp-auth-peps</span>
     <h1>Nobody tells the gateway <em>where the PDP is</em></h1>
-    <p class="lede">Or what the API behind it requires. The API publishes both. A gateway that reads them finds its Policy Decision Point and hands it the API's own requirements, and a federation decides whether the API is to be believed. These are OpenID AuthZEN enforcement points for Envoy, Istio and agentgateway, for Kong, and for Node, built around that.</p>
+    <p class="lede">A gateway is usually told by hand where its Policy Decision Point is, and which scopes and acr each API requires. Here it is told neither. The API publishes both at its well-known address, <code>/.well-known/oauth-protected-resource</code>. A gateway that reads it finds the PDP and hands the PDP the API's own requirements, and a federation decides whether the API is to be believed. These are OpenID AuthZEN enforcement points for Envoy, Istio and agentgateway, for Kong, and for Node, built around that.</p>
     <div class="two">
       <div>
         <span class="n">discovery 1</span>
