@@ -782,6 +782,35 @@ func (s *server) resolveFor(ctx context.Context, resource string) (discovery.PDP
 	return ep, nil
 }
 
+// mergePermit folds a permitting layer's outcome into the running one.
+//
+// Only the DECISION is a single answer; the OBLIGATIONS are cumulative. Replacing the
+// outcome wholesale let a later layer's plain permit erase an earlier layer's step-up or
+// identity-proofing requirement, and the request was then permitted with no challenge
+// issued at all — which defeats the point of putting a generic PDP in front of the
+// resource's own. The first layer to require something owns its parameter, and its
+// reason is what explains the challenge the client sees.
+func mergePermit(acc, layer pepOutcome) pepOutcome {
+	out := layer
+	out.Decision = true
+	if acc.IdentityReq {
+		out.IdentityReq = true
+		if acc.IdentityDoctype != "" {
+			out.IdentityDoctype = acc.IdentityDoctype
+		}
+	}
+	if acc.StepUp {
+		out.StepUp = true
+		if acc.StepUpScope != "" {
+			out.StepUpScope = acc.StepUpScope
+		}
+	}
+	if acc.IdentityReq || acc.StepUp {
+		out.Reason = acc.Reason
+	}
+	return out
+}
+
 // evaluateLayers asks each PDP in order; every layer must permit, the first that does
 // not is the answer. A PDP error fails closed unless the layer is fail-open, in which
 // case it is skipped and named; if every layer was skipped the request is permitted and
@@ -802,7 +831,7 @@ func (s *server) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoint
 		if !o.Decision {
 			return o, nil
 		}
-		out = o
+		out = mergePermit(out, o)
 	}
 	out.FailedOpen = skipped
 	if !decided {

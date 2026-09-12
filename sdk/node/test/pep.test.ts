@@ -1696,3 +1696,58 @@ describe('coverage completeness: fallbacks and branch tails', () => {
     expect(v.reason).toContain('a bare string');
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describe('layered fold keeps obligations', () => {
+  /** A fetch stub that answers each endpoint with its own body. */
+  function byEndpoint(bodies: Record<string, unknown>) {
+    return vi.fn(async (url: unknown) =>
+      new Response(JSON.stringify(bodies[String(url)] ?? { decision: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ) as unknown as typeof globalThis.fetch;
+  }
+
+  const generic = 'http://generic/access/v1/evaluation';
+  const resource = 'http://resource/access/v1/evaluation';
+
+  // A generic PDP's "permit, but step up" must not be erased by the resource PDP's
+  // plain permit: a caller reading `context` has to still see the requirement.
+  it('a permitting layer obligation survives a later plain permit', async () => {
+    const client = new AuthzenClient({
+      url: 'http://generic',
+      layers: ['http://generic', 'http://resource'],
+      discovery: { mode: 'off' },
+      fetch: byEndpoint({
+        [generic]: {
+          decision: true,
+          context: { reason: 'step up for this amount', step_up_required: true, step_up_scope: 'banking:payments:transfer' },
+        },
+        [resource]: { decision: true, context: { reason: 'resource is fine' } },
+      }),
+    });
+    const v = await client.evaluate({ subject: { type: 'user', id: 'u1' }, action: { name: 'pay' }, resource: { type: 'account', id: 'a1' } });
+    expect(v.allow).toBe(true);
+    expect(v.context?.step_up_required).toBe(true);
+    expect(v.context?.step_up_scope).toBe('banking:payments:transfer');
+    expect(v.reason).toBe('step up for this amount');
+  });
+
+  it('a deny still short-circuits and keeps its own advice', async () => {
+    const client = new AuthzenClient({
+      url: 'http://generic',
+      layers: ['http://generic', 'http://resource'],
+      discovery: { mode: 'off' },
+      fetch: byEndpoint({
+        [generic]: { decision: false, context: { reason: 'no', step_up_required: true, step_up_scope: 's' } },
+        [resource]: { decision: true },
+      }),
+    });
+    const v = await client.evaluate({ subject: { type: 'user', id: 'u1' }, action: { name: 'pay' }, resource: { type: 'account', id: 'a1' } });
+    expect(v.allow).toBe(false);
+    expect(v.kind).toBe('step_up_required');
+    expect(v.reason).toBe('no');
+  });
+});

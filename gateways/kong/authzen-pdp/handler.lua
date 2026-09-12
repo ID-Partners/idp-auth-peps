@@ -142,6 +142,34 @@ local function map_request(conf)
   return action, rtype, rid, rprops, ctx
 end
 
+-- has_obligation reports whether a folded context already carries a challenge.
+local function has_obligation(ctx)
+  return ctx ~= nil and (ctx.identity_proofing_required or ctx.step_up_required) and true or false
+end
+
+-- merge_permit folds a permitting layer's context into the running one.
+--
+-- Only the DECISION is a single answer; the OBLIGATIONS are cumulative. Replacing the
+-- context wholesale let a later layer's plain permit erase an earlier layer's step-up or
+-- identity-proofing requirement, and the request was then forwarded with no challenge
+-- issued at all -- which defeats the point of putting a generic PDP in front of the
+-- resource's own. The first layer to require something owns its parameter.
+local function merge_permit(acc, layer)
+  local out = {}
+  for k, v in pairs(layer) do out[k] = v end
+  if acc then
+    if acc.identity_proofing_required then
+      out.identity_proofing_required = true
+      out.identity_proofing_doctype = acc.identity_proofing_doctype or out.identity_proofing_doctype
+    end
+    if acc.step_up_required then
+      out.step_up_required = true
+      out.step_up_scope = acc.step_up_scope or out.step_up_scope
+    end
+  end
+  return out
+end
+
 -- ---------- main phase ----------
 
 -- The resource's two well-known documents: OpenID Federation appends its segment to the
@@ -448,7 +476,8 @@ function AuthzenPDP:access(conf)
   --    layer is fail-open, in which case it is skipped and named; if every layer was
   --    skipped the request is permitted and marked. A deny is never skipped.
   local body = cjson.encode(authzen_req)
-  local data, decision, dctx, reason
+  local data, decision, reason
+  local dctx = {}
   local decided = false
   for _, ep in ipairs(eps) do
     local httpc = http.new()
@@ -475,9 +504,16 @@ function AuthzenPDP:access(conf)
       decided = true
       data = cjson.decode(res.body) or {}
       decision = data.decision == true
-      dctx = (type(data.context) == "table" and data.context) or {}
-      reason = dctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
-      if not decision then break end
+      local lctx = (type(data.context) == "table" and data.context) or {}
+      local lreason = lctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
+      if not decision then
+        -- A deny is reported with its own advice, and later layers are not consulted.
+        dctx, reason = lctx, lreason
+        break
+      end
+      -- A permit: obligations accumulate. See merge_permit.
+      if not has_obligation(dctx) then reason = lreason end
+      dctx = merge_permit(dctx, lctx)
     end
   end
   if not decided then
@@ -565,6 +601,8 @@ AuthzenPDP._TEST = {
   jwt_claims = jwt_claims,
   extract_token = extract_token,
   map_request = map_request,
+  merge_permit = merge_permit,
+  has_obligation = has_obligation,
 }
 
 return AuthzenPDP

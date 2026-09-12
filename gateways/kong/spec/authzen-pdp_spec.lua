@@ -632,3 +632,46 @@ describe('subject.identity -> subject.id migration', function()
     assert.equal('unknown-agent', mock.json_decode(state2.pdp_requests[1].body).subject.id)
   end)
 end)
+
+describe('layered fold keeps obligations', function()
+  -- A permitting layer's obligation must survive a later layer's plain permit. Replacing
+  -- the context wholesale let a generic PDP's "permit, but step up" be erased by the
+  -- resource PDP's permit, and the request was then forwarded with no challenge at all.
+  local T = (load_plugin({}))._TEST
+
+  it('carries a step-up forward onto a later permit', function()
+    local folded = T.merge_permit(
+      { step_up_required = true, step_up_scope = 'banking:payments:transfer' },
+      { reason = 'resource is fine' })
+    assert.is_true(folded.step_up_required)
+    assert.equal('banking:payments:transfer', folded.step_up_scope)
+  end)
+
+  it('carries identity proofing forward onto a later permit', function()
+    local folded = T.merge_permit(
+      { identity_proofing_required = true, identity_proofing_doctype = 'org.iso.18013.5.1.mDL' },
+      { reason = 'resource is fine' })
+    assert.is_true(folded.identity_proofing_required)
+    assert.equal('org.iso.18013.5.1.mDL', folded.identity_proofing_doctype)
+  end)
+
+  it('lets the requiring layer own the parameter', function()
+    local folded = T.merge_permit(
+      { step_up_required = true, step_up_scope = 'first' },
+      { step_up_required = true, step_up_scope = 'second' })
+    assert.equal('first', folded.step_up_scope)
+  end)
+
+  it('keeps a later layer members when nothing was carried', function()
+    local folded = T.merge_permit({}, { reason = 'resource is fine' })
+    assert.equal('resource is fine', folded.reason)
+    assert.is_nil(folded.step_up_required)
+  end)
+
+  it('recognises a context that already carries a challenge', function()
+    assert.is_true(T.has_obligation({ step_up_required = true }))
+    assert.is_true(T.has_obligation({ identity_proofing_required = true }))
+    assert.is_false(T.has_obligation({ reason = 'nothing to resolve' }))
+    assert.is_false(T.has_obligation(nil))
+  end)
+end)

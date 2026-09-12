@@ -231,7 +231,11 @@ same request and the same context:
 | a PDP identifier | An explicit PDP. Its metadata is read like any other. |
 
 Every layer must permit. The first that does not is the answer, advice and all, and the
-remaining layers are not asked — a generic layer is a gate in front of a specific one. A
+remaining layers are not asked — a generic layer is a gate in front of a specific one.
+Across permitting layers the decision is one answer but the obligations accumulate: a
+step-up or identity-proofing requirement one layer attaches to its permit survives a
+later layer's plain permit, and the first layer to require something owns its parameter
+and its reason. A
 PDP error in any layer fails closed unless that layer was told otherwise (next section).
 Two layers that resolve to the same PDP are one call. The same forwarded context goes to
 every layer, so an estate PDP can read the resource's requirements if it wants to and

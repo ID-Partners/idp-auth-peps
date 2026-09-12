@@ -8,6 +8,7 @@
  */
 
 import type {
+  DecisionContext,
   EvaluationRequest,
   EvaluationResponse,
   EvaluationsRequest,
@@ -149,7 +150,7 @@ export class AuthzenClient {
           skipped.push(`${ep.identifier} (${describe(err)})`);
           continue;
         }
-        verdict = { ...foldDecision(res), request };
+        verdict = mergePermit(verdict, { ...foldDecision(res), request });
         if (!verdict.allow) break;
       }
       return finishFold(verdict, skipped, request);
@@ -198,13 +199,14 @@ export class AuthzenClient {
           skipped.push(`${ep.identifier} (empty evaluations response)`);
           continue;
         }
-        verdict = { allow: true, kind: 'ok', reason: 'permit', request };
+        let layerVerdict: Verdict = { allow: true, kind: 'ok', reason: 'permit', request };
         for (const d of list) {
           if (!d?.decision) {
-            verdict = { ...foldDecision(d), request };
+            layerVerdict = { ...foldDecision(d), request };
             break;
           }
         }
+        verdict = mergePermit(verdict, layerVerdict);
         if (!verdict.allow) break;
       }
       return finishFold(verdict, skipped, request);
@@ -323,6 +325,33 @@ function withForwardedContext<T extends { context?: Record<string, unknown> }>(
   const context = { ...extra, ...(request.context ?? {}) };
   // A boxcar carries its context at the top level too; either way, the merge is the same.
   return { ...request, context };
+}
+
+/**
+ * Fold a permitting layer's verdict into the running one.
+ *
+ * Only the DECISION is a single answer; the OBLIGATIONS a policy attaches are cumulative.
+ * Replacing the verdict wholesale let a later layer's plain permit erase an earlier
+ * layer's step-up or identity-proofing advice, so a caller reading `context` could not
+ * see a requirement a PDP had in fact asserted. A deny is returned untouched: it short
+ * circuits the fold and carries its own advice. The first layer to require something owns
+ * its parameter.
+ */
+function mergePermit(acc: Verdict | undefined, layer: Verdict): Verdict {
+  if (!layer.allow || !acc?.allow) return layer;
+  const a = acc.context;
+  if (!a?.identity_proofing_required && !a?.step_up_required) return layer;
+  const context: DecisionContext = { ...(layer.context ?? {}) };
+  if (a.identity_proofing_required) {
+    context.identity_proofing_required = true;
+    context.identity_proofing_doctype = a.identity_proofing_doctype ?? context.identity_proofing_doctype;
+  }
+  if (a.step_up_required) {
+    context.step_up_required = true;
+    context.step_up_scope = a.step_up_scope ?? context.step_up_scope;
+  }
+  // The obligation's own reason explains the challenge; a later plain permit's does not.
+  return { ...layer, context, reason: acc.reason };
 }
 
 /**
