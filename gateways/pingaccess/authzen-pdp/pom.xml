@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.idpartners.authzen</groupId>
+  <artifactId>authzen-pdp-pingaccess</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>AuthZEN PDP rule for PingAccess</name>
+  <description>
+    A PingAccess Add-on SDK rule that enforces an OpenID AuthZEN 1.0 decision on every
+    request: the PingAccess counterpart of the Kong authzen-pdp plugin, sending the PDP
+    the same evaluation request and rendering the same challenges.
+  </description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- PingAccess 8.x runs on Java 17 and 9.x on Java 21; 17 bytecode loads on both. -->
+    <maven.compiler.release>17</maven.compiler.release>
+
+    <!-- The PingAccess Add-on SDK is not on any public Maven repository. It is taken
+         from a PingAccess install (or the public Docker image: see the README) at
+         ${pa.server.root}/lib/pingaccess-sdk-${pa.sdk.version}.jar and is `provided` at
+         runtime, so nothing from it is bundled. Override both with -D. -->
+    <pa.server.root>${project.basedir}/.pa</pa.server.root>
+    <pa.sdk.version>9.1.0.1</pa.sdk.version>
+
+    <!-- What PingAccess 9.1 ships in lib/. Compiled against the same versions so the
+         classes seen at compile time are the ones on the engine's classpath; none of
+         these are bundled either. -->
+    <jackson.version>2.21.1</jackson.version>
+    <jakarta.validation.version>3.1.1</jakarta.validation.version>
+    <slf4j.version>1.7.36</slf4j.version>
+    <jose4j.version>0.9.6</jose4j.version>
+
+    <!-- Coverage floor, set just under the number on the day it was added. A change
+         that drops coverage fails the build; one that raises it needs nothing here.
+         Raise it when coverage rises; never lower it to make the build pass. -->
+    <coverage.line.floor>0.97</coverage.line.floor>
+    <coverage.branch.floor>0.90</coverage.branch.floor>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.pingidentity.pingaccess</groupId>
+      <artifactId>pingaccess-sdk</artifactId>
+      <version>${pa.sdk.version}</version>
+      <scope>system</scope>
+      <systemPath>${pa.server.root}/lib/pingaccess-sdk-${pa.sdk.version}.jar</systemPath>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>jakarta.validation</groupId>
+      <artifactId>jakarta.validation-api</artifactId>
+      <version>${jakarta.validation.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- JWS verification for X-User-Token. PingAccess validates the access token
+         itself; the user token is the one thing it cannot, and jose4j is already on
+         its classpath. -->
+    <dependency>
+      <groupId>org.bitbucket.b_c</groupId>
+      <artifactId>jose4j</artifactId>
+      <version>${jose4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.4</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <version>5.14.2</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>${project.artifactId}-${project.version}</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all,-processing,-serial</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <!-- Mockito's inline mock maker attaches an agent; newer JDKs want it said. -->
+          <argLine>@{argLine} -XX:+EnableDynamicAgentLoading</argLine>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Implementation-Title>${project.artifactId}</Implementation-Title>
+              <Implementation-Version>${project.version}</Implementation-Version>
+              <Implementation-Vendor>ID Partners</Implementation-Vendor>
+              <PingAccess-SDK-Version>${pa.sdk.version}</PingAccess-SDK-Version>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+      <!--
+        Coverage ratchet, the same contract as the Go, Lua and TypeScript gates. Two
+        things are deliberately excluded, and only these two, each because it needs a
+        running PingAccess or a socket rather than because it is hard:
+
+          PaResponses    builds a com.pingidentity.pa.sdk.http.Response through the
+                         SDK's ResponseBuilder, whose implementation is registered by
+                         the engine at boot. Exercised by the live-server run in demo/.
+          JdkTransport   opens real sockets; its request/response mapping is covered
+                         against a loopback server, but the trust-all TLS path can
+                         only be tried against a TLS endpoint.
+      -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>0.8.12</version>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals><goal>prepare-agent</goal></goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <phase>test</phase>
+            <goals><goal>report</goal></goals>
+          </execution>
+          <execution>
+            <id>check</id>
+            <phase>verify</phase>
+            <goals><goal>check</goal></goals>
+            <configuration>
+              <excludes>
+                <exclude>com/idpartners/pa/authzen/PaResponses.class</exclude>
+                <exclude>com/idpartners/pa/authzen/JdkTransport$Insecure.class</exclude>
+              </excludes>
+              <rules>
+                <rule>
+                  <element>BUNDLE</element>
+                  <limits>
+                    <limit>
+                      <counter>LINE</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>${coverage.line.floor}</minimum>
+                    </limit>
+                    <limit>
+                      <counter>BRANCH</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>${coverage.branch.floor}</minimum>
+                    </limit>
+                  </limits>
+                </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -4,15 +4,16 @@ Policy Enforcement Points that speak **[OpenID AuthZEN 1.0](https://openid.net/w
 to a PDP — in our deployments, **Ping Authorize** — and enforce the answer at whatever
 sits in front of your traffic.
 
-Three enforcement surfaces, one decision contract:
+Four enforcement surfaces, one decision contract:
 
 | | Where it runs | What it guards |
 | --- | --- | --- |
 | [`gateways/kong`](gateways/kong) | Kong Gateway, as a Lua plugin | REST + MCP |
 | [`gateways/envoy`](gateways/envoy) | agentgateway (solo.io), Istio, plain Envoy — via `ext_authz` | REST + MCP |
+| [`gateways/pingaccess`](gateways/pingaccess) | PingAccess, as an Add-on SDK rule (Java) | REST + MCP |
 | [`sdk/node`](sdk/node) | In your Node process, as Express middleware or an MCP guard | REST + MCP |
 
-They share [`core/`](core) — the Go COAZ engine and the `coaz-pep` service that both
+They share [`core/`](core) — the Go COAZ engine and the `coaz-pep` service that the
 gateway surfaces call. That is the point: **a client gets the same challenge whichever
 PEP denies it**, because there is one implementation of the decision and one of the
 challenge, not three.
@@ -42,8 +43,9 @@ human reading prose.
 does, the decision contract, and how a PEP finds its PDP. **Then [`demo/`](demo)** stands
 the whole thing up — a stub federation, a good PDP and a rogue one — with one
 `docker compose up`, and shows why the federation's word beats a resource's own: as a
-scripted walkthrough, or a console on :8088 that runs one request through all three PEPs
-and traces what each of them fetched.
+scripted walkthrough, or a console on :8088 that runs one request through the three
+`coaz-pep` modes and traces what each of them fetched. Profiles add Kong and PingAccess
+doing the same discovery in front of the same resource.
 
 ## Layout
 
@@ -62,6 +64,7 @@ gateways/
   kong/authzen-pdp/            Kong Lua plugin
   envoy/agentgateway/          agentgateway (solo.io) attachment
   envoy/istio/                 Istio CUSTOM AuthorizationPolicy + EnvoyFilter
+  pingaccess/authzen-pdp/      PingAccess Add-on SDK rule (Java, Maven)
 sdk/node/                    @id-partners/authzen-pep — TypeScript
 ```
 
@@ -71,8 +74,8 @@ One binary, two front doors, because Lua has no credible CEL evaluator and dupli
 the spec in it would guarantee drift:
 
 - **`:9191` Envoy `ext_authz` gRPC** — what agentgateway, Istio and Envoy attach to.
-- **`:9192` HTTP check API** (`POST /v1/mcp/check`) — what the Kong plugin calls, and
-  what the Node SDK can delegate to.
+- **`:9192` HTTP check API** (`POST /v1/mcp/check`) — what the Kong plugin and the
+  PingAccess rule call, and what the Node SDK can delegate to.
 
 ```sh
 cd core
@@ -184,9 +187,10 @@ The demo that exercises all of this end to end is
 cd core       && go test ./...
 cd sdk/node   && npm test
 cd gateways/kong && busted --lpath="./?.lua;./?/init.lua" spec/
+cd gateways/pingaccess/authzen-pdp && mvn verify   # needs the SDK jar: see its README
 ```
 
-All three run offline. CI enforces a coverage **ratchet** — floors set just under the
+All four run offline. CI enforces a coverage **ratchet** — floors set just under the
 current numbers, so a change that drops coverage fails while one that raises it does not
 need the gate touched. Raise a floor when coverage rises; never lower one to make CI pass.
 
@@ -196,9 +200,12 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 | `core/cmd/coaz-pep` | 95.6% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `sdk/node` | 96.8% stmts / 100% funcs | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
 | `gateways/kong` | 97.1% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
+| `gateways/pingaccess` | 98.4% lines / 91.2% branches | [`pom.xml`](gateways/pingaccess/authzen-pdp/pom.xml) (JaCoCo) |
 
 The target is **100% of what can be meaningfully tested, with the rest named** — not a
-coverage-number fetish. Two things are deliberately excluded, and only these two:
+coverage-number fetish. Two things are deliberately excluded from the Go gate, and only
+these two (the PingAccess gate names its own two, for the same reason: they need the
+running engine or a TLS peer):
 
 - **`main()`'s listen-and-serve loop.** All of its config-bearing logic is extracted into
   `buildServer`, which is tested across the configuration matrix; `main()` itself only

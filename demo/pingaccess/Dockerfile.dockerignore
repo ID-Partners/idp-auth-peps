@@ -1,0 +1,6 @@
+# BuildKit reads <Dockerfile>.dockerignore in preference to the root .dockerignore, which
+# excludes gateways/ for the Railway image. This build needs only the rule and its hook.
+*
+!gateways/pingaccess/authzen-pdp/pom.xml
+!gateways/pingaccess/authzen-pdp/src
+!demo/pingaccess/hooks

@@ -7,6 +7,8 @@
 #   pep-federation  PDP_DISCOVERY=federation — trusts the federation's word        :9194
 #   console         a clickable walkthrough: one request, all three PEPs          :8088
 #   kong            (profile `kong`) the Kong plugin doing discovery in Lua        :8000
+#   pingaccess      (profile `pingaccess`) the PingAccess rule doing it in Java   :3000
+#                   needs a licence: PING_IDENTITY_DEVOPS_USER / _KEY in demo/.env
 #
 # Everything is plain http on a private network, hence PDP_DISCOVERY_INSECURE. Do not
 # copy that line anywhere real.
@@ -132,6 +134,31 @@ services:
       - ../gateways/kong/authzen-pdp:/opt/kong/plugins/authzen-pdp:ro
     ports:
       - "8000:8000"
+    depends_on:
+      stubs:
+        condition: service_healthy
+
+  pingaccess:
+    profiles: ["pingaccess"]
+    build:
+      context: ..
+      dockerfile: demo/pingaccess/Dockerfile
+    environment:
+      # The DevOps image fetches an evaluation licence with these; without them it stops
+      # at boot and says so. Compose reads them from the shell or demo/.env (git-ignored).
+      PING_IDENTITY_ACCEPT_EULA: "YES"
+      PING_IDENTITY_DEVOPS_USER: ${PING_IDENTITY_DEVOPS_USER:-}
+      PING_IDENTITY_DEVOPS_KEY: ${PING_IDENTITY_DEVOPS_KEY:-}
+      # What pingaccess/hooks/81-after-start-process.sh configures: the same route as
+      # kong/kong.yml, in front of the same resource.
+      AUTHZEN_URL: http://stubs:9002
+      AUTHZEN_API_KEY: static-pdp-key
+      RESOURCE: http://stubs:9004
+      SITE_TARGET: stubs:9004
+      PEP_LABEL: "PingAccess (resource discovery)"
+    ports:
+      - "3000:3000"   # the engine, https with a self-signed certificate
+      - "9443:9000"   # the admin API and console: administrator / 2FederateM0re
     depends_on:
       stubs:
         condition: service_healthy

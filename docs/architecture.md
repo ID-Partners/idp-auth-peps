@@ -10,23 +10,23 @@ An AI agent calling a tool is one agent, acting for one human, touching one reso
 right now. Whether that is allowed depends on all three, and it belongs in policy, not
 in tool code. OpenID AuthZEN gives a Policy Enforcement Point (PEP) a standard way to ask
 a Policy Decision Point (PDP) that question. This repository is the enforcement side:
-three PEPs for three places traffic already flows through, with one decision contract
+four PEPs for four places traffic already flows through, with one decision contract
 between them so a client sees the same answer, and the same *resolvable* challenge on a
 deny, whichever one said no.
 
 ## The pieces
 
 ```
-                      agent / MCP client
-                             │
-        ┌────────────────────┼─────────────────────┐
-        ▼                    ▼                     ▼
-   Kong Gateway       Envoy / Istio /         Node process
-   (Lua plugin)       agentgateway            (Express middleware
-        │             (ext_authz gRPC)         or McpGuard)
-        │                    │                     │
-        │  /v1/mcp/check     │                     │  delegate (optional)
-        └─────────►  coaz-pep (Go)  ◄──────────────┘
+                            agent / MCP client
+                                    │
+        ┌──────────────┬────────────┼──────────────────┬─────────────────┐
+        ▼              ▼            ▼                  ▼                 ▼
+   Kong Gateway    PingAccess   Envoy / Istio /    Node process
+   (Lua plugin)    (Java rule)  agentgateway       (Express middleware
+        │              │        (ext_authz gRPC)    or McpGuard)
+        │              │            │                  │
+        │ /v1/mcp/check│            │                  │  delegate (optional)
+        └──────────────┴──►  coaz-pep (Go)  ◄──────────┘
                      ├─ COAZ engine: tools/list discovery, CEL mapping, JSON-RPC errors
                      ├─ token + DPoP verification
                      ├─ PDP discovery: RFC 9728 / AuthZEN well-known / OpenID Federation
@@ -41,6 +41,7 @@ deny, whichever one said no.
 | [`core/`](../core) | Go module | `coaz-pep`, the shared engine. Two front doors: Envoy `ext_authz` gRPC on :9191 and an HTTP check API on :9192. Everything with a spec behind it lives here once. |
 | [`gateways/kong/`](../gateways/kong) | Lua plugin | A Kong PEP. Native Lua for claims, REST mapping, challenges and PDP discovery; delegates DPoP verification and COAZ tool-call checks to `coaz-pep`, because a Kong plugin has no JOSE verifier and no CEL. |
 | [`gateways/envoy/`](../gateways/envoy) | YAML | How agentgateway, Istio and plain Envoy attach to `coaz-pep`. No code: the gateway only points at the engine. |
+| [`gateways/pingaccess/`](../gateways/pingaccess) | Java rule | A PingAccess PEP, as an Add-on SDK rule. The Kong plugin's split, in Java: claims, REST mapping, challenges and PDP discovery natively; DPoP and COAZ delegated to `coaz-pep`. Reads the identity PingAccess validated, and verifies `X-User-Token` itself. |
 | [`sdk/node/`](../sdk/node) | TypeScript | `@id-partners/authzen-pep`: an AuthZEN client, Express middleware, and an MCP guard for a process that is its own PEP. Evaluates a CEL subset itself; can delegate to `coaz-pep` for the rest. |
 | [`demo/`](../demo) | Compose + scripts | A stub federation, two banks' PDPs and a rogue one, and three `coaz-pep` instances in three discovery modes. Stands up with `docker compose up` or with `run-local.sh`; a console on :8088 runs one request through all three PEPs, traces what each fetched, and lets you move a PDP or hand a resource to another bank while it runs. |
 
@@ -77,11 +78,11 @@ policy that says *how* to resolve a deny gets that rendered three consistent way
 | `step_up_required` (RFC 9470) | 401 | `insufficient_scope` | `resource_authorisation` |
 | no authenticated user | 401 | `login_required` | `authn` |
 
-The same three words in a header, in a JSON body and in an MCP error, from all three
-PEPs. That is why there is one engine and not three: two renderings of one decision would
+The same three words in a header, in a JSON body and in an MCP error, from all four
+PEPs. That is why there is one engine and not four: two renderings of one decision would
 drift.
 
-## Three surfaces, one implementation
+## Four surfaces, one implementation
 
 The rule for what lives where: **anything with a spec behind it is implemented once, in
 Go, and the other surfaces either reuse it natively when that is safe or delegate to it
@@ -91,6 +92,11 @@ when it is not.**
   JSON document. It cannot verify a signature (no JOSE library is available to a plugin)
   or evaluate CEL. So it does the first list in Lua and delegates DPoP and COAZ tool calls
   to `coaz-pep` over the HTTP check API.
+- The PingAccess rule makes the same split as Kong, in Java, with two additions its
+  host makes safe: PingAccess validates the access token before any rule runs, so the
+  rule reads the identity the engine established rather than the token's own word; and
+  jose4j is on PingAccess's classpath, so `X-User-Token` is verified in-process when a
+  JWKS is configured. DPoP proofs and COAZ tool calls still go to `coaz-pep`.
 - The Node SDK can do more in-process, and does: a deliberately narrow CEL subset, so a
   mapping that needs more raises a mapping error rather than guessing. Anything past the
   subset is delegated, exactly as Kong does.
@@ -98,8 +104,9 @@ when it is not.**
   carry per-route knobs in `context_extensions`.
 
 The per-route knobs are the same map everywhere (`style`, `require_token`,
-`require_dpop`, `mcp_upstream_url`, `resource`, …): Kong plugin config, ext_authz
-context extensions, or the `config` object of an HTTP check.
+`require_dpop`, `mcp_upstream_url`, `resource`, …): Kong plugin config, the PingAccess
+rule's configuration, ext_authz context extensions, or the `config` object of an HTTP
+check.
 
 ## COAZ: authorising a tool call
 
@@ -275,8 +282,9 @@ A resource that belongs to a federation has to publish two things: a signed Enti
 Configuration at `{resource}/.well-known/openid-federation`, which is what a trust
 controller fetches to onboard it, and its RFC 9728 metadata. The gateway is the
 resource's public face, so it is the natural place for both, and every surface here can
-be that face: `coaz-pep` holds the key and serves both documents, the Kong plugin relays
-them from `coaz-pep`, and the Node SDK's `FederationEntity` signs and serves its own.
+be that face: `coaz-pep` holds the key and serves both documents, the Kong plugin and
+the PingAccess rule relay them from `coaz-pep`, and the Node SDK's `FederationEntity`
+signs and serves its own.
 
 The split is deliberate, and it is the whole point:
 
@@ -306,9 +314,9 @@ Configuration is four variables on `coaz-pep` — `FEDERATION_ENTITY_ID`,
 `FEDERATION_ENTITY_KEY_FILE` (a private JWK; `FEDERATION_ENTITY_KEY_GENERATE=true` mints
 one on first start), `FEDERATION_AUTHORITY_HINTS`, and the trust anchors it already has
 for federation-mode discovery — plus a gateway route sending the two well-known paths to
-the PEP's HTTP port. Kong sets `federation_entity_url` to that port instead. The SDK has
-no chain resolver, so its document is self-asserted; put `coaz-pep` in front when the
-public document must be the controller's word.
+the PEP's HTTP port. Kong and PingAccess set `federation_entity_url` to that port
+instead. The SDK has no chain resolver, so its document is self-asserted; put `coaz-pep`
+in front when the public document must be the controller's word.
 
 ### The rules that never relax
 
@@ -328,9 +336,9 @@ public document must be the controller's word.
 - Allowlists are re-applied on every call, not only when a document is fetched, because a
   cache is shared and a policy is per route.
 
-Federation resolution lives only in Go. The Kong plugin and the Node SDK implement the
-`resource` and `authzen` modes natively (there is no JOSE verifier in Kong; the SDK leaves
-a `sources` seam) and get federation by delegating to `coaz-pep`.
+Federation resolution lives only in Go. The Kong plugin, the PingAccess rule and the
+Node SDK implement the `resource` and `authzen` modes natively (there is no JOSE verifier
+in Kong; the SDK leaves a `sources` seam) and get federation by delegating to `coaz-pep`.
 
 ## What is deliberately not here
 
@@ -352,7 +360,8 @@ a `sources` seam) and get federation by delegating to `coaz-pep`.
 
 `demo/` stands up a stub Trust Anchor, resources that are and are not members, two banks'
 PDPs, an estate PDP and a rogue one that permits everything, and `coaz-pep` three times in
-three discovery modes. `demo.sh` walks the security cases in the terminal. The console on
+three discovery modes; profiles add Kong and PingAccess doing resource discovery in front
+of the same stub. `demo.sh` walks the security cases in the terminal. The console on
 :8088 is about the two discoveries themselves: for one request, each of the three PEPs
 shows the chain it followed, top to bottom — the document it read to find the PDP (the
 resource's own, or the entity configuration with the anchor's policy applied and the

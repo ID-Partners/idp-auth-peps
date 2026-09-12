@@ -141,7 +141,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
   <div class="wrap">
     <span class="eyebrow">idp-auth-peps</span>
     <h1>Nobody tells the gateway <em>where the PDP is</em></h1>
-    <p class="lede">A gateway is usually told by hand where its Policy Decision Point is, and which scopes and acr each API requires. Here it is told neither. The API publishes both at its well-known address, <code>/.well-known/oauth-protected-resource</code>. A gateway that reads it finds the PDP and hands the PDP the API's own requirements, and a federation decides whether the API is to be believed. These are OpenID AuthZEN enforcement points for Envoy, Istio and agentgateway, for Kong, and for Node, built around that.</p>
+    <p class="lede">A gateway is usually told by hand where its Policy Decision Point is, and which scopes and acr each API requires. Here it is told neither. The API publishes both at its well-known address, <code>/.well-known/oauth-protected-resource</code>. A gateway that reads it finds the PDP and hands the PDP the API's own requirements, and a federation decides whether the API is to be believed. These are OpenID AuthZEN enforcement points for Envoy, Istio and agentgateway, for Kong, for PingAccess, and for Node, built around that.</p>
     <div class="two">
       <div>
         <span class="n">discovery 1</span>
@@ -386,14 +386,15 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
 
 <section class="band">
   <div class="wrap">
-    <h2>Three surfaces, one set of rules</h2>
-    <p class="measure">Everything with a specification behind it lives once, in Go. The Kong plugin does the two plain-JSON discoveries natively in Lua and delegates what needs a JOSE library; the Node SDK does the same in TypeScript.</p>
+    <h2>Four surfaces, one set of rules</h2>
+    <p class="measure">Everything with a specification behind it lives once, in Go. The Kong plugin does the two plain-JSON discoveries natively in Lua and delegates what needs a JOSE library; the PingAccess rule does the same in Java, and reads the identity PingAccess itself validated; the Node SDK does the same in TypeScript.</p>
     <div class="wide">
     <table>
       <thead><tr><th>Surface</th><th>Sits in front of</th><th>Finds the PDP</th><th>Federation</th><th>Federation face</th></tr></thead>
       <tbody>
-        <tr><td><code>coaz-pep</code> (Go)</td><td>Envoy, Istio, agentgateway, and Kong's MCP routes</td><td>RFC 9728 and AuthZEN metadata</td><td>resolves trust chains to configured anchors</td><td>holds the key, republishes the resolved document</td></tr>
+        <tr><td><code>coaz-pep</code> (Go)</td><td>Envoy, Istio, agentgateway, and the MCP routes of Kong and PingAccess</td><td>RFC 9728 and AuthZEN metadata</td><td>resolves trust chains to configured anchors</td><td>holds the key, republishes the resolved document</td></tr>
         <tr><td>Kong plugin (Lua)</td><td>Kong routes</td><td>RFC 9728 and AuthZEN metadata, in Lua</td><td>delegated to <code>coaz-pep</code></td><td>relayed from <code>coaz-pep</code></td></tr>
+        <tr><td>PingAccess rule (Java)</td><td>PingAccess applications and resources</td><td>RFC 9728 and AuthZEN metadata, in Java</td><td>delegated to <code>coaz-pep</code></td><td>relayed from <code>coaz-pep</code></td></tr>
         <tr><td>Node SDK (TypeScript)</td><td>Express, and MCP servers in process</td><td>RFC 9728 and AuthZEN metadata</td><td>no resolver; a seam for one</td><td>signs and serves its own, self-asserted</td></tr>
       </tbody>
     </table>

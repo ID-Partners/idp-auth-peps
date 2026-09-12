@@ -83,3 +83,33 @@ jobs:
         run: busted --lpath="./?.lua;./?/init.lua" spec/
       - name: Coverage ratchet
         run: ../../scripts/lua-coverage-gate.sh
+
+  pingaccess:
+    name: gateways/pingaccess (java)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateways/pingaccess/authzen-pdp
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Take the PingAccess Add-on SDK from the public image
+        # The SDK is on no Maven repository. The image is public and needs no licence to
+        # pull; only running it does. The jar's version is whatever the image ships, so
+        # it is read rather than assumed.
+        run: |
+          image=pingidentity/pingaccess:9.1.0-latest
+          jar=$(docker run --rm --entrypoint sh "$image" -c 'ls /opt/server/lib/pingaccess-sdk-*.jar')
+          version=$(basename "$jar" .jar | sed 's/^pingaccess-sdk-//')
+          id=$(docker create "$image")
+          mkdir -p .pa/lib
+          docker cp "$id:$jar" .pa/lib/
+          docker rm "$id" >/dev/null
+          echo "PA_SDK_VERSION=$version" >> "$GITHUB_ENV"
+          echo "PingAccess SDK $version"
+      - name: Tests and the coverage ratchet
+        run: mvn -B -Dpa.sdk.version="$PA_SDK_VERSION" verify

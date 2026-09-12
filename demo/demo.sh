@@ -161,4 +161,12 @@ if curl -s -o /dev/null -w '%{http_code}' "http://${PEP_HOST}:8000/bank/accounts
   step "read a balance via Kong"; curl -s -H "Authorization: Bearer $(jwt)" "http://${PEP_HOST}:8000/bank/accounts/a1/balance"; echo
   step "read-only token pays via Kong"; curl -s -X POST -H "Authorization: Bearer $(SCOPE='accounts:read' jwt)" -H 'Content-Type: application/json' -d "$PAY50" "http://${PEP_HOST}:8000/bank/payments"; echo
 fi
+
+# PingAccess serves https on its engine port with a self-signed certificate, hence -k.
+if curl -sk -o /dev/null -w '%{http_code}' "https://${PEP_HOST}:3000/accounts/a1/balance" 2>/dev/null | grep -q '^[0-9]'; then
+  say "9. PingAccess, doing the same discovery in Java (profile pingaccess)"
+  step "read a balance via PingAccess"; curl -sk -H "Authorization: Bearer $(jwt)" "https://${PEP_HOST}:3000/accounts/a1/balance"; echo
+  step "read-only token pays via PingAccess"; curl -sk -X POST -H "Authorization: Bearer $(SCOPE='accounts:read' jwt)" -H 'Content-Type: application/json' -d "$PAY50" "https://${PEP_HOST}:3000/payments"; echo
+  step "pay 5000 via PingAccess -> the same challenge"; curl -sk -X POST -H "Authorization: Bearer $(jwt)" -H 'Content-Type: application/json' -d "$PAY5000" "https://${PEP_HOST}:3000/payments"; echo
+fi
 echo
