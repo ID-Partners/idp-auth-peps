@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"math/big"
 )
 
 // Sign mints a compact JWS over claims with the given protected header. The alg is read
@@ -77,10 +78,13 @@ func PublicJWK(key crypto.Signer) (map[string]any, error) {
 			"x": B64URLEncode(x), "y": B64URLEncode(y),
 		}
 	case *rsa.PrivateKey:
+		// The key's own exponent, not an assumed 65537: a JWK that misreports e
+		// describes a different key than the one that signed.
+		e := big.NewInt(int64(k.E))
 		jwk = map[string]any{
 			"kty": "RSA",
 			"n":   B64URLEncode(k.N.Bytes()),
-			"e":   B64URLEncode([]byte{1, 0, 1}),
+			"e":   B64URLEncode(e.Bytes()),
 		}
 	default:
 		return nil, fmt.Errorf("unsupported key %T", key)

@@ -259,6 +259,31 @@ URL, so `https://mcp.example.com` does not admit `https://mcp.example.com.evil.t
 
 Set both in any environment where the port is reachable by anything you do not control.
 
+## Bounding what discovery will fetch
+
+Discovery follows URLs out of documents the PEP did not write: a resource's RFC 9728
+metadata, an Entity Configuration, a Superior's `federation_fetch_endpoint`. Every one of
+them goes through a single bounded GET — https only, hop-by-hop redirect re-checks capped
+at three, a 1 MiB body cap, and a per-resolution fetch budget — so a hostile document
+cannot turn the PEP into an open proxy or a memory sink.
+
+What is **not** bounded by default is *which hosts* may be reached. `FetchAllowed` (and
+`SubjectAllowed`, for the subject's own configuration) default to nil, meaning
+unrestricted, so a document can name an internal address and the PEP will fetch it:
+
+```go
+federation.Options{
+    FetchAllowed: func(u string) bool { return strings.HasPrefix(u, "https://fed.example/") },
+}
+```
+
+The https-only default already rules out the plaintext link-local metadata services that
+make SSRF interesting on a cloud instance, and the budget and body caps bound the blast
+radius. But an internal *https* service is still reachable. **Set an allowlist in any
+deployment where the PEP can route to something you would not publish**, and keep
+`AllowInsecure` off outside tests — it is what permits `http` both in an Entity Identifier
+and on the wire.
+
 ## DPoP
 
 The `cnf.jkt` comparison is only meaningful once the proof's **signature** verifies under

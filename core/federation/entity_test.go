@@ -60,7 +60,7 @@ func TestEntityConfigurationIsMinimalAndSelfSigned(t *testing.T) {
 	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != contentType {
 		t.Fatalf("%d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
-	st, err := parseStatement(body, time.Now(), time.Minute)
+	st, err := parseStatement(body, time.Now(), time.Minute, true) // a local http test server
 	if err != nil {
 		t.Fatal(err)
 	}

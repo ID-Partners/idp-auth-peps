@@ -174,7 +174,7 @@ func (r *Resolver) Resolve(ctx context.Context, entityID string) (Resolved, erro
 // fetch it back from its public address. The statement is verified exactly as a fetched
 // ES[0] would be; only the fetch is skipped.
 func (r *Resolver) ResolveLeaf(ctx context.Context, entityConfiguration string) (Resolved, error) {
-	st, err := parseStatement(strings.TrimSpace(entityConfiguration), r.opts.Now(), r.opts.Leeway)
+	st, err := parseStatement(strings.TrimSpace(entityConfiguration), r.opts.Now(), r.opts.Leeway, r.opts.AllowInsecure)
 	if err != nil {
 		return Resolved{}, fmt.Errorf("%w: entity configuration: %v", ErrInvalidChain, err)
 	}

@@ -137,3 +137,49 @@ func TestAlgForCurves(t *testing.T) {
 		}
 	}
 }
+
+// The private-key parsing paths: a JWK that is the wrong shape must be refused rather than
+// producing a key that cannot sign, and a key/alg mismatch must be caught at signing time.
+func TestPrivateKeyAndSignRefusals(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := PublicJWK(rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An RSA private JWK is only a key with all of d, p and q; each missing one is a
+	// different error, and none of them may yield a usable signer.
+	for _, missing := range []string{"d", "p", "q"} {
+		jwk := map[string]any{"kty": "RSA", "n": full["n"], "e": full["e"],
+			"d": B64URLEncode(rsaKey.D.Bytes()),
+			"p": B64URLEncode(rsaKey.Primes[0].Bytes()),
+			"q": B64URLEncode(rsaKey.Primes[1].Bytes())}
+		delete(jwk, missing)
+		if _, err := PrivateKeyFromJWK(jwk); err == nil {
+			t.Errorf("an RSA private JWK without %q must be refused", missing)
+		}
+	}
+	// A complete one round-trips.
+	whole := map[string]any{"kty": "RSA", "n": full["n"], "e": full["e"],
+		"d": B64URLEncode(rsaKey.D.Bytes()),
+		"p": B64URLEncode(rsaKey.Primes[0].Bytes()),
+		"q": B64URLEncode(rsaKey.Primes[1].Bytes())}
+	if _, err := PrivateKeyFromJWK(whole); err != nil {
+		t.Fatalf("a complete RSA private JWK should parse: %v", err)
+	}
+
+	// Signing with the wrong family for the alg: the key and the header must agree, or a
+	// signature would be made that no verifier could match to the declared alg.
+	ec, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Sign(map[string]any{"alg": "RS256"}, map[string]any{}, ec); err == nil {
+		t.Error("an EC key must not sign an RS256 header")
+	}
+	if _, err := Sign(map[string]any{"alg": "ES256"}, map[string]any{}, rsaKey); err == nil {
+		t.Error("an RSA key must not sign an ES256 header")
+	}
+}

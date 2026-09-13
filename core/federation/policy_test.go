@@ -44,7 +44,7 @@ func TestValidateOperatorCombinations(t *testing.T) {
 func TestMergeOperators(t *testing.T) {
 	above := paramPolicy{"add": []any{"a"}, "superset_of": []any{"a"}, "subset_of": []any{"a", "b", "c"}, "essential": false, "default": "x", "value": []any{"a", "b"}}
 	below := paramPolicy{"add": []any{"b"}, "superset_of": []any{"b"}, "subset_of": []any{"a", "b", "d"}, "essential": true, "default": "x", "value": []any{"a", "b"}, "regexp": "ignored"}
-	got, err := mergeOperators(above, below, nil)
+	got, err := mergeOperators(above, below)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,10 +52,10 @@ func TestMergeOperators(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
 	}
-	if _, err := mergeOperators(paramPolicy{"default": "x"}, paramPolicy{"default": "y"}, nil); err == nil {
+	if _, err := mergeOperators(paramPolicy{"default": "x"}, paramPolicy{"default": "y"}); err == nil {
 		t.Fatal("default conflict")
 	}
-	if got, err := mergeOperators(paramPolicy{"one_of": []any{"a", "b"}}, paramPolicy{"one_of": []any{"b"}}, nil); err != nil || !reflect.DeepEqual(got["one_of"], []any{"b"}) {
+	if got, err := mergeOperators(paramPolicy{"one_of": []any{"a", "b"}}, paramPolicy{"one_of": []any{"b"}}); err != nil || !reflect.DeepEqual(got["one_of"], []any{"b"}) {
 		t.Fatalf("one_of intersection: %v %v", got, err)
 	}
 }

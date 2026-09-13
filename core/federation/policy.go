@@ -116,13 +116,13 @@ func validateOperators(ops paramPolicy) error {
 
 // mergePolicies folds sub (a deeper Superior's policy) into acc (the policy resolved
 // so far from above) per the §6.1.3.1 merge semantics.
-func mergePolicies(acc, sub map[string]map[string]map[string]any, crit []string) error {
+func mergePolicies(acc, sub map[string]map[string]map[string]any) error {
 	for et, params := range sub {
 		if acc[et] == nil {
 			acc[et] = map[string]map[string]any{}
 		}
 		for name, ops := range params {
-			merged, err := mergeOperators(acc[et][name], ops, crit)
+			merged, err := mergeOperators(acc[et][name], ops)
 			if err != nil {
 				return fmt.Errorf("%s.%s: %v", et, name, err)
 			}
@@ -132,7 +132,7 @@ func mergePolicies(acc, sub map[string]map[string]map[string]any, crit []string)
 	return nil
 }
 
-func mergeOperators(above, below paramPolicy, crit []string) (paramPolicy, error) {
+func mergeOperators(above, below paramPolicy) (paramPolicy, error) {
 	out := paramPolicy{}
 	for k, v := range above {
 		out[k] = v
@@ -253,7 +253,7 @@ func resolveMetadata(chain []*Statement) (map[string]map[string]any, error) {
 	merged := map[string]map[string]map[string]any{}
 	// Superiors from the top down: chain[len-2] is the anchor's statement.
 	for j := len(chain) - 2; j >= 1; j-- {
-		if err := mergePolicies(merged, chain[j].MetadataPolicy, chain[j].MetadataPolicyCrit); err != nil {
+		if err := mergePolicies(merged, chain[j].MetadataPolicy); err != nil {
 			return nil, fmt.Errorf("metadata policy from %s: %v", chain[j].Iss, err)
 		}
 	}

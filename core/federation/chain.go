@@ -37,11 +37,16 @@ func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) (
 		return nil, "", fmt.Errorf("%w: %s has no authority_hints", ErrInvalidChain, entityID)
 	}
 
+	// seen is per-PATH, not global. A global set looks like a cheap loop guard, but it
+	// also means an intermediate reachable two ways is only ever explored through
+	// whichever path happened to reach it first — so a chain to the PREFERRED anchor can
+	// be missed, or a valid chain not found at all, depending on hint ordering. Carrying
+	// the set along each path costs a small copy per link and removes that.
 	type frontierItem struct {
-		chain []*Statement // ES[0..j], the last element is the current subject's statement
+		chain []*Statement    // ES[0..j], the last element is the current subject's statement
+		seen  map[string]bool // the entities already on THIS path, to stop a cycle
 	}
-	frontier := []frontierItem{{chain: []*Statement{leaf}}}
-	visited := map[string]bool{entityID: true}
+	frontier := []frontierItem{{chain: []*Statement{leaf}, seen: map[string]bool{entityID: true}}}
 	var best []*Statement
 	bestAnchor := ""
 	var lastErr error
@@ -60,8 +65,8 @@ func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) (
 		intermediates := len(item.chain) - 1
 
 		for _, hint := range currentConfig.AuthorityHints {
-			if visited[hint] {
-				continue
+			if item.seen[hint] {
+				continue // already on this path: a cycle
 			}
 			_, isAnchor := r.anchors[hint]
 			if !isAnchor && intermediates+1 > r.opts.MaxPathLength {
@@ -102,8 +107,12 @@ func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) (
 				}
 				continue
 			}
-			visited[hint] = true
-			frontier = append(frontier, frontierItem{chain: chain})
+			seen := make(map[string]bool, len(item.seen)+1)
+			for k := range item.seen {
+				seen[k] = true
+			}
+			seen[hint] = true
+			frontier = append(frontier, frontierItem{chain: chain, seen: seen})
 		}
 	}
 	if best != nil {
@@ -152,7 +161,7 @@ func (w *walker) entityConfiguration(entityID string) (*Statement, error) {
 		}
 		return nil, fmt.Errorf("fetching entity configuration of %s: %w", entityID, err)
 	}
-	st, err := parseStatement(strings.TrimSpace(string(body)), w.r.opts.Now(), w.r.opts.Leeway)
+	st, err := parseStatement(strings.TrimSpace(string(body)), w.r.opts.Now(), w.r.opts.Leeway, w.r.opts.AllowInsecure)
 	if err != nil {
 		return nil, fmt.Errorf("%w: entity configuration of %s: %v", ErrInvalidChain, entityID, err)
 	}
@@ -196,7 +205,7 @@ func (w *walker) subordinateStatement(superior *Statement, sub string) (*Stateme
 		}
 		return nil, fmt.Errorf("fetching subordinate statement about %s from %s: %w", sub, superior.Sub, err)
 	}
-	st, err := parseStatement(strings.TrimSpace(string(body)), w.r.opts.Now(), w.r.opts.Leeway)
+	st, err := parseStatement(strings.TrimSpace(string(body)), w.r.opts.Now(), w.r.opts.Leeway, w.r.opts.AllowInsecure)
 	if err != nil {
 		return nil, fmt.Errorf("%w: subordinate statement about %s from %s: %v", ErrInvalidChain, sub, superior.Sub, err)
 	}

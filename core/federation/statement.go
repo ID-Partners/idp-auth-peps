@@ -47,7 +47,7 @@ var (
 // parseStatement decodes and syntactically validates one Entity Statement (§3.2 steps
 // 1–9 and 13–23). Signature verification is separate because the key comes from the
 // issuer's Entity Configuration, which the caller holds.
-func parseStatement(raw string, now time.Time, leeway time.Duration) (*Statement, error) {
+func parseStatement(raw string, now time.Time, leeway time.Duration, allowInsecure bool) (*Statement, error) {
 	hdr := jose.Header(raw)
 	claims := jose.Claims(raw)
 	if hdr == nil || claims == nil {
@@ -71,7 +71,7 @@ func parseStatement(raw string, now time.Time, leeway time.Duration) (*Statement
 	st.Iss, _ = claims["iss"].(string)
 	st.Sub, _ = claims["sub"].(string)
 	for name, v := range map[string]string{"iss": st.Iss, "sub": st.Sub} {
-		if !validEntityID(v) {
+		if !validEntityID(v, allowInsecure) {
 			return nil, fmt.Errorf("%s %q is not a valid entity identifier", name, v)
 		}
 	}
@@ -130,7 +130,7 @@ func parseStatement(raw string, now time.Time, leeway time.Duration) (*Statement
 				return nil, fmt.Errorf("authority_hints must not be empty")
 			}
 			for _, h := range st.AuthorityHints {
-				if !validEntityID(h) {
+				if !validEntityID(h, allowInsecure) {
 					return nil, fmt.Errorf("authority hint %q is not a valid entity identifier", h)
 				}
 			}
@@ -193,22 +193,56 @@ func (s *Statement) verifyWith(keys []map[string]any) error {
 	kid, _ := s.Header["kid"].(string)
 	alg, _ := s.Header["alg"].(string)
 	for _, k := range keys {
-		if id, _ := k["kid"].(string); id == kid {
-			if err := jose.VerifyJWS(s.Raw, k, alg); err != nil {
-				return fmt.Errorf("signature by kid %q does not verify: %v", kid, err)
-			}
-			return nil
+		if id, _ := k["kid"].(string); id != kid {
+			continue
 		}
+		// A key that says what it is for is taken at its word: a federation key published
+		// for encryption is not a signing key, and accepting one anyway would let a key
+		// chosen for one purpose be used for another.
+		if !usableForSigning(k) {
+			return fmt.Errorf("kid %q is not published for signature verification", kid)
+		}
+		if err := jose.VerifyJWS(s.Raw, k, alg); err != nil {
+			return fmt.Errorf("signature by kid %q does not verify: %v", kid, err)
+		}
+		return nil
 	}
 	return fmt.Errorf("kid %q is not among the issuer's federation keys", kid)
 }
 
-func validEntityID(s string) bool {
+// validEntityID applies §1.2: "All Entity Identifiers defined by this specification are
+// URLs that use the https scheme, have a host component, and MAY contain port and path
+// components." http is admitted only when the operator has already accepted insecure
+// metadata (the same AllowInsecure that governs whether metafetch will dial it) — tests
+// and local development. Without that, a chain cannot name a plaintext authority at all,
+// rather than relying on the fetch layer to refuse it later.
+// usableForSigning applies a JWK's own `use` and `key_ops` (RFC 7517 §4.2-4.3). A key
+// that declares neither is unrestricted, which is the common case for federation keys.
+func usableForSigning(jwk map[string]any) bool {
+	if use, ok := jwk["use"].(string); ok && use != "" && use != "sig" {
+		return false
+	}
+	ops, present := jwk["key_ops"].([]any)
+	if !present {
+		return true
+	}
+	for _, op := range ops {
+		if s, _ := op.(string); s == "verify" {
+			return true
+		}
+	}
+	return false
+}
+
+func validEntityID(s string, allowInsecure bool) bool {
 	u, err := url.Parse(s)
 	if err != nil || !u.IsAbs() || u.Host == "" || u.Fragment != "" || u.RawQuery != "" {
 		return false
 	}
-	return u.Scheme == "https" || u.Scheme == "http"
+	if u.Scheme == "https" {
+		return true
+	}
+	return allowInsecure && u.Scheme == "http"
 }
 
 func numClaim(claims map[string]any, name string) (int64, bool) {

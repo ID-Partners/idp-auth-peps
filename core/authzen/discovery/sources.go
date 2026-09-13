@@ -10,6 +10,7 @@ import (
 
 	"github.com/ID-Partners/idp-auth-peps/core/federation"
 	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
 // StaticSource names the operator-configured PDP for every resource.
@@ -49,6 +50,10 @@ func (s *RFC9728Source) Lookup(ctx context.Context, resource string) (ResourceMe
 	// answer at that path has just named a PDP for someone else's resource.
 	if echoed, _ := doc["resource"].(string); echoed != resource {
 		return ResourceMetadata{}, fmt.Errorf("%w: %s says resource is %q, expected %q", ErrInvalid, wk, echoed, resource)
+	}
+	// RFC 9728 §2.1 signed_metadata, when the resource published one.
+	if err := s.applySignedMetadata(ctx, doc, resource, wk); err != nil {
+		return ResourceMetadata{}, err
 	}
 	raw, _ := doc[ParamPolicyDecisionPoints].([]any)
 	pdps, err := pdpList(raw, wk)
@@ -112,4 +117,97 @@ func pdpList(raw []any, from string) ([]string, error) {
 		return nil, ErrNoMetadata
 	}
 	return out, nil
+}
+
+// jwtReserved are the JWS/JWT claims that carry the assertion itself rather than a
+// metadata parameter, so they are not merged into the document.
+var jwtReserved = map[string]bool{"iss": true, "iat": true, "exp": true, "nbf": true, "aud": true, "jti": true, "sub": true}
+
+// applySignedMetadata verifies RFC 9728 §2.1's signed_metadata and lets its claims
+// override the plain JSON members, in place. A document without one is left alone.
+//
+// The RFC permits ignoring the member outright — "Consumers of the metadata MAY ignore the
+// signed metadata if they do not support this feature" — but supporting it has a sharp
+// edge. A consumer that does "MUST validate that any signed metadata was signed by a key
+// belonging to the issuer", and the signed values "MUST take precedence over the
+// corresponding values conveyed using plain JSON elements". So once we look at it, a
+// present-but-unverifiable signature can never fall back to the unsigned body: that would
+// be a downgrade an attacker forces by breaking the signature, which is easier than
+// forging one.
+//
+// What this proves is narrow, and worth saying plainly: the body was signed by a key
+// published at the document's OWN jwks_uri. Both are served by the resource, so it is a
+// self-assertion either way. It catches a body altered in front of the resource — a cache,
+// a proxy, a compromised CDN — but it is not the federation's word about the resource.
+// That is what FederationSource is for, and why it is asked first.
+func (s *RFC9728Source) applySignedMetadata(ctx context.Context, doc map[string]any, resource, wk string) error {
+	raw, present := doc["signed_metadata"]
+	if !present {
+		return nil
+	}
+	tok, _ := raw.(string)
+	if tok == "" {
+		return fmt.Errorf("%w: %s carries an empty signed_metadata", ErrInvalid, wk)
+	}
+	hdr, claims := jose.Header(tok), jose.Claims(tok)
+	if hdr == nil || claims == nil {
+		return fmt.Errorf("%w: %s signed_metadata is not a compact JWS", ErrInvalid, wk)
+	}
+	// "MUST contain an iss claim denoting the party attesting to the claims." The only
+	// keys we can locate are the resource's own, so an assertion by anyone else is one we
+	// cannot validate — and an unvalidatable signature is not a reason to trust the body.
+	if iss, _ := claims["iss"].(string); iss != resource {
+		return fmt.Errorf("%w: %s signed_metadata is issued by %q, not the resource", ErrInvalid, wk, claims["iss"])
+	}
+	// A signature lifted from another resource's document must not pass here.
+	if r, ok := claims["resource"].(string); ok && r != resource {
+		return fmt.Errorf("%w: %s signed_metadata is about %q", ErrInvalid, wk, r)
+	}
+	alg, _ := hdr["alg"].(string)
+	if _, err := jose.HashFor(alg); err != nil {
+		return fmt.Errorf("%w: %s signed_metadata alg %q is not acceptable", ErrInvalid, wk, alg)
+	}
+	jwksURI, _ := doc["jwks_uri"].(string)
+	if jwksURI == "" {
+		return fmt.Errorf("%w: %s has signed_metadata but no jwks_uri to verify it with", ErrInvalid, wk)
+	}
+	body, err := s.fetch.Get(ctx, jwksURI, "application/json")
+	if err != nil {
+		// A refused URL stays refused; anything else means we cannot verify, and an
+		// unverified signed document is not usable.
+		if errors.Is(err, metafetch.ErrNotAllowed) {
+			return err
+		}
+		return fmt.Errorf("%w: fetching %s to verify signed_metadata: %v", ErrInvalid, jwksURI, err)
+	}
+	var set struct {
+		Keys []map[string]any `json:"keys"`
+	}
+	if err := json.Unmarshal(body, &set); err != nil || len(set.Keys) == 0 {
+		return fmt.Errorf("%w: %s served no usable JWK set", ErrInvalid, jwksURI)
+	}
+	kid, _ := hdr["kid"].(string)
+	verified := false
+	for _, k := range set.Keys {
+		// With a kid, only that key may verify; without one, any key in the set may.
+		if kid != "" {
+			if id, _ := k["kid"].(string); id != kid {
+				continue
+			}
+		}
+		if jose.VerifyJWS(tok, k, alg) == nil {
+			verified = true
+			break
+		}
+	}
+	if !verified {
+		return fmt.Errorf("%w: %s signed_metadata does not verify against any key at %s", ErrInvalid, wk, jwksURI)
+	}
+	// Precedence: the signed claims win over the plain members.
+	for k, v := range claims {
+		if !jwtReserved[k] && k != "signed_metadata" {
+			doc[k] = v
+		}
+	}
+	return nil
 }

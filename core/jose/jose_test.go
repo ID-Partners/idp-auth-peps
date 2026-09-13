@@ -128,16 +128,25 @@ func TestJWKParsingErrors(t *testing.T) {
 			t.Fatalf("want exponent error for e=%q", e)
 		}
 	}
-	if _, err := RSAFromJWK(map[string]any{"kty": "RSA", "n": "AQ", "e": "AQAB"}); err != nil {
-		t.Fatalf("valid RSA JWK rejected: %v", err)
+	// A modulus short enough to factor must be refused, however well-formed the JWK is:
+	// stdlib would verify against it and the signature would mean nothing.
+	if _, err := RSAFromJWK(map[string]any{"kty": "RSA", "n": "AQ", "e": "AQAB"}); err == nil || !strings.Contains(err.Error(), "minimum is 2048") {
+		t.Fatalf("want a modulus-size error, got %v", err)
+	}
+	if _, err := RSAFromJWK(map[string]any{"kty": "RSA", "n": rfc7638N, "e": "AQAB"}); err != nil {
+		t.Fatalf("valid 2048-bit RSA JWK rejected: %v", err)
 	}
 }
+
+// rfc7638N is the 2048-bit modulus from RFC 7638 3.1, used wherever a test needs a key of
+// a size this package will actually accept.
+const rfc7638N = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
 
 func TestThumbprintAndParts(t *testing.T) {
 	// RFC 7638 §3.1 example.
 	jwk := map[string]any{
 		"kty": "RSA",
-		"n":   "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+		"n":   rfc7638N,
 		"e":   "AQAB",
 	}
 	if got := Thumbprint(jwk); got != "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs" {
@@ -188,4 +197,56 @@ type fakeSigner struct{}
 func (fakeSigner) Public() crypto.PublicKey { return nil }
 func (fakeSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
 	return nil, nil
+}
+
+// RFC 7638 is a JSON construction. Building it by interpolation would let a member value
+// containing a quote reshape the document it sits inside, which is how two different keys
+// come to share a thumbprint — so a value with JSON metacharacters must be escaped, and
+// must not collide with the key it is imitating.
+func TestThumbprintEscapesMemberValues(t *testing.T) {
+	honest := map[string]any{"kty": "EC", "crv": "P-256", "x": "XX", "y": "YY"}
+	// crv carries the rest of an honest-looking document.
+	forged := map[string]any{
+		"kty": "EC",
+		"crv": `P-256","kty":"EC","x":"XX","y":"YY`,
+		"x":   "XX",
+		"y":   "YY",
+	}
+	if Thumbprint(honest) == "" {
+		t.Fatal("the honest key should have a thumbprint")
+	}
+	if Thumbprint(honest) == Thumbprint(forged) {
+		t.Fatal("a key whose member value contains JSON metacharacters must not share a thumbprint")
+	}
+	// A backslash must not escape the closing quote either.
+	if Thumbprint(map[string]any{"kty": "EC", "crv": "P-256", "x": `A\`, "y": "YY"}) ==
+		Thumbprint(map[string]any{"kty": "EC", "crv": "P-256", "x": `A\"`, "y": "YY"}) {
+		t.Fatal("distinct values must give distinct thumbprints")
+	}
+	if Thumbprint(map[string]any{"kty": "oct", "k": "s"}) != "" {
+		t.Error("a kty with no RFC 7638 construction has no thumbprint")
+	}
+}
+
+// PublicJWK must describe the key it was given, including an unusual exponent.
+func TestPublicJWKReportsTheRealExponent(t *testing.T) {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.E = 3 // a legal, if unfashionable, exponent
+	jwk, err := PublicJWK(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jwk["e"]; got != B64URLEncode([]byte{3}) {
+		t.Fatalf("want the key's own exponent, got %v", got)
+	}
+	pub, err := RSAFromJWK(jwk)
+	if err != nil {
+		t.Fatalf("the JWK we emit must parse back: %v", err)
+	}
+	if pub.E != 3 {
+		t.Fatalf("round trip lost the exponent: %d", pub.E)
+	}
 }

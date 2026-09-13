@@ -51,11 +51,57 @@ func checkConstraints(chain []*Statement) error {
 	return nil
 }
 
+// anyPrefix reports whether s is covered by any of the naming constraints.
+//
+// A bare string prefix is not enough. A constraint naming https://bank.example.com would
+// then also cover https://bank.example.com.evil.test, so an intermediate limited to its
+// own namespace could still vouch for a lookalike host someone else controls — which is
+// the one thing the constraint exists to prevent. A constraint therefore matches only at
+// a boundary: the identifier must equal it, or continue with a delimiter rather than with
+// more hostname.
 func anyPrefix(s string, prefixes []string) bool {
 	for _, p := range prefixes {
-		if strings.HasPrefix(s, p) {
+		if coveredBy(s, p) {
 			return true
 		}
 	}
 	return false
+}
+
+// coveredBy is boundary-aware prefix matching for entity identifiers.
+//
+// Deliberately nothing more. A host-suffix form ("https://.example.com" delegating every
+// subdomain, as RFC 5280 name constraints allow) is NOT implemented, because §6.2.2's
+// normative matching rule could not be confirmed and guessing it would risk making a
+// constraint looser than whoever set it intended — the opposite of the point. This
+// matches at a boundary or not at all, which is strictly tighter than the bare prefix
+// test it replaces.
+func coveredBy(id, constraint string) bool {
+	if constraint == "" || !strings.HasPrefix(id, constraint) {
+		return false
+	}
+	if len(id) == len(constraint) {
+		return true
+	}
+	// The constraint ended where the identifier continues; the next character decides
+	// whether that is a sub-name (fine) or the rest of a different name (not).
+	switch id[len(constraint)] {
+	case '/', '?', '#':
+		return true // a path, query or fragment under the same authority
+	case ':':
+		// A port on the same host, and only when the constraint stopped at the host:
+		// a constraint that already names a path cannot be extended by a port.
+		return !strings.Contains(afterScheme(constraint), "/")
+	default:
+		return false
+	}
+}
+
+// afterScheme is constraint without its URL scheme, so "ends at the host" can be tested
+// without the "//" of the scheme counting as a path separator.
+func afterScheme(s string) string {
+	if i := strings.Index(s, "://"); i >= 0 {
+		return s[i+3:]
+	}
+	return s
 }
