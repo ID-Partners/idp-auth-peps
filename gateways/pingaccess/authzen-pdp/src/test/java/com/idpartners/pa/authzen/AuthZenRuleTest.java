@@ -160,6 +160,27 @@ class AuthZenRuleTest {
     }
 
     @Test
+    void theConsoleGetsFieldLevelConstraintsThatMatchValidate() throws Exception {
+        // PingAccess runs Bean Validation on the configuration and reports a violation on
+        // the field in the console; validate() reports the same rule as a banner. The two
+        // must agree, so the annotations are pinned here.
+        java.lang.reflect.Field style = AuthZenRuleConfiguration.class.getField("style");
+        assertEquals("rest|mcp", style.getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
+        assertEquals("off|authzen|resource", AuthZenRuleConfiguration.class.getField("pdp_discovery").getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
+        assertEquals("closed|open", AuthZenRuleConfiguration.class.getField("fail_mode").getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
+        for (String f : new String[]{"pdp_metadata_ttl", "pdp_timeout_ms", "coaz_timeout_ms"}) {
+            assertEquals(1, AuthZenRuleConfiguration.class.getField(f).getAnnotation(jakarta.validation.constraints.Min.class).value(), f);
+        }
+        assertNotNull(AuthZenRuleConfiguration.class.getField("authzen_url").getAnnotation(jakarta.validation.constraints.NotBlank.class));
+        // Every field the console shows carries a UIElement with a label naming its JSON key.
+        for (java.lang.reflect.Field f : AuthZenRuleConfiguration.class.getDeclaredFields()) {
+            com.pingidentity.pa.sdk.ui.UIElement ui = f.getAnnotation(com.pingidentity.pa.sdk.ui.UIElement.class);
+            assertNotNull(ui, f.getName());
+            assertTrue(ui.label().contains("(" + f.getName() + ")"), f.getName());
+        }
+    }
+
+    @Test
     void configureBuildsThePipelineAndDescribesEveryKnob() throws Exception {
         AuthZenRule rule = new AuthZenRule(new FakeTransport(), DIRECT, new CapturingResponses(), () -> 0L);
         AuthZenRuleConfiguration c = conf();

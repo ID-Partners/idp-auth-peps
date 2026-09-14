@@ -5,7 +5,9 @@ import com.pingidentity.pa.sdk.ui.ConfigurationType;
 import com.pingidentity.pa.sdk.ui.Help;
 import com.pingidentity.pa.sdk.ui.Option;
 import com.pingidentity.pa.sdk.ui.UIElement;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -18,7 +20,11 @@ import java.util.List;
  * rule's JSON configuration to these fields by name.
  *
  * <p>Public fields, as the SDK's own configuration classes have: it is what PingAccess
- * deserialises into.
+ * deserialises into. The constraint annotations are what the admin console reports on
+ * the field itself; {@link AuthZenRule#validate} repeats them (the console cannot run
+ * Bean Validation for a cross-field rule such as require_dpop needing coaz_url, and a
+ * caller of {@code configure} may have skipped it), and its messages reach the console
+ * as a banner.
  */
 public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
 
@@ -40,6 +46,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     @UIElement(order = 40, type = ConfigurationType.SELECT, label = "Style (style)", defaultValue = "rest",
         options = {@Option(label = "rest: resource server", value = "rest"), @Option(label = "mcp: MCP edge", value = "mcp")},
         help = @Help(title = "Request mapping", content = "rest maps REST requests to actions and resources; mcp authorises access on the JSON-RPC initialize handshake and delegates tools/call to coaz-pep.", url = ""))
+    @Pattern(regexp = "rest|mcp", message = "must be rest or mcp")
     public String style = "rest";
 
     @UIElement(order = 50, type = ConfigurationType.CHECKBOX, label = "Require an access token (require_token)", defaultValue = "true")
@@ -93,6 +100,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
             @Option(label = "authzen: the static PDP's own metadata", value = "authzen"),
             @Option(label = "resource: the resource's RFC 9728 metadata names the PDP", value = "resource")},
         help = @Help(title = "Who decides", content = "No federation mode here: a Trust Chain cannot be validated without coaz-pep. A route that must take the federation's word belongs behind it.", url = ""))
+    @Pattern(regexp = "off|authzen|resource", message = "must be off, authzen or resource")
     public String pdp_discovery = "off";
 
     @UIElement(order = 180, type = ConfigurationType.TEXT, label = "Resource identifier (resource)",
@@ -100,6 +108,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public String resource;
 
     @UIElement(order = 190, type = ConfigurationType.TEXT, label = "Metadata cache TTL, seconds (pdp_metadata_ttl)", defaultValue = "300", advanced = true)
+    @Min(value = 1, message = "must be greater than zero")
     public int pdp_metadata_ttl = 300;
 
     @UIElement(order = 200, type = ConfigurationType.LIST, label = "Permitted PDPs (pdp_allowlist)", advanced = true,
@@ -125,6 +134,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     @UIElement(order = 250, type = ConfigurationType.SELECT, label = "Failure mode (fail_mode)", defaultValue = "closed",
         options = {@Option(label = "closed: an unreachable PDP denies", value = "closed"), @Option(label = "open: an unreachable layer is skipped and the permit marked", value = "open")},
         help = @Help(title = "Outages only", content = "A deny is a decision and a refusal is the PEP's own rule; neither ever opens.", url = ""))
+    @Pattern(regexp = "closed|open", message = "must be closed or open")
     public String fail_mode = "closed";
 
     @UIElement(order = 260, type = ConfigurationType.TEXT, label = "X-User-Token JWKS (user_token_jwks_url)",
@@ -138,8 +148,10 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public String user_token_audience;
 
     @UIElement(order = 290, type = ConfigurationType.TEXT, label = "PDP timeout, ms (pdp_timeout_ms)", defaultValue = "10000", advanced = true)
+    @Min(value = 1, message = "must be greater than zero")
     public int pdp_timeout_ms = 10000;
 
     @UIElement(order = 300, type = ConfigurationType.TEXT, label = "coaz-pep timeout, ms (coaz_timeout_ms)", defaultValue = "15000", advanced = true)
+    @Min(value = 1, message = "must be greater than zero")
     public int coaz_timeout_ms = 15000;
 }
