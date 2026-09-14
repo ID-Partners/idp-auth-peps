@@ -11,6 +11,11 @@ per-tool-call COAZ authorisation are delegated to `coaz-pep`, exactly as Kong do
 Two things it does natively that a Kong plugin cannot: it reads the identity PingAccess
 itself validated, and it verifies `X-User-Token` (jose4j is on PingAccess's classpath).
 
+This file is the reference card. **[docs/pingaccess.md](../../docs/pingaccess.md)** is
+the explainer: where the rule sits in PingAccess's object model and request order, one
+request end to end, what PingAccess validates and what the rule reads, the deny on the
+wire, three worked configurations, production posture and troubleshooting.
+
 Not to be confused with PingAccess's built-in *PingAuthorize Policy Decision Access
 Control* and *PingAuthorize Access Control* rules. Those speak PingAuthorize's own
 sideband and policy-decision APIs to PingAuthorize alone. This one speaks AuthZEN 1.0
@@ -106,7 +111,9 @@ is the whole sequence, site and application included, as a script.
 | `pdp_timeout_ms` / `coaz_timeout_ms` | `10000` / `15000` | Call timeouts |
 
 The semantics are the Kong plugin's, knob for knob; its [README](../kong/README.md) has
-the long form of each. The validation is the same too: `require_dpop` without `coaz_url`
+the long form of each, and [docs/pingaccess-console.md](../../docs/pingaccess-console.md)
+documents the same knobs as the console form: widgets, defaults, help text, what is
+behind Show Advanced Settings, and how a bad value is reported. The validation is the same too: `require_dpop` without `coaz_url`
 is refused at configuration time, because this rule cannot verify a DPoP proof
 signature itself and a thumbprint comparison proves nothing when the proof carries the
 very JWK being compared.

@@ -40,7 +40,9 @@ human reading prose.
 
 **Start with [docs/architecture.md](docs/architecture.md)** (or the one-page
 [overview](docs/overview.html), open it in a browser) for the map: what each piece
-does, the decision contract, and how a PEP finds its PDP. **Then [`demo/`](demo)** stands
+does, the decision contract, and how a PEP finds its PDP. **[docs/pingaccess.md](docs/pingaccess.md)**
+is the explainer for the PingAccess rule, for administrators who know PingAccess but
+not AuthZEN and the other way round. **Then [`demo/`](demo)** stands
 the whole thing up — a stub federation, a good PDP and a rogue one — with one
 `docker compose up`, and shows why the federation's word beats a resource's own: as a
 scripted walkthrough, or a console on :8088 that runs one request through the three
