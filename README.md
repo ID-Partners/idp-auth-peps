@@ -49,6 +49,12 @@ scripted walkthrough, or a console on :8088 that runs one request through the th
 `coaz-pep` modes and traces what each of them fetched. Profiles add Kong and PingAccess
 doing the same discovery in front of the same resource.
 
+The **[reference site](docs/reference/index.html)** documents every configurable item
+of every component — coaz-pep, the Envoy family, the Kong plugin, the PingAccess rule, the
+Node SDK and the demo — with complete configurations and, where a component has a
+screen, screenshots of it. The hosted demo serves it at
+[demo-production-6ee6.up.railway.app/docs/](https://demo-production-6ee6.up.railway.app/docs/).
+
 ## Layout
 
 ```
@@ -56,7 +62,7 @@ docs/                        architecture.md — the explainer
 demo/                        docker compose + scripts + a console: see discovery work
 core/                        Go: the COAZ engine + the coaz-pep service
   coaz/                        COAZ — discovery, CEL, envelopes, trust anchoring
-  authzen/discovery/           resource -> PDP -> endpoints (RFC 9728, AuthZEN well-known, federation)
+  authzen/discovery/           resource -> PDPs (and the layers in front of them) -> endpoints (RFC 9728, AuthZEN well-known, federation)
   federation/                  OpenID Federation 1.0 trust chain resolver
   jose/                        JWS verification shared by tokens, DPoP and federation
   cmd/coaz-pep/                ext_authz gRPC (:9191) + HTTP check API (:9192)
@@ -109,7 +115,7 @@ docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coa
 | `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
 | `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for the climb to the anchor (Superiors' Entity Configurations and fetch endpoints); the resource's own is governed by `RESOURCE_METADATA_ALLOWLIST` | unset — **warns** |
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
-| `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit | `resource` |
+| `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit. `resource` is the resource's PDP behind any layers its metadata publishes in `authzen_policy_layers` | `resource` |
 | `PDP_FAIL_MODE` | what a layer does when its PDP cannot be reached, unless the layer says for itself: `closed` denies, `open` skips it and marks the permit with `X-PDP-Fail-Open`. A deny or a refusal never opens | `closed` |
 | `FEDERATION_ENTITY_ID` | make this PEP the federation entity for the resource it fronts: a minimal Entity Configuration at `{id}/.well-known/openid-federation` for the controller to onboard, and RFC 9728 metadata at `/.well-known/oauth-protected-resource{path}` republishing what the federation resolved (self-asserted until onboarded) | — |
 | `FEDERATION_ENTITY_KEY_FILE` | the private JWK the entity signs with; `FEDERATION_ENTITY_KEY_GENERATE=true` mints a P-256 key into it when absent | — |

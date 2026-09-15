@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>coaz-pep reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html" aria-current="page">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="pingaccess.html">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#what">What it is</a></li>
+    <li><a href="#run">Run it</a></li>
+    <li><a href="#env">Environment reference</a>
+      <ol>
+        <li><a href="#env-core">Core</a></li>
+        <li><a href="#env-check">Check API security</a></li>
+        <li><a href="#env-tokens">Token validation</a></li>
+        <li><a href="#env-discovery">PDP discovery</a></li>
+        <li><a href="#env-federation">Federation</a></li>
+        <li><a href="#env-layers">Layers and fail mode</a></li>
+        <li><a href="#env-entity">The federation face</a></li>
+      </ol></li>
+    <li><a href="#route">Per-route knobs</a></li>
+    <li><a href="#http">The HTTP API</a></li>
+    <li><a href="#wire">What it puts on the wire</a></li>
+    <li><a href="#log">What the startup log tells you</a></li>
+    <li><a href="#shows">What the settings produce</a></li>
+    <li><a href="#worked">Worked configurations</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">core/ · Go</span>
+  <h1>coaz-pep</h1>
+  <p class="lede">The engine every other surface leans on. One binary serves Envoy's external-authorization gRPC and an HTTP check API over the same enforcement core, and it is the only component that resolves OpenID Federation trust chains, verifies DPoP proofs and evaluates COAZ tool-call mappings. Service-wide settings are environment variables; per-route settings arrive with each request.</p>
+
+  <div class="noscreen"><b>There is no screen for this component.</b> It is configured by environment variables and by the gateway that calls it. This page lists every one, then shows what they produce: the startup log, the documents the PEP serves, and the demo console's trace of a request under a given configuration.</div>
+
+  <h2 id="what">What it is</h2>
+  <ul>
+    <li><b>Envoy ext_authz</b> on <code>:9191</code> (gRPC, <code>envoy.service.auth.v3.Authorization/Check</code>). Envoy, Istio and agentgateway attach it; per-route knobs arrive as <code>context_extensions</code>.</li>
+    <li><b>HTTP check API</b> on <code>:9192</code>. <code>POST /v1/mcp/check</code> takes the same knobs as a <code>config</code> object; the Kong plugin and the PingAccess rule delegate to it, and the Node SDK can. <code>POST /v1/dpop/verify</code> checks a sender constraint on its own. <code>GET /healthz</code>.</li>
+    <li><b>The resource's well-known documents</b>, on the same HTTP port, when the PEP is configured as the resource's federation entity.</li>
+  </ul>
+  <p>What it enforces: token presence and validation, the RFC 9449 sender constraint, RFC 9470 step-up and login challenges, REST and MCP request mapping to AuthZEN, per-tool-call COAZ authorisation, PDP discovery in four modes, ordered policy layers with per-layer failure modes, and forwarding the resource's own requirements to the PDP without judging them.</p>
+
+  <h2 id="run">Run it</h2>
+  <pre><code>go build ./... &amp;&amp; go test ./...
+
+docker build -t coaz-pep core/
+docker run -p 9191:9191 -p 9192:9192 \
+  -e AUTHZEN_URL=https://pdp.bank.example \
+  -e AUTHZEN_API_KEY=… \
+  -e CHECK_API_TOKEN=… \
+  coaz-pep</code></pre>
+  <p>A production-shaped service, as a compose service. Every variable is explained in the reference below; the values here are a bank API fronted by a gateway, discovering its PDP from the federation, holding the key for its own federation face.</p>
+  <pre><code>services:
+  coaz-pep:
+    image: ghcr.io/id-partners/coaz-pep:latest
+    environment:
+      <span class="c"># the static PDP: always the fallback, the only PDP that gets the key</span>
+      AUTHZEN_URL: https://pdp.bank.example
+      AUTHZEN_API_KEY: ${AUTHZEN_API_KEY}
+      <span class="c"># the HTTP check API is reachable by Kong / PingAccess: authenticate it, bound what it may fetch</span>
+      CHECK_API_TOKEN: ${CHECK_API_TOKEN}
+      MCP_UPSTREAM_ALLOWLIST: https://mcp.bank.example/mcp
+      <span class="c"># validate tokens before their claims are used</span>
+      ACCESS_TOKEN_JWKS_URL: https://as.bank.example/jwks
+      ACCESS_TOKEN_ISSUER: https://as.bank.example
+      ACCESS_TOKEN_AUDIENCE: https://api.bank.example
+      USER_TOKEN_AUDIENCE: https://app.bank.example
+      <span class="c"># discovery: the federation's word, bounded</span>
+      PDP_DISCOVERY: federation
+      PDP_METADATA_TTL: 5m
+      RESOURCE_METADATA_ALLOWLIST: https://api.bank.example,https://mcp.bank.example
+      PDP_ALLOWLIST: https://pdp.bank.example,https://estate-pdp.bank.example
+      FEDERATION_TRUST_ANCHORS_FILE: /etc/coaz-pep/anchors.json
+      FEDERATION_FETCH_ALLOWLIST: https://federation.example
+      FEDERATION_MAX_PATH_LENGTH: "2"
+      <span class="c"># an estate PDP first, advisory; then whoever the resource's metadata names</span>
+      PDP_LAYERS: https://estate-pdp.bank.example fail-open, resource
+      PDP_FAIL_MODE: closed
+      <span class="c"># this PEP is the federation face of the API it fronts</span>
+      FEDERATION_ENTITY_ID: https://api.bank.example
+      FEDERATION_ENTITY_KEY_FILE: /etc/coaz-pep/entity-key.json
+      FEDERATION_AUTHORITY_HINTS: https://federation.example
+    volumes:
+      - ./anchors.json:/etc/coaz-pep/anchors.json:ro
+      - ./entity-key.json:/etc/coaz-pep/entity-key.json:ro
+    ports: ["9191:9191", "9192:9192"]</code></pre>
+
+  <h2 id="env">Environment reference</h2>
+  <p>Every variable the binary reads. A blank default means the setting is off or unset; a <span class="req">warns</span> mark means startup logs a warning when it is unset, because the safe value is one the operator has to choose.</p>
+
+  <h3 id="env-core">Core</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>AUTHZEN_URL</code> <span class="req">required</span></td><td class="d">—</td><td>The static PDP's base URL, e.g. <code>https://pdp.bank.example</code>. With discovery off the AuthZEN default paths are appended; with discovery on it is the fallback every mode ends at, and the one PDP that receives <code>AUTHZEN_API_KEY</code>. A trailing slash is trimmed.</td></tr>
+      <tr><td><code>AUTHZEN_API_KEY</code></td><td class="d">—</td><td>Sent as <code>Authorization: Bearer</code> to <code>AUTHZEN_URL</code> only. A discovered PDP never receives it.</td></tr>
+      <tr><td><code>PORT</code></td><td class="d">9191</td><td>The ext_authz gRPC port. Dual-stack.</td></tr>
+      <tr><td><code>HTTP_PORT</code></td><td class="d">9192</td><td>The HTTP check API port, also where the well-known documents are served.</td></tr>
+      <tr><td><code>HTTP_ADDR</code></td><td class="d">all interfaces</td><td>Bind address for the HTTP port, e.g. <code>127.0.0.1</code> when only a co-located gateway should reach it.</td></tr>
+      <tr><td><code>COAZ_DISCOVERY_TTL</code></td><td class="d">60s</td><td>How long a discovered <code>tools/list</code> is reused for COAZ mappings. A Go duration.</td></tr>
+      <tr><td><code>PDP_TLS_INSECURE</code></td><td class="d">false</td><td><code>true</code> skips TLS verification on PDP calls. Demo only.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="env-check">Check API security</h3>
+  <p>The gRPC port takes its per-route configuration from the gateway's own config. The HTTP check API is different: the caller supplies <code>config.mcp_upstream_url</code> and the <code>authorization</code> header, and the PEP fetches that URL with that header. Unbounded, that is a server-side request forgery and credential-relay primitive. Both guards are off by default so no existing deployment breaks, and both <span class="req">warn</span> at startup when unset.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>CHECK_API_TOKEN</code></td><td class="d">unset, <span class="req">warns</span></td><td>Shared secret callers must present as a bearer on <code>/v1/mcp/check</code> and <code>/v1/dpop/verify</code>. Kong sets it as <code>coaz_api_key</code>, PingAccess as <code>coaz_api_key</code>, the Node SDK as <code>delegate.apiKey</code>.</td></tr>
+      <tr><td><code>MCP_UPSTREAM_ALLOWLIST</code></td><td class="d">unset, <span class="req">warns</span></td><td>Comma-separated prefixes a caller-supplied <code>mcp_upstream_url</code> may match. Matched on scheme, host and path prefix against the parsed URL, so <code>https://mcp.example.com</code> does not admit <code>https://mcp.example.com.evil.test</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="env-tokens">Token validation</h3>
+  <p>The COAZ-MCP binding requires the access token to be validated before its claims are used. Configured, a token that fails verification is a 401 <code>invalid_token</code>, and an <code>X-User-Token</code> that fails yields no claims, so the step-up and consent gates it feeds close rather than open. Unconfigured, tokens are decoded only and startup <span class="req">warns</span>.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ACCESS_TOKEN_JWKS_URL</code></td><td class="d">unset, <span class="req">warns</span></td><td>JWKS to verify the access token's signature (ES256/384/512, RS/PS256/384/512). <code>alg: none</code> and unknown <code>kid</code> are refused. Cached ten minutes, refreshed on an unknown kid at most every 30 seconds.</td></tr>
+      <tr><td><code>ACCESS_TOKEN_ISSUER</code></td><td class="d">—</td><td>Expected <code>iss</code>. Unset, the issuer is not checked.</td></tr>
+      <tr><td><code>ACCESS_TOKEN_AUDIENCE</code></td><td class="d">—</td><td>Expected <code>aud</code>, as a string or a member of an array.</td></tr>
+      <tr><td><code>USER_TOKEN_JWKS_URL</code></td><td class="d">the access-token JWKS</td><td>JWKS for <code>X-User-Token</code>, whose claims drive <code>user_scope</code>, <code>user_acr</code>, <code>authorization_details</code> and the consented-amount cap.</td></tr>
+      <tr><td><code>USER_TOKEN_ISSUER</code></td><td class="d">the access-token issuer</td><td>Expected <code>iss</code> for <code>X-User-Token</code>.</td></tr>
+      <tr><td><code>USER_TOKEN_AUDIENCE</code></td><td class="d">—</td><td>Expected <code>aud</code> for <code>X-User-Token</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="env-discovery">PDP discovery</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>PDP_DISCOVERY</code></td><td class="d">off</td><td><code>off</code>: the static PDP, default paths, no HTTP. <code>authzen</code>: read <code>AUTHZEN_URL</code>'s <code>/.well-known/authzen-configuration</code>. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code>, then that PDP's metadata; fall back to static. <code>federation</code>: resolve the resource's trust chain to a configured anchor and read the resolved <code>oauth_resource</code> metadata; never consult the resource's own document; fall back to static only for a resource that is not a member.</td></tr>
+      <tr><td><code>PDP_METADATA_TTL</code></td><td class="d">5m</td><td>Cache TTL for resource and PDP metadata, and for resolved chains. A short value also shortens how long a failed chain is remembered.</td></tr>
+      <tr><td><code>PDP_ALLOWLIST</code></td><td class="d">unset, <span class="req">warns</span> in resource and federation modes</td><td>Comma-separated prefixes a discovered PDP must match. <code>AUTHZEN_URL</code> and any identifier named in <code>PDP_LAYERS</code> are always permitted. Unset means any https PDP a resource names.</td></tr>
+      <tr><td><code>RESOURCE_METADATA_ALLOWLIST</code></td><td class="d">unset, <span class="req">warns</span> in resource and federation modes</td><td>Comma-separated prefixes a route's <code>resource</code> must match before its metadata or entity configuration is fetched. Governs the subject's own document in every mode.</td></tr>
+      <tr><td><code>PDP_DISCOVERY_INSECURE</code></td><td class="d">false</td><td><code>true</code> accepts <code>http</code> for discovered URLs and entity identifiers. Dev only; <code>AUTHZEN_URL</code>'s own origin is always accepted.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="env-federation">Federation</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>FEDERATION_TRUST_ANCHORS_FILE</code></td><td class="d">—, required in federation mode</td><td>A JSON file of the trust anchors this PEP recognises and their keys, distributed out of band. A chain is only valid if it ends at one of these, verified against these keys and never against the anchor's own published configuration. Also required for the federation face to republish resolved metadata.</td></tr>
+      <tr><td><code>FEDERATION_FETCH_ALLOWLIST</code></td><td class="d">unset, <span class="req">warns</span></td><td>Comma-separated prefixes for the climb from a resource to its anchor: superiors' entity configurations and fetch endpoints. The subject's own is governed by <code>RESOURCE_METADATA_ALLOWLIST</code>.</td></tr>
+      <tr><td><code>FEDERATION_MAX_PATH_LENGTH</code></td><td class="d">4</td><td>Intermediates allowed between a resource and its anchor.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The anchors file:</p>
+  <pre><code>{
+  "https://federation.example": {
+    "keys": [
+      { "kty": "EC", "crv": "P-256", "kid": "…", "x": "…", "y": "…" }
+    ]
+  }
+}</code></pre>
+
+  <h3 id="env-layers">Layers and fail mode</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>PDP_LAYERS</code></td><td class="d">resource</td><td>The ordered PDPs every route asks unless it names its own. One entry per comma or line: <code>static</code> (the configured PDP, regardless of discovery), <code>resource</code> (whatever discovery resolves for the route's resource), or a PDP identifier. Each may be followed by <code>fail-open</code> or <code>fail-closed</code>. Every layer must permit; the first that does not is the answer; duplicates are one call; every layer gets the same context. An unreadable entry fails startup.</td></tr>
+      <tr><td><code>PDP_FAIL_MODE</code></td><td class="d">closed</td><td>What a layer does when its PDP cannot be reached, unless the layer says for itself. <code>closed</code> denies with a 503. <code>open</code> skips the layer; if every layer was skipped the request is permitted, and any permit that skipped a layer carries <code>X-PDP-Fail-Open</code>. A deny is never skipped, nor is a refusal (allowlist, invalid chain). Startup warns when set to <code>open</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="env-entity">The federation face</h3>
+  <p>Set <code>FEDERATION_ENTITY_ID</code> and the PEP is the federation entity for the resource it fronts. It publishes a minimal entity configuration for a trust controller to onboard, and republishes what the federation resolved as the resource's RFC 9728 document. Nothing about the resource's policy is configured here; the controller maintains it.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>FEDERATION_ENTITY_ID</code></td><td class="d">—</td><td>The resource identifier this PEP fronts, an absolute URL without query or fragment. Enables <code>{path}/.well-known/openid-federation</code> and <code>/.well-known/oauth-protected-resource{path}</code> on the HTTP port.</td></tr>
+      <tr><td><code>FEDERATION_ENTITY_KEY_FILE</code></td><td class="d">—, required with an id</td><td>A private JWK (EC P-256/384/521, or RSA with <code>d</code>, <code>p</code>, <code>q</code>) the entity signs with. Its public half, with an RFC 7638 thumbprint as <code>kid</code>, is the Federation Entity Key.</td></tr>
+      <tr><td><code>FEDERATION_ENTITY_KEY_GENERATE</code></td><td class="d">false</td><td><code>true</code> mints a P-256 key into the file (mode 0600) when the file is absent, and logs its kid. The controller must onboard that key before the chain resolves.</td></tr>
+      <tr><td><code>FEDERATION_AUTHORITY_HINTS</code></td><td class="d">—, required with an id</td><td>Comma-separated superiors the trust controller is reached through; published as <code>authority_hints</code>.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The key file, as generated:</p>
+  <pre><code>{
+  "crv": "P-256",
+  "d": "…",
+  "kid": "mbAWDqnKestjJF8pyLi8LMGfARPUeBAS7LDCiKulELc",
+  "kty": "EC",
+  "x": "…",
+  "y": "…"
+}</code></pre>
+  <p>Before the controller has onboarded the entity, the RFC 9728 document is self-asserted and carries only <code>resource</code>, <code>authzen_policy_decision_points: [AUTHZEN_URL]</code> and <code>signed_metadata</code>; the response header <code>X-Resource-Metadata-Source</code> says <code>self</code>. Once the chain resolves it says <code>federation</code> and the document is the controller's word.</p>
+
+  <h2 id="route">Per-route knobs</h2>
+  <p>These are not environment variables. They arrive with each request: as ext_authz <code>context_extensions</code> from Envoy, Istio or agentgateway, or as the <code>config</code> object of an HTTP check from Kong, PingAccess or the Node SDK. Values are strings; booleans are <code>"true"</code> and <code>"false"</code>.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pep_label</code></td><td class="d">coaz-pep</td><td>Names this PEP in denials, logs and the <code>X-PDP-PEP</code> response header.</td></tr>
+      <tr><td><code>style</code></td><td class="d">rest</td><td><code>rest</code> maps method and path to an evaluation; <code>mcp</code> treats the route as an MCP edge and authorises JSON-RPC.</td></tr>
+      <tr><td><code>require_token</code></td><td class="d">false</td><td>Deny a request with no readable access token.</td></tr>
+      <tr><td><code>require_dpop</code></td><td class="d">false</td><td>Enforce the RFC 9449 sender constraint: verify the proof's signature, <code>iat</code> freshness, <code>jti</code> replay and the <code>cnf.jkt</code>/<code>htm</code>/<code>ath</code> binding.</td></tr>
+      <tr><td><code>require_user_login</code></td><td class="d">false</td><td>Deny without a valid <code>X-User-Token</code>, with a 401 <code>login_required</code> challenge.</td></tr>
+      <tr><td><code>stepup_scope</code></td><td class="d">—</td><td>The scope demanded for <code>stepup_action</code>; missing, a 401 <code>insufficient_scope</code> challenge.</td></tr>
+      <tr><td><code>stepup_action</code></td><td class="d">make_payment</td><td>The action the step-up applies to.</td></tr>
+      <tr><td><code>mcp_upstream_url</code></td><td class="d">—</td><td>Enables COAZ on an <code>mcp</code> route: the MCP server whose <code>tools/list</code> declares the mappings. Must match <code>MCP_UPSTREAM_ALLOWLIST</code> when it arrives over the HTTP check API.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">—</td><td>The protected resource's identifier, RFC 8707, the key discovery starts from. An <code>mcp</code> route defaults to <code>mcp_upstream_url</code>; a <code>rest</code> route without one uses the static PDP.</td></tr>
+      <tr><td><code>forward_access_token</code></td><td class="d">false</td><td>Send the raw token to the PDP as <code>context.access_token</code>. Only over a PDP connection that is TLS and authenticated.</td></tr>
+      <tr><td><code>pdp_layers</code></td><td class="d"><code>PDP_LAYERS</code></td><td>This route's ordered layers, same grammar as the variable. A PDP identifier named here must be on <code>PDP_ALLOWLIST</code>. An unreadable value fails the route closed.</td></tr>
+      <tr><td><code>fail_mode</code></td><td class="d"><code>PDP_FAIL_MODE</code></td><td><code>closed</code> or <code>open</code> for this route's layers that say nothing for themselves.</td></tr>
+      <tr><td><code>coaz_defaults</code></td><td class="d">false</td><td>Apply the COAZ-MCP binding's default mappings to methods and tools that declare none, as the binding requires. Off keeps the non-conformant pass-through deployed routes expect.</td></tr>
+      <tr><td><code>legacy_subject_identity</code></td><td class="d">true</td><td>Also send the non-standard <code>subject.identity</code> beside AuthZEN's <code>subject.id</code>. Set <code>"false"</code> once policies read <code>subject.id</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="http">The HTTP API</h2>
+  <h3><code>POST /v1/mcp/check</code></h3>
+  <p>The whole decision for one request, for gateways that cannot host the logic themselves. Authenticated by <code>CHECK_API_TOKEN</code>.</p>
+  <pre><code>POST /v1/mcp/check
+Authorization: Bearer &lt;CHECK_API_TOKEN&gt;
+Content-Type: application/json
+
+{
+  "config":  { "pep_label": "PEP#2 (Bank API edge)", "style": "rest", "require_token": "true",
+               "resource": "https://api.bank.example", "forward_access_token": "true",
+               "pdp_layers": "https://estate-pdp.bank.example fail-open, resource" },
+  "method":  "POST",
+  "path":    "/payments",
+  "headers": { "authorization": "Bearer …", "x-user-token": "…", "content-type": "application/json" },
+  "body":    "{\"from_account\":\"a1\",\"to_account\":\"b2\",\"amount\":50,\"currency\":\"AUD\"}"
+}</code></pre>
+  <pre><code><span class="c">// permit</span>
+{ "decision": true,
+  "upstream_headers": { "X-Auth-Principal": "customer", "X-Auth-Agent": "agent-1", "X-Auth-Scope": "accounts:read payments:write" },
+  "response_headers": { "X-PDP-PEP": "PEP#2 (Bank API edge)", "X-PDP-Decision": "PERMIT",
+                        "X-PDP-Action": "make_payment", "X-PDP-Reason": "Permitted by policy." } }
+
+<span class="c">// deny: status, headers and body are returned to the client verbatim</span>
+{ "decision": false,
+  "response": { "status": 401,
+                "headers": { "WWW-Authenticate": "Bearer error=\"insufficient_scope\", scope=\"payments:approve\"" },
+                "body": "{\"error\":\"authorization_failed\",\"pep\":\"PEP#2 (Bank API edge)\",\"reason\":\"…\"}" } }</code></pre>
+
+  <h3><code>POST /v1/dpop/verify</code></h3>
+  <p>The sender-constraint check on its own, without a PDP evaluation as a side effect. Same bearer.</p>
+  <pre><code>{ "method": "POST", "path": "/payments", "pep_label": "kong",
+  "headers": { "authorization": "DPoP &lt;token&gt;", "dpop": "&lt;proof&gt;" } }
+
+{ "valid": true }
+{ "valid": false, "reason": "DPoP proof signature is invalid: …", "status": 401 }</code></pre>
+
+  <h3>The well-known documents</h3>
+  <p>With <code>FEDERATION_ENTITY_ID=https://api.bank.example/v1</code> the PEP answers <code>GET /v1/.well-known/openid-federation</code> with <code>application/entity-statement+jwt</code> and <code>GET /.well-known/oauth-protected-resource/v1</code> with JSON. Route those two paths on the resource's host to <code>HTTP_PORT</code> as an ordinary upstream, not through ext_authz; they are public.</p>
+  <pre><code><span class="c">// the entity configuration, decoded — minimal by design</span>
+{ "iss": "https://api.bank.example/v1", "sub": "https://api.bank.example/v1",
+  "iat": 1788930600, "exp": 1789017000,
+  "jwks": { "keys": [ { "kty": "EC", "crv": "P-256", "kid": "…", "x": "…", "y": "…" } ] },
+  "authority_hints": ["https://federation.example"],
+  "metadata": { "oauth_resource": { "resource": "https://api.bank.example/v1" } } }
+
+<span class="c">// the RFC 9728 document once the controller has onboarded the entity</span>
+{ "resource": "https://api.bank.example/v1",
+  "<span class="k">authzen_policy_decision_points</span>": ["https://pdp.bank.example/tenants/bank-a"],
+  "<span class="g">scopes_supported</span>": ["accounts:read", "payments:write"],
+  "<span class="g">acr_values_required</span>": ["urn:idp:loa:mfa"],
+  "signed_metadata": "eyJ…" }</code></pre>
+
+  <h2 id="wire">What it puts on the wire</h2>
+  <div class="wide"><table>
+    <thead><tr><th>Where</th><th>Header or field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>upstream request, on permit</td><td><code>X-Auth-Principal</code>, <code>X-Auth-Agent</code>, <code>X-Auth-Scope</code></td><td>The decided identity: the human, the acting client, the scope. A resource server records the delegation chain from these rather than inferring it.</td></tr>
+      <tr><td>response, on permit</td><td><code>X-PDP-PEP</code>, <code>X-PDP-Decision</code>, <code>X-PDP-Action</code>, <code>X-PDP-Reason</code></td><td>Which PEP decided, what it decided, for which action, and the PDP's reason.</td></tr>
+      <tr><td>response, on a fail-open permit</td><td><code>X-PDP-Fail-Open</code></td><td>The layers that were skipped, so a permit resting on fewer opinions than the policy asked for is visible and countable.</td></tr>
+      <tr><td>response, on deny</td><td>status, <code>WWW-Authenticate</code>, body</td><td>401 with <code>invalid_token</code>, <code>login_required</code> (<code>insufficient_user_authentication</code>), <code>insufficient_scope</code> (RFC 9470) or <code>identity_verification_required</code>; 403 for a plain deny; 503 when a PDP could not be reached or a refusal applied. The body is <code>{"error":"authorization_failed","pep":…,"reason":…}</code>, or a JSON-RPC error object on an MCP route.</td></tr>
+      <tr><td>to the PDP</td><td><code>context.resource_metadata</code>, <code>context.resource_metadata_source</code>, <code>context.request</code>, <code>context.access_token</code></td><td>The resource's document verbatim, where it came from (<code>rfc9728</code> or <code>federation</code>), the endpoint hit, and the raw token when the route allows. Every layer receives the same context.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="log">What the startup log tells you</h2>
+  <p>Every unsafe default announces itself. This is the demo's federation-mode PEP starting, verbatim, with the warnings that a development configuration earns.</p>
+  <div class="term">2026/09/15 07:17:06 <span class="w">WARNING: PDP_DISCOVERY_INSECURE is set — discovered http URLs are accepted. Dev only.</span>
+2026/09/15 07:17:06 PDP discovery (federation): http://stubs:9002/tenants/bank-a evaluates at http://stubs:9002/tenants/bank-a/access/v1/evaluation
+2026/09/15 07:17:06 <span class="w">WARNING: ACCESS_TOKEN_JWKS_URL is unset — access tokens are DECODED, NOT VERIFIED. The COAZ-MCP binding requires validation before claims are used.</span>
+2026/09/15 07:17:06 <span class="w">WARNING: no JWKS configured for X-User-Token — it is DECODED, NOT VERIFIED. Its claims drive the step-up and consent gates, so a forged one bypasses them.</span>
+2026/09/15 07:17:06 <span class="w">WARNING: minted a new federation entity key into /tmp/entity-key.json (kid mbAWDqnKestjJF8pyLi8LMGfARPUeBAS7LDCiKulELc) — the trust controller must onboard this key before the chain resolves.</span>
+2026/09/15 07:17:06 federation entity http://pep-federation:9192: entity configuration at /.well-known/openid-federation, protected resource metadata at /.well-known/oauth-protected-resource
+2026/09/15 07:17:06 coaz-pep HTTP check API listening on :9192
+2026/09/15 07:17:06 coaz-pep ext_authz (Envoy gRPC) listening on :9191, PDP at http://stubs:9002/tenants/bank-a
+2026/09/15 07:17:10 [demo] PERMIT make_payment a1 (principal=customer agent=agent-1)
+2026/09/15 07:17:10 [demo] DENY make_payment a1: this resource requires acr [urn:idp:loa:mfa] (per its federation metadata); the token was authenticated at "urn:idp:loa:password"
+2026/09/15 07:17:11 [demo] DENY get_balance a1: estate: client agent-risky is on the watch list; nothing further is asked
+2026/09/15 07:17:26 federation entity http://pep-federation:9192: chain resolved via http://stubs:9000, publishing the federation's metadata</div>
+  <p>Also logged: <code>PDP_FAIL_MODE=open</code> and any fail-open layer; <code>CHECK_API_TOKEN</code> and <code>MCP_UPSTREAM_ALLOWLIST</code> unset; the allowlists unset in a discovery mode; a route whose policy could not be read; every permit that failed open, with the layers it skipped.</p>
+
+  <h2 id="shows">What the settings produce</h2>
+  <p>The demo console runs one request through three instances of this binary, in three <code>PDP_DISCOVERY</code> modes, and shows the chain each followed. The third column is the federation-mode PEP configured as above.</p>
+  <figure><img src="img/console-member.jpg" alt="The demo console: three coaz-pep instances deciding one request on the federated member resource" loading="lazy"><figcaption><b>Three configurations of coaz-pep, one request.</b> <code>PDP_DISCOVERY=off</code> reads nothing and permits on the token alone. <code>resource</code> reads the API's own document and believes it. <code>federation</code> resolves the anchor's policy, hands the PDP an MFA floor the API never mentioned, and the same PDP denies. Nothing but the environment differs between the columns.</figcaption></figure>
+  <div class="shots">
+    <figure><img src="img/wk-gateway-rfc9728.png" alt="The RFC 9728 document coaz-pep serves for the resource it fronts, in a browser" loading="lazy"><figcaption><b>The federation face.</b> The RFC 9728 document this PEP serves at <code>/.well-known/oauth-protected-resource</code> once the controller has onboarded it: the PDP, the scopes and the acr are the controller's, with <code>signed_metadata</code>.</figcaption></figure>
+    <figure><img src="img/wk-pdp-authzen.png" alt="A PDP's AuthZEN metadata document in a browser" loading="lazy"><figcaption><b>What discovery reads next.</b> The PDP's <code>authzen-configuration</code>, with the well-known segment inserted after the host and the identifier's path kept: <code>/.well-known/authzen-configuration/tenants/bank-a</code>.</figcaption></figure>
+  </div>
+
+  <h2 id="worked">Worked configurations</h2>
+  <p>The demo runs the binary three ways. These are its compose services, complete; the allowlists list every stub because an allowlist entry matches scheme, host and port.</p>
+  <pre><code><span class="c"># pep-static: told where its PDP is, no discovery</span>
+AUTHZEN_URL: http://stubs:9002/tenants/bank-a
+AUTHZEN_API_KEY: static-pdp-key
+CHECK_API_TOKEN: demo
+MCP_UPSTREAM_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9009
+PDP_METADATA_TTL: 15s
+
+<span class="c"># pep-resource: trusts each resource's own RFC 9728 document (deliberately no PDP_ALLOWLIST, so the impostor can name the rogue)</span>
+PDP_DISCOVERY: resource
+PDP_DISCOVERY_INSECURE: "true"
+RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
+
+<span class="c"># pep-federation: trusts the federation's word, and is the federation face of the API it fronts</span>
+PDP_DISCOVERY: federation
+PDP_DISCOVERY_INSECURE: "true"
+RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
+PDP_ALLOWLIST: http://stubs:9002,http://stubs:9008,http://stubs:9098
+FEDERATION_TRUST_ANCHORS_FILE: /shared/anchors.json
+FEDERATION_FETCH_ALLOWLIST: http://stubs:9000
+FEDERATION_ENTITY_ID: http://pep-federation:9192
+FEDERATION_ENTITY_KEY_FILE: /tmp/entity-key.json
+FEDERATION_ENTITY_KEY_GENERATE: "true"
+FEDERATION_AUTHORITY_HINTS: http://stubs:9000</code></pre>
+  <p>The single-container image in <code>demo/railway/</code> runs the same three from one shell script, <code>demo/railway/entrypoint.sh</code>, which is the shortest complete example of starting the binary in each mode.</p>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/core">core/</a> on GitHub · <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/docs/architecture.md">the architecture explainer</a></span>
+</div></footer>
+</body>
+</html>

@@ -17,6 +17,7 @@ RUN CGO_ENABLED=0 go build -o /coaz-pep ./cmd/coaz-pep && \
 
 FROM alpine:3.20
 COPY --from=build /coaz-pep /demo-stubs /demo-console /usr/local/bin/
+COPY docs/reference /srv/docs
 COPY demo/railway/entrypoint.sh /usr/local/bin/demo
 RUN chmod +x /usr/local/bin/demo
 EXPOSE 8088

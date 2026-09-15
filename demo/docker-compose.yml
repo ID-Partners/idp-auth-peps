@@ -111,6 +111,9 @@ services:
       PEP_FEDERATION: http://pep-federation:9192
       GATEWAY_ENTITY: http://pep-federation:9192
       CHECK_API_TOKEN: demo
+      DOCS_DIR: /srv/docs
+    volumes:
+      - ../docs/reference:/srv/docs:ro
     ports:
       - "8088:8088"
     depends_on:

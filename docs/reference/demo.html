@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Demo reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="pingaccess.html">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html" aria-current="page">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#run">Run it</a></li>
+    <li><a href="#cast">The cast</a></li>
+    <li><a href="#compose">The compose file</a></li>
+    <li><a href="#console">The console</a>
+      <ol>
+        <li><a href="#c-controls">The controls</a></li>
+        <li><a href="#c-chain">The chain</a></li>
+        <li><a href="#c-levers">The levers</a></li>
+      </ol></li>
+    <li><a href="#control">The control API</a></li>
+    <li><a href="#script">The scripted walk</a></li>
+    <li><a href="#hosted">One container, hosted</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">demo/ · compose</span>
+  <h1>The demo</h1>
+  <p class="lede">Every component wired together: a stub trust anchor, resources that are and are not federation members, two banks' PDPs, an estate PDP and a rogue one, coaz-pep three times in three discovery modes, the Kong plugin and the PingAccess rule in front of the same resource, and a console that shows the chain each gateway followed. Its compose file is the fullest worked configuration in the repository, and the console is the screen on which every setting's effect can be seen.</p>
+
+  <h2 id="run">Run it</h2>
+  <pre><code>cd demo &amp;&amp; docker compose up --build -d &amp;&amp; ./demo.sh        <span class="c"># the scripted walk</span>
+open http://localhost:8088                                        <span class="c"># the console</span>
+
+docker compose --profile kong up -d            <span class="c"># add Kong on :8000, the plugin doing discovery in Lua</span>
+docker compose --profile pingaccess up -d      <span class="c"># add PingAccess on :3000 (needs Ping DevOps credentials in demo/.env)</span>
+
+demo/run-local.sh --console                    <span class="c"># the same without Docker; needs Go</span></code></pre>
+
+  <h2 id="cast">The cast</h2>
+  <div class="wide"><table>
+    <thead><tr><th>Stub</th><th>Port</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>anchor</code></td><td class="d">9000</td><td>A federation trust anchor. Its policy for members: <code>authzen_policy_decision_points</code> must be a subset of <code>[pdp-a]</code>, and <code>acr_values_required</code> is <code>[MFA]</code>, whatever the member says. It onboards entities on request.</td></tr>
+      <tr><td><code>member</code></td><td class="d">9001</td><td>A federated resource. Its own RFC 9728 document names Bank A's PDP and says a password is enough; its entity configuration names the rogue PDP first. The anchor's policy strips the rogue and raises the acr floor to MFA.</td></tr>
+      <tr><td><code>pdp-a</code></td><td class="d">9002</td><td>Bank A's PDP, identifier <code>…:9002/tenants/bank-a</code>. Holds the token to what the resource published; steps up payments over 1000; advertises a batch endpoint.</td></tr>
+      <tr><td><code>rogue-pdp</code></td><td class="d">9003</td><td>Permits everything, logs loudly when asked, advertises no batch endpoint.</td></tr>
+      <tr><td><code>plain</code></td><td class="d">9004</td><td>Not federated. RFC 9728 metadata names Bank A's PDP; accepts a password.</td></tr>
+      <tr><td><code>impostor</code></td><td class="d">9005</td><td>Not federated. RFC 9728 metadata names the rogue PDP.</td></tr>
+      <tr><td><code>broken</code></td><td class="d">9006</td><td>Federated, but signs with a key the anchor never vouched for.</td></tr>
+      <tr><td><code>stray</code></td><td class="d">9007</td><td>No metadata of any kind.</td></tr>
+      <tr><td><code>pdp-b</code></td><td class="d">9008</td><td>Bank B's PDP, identifier <code>…:9008/tenants/bank-b</code>. Same product, stricter threshold: steps up payments over 100.</td></tr>
+      <tr><td><code>bank-b</code></td><td class="d">9009</td><td>Not federated. RFC 9728 metadata names Bank B's PDP; requires MFA.</td></tr>
+      <tr><td><code>pdp-estate</code></td><td class="d">9098</td><td>A generic PDP for the whole estate: judges the token and the client (<code>agent-risky</code> is on its watch list), knows nothing about any resource. The first layer.</td></tr>
+      <tr><td><code>control</code></td><td class="d">9099</td><td>The event feed the console traces, and the levers it pulls. Not part of any spec.</td></tr>
+      <tr><td>the gateway's own API</td><td class="d">pep-federation:9192</td><td>Not a stub. <code>pep-federation</code> is the federation entity for the API it fronts: it holds a key, publishes a minimal entity configuration, and republishes what the anchor resolves as that API's RFC 9728 document.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Then <code>coaz-pep</code> three times: <code>pep-static</code> (:9192, told where its PDP is), <code>pep-resource</code> (:9193, trusts each resource's own well-known), <code>pep-federation</code> (:9194, trusts the federation's word).</p>
+
+  <h2 id="compose">The compose file</h2>
+  <p><code>demo/docker-compose.yml</code>, complete. Everything is plain http on a private network, hence <code>PDP_DISCOVERY_INSECURE</code>; do not copy that line anywhere real. Allowlists list each stub with its port because an entry matches scheme, host and port.</p>
+  <pre><code>services:
+  stubs:
+    build: { context: ../core, target: demo-stubs }
+    environment:
+      STUB_HOST: stubs
+      ANCHORS_FILE: /shared/anchors.json
+    volumes: [ "shared:/shared" ]
+    ports: [ "9000-9009:9000-9009", "9098-9099:9098-9099" ]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9099/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  pep-static:
+    build: { context: ../core, target: coaz-pep }
+    environment: &amp;pep-env
+      AUTHZEN_URL: http://stubs:9002/tenants/bank-a
+      AUTHZEN_API_KEY: static-pdp-key
+      CHECK_API_TOKEN: demo
+      MCP_UPSTREAM_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9009
+      PDP_METADATA_TTL: 15s        <span class="c"># short so the console's trace shows fetches on every run; the shipped default is 5m</span>
+    ports: [ "9192:9192" ]
+    depends_on: { stubs: { condition: service_healthy } }
+
+  pep-resource:
+    build: { context: ../core, target: coaz-pep }
+    environment:
+      &lt;&lt;: *pep-env
+      PDP_DISCOVERY: resource
+      PDP_DISCOVERY_INSECURE: "true"
+      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
+      <span class="c"># deliberately no PDP_ALLOWLIST (it warns at boot): the impostor may name the rogue</span>
+    ports: [ "9193:9192" ]
+    depends_on: { stubs: { condition: service_healthy } }
+
+  pep-federation:
+    build: { context: ../core, target: coaz-pep }
+    environment:
+      &lt;&lt;: *pep-env
+      PDP_DISCOVERY: federation
+      PDP_DISCOVERY_INSECURE: "true"
+      RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
+      PDP_ALLOWLIST: http://stubs:9002,http://stubs:9008,http://stubs:9098
+      FEDERATION_TRUST_ANCHORS_FILE: /shared/anchors.json
+      FEDERATION_FETCH_ALLOWLIST: http://stubs:9000
+      FEDERATION_ENTITY_ID: http://pep-federation:9192
+      FEDERATION_ENTITY_KEY_FILE: /tmp/entity-key.json
+      FEDERATION_ENTITY_KEY_GENERATE: "true"
+      FEDERATION_AUTHORITY_HINTS: http://stubs:9000
+    volumes: [ "shared:/shared:ro" ]
+    ports: [ "9194:9192" ]
+    depends_on: { stubs: { condition: service_healthy } }
+
+  console:
+    build: { context: ../core, target: demo-console }
+    environment:
+      LISTEN: ":8088"
+      STUBS_BASE: http://stubs
+      STUBS_CONTROL: http://stubs:9099
+      PEP_STATIC: http://pep-static:9192
+      PEP_RESOURCE: http://pep-resource:9192
+      PEP_FEDERATION: http://pep-federation:9192
+      GATEWAY_ENTITY: http://pep-federation:9192
+      CHECK_API_TOKEN: demo
+    ports: [ "8088:8088" ]
+    depends_on: { stubs: { condition: service_healthy } }
+
+  kong:
+    profiles: ["kong"]
+    image: kong:3.9
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PLUGINS: bundled,authzen-pdp
+      KONG_LUA_PACKAGE_PATH: /opt/?.lua;;
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: "off"
+    volumes:
+      - ./kong/kong.yml:/kong/kong.yml:ro
+      - ../gateways/kong/authzen-pdp:/opt/kong/plugins/authzen-pdp:ro
+    ports: [ "8000:8000" ]
+
+  pingaccess:
+    profiles: ["pingaccess"]
+    build: { context: .., dockerfile: demo/pingaccess/Dockerfile }
+    environment:
+      PING_IDENTITY_ACCEPT_EULA: "YES"
+      PING_IDENTITY_DEVOPS_USER: ${PING_IDENTITY_DEVOPS_USER:-}
+      PING_IDENTITY_DEVOPS_KEY: ${PING_IDENTITY_DEVOPS_KEY:-}
+      AUTHZEN_URL: http://stubs:9002
+      AUTHZEN_API_KEY: static-pdp-key
+      RESOURCE: http://stubs:9004
+      SITE_TARGET: stubs:9004
+      PEP_LABEL: "PingAccess (resource discovery)"
+    ports: [ "3000:3000", "9443:9000" ]      <span class="c"># the engine; the admin console (administrator / 2FederateM0re)</span>
+
+volumes:
+  shared:</code></pre>
+
+  <h2 id="console">The console</h2>
+  <p>Pick an API and a request, press Discover, and each of the three gateways shows the chain it followed, top to bottom: the document it read to find the PDP, the PDP's own metadata and the endpoint used, the context it handed the PDP, and last the decision.</p>
+
+  <h3 id="c-controls">The controls</h3>
+  <figure><img src="img/console-controls.png" alt="The demo console's controls: the API picker, the request picker, the token disclosure, Discover, and the levers" loading="lazy"><figcaption><b>The controls.</b> The API behind the gateway, the request, and the levers. The disclosure below Discover holds the token and the route's policy.</figcaption></figure>
+  <figure><img src="img/console-explore.png" alt="The token and route policy disclosure opened: client, acr, scopes, forward, layers" loading="lazy"><figcaption><b>The token and the route's policy.</b> Who the token was issued to, how the customer authenticated, which scopes it carries, whether the route forwards it, and the route's layers. Each maps to a per-route knob on the PEPs: <code>forward_access_token</code>, <code>pdp_layers</code>, and the token's claims.</figcaption></figure>
+  <div class="wide"><table>
+    <thead><tr><th>Control</th><th>Options</th><th>What it sets</th></tr></thead>
+    <tbody>
+      <tr><td>The API behind the gateway</td><td>plain, bank-b, impostor, member, broken, stray, the gateway's own API, no resource</td><td>The route's <code>resource</code>, which discovery starts from.</td></tr>
+      <tr><td>The request</td><td>read a balance, pay 50, pay 500, pay 5000, MCP transfer (batch)</td><td>The method, path and body; the MCP one is a <code>tools/call</code> whose mapping is a two-evaluation boxcar.</td></tr>
+      <tr><td>The token was issued to</td><td>agent-1, agent-risky</td><td>The token's <code>client_id</code>. The estate PDP has agent-risky on its watch list.</td></tr>
+      <tr><td>Authenticated with</td><td>password, MFA</td><td>The token's <code>acr</code>.</td></tr>
+      <tr><td>Scopes</td><td>read only, read + payments</td><td>The token's <code>scope</code>.</td></tr>
+      <tr><td>Forward the raw token</td><td>yes, no</td><td>The route's <code>forward_access_token</code>.</td></tr>
+      <tr><td>Policy layers</td><td>the API's PDP alone; the estate PDP first; the same, estate layer fail-open</td><td>The route's <code>pdp_layers</code>: nothing, <code>http://stubs:9098,resource</code>, or <code>http://stubs:9098 fail-open,resource</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="c-chain">The chain</h3>
+  <figure><img src="img/console-member.jpg" alt="The console after discovering the member resource: three columns, the federation column denying on the MFA floor" loading="lazy"><figcaption><b><code>member</code>, a read-only password token.</b> The static gateway reads nothing and permits. The resource gateway reads the API's own document, which says a password is enough, and permits. The federation gateway resolves the anchor's policy, which strikes the rogue PDP out of the API's claim and sets the floor at MFA, hands the PDP the resolved document, and the same PDP denies. Nothing but <code>PDP_DISCOVERY</code> differs.</figcaption></figure>
+  <figure><img src="img/console-bank-b.jpg" alt="The console after discovering bank-b with a password token: the discovering gateways deny for acr" loading="lazy"><figcaption><b><code>bank-b</code>, a password token.</b> Bank B requires MFA in its own document. The static gateway's PDP was told nothing and permits; both discovering gateways hand their PDP the requirement, and it denies, citing the document it read.</figcaption></figure>
+
+  <h3 id="c-levers">The levers</h3>
+  <p>Four buttons change the world while it runs. None restarts a PEP or edits its configuration; the PEPs pick the change up on their next metadata refresh, and the documents in the chain change under them.</p>
+  <figure><img src="img/console-moved.jpg" alt="The console after relocating Bank A's PDP: the discovering gateways follow, the static one posts to a stale base" loading="lazy"><figcaption><b>Relocate Bank A's PDP.</b> Its metadata advertises the same AuthZEN endpoints under a new base, <code>/tenants/bank-a-v2</code>. The two gateways that read metadata follow; the static one keeps posting to the base it assumed, marked <em>stale</em>. This is the answer to "why not just set <code>AUTHZEN_URL</code>": because then this is a deploy.</figcaption></figure>
+  <figure><img src="img/console-fail-open.jpg" alt="The console with the estate PDP down and the estate layer marked fail-open: permits marked FAILED OPEN" loading="lazy"><figcaption><b>Take the estate PDP down, with the fail-open layers option.</b> The estate layer's PDP answers 503. Because the route marked that layer <code>fail-open</code>, it is skipped and Bank A's PDP alone decides; the permit is marked and <code>X-PDP-Fail-Open</code> names what was skipped. With the plain layers option the same outage is a 503.</figcaption></figure>
+  <div class="shots">
+    <figure><img src="img/console-gateway-before.jpg" alt="The gateway's own API before onboarding: the entity configuration, and the anchor knowing nothing about it" loading="lazy"><figcaption><b>The gateway's own API, before onboarding.</b> pep-federation publishes a minimal entity configuration; the anchor's fetch endpoint knows nothing about it, so there is no chain and the RFC 9728 document is self-asserted.</figcaption></figure>
+    <figure><img src="img/console-gateway-onboarded.jpg" alt="The gateway's own API after onboarding: the anchor's word, resolved, republished" loading="lazy"><figcaption><b>After the onboarding lever.</b> The anchor fetched the configuration, checked it was self-signed, and now vouches for the key. The chain resolves, and the gateway's RFC 9728 document has become the anchor's word: Bank A's PDP, the scopes, MFA. Nothing on the PEP changed.</figcaption></figure>
+  </div>
+
+  <h2 id="control">The control API</h2>
+  <p>The stubs' control endpoint at <code>:9099/control</code>, which the console relays as <code>/api/control</code>. <code>GET</code> returns the state; <code>POST {"op": …}</code> pulls a lever.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Op</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>move_pdp</code></td><td>Bank A's PDP advertises its endpoints under <code>/tenants/bank-a-v2</code>. It still answers on the old base, so nothing breaks mid-flight; the trace shows who followed.</td></tr>
+      <tr><td><code>repoint_plain</code></td><td>The <code>plain</code> resource's metadata names Bank B's PDP instead. No gateway is touched.</td></tr>
+      <tr><td><code>estate_down</code> / <code>estate_up</code></td><td>The estate PDP's evaluation endpoints answer 503; its metadata stays up.</td></tr>
+      <tr><td><code>onboard</code> / <code>offboard</code> with <code>"entity"</code></td><td>The anchor fetches the entity's configuration, checks it is self-signed, and starts (or stops) vouching for its keys, saying what the resource requires in its subordinate statement.</td></tr>
+      <tr><td><code>reset</code></td><td>Everything back.</td></tr>
+    </tbody>
+  </table></div>
+  <pre><code>curl -s -X POST -H 'Content-Type: application/json' -d '{"op":"onboard","entity":"http://pep-federation:9192"}' http://localhost:9099/control
+curl -s http://localhost:9099/control | jq .
+{ "onboarded": ["http://pep-federation:9192"], "pdp_down": [],
+  "pdp_evaluation_path": { "pdp-a": "/tenants/bank-a/access/v1/evaluation", … },
+  "pdp_home": { "pdp-a": "/tenants/bank-a", … },
+  "resource_pdps": { "plain": ["http://stubs:9002/tenants/bank-a"], … } }</code></pre>
+
+  <h2 id="script">The scripted walk</h2>
+  <p><code>demo/demo.sh</code> runs the same requests against the three PEPs' HTTP check APIs and prints the decision, the status and the body. Its sections, in order: what the metadata says; where the PDP comes from and what it was told; two banks, one gateway; what the resource requires is the PDP's to enforce, and the federation sets the floor; layers; failing open, deliberately; the gateway as the resource's federation face; the challenge contract; and Kong, when the profile is up. Shape the token with <code>CLIENT</code>, <code>ACR</code> and <code>SCOPE</code>; set <code>FORWARD=no</code> or <code>LAYERS</code> per call.</p>
+  <div class="term">5. Failing open, deliberately: the estate PDP goes down
+  estate DOWN, layers as before (fail-closed): 503               {"decision":false,"status":503,"body":{"error":"authorization_failed","pep":"demo","reason":"Authorization service unreachable; denying (fail-closed)."}}
+  estate DOWN, estate layer marked fail-open: Bank A decides     {"decision":true,"status":null,"body":null,"failed_open":"http://stubs:9098 (PDP returned 503)"}
+  estate back up, same fail-open policy: no marker               {"decision":true,"status":null,"body":null}
+
+6. The gateway as the resource's federation face: it holds the key, the anchor holds the policy
+  its RFC 9728 document before onboarding                        {"authzen_policy_decision_points":["http://stubs:9002/tenants/bank-a"],"resource":"http://pep-federation:9192"}
+  after onboarding (the PEP re-walks its chain when its cache lapses) {"acr_values_required":["urn:idp:loa:mfa"],"authzen_policy_decision_points":["http://stubs:9002/tenants/bank-a"],"resource":"http://pep-federation:9192","scopes_supported":["accounts:read","payments:write"]}</div>
+
+  <h2 id="hosted">One container, hosted</h2>
+  <p><code>demo/railway/Dockerfile</code> builds the stubs, the three PEPs and the console into one image, and <code>demo/railway/entrypoint.sh</code> runs them on localhost with the console on <code>$PORT</code>. It is the local runner without the Go toolchain, and it is what runs at <a href="https://demo-production-6ee6.up.railway.app">demo-production-6ee6.up.railway.app</a>, redeployed on every push to <code>main</code>.</p>
+  <pre><code>docker build -f demo/railway/Dockerfile -t idp-auth-peps-demo .
+docker run --rm -p 8088:8088 idp-auth-peps-demo</code></pre>
+  <p>On Railway: a service pointed at the repository with the Dockerfile path set to <code>demo/railway/Dockerfile</code> and the healthcheck at <code>/healthz</code>. The levers are shared state, so two people clicking at once will surprise each other, and nothing in it is authenticated: it is a demo of PDP discovery, not a service.</p>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/demo">demo/</a> on GitHub · <a href="https://demo-production-6ee6.up.railway.app">the hosted demo</a></span>
+</div></footer>
+</body>
+</html>

@@ -148,6 +148,8 @@ everywhere:
 
 An array of PDP *identifiers*, first preferred, and the same bytes whether it sits in an
 RFC 9728 document or under `metadata.oauth_resource` in a federation Entity Statement.
+A second parameter, `authzen_policy_layers`, lets the same document say which PDPs to
+ask *in front of* those; see [Layers](#layers-a-generic-pdp-first-the-resources-after).
 
 ### Why the federation's word beats the resource's own
 
@@ -249,6 +251,73 @@ must be on `PDP_ALLOWLIST`.
 The demo's estate PDP denies a client on its watch list and permits everything else. Put
 it first and the resource's PDP never hears about the risky client at all.
 
+#### Layers the resource publishes
+
+Typing the stack into every PEP is the wrong place for it when the stack is a fact about
+the resource. So a resource's metadata may carry it:
+
+```json
+"authzen_policy_decision_points": ["https://pdp.bank-b.example"],
+"authzen_policy_layers": ["https://pdp.estate.example"]
+```
+
+`authzen_policy_layers` is the ordered list of PDPs to ask *before* the resource's own,
+every one of which must permit. It is what the `resource` layer means: the resource's
+PDP, behind whatever its document put in front of it. A PEP with `pdp_layers` unset,
+fronting a resource that publishes this, asks the estate PDP first because the document
+said so, and nothing on the PEP names the estate at all. As provisional as the parameter
+that names the PDP, and minted in the same place.
+
+The reason it is a second parameter and not a reinterpretation of the first is that the
+first already means something: *fallback*. Its entries are candidates for one decision,
+tried in order until one has usable metadata. Turning that into a mandatory chain would
+silently change every consumer that reads it today. The layers array has the opposite
+semantics — every entry is asked — so it gets its own name.
+
+What a document may and may not say:
+
+- **It names who is asked, never how they fail.** A published layer takes the failure
+  mode of the `resource` entry it came out of (which in turn takes the PEP's default).
+  A document cannot mark its own gate fail-open; that is the operator's call about the
+  operator's PEP.
+- **It passes the same allowlist as a route.** A self-asserted document is as
+  caller-supplied as a route's config, so `PDP_ALLOWLIST` bounds it, and a published
+  layer outside it is a refusal — the request fails, whatever the failure mode says.
+  The impostor case is what this guards: a document that names a permit-everything
+  gate in front of a permit-everything PDP is still only naming PDPs the operator trusts.
+- **It composes with what is configured.** A configured entry and a published one that
+  name the same PDP are one call. If the configured entry set a failure mode of its own,
+  that is the operator's word about that PDP and it wins; otherwise the stricter of the
+  two defaults.
+- **It cannot be read, it is not used.** An entry that is not a PDP identifier makes the
+  document invalid, and an invalid document takes the path it always took: the operator's
+  own PDP, logged.
+
+Where this earns its keep is the federation. An anchor or intermediate that wants its
+PDP in front of every member's writes a `metadata_policy` for `oauth_resource`:
+
+```json
+"authzen_policy_layers": {"add": ["https://pdp.estate.example"], "essential": true}
+```
+
+`add` puts the estate PDP into the member's resolved layers whether or not the member
+published any; `essential` makes a resolved document without it invalid; `subset_of`
+would stop a member adding a gate of its own choosing. The member cannot take it out by
+editing its own configuration, because the PEP in federation mode never reads that — it
+reads what survived the chain. And because the PEP republishes the resolved document as
+its own RFC 9728 metadata, a plain RFC 9728 consumer sees the same stack without knowing
+a federation put it there. That is the demo's `member`: its own document names no
+layers, the anchor's policy adds the estate PDP, and in federation mode the estate
+decides first.
+
+The forwarded `resource_metadata` carries the parameter verbatim, like everything else
+in the document, so every PDP in the stack can see the stack it is part of.
+
+Published layers are read by `coaz-pep` today. The Kong plugin, the PingAccess rule and
+the Node SDK still take their layers from configuration only; they read the same
+document and forward it unchanged, so a PDP behind them sees the parameter, but nothing
+acts on it there yet.
+
 ### Failing open, deliberately
 
 A PDP that cannot be reached is an outage, and the answer to an outage is deny: that is
@@ -330,6 +399,8 @@ in front when the public document must be the controller's word.
 - A discovered PDP never receives the static API key. The key is bound to `AUTHZEN_URL`.
 - Fail-open covers outages only, and only where a layer or the PEP asked for it. A deny
   never opens, a refusal never opens, and a permit that skipped anything is marked.
+- A document may say which PDPs decide and in what order; it may not widen the PDP
+  allowlist, and it may not say how a layer fails.
 - A PEP that is a federation entity publishes nothing about the resource's policy. The
   controller says it; the PEP republishes it, and says which it is publishing.
 - A batch is never sent to a guessed path: a boxcar mapping needs the PDP to advertise

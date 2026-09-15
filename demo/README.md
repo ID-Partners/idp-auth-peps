@@ -19,6 +19,13 @@ must permit. The demo's estate PDP judges the token and the client and knows not
 any resource; put first, it gates every request before the resource's own PDP is asked.
 That is the layers picker, and section 4.
 
+**Does the stack have to be configured on the PEP?** No. A resource can publish it:
+`bank-b`'s document names the estate PDP in `authzen_policy_layers`, and a PEP with
+nothing set on the route asks the estate first because the document said so. A federation
+can mandate it: the anchor's policy adds the estate PDP to every member's resolved
+document, so `member` is gated in federation mode and not in resource mode. Pick `bank-b`
+or `member` with "whatever the API's document says", and the second half of section 4.
+
 **What if a layer's PDP is down?** Deny, unless that layer (or the PEP) was told to fail
 open, in which case it is skipped and the permit says so. The third layers option and the
 "Take the estate PDP down" lever show both; section 5 of `demo.sh` does the same.
@@ -37,8 +44,8 @@ what document it was given, what the token carries, and which layers ran. One su
 
 | Stub | Port | What it is |
 | --- | --- | --- |
-| `anchor` | 9000 | A federation Trust Anchor. Its policy for members: `authzen_policy_decision_points` must be a subset of `[pdp-a]`, and `acr_values_required` **is** `[MFA]`, whatever the member says. |
-| `member` | 9001 | A federated resource. Its **own** RFC 9728 document names Bank A's PDP and says a password is enough; its entity configuration names the rogue PDP first. The anchor's policy strips the rogue **and raises the acr floor to MFA**. |
+| `anchor` | 9000 | A federation Trust Anchor. Its policy for members: `authzen_policy_decision_points` must be a subset of `[pdp-a]`, `acr_values_required` **is** `[MFA]`, and `authzen_policy_layers` gains the estate PDP — whatever the member says. |
+| `member` | 9001 | A federated resource. Its **own** RFC 9728 document names Bank A's PDP, says a password is enough and names no layers; its entity configuration names the rogue PDP first. The anchor's policy strips the rogue, **raises the acr floor to MFA**, and **puts the estate PDP in front**. |
 | `pdp-a` | 9002 | Bank A's PDP, identifier `…:9002/tenants/bank-a`. Holds the token to what the resource published; steps up payments over 1000. Advertises a batch endpoint. |
 | `rogue-pdp` | 9003 | Permits everything, logs loudly when asked, and advertises **no** batch endpoint. Bare identifier, no tenant path. |
 | `plain` | 9004 | Not federated. RFC 9728 metadata names Bank A's PDP; requires a password. |
@@ -47,7 +54,7 @@ what document it was given, what the token carries, and which layers ran. One su
 | `stray` | 9007 | No metadata of any kind. |
 | `pdp-b` | 9008 | Bank B's PDP, identifier `…:9008/tenants/bank-b`. Same product, stricter threshold: steps up payments over 100. |
 | `pdp-estate` | 9098 | A generic PDP for the whole estate: judges the token and the client (`agent-risky` is on its watch list), knows nothing about any resource. The first layer. |
-| `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP; requires MFA. |
+| `bank-b` | 9009 | Not federated. RFC 9728 metadata names Bank B's PDP **and publishes the estate PDP as a layer in front of it** (`authzen_policy_layers`); requires MFA. |
 | `control` | 9099 | The event feed the console traces, and the levers it pulls. Not part of any spec. |
 | the gateway's own API | `pep-federation:9192` | Not a stub. `pep-federation` is the federation entity for the API it fronts: it holds a key, publishes a minimal entity configuration, and republishes what the anchor resolves as that API's RFC 9728 document. The anchor maintains the API's metadata (Bank A's PDP, its scopes, MFA); the PEP maintains a key. |
 
@@ -185,6 +192,10 @@ documents in step 1 and 2 change under them.
   it has one PDP for everything.
 - **agent-risky with "estate PDP first" on any resource.** The estate PDP denies and the
   resource's PDP is never asked. Switch to agent-1 and both layers permit, in order.
+- **agent-risky on bank-b with nothing set on the route.** The estate PDP still goes
+  first and denies: bank-b's own document published the stack. Then agent-risky on
+  member: the resource column permits (member's own document names no layers), the
+  federation column denies (the anchor added the estate PDP to the resolved document).
 - **member, password token, read a balance — resource mode then federation mode.** The
   resource column permits: the member's own document says a password is enough, and Bank
   A's PDP believes it. The federation column denies, from the *same* PDP with the *same*
@@ -229,7 +240,11 @@ denies. With the token not forwarded, the PDP says it could not examine it.
 
 **4. Layers.** With `pdp_layers` naming the estate PDP first, `agent-1` is permitted by
 both PDPs in order, and `agent-risky` is stopped by the estate PDP before Bank A's is
-asked.
+asked. Then the same with nothing on the route: `bank-b` published the estate PDP in
+`authzen_policy_layers`, so it is asked first anyway and stops `agent-risky`. And the
+federation mandates it: `agent-risky` reads `member` in resource mode and Bank A permits,
+because the member's own document names no layers; in federation mode the anchor's
+policy has added the estate PDP to the resolved document, and it denies.
 
 **5. Failing open.** The estate PDP is taken down. With the layers as before, every PEP
 answers 503: closed is the default. With the estate entry marked ` fail-open`, Bank A's
@@ -240,8 +255,8 @@ the estate back and the same policy permits with no marker.
 minimal entity configuration for the API it fronts and, before onboarding, an RFC 9728
 document that says only which PDP it is configured with. The anchor onboards it: fetches
 the configuration, checks it is self-signed, starts vouching for the key. Within the
-metadata TTL the PEP's RFC 9728 document becomes the anchor's word: Bank A's PDP, the
-scopes, MFA. Nothing on the PEP changed.
+metadata TTL the PEP's RFC 9728 document becomes the anchor's word: Bank A's PDP with the
+estate PDP in front of it, the scopes, MFA. Nothing on the PEP changed.
 
 **7. Challenges.** A 50 payment is permitted; a 5000 payment comes back as a 401 with
 `WWW-Authenticate: Bearer error="insufficient_scope", scope="payments:approve"` and an

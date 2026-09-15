@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>idp-auth-peps reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html" aria-current="page">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="pingaccess.html">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#components">The components</a></li>
+    <li><a href="#where">Where each setting lives</a></li>
+    <li><a href="#shared">Settings every PEP shares</a></li>
+    <li><a href="#screens">What has a screen</a></li>
+    <li><a href="#conventions">Conventions</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">Reference</span>
+  <h1>Configuring the AuthZEN enforcement points</h1>
+  <p class="lede">One page per component, every configurable item with its type, default and meaning, and a complete working configuration for each. Where a component has a screen, the screen is shown. Where it does not, what the setting produces is shown instead.</p>
+
+  <h2 id="components">The components</h2>
+  <div class="cards">
+    <a href="coaz-pep.html"><span class="k">core/ · Go</span><span class="n">coaz-pep</span><p>The engine. Serves Envoy ext_authz gRPC and an HTTP check API; owns PDP discovery, federation, token validation, DPoP and COAZ. Configured by environment variables and per-route knobs.</p></a>
+    <a href="envoy.html"><span class="k">gateways/envoy/ · YAML</span><span class="n">Envoy · Istio · agentgateway</span><p>How to attach coaz-pep as an external authorizer, and how per-route knobs travel as ext_authz <code>context_extensions</code>.</p></a>
+    <a href="kong.html"><span class="k">gateways/kong/ · Lua</span><span class="n">Kong plugin</span><p><code>authzen-pdp</code>: native REST and MCP mapping, RFC 9728 and AuthZEN discovery in Lua; DPoP, COAZ and federation delegated to coaz-pep. Configured as plugin config, shown in Kong Manager.</p></a>
+    <a href="pingaccess.html"><span class="k">gateways/pingaccess/ · Java</span><span class="n">PingAccess rule</span><p><code>AuthZEN PDP</code>: an Add-on SDK rule with the same knobs, configured in the PingAccess console or admin API.</p></a>
+    <a href="node.html"><span class="k">sdk/node/ · TypeScript</span><span class="n">Node SDK</span><p><code>@id-partners/authzen-pep</code>: an AuthZEN client, Express middleware, an MCP guard and a federation entity, configured as options in code.</p></a>
+    <a href="demo.html"><span class="k">demo/ · compose</span><span class="n">The demo</span><p>Every component above wired together with a stub federation and PDPs, the console, and the levers. Its compose file is the fullest worked configuration in the repository.</p></a>
+  </div>
+
+  <h2 id="where">Where each setting lives</h2>
+  <p>Every enforcement point takes the same set of knobs, spelled the same way. What differs is only the channel they arrive through.</p>
+  <div class="wide">
+  <table>
+    <thead><tr><th>Component</th><th>Service-wide settings</th><th>Per-route settings</th><th>Screen</th></tr></thead>
+    <tbody>
+      <tr><td><a href="coaz-pep.html">coaz-pep</a></td><td>environment variables</td><td>ext_authz <code>context_extensions</code>, or the <code>config</code> object of an HTTP check</td><td>none; its effects show in the demo console and in the documents it serves</td></tr>
+      <tr><td><a href="envoy.html">Envoy · Istio · agentgateway</a></td><td>the coaz-pep deployment's environment</td><td><code>context_extensions</code> in the filter, the EnvoyFilter, or the agentgateway policy <code>context</code></td><td>none</td></tr>
+      <tr><td><a href="kong.html">Kong plugin</a></td><td>—</td><td>plugin <code>config</code> on a route or service</td><td>Kong Manager</td></tr>
+      <tr><td><a href="pingaccess.html">PingAccess rule</a></td><td>—</td><td>the rule's configuration, attached to an application's API policy</td><td>the PingAccess console</td></tr>
+      <tr><td><a href="node.html">Node SDK</a></td><td>client options</td><td>middleware, guard and per-call options</td><td>none</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="shared">Settings every PEP shares</h2>
+  <p>These names mean the same thing on every surface. Each component page lists them again with that component's spelling, defaults and channel.</p>
+  <div class="wide">
+  <table>
+    <thead><tr><th>Setting</th><th>What it decides</th></tr></thead>
+    <tbody>
+      <tr><td><code>authzen_url</code> / <code>AUTHZEN_URL</code></td><td>The static PDP. Always the fallback, always permitted; the one PDP that receives the configured API key.</td></tr>
+      <tr><td><code>style</code></td><td><code>rest</code> maps an HTTP request to an evaluation; <code>mcp</code> treats the route as an MCP edge and authorises JSON-RPC.</td></tr>
+      <tr><td><code>require_token</code></td><td>Deny a request that carries no readable access token.</td></tr>
+      <tr><td><code>require_dpop</code></td><td>Enforce the RFC 9449 sender constraint. Kong and PingAccess delegate the proof check to coaz-pep.</td></tr>
+      <tr><td><code>require_user_login</code>, <code>stepup_scope</code>, <code>stepup_action</code></td><td>The RFC 9470 challenges: demand a logged-in end user, and a consented scope for a named action.</td></tr>
+      <tr><td><code>mcp_upstream_url</code></td><td>The MCP server whose <code>tools/list</code> declares the COAZ mappings. Setting it enables per-tool-call authorisation.</td></tr>
+      <tr><td><code>pdp_discovery</code> / <code>PDP_DISCOVERY</code></td><td><code>off</code>, <code>authzen</code>, <code>resource</code>, or (coaz-pep only) <code>federation</code>. How the PDP is found.</td></tr>
+      <tr><td><code>resource</code></td><td>The protected resource's identifier, RFC 8707. The key discovery starts from.</td></tr>
+      <tr><td><code>pdp_allowlist</code>, <code>resource_metadata_allowlist</code></td><td>What discovery may reach: which PDPs a document may name, which resources may be looked up.</td></tr>
+      <tr><td><code>forward_access_token</code></td><td>Hand the PDP the raw token as <code>context.access_token</code>. Only over a TLS, authenticated PDP connection.</td></tr>
+      <tr><td><code>pdp_layers</code>, <code>fail_mode</code></td><td>The ordered PDPs to ask, every one of which must permit, and what a layer does when its PDP cannot be reached.</td></tr>
+      <tr><td><code>federation_entity_url</code> / <code>FEDERATION_ENTITY_ID</code></td><td>Serve the resource's two well-known documents: coaz-pep holds the key; Kong and PingAccess relay from it.</td></tr>
+      <tr><td><code>coaz_defaults</code>, <code>legacy_subject_identity</code></td><td>Apply the COAZ binding's default mappings to undeclared methods; keep sending the pre-AuthZEN <code>subject.identity</code> field.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="screens">What has a screen</h2>
+  <p>Two of the five surfaces have a console: Kong Manager shows a plugin's configuration, and the PingAccess console draws a form from the rule's descriptor. Both are captured on their pages. coaz-pep, the Envoy family and the Node SDK are configured in files and code, so there is no form to show. For those, the pages show what a setting produces: the startup log that names what is set, the well-known documents the PEP serves, and the demo console's trace of a request under that configuration.</p>
+  <div class="shots">
+    <figure><img src="img/kong-manager-plugin-config.png" alt="Kong Manager showing the authzen-pdp plugin's configuration" loading="lazy"><figcaption><b>Kong Manager</b>, the plugin as Kong shows it. Every field on the <a href="kong.html">Kong page</a>.</figcaption></figure>
+    <figure><img src="img/pa-rule-form.png" alt="The PingAccess console showing the AuthZEN PDP rule's form" loading="lazy"><figcaption><b>The PingAccess console</b>, the rule's form. Every field on the <a href="pingaccess.html">PingAccess page</a>.</figcaption></figure>
+  </div>
+
+  <h2 id="conventions">Conventions</h2>
+  <ul>
+    <li><b>Allowlists</b> are lists of URL prefixes. An entry matches on scheme, host and port at a path boundary: <code>https://pdp.example</code> admits <code>https://pdp.example/tenants/a</code> and refuses <code>https://pdp.example.evil.test</code>. Comma-separated in environment variables, arrays in plugin config and code.</li>
+    <li><b>Layer lists</b> are ordered. An entry is <code>static</code>, <code>resource</code>, or a PDP identifier, optionally followed by a space and <code>fail-open</code> or <code>fail-closed</code>: <code>https://estate.example fail-open, resource</code>. Comma-separated in environment variables and Envoy knobs, arrays elsewhere.</li>
+    <li><b>Booleans in per-route knobs</b> are the strings <code>"true"</code> and <code>"false"</code>, because ext_authz <code>context_extensions</code> carries only strings. Kong and PingAccess use real booleans; the Node SDK uses <code>true</code> and <code>false</code>.</li>
+    <li><b>Durations</b>: Go durations in environment variables (<code>15s</code>, <code>5m</code>), seconds in Kong and PingAccess, milliseconds in the Node SDK.</li>
+    <li><b>Well-known paths</b>: RFC 9728 inserts its segment after the host and keeps the identifier's path after it (<code>/.well-known/oauth-protected-resource/bank</code>); AuthZEN does the same (<code>/.well-known/authzen-configuration/tenants/bank-a</code>); OpenID Federation appends its segment to the identifier's path (<code>/bank/.well-known/openid-federation</code>).</li>
+    <li><b>Fail closed</b> is the default everywhere: a PDP that cannot be reached is a 503 (Envoy family, Kong, PingAccess) or a <code>pdp_error</code> verdict rendered as 502 (Node). <code>fail_mode</code> and a layer's own modifier are the only ways to change that, and neither ever turns a deny or a refusal into a permit.</li>
+  </ul>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps">ID-Partners/idp-auth-peps</a> on GitHub · <a href="../overview.html">the overview</a> · <a href="https://demo-production-6ee6.up.railway.app">the demo</a></span>
+</div></footer>
+</body>
+</html>

@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Node SDK reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="pingaccess.html">PingAccess</a><a href="node.html" aria-current="page">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#install">Install</a></li>
+    <li><a href="#client">AuthzenClient</a></li>
+    <li><a href="#discovery">Discovery options</a></li>
+    <li><a href="#evaluate">Per-call options</a></li>
+    <li><a href="#express">Express middleware</a></li>
+    <li><a href="#mcp">McpGuard</a></li>
+    <li><a href="#entity">FederationEntity</a></li>
+    <li><a href="#verdicts">Verdicts and challenges</a></li>
+    <li><a href="#samples">Complete samples</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">sdk/node/ · TypeScript</span>
+  <h1>The Node SDK</h1>
+  <p class="lede"><code>@id-partners/authzen-pep</code> is the enforcement point for when there is no gateway: an AuthZEN client, Express middleware, an MCP guard, and a federation entity, in one package with no runtime dependencies. Every setting is an option in code; this page lists all of them with their defaults, then gives complete programs.</p>
+
+  <div class="noscreen"><b>There is no screen for this component.</b> Configuration is the option objects below. What they produce is the verdict, the challenge on the wire, and the context handed to the PDP, all shown in the samples.</div>
+
+  <h2 id="install">Install</h2>
+  <pre><code>npm install @id-partners/authzen-pep
+
+import { AuthzenClient, FederationEntity } from '@id-partners/authzen-pep';
+import { authzenMiddleware, pathMapper } from '@id-partners/authzen-pep/express';
+import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
+  <p>Node 20 or 22. ESM. Types ship with the package.</p>
+
+  <h2 id="client">AuthzenClient</h2>
+  <p><code>new AuthzenClient(options)</code>. The client is the one thing every other piece is built on; the middleware and the guard accept either a client or these options.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>url</code> <span class="req">required</span></td><td class="d">string</td><td>The static PDP's base URL. Without <code>discovery</code> the AuthZEN default paths are appended; with it, the PDP every mode falls back to.</td></tr>
+      <tr><td><code>apiKey</code></td><td class="d">string</td><td>Sent as <code>Authorization: Bearer</code> to <code>url</code>. A discovered PDP never receives it.</td></tr>
+      <tr><td><code>discovery</code></td><td class="d">ClientDiscoveryOptions | PdpResolver</td><td>PDP discovery, below, or a resolver of your own (<code>{ resolve(resource), resolvePdp(pdp) }</code>). Absent means off: no HTTP beyond the evaluation itself.</td></tr>
+      <tr><td><code>layers</code></td><td class="d">Array&lt;string | LayerSpec&gt; · ['resource']</td><td>The ordered PDPs every call asks unless it overrides them: <code>'static'</code> (this client's <code>url</code>, regardless of discovery), <code>'resource'</code> (what discovery finds for the call's resource), or a PDP identifier, each optionally suffixed <code> fail-open</code> or <code> fail-closed</code>, or as <code>{ name, failOpen }</code>. Every layer must permit; the first that does not is the verdict.</td></tr>
+      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed' · 'closed'</td><td>What a layer does when its PDP cannot be reached, unless the layer says for itself. <code>closed</code> makes the verdict a <code>pdp_error</code>. <code>open</code> skips the layer; if every layer was skipped the verdict is a permit with <code>failedOpen</code> naming what was skipped. A refusal never opens; a deny is a decision.</td></tr>
+      <tr><td><code>timeoutMs</code></td><td class="d">number · 1500</td><td>Per-request timeout. A PEP sits in the request path.</td></tr>
+      <tr><td><code>headers</code></td><td class="d">Record&lt;string,string&gt;</td><td>Extra headers on every PDP call: tracing, tenant routing.</td></tr>
+      <tr><td><code>fetch</code></td><td class="d">typeof fetch · global fetch</td><td>Swapped out in tests.</td></tr>
+      <tr><td><code>onTrace</code></td><td class="d">(trace: PdpTrace) =&gt; void</td><td>Called with every PDP exchange. Never throws into the request path.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Methods: <code>evaluate(request, options)</code>, <code>evaluateAll(batch, options)</code> (a boxcar, folded to one verdict, first deny wins so its advice survives), <code>evaluations</code>, <code>searchSubject</code>, <code>searchResource</code>.</p>
+
+  <h2 id="discovery">Discovery options</h2>
+  <p><code>discovery: { … }</code> on the client, or <code>new PdpDiscovery({ staticPdp, … })</code> directly. The rules are the Go PEP's: the resource's echoed <code>resource</code> must be byte-identical, the PDP's <code>policy_decision_point</code> must equal the identifier it was fetched from, a PDP without metadata gets the default paths, a batch is never sent to a PDP that advertises no <code>access_evaluations_endpoint</code>, and a URL outside an allowlist never falls through to a weaker source.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>mode</code></td><td class="d">'off' | 'authzen' | 'resource' · 'off'</td><td><code>authzen</code> reads the static PDP's <code>/.well-known/authzen-configuration</code>; <code>resource</code> follows a call's <code>resource</code> to its RFC 9728 document for the PDP that decides for it, then that PDP's metadata, falling back to the static PDP. No federation mode in the SDK; <code>sources</code> is the seam for one.</td></tr>
+      <tr><td><code>staticPdp</code> <span class="req">required on PdpDiscovery</span></td><td class="d">string</td><td>The configured PDP: always the fallback, always permitted. The client fills it from <code>url</code>.</td></tr>
+      <tr><td><code>apiKeys</code></td><td class="d">Record&lt;identifier, bearer&gt;</td><td>Which bearer goes to which PDP. The client seeds <code>{ [url]: apiKey }</code>.</td></tr>
+      <tr><td><code>ttlMs</code></td><td class="d">number · 300000</td><td>Cache TTL for resource and PDP metadata.</td></tr>
+      <tr><td><code>minRefreshMs</code></td><td class="d">number · 30000</td><td>Retry throttle while a refresh keeps failing; the stale value is served in between.</td></tr>
+      <tr><td><code>maxEntries</code></td><td class="d">number · 1024</td><td>Cache bound.</td></tr>
+      <tr><td><code>timeoutMs</code></td><td class="d">number · 3000</td><td>Per metadata fetch.</td></tr>
+      <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>Allow http for discovered URLs. Same-origin http as <code>staticPdp</code> is always allowed.</td></tr>
+      <tr><td><code>pdpAllowlist</code></td><td class="d">string[]</td><td>Permitted discovered-PDP prefixes; <code>staticPdp</code> is always permitted. Empty: any https.</td></tr>
+      <tr><td><code>resourceAllowlist</code></td><td class="d">string[]</td><td>Permitted <code>resource</code> prefixes for metadata fetches. Empty: any.</td></tr>
+      <tr><td><code>sources</code></td><td class="d">MetadataSource[]</td><td>Overrides the mode-derived sources. Each is <code>{ name, lookup(resource) }</code>.</td></tr>
+      <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>One line per degraded step.</td></tr>
+      <tr><td><code>fetch</code>, <code>now</code></td><td class="d"></td><td>Swapped out in tests.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="evaluate">Per-call options</h2>
+  <p><code>EvaluateOptions</code>, the second argument of <code>evaluate</code> and <code>evaluateAll</code>. The middleware and the guard fill these from the request.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Option</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>resource</code></td><td class="d">string</td><td>The protected resource's identifier (RFC 8707), the key discovery starts from.</td></tr>
+      <tr><td><code>accessToken</code></td><td class="d">string</td><td>The raw token, forwarded as <code>context.access_token</code> so the PDP can examine it itself. Only over a TLS, authenticated PDP connection.</td></tr>
+      <tr><td><code>request</code></td><td class="d">{ method, path }</td><td>The endpoint actually hit, forwarded as <code>context.request</code>.</td></tr>
+      <tr><td><code>layers</code></td><td class="d">Array&lt;string | LayerSpec&gt;</td><td>Overrides the client's layers for this call.</td></tr>
+      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode for this call.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Whatever document named the PDP is forwarded verbatim as <code>context.resource_metadata</code> with <code>context.resource_metadata_source</code>. The SDK enforces none of it.</p>
+
+  <h2 id="express">Express middleware</h2>
+  <p><code>authzenMiddleware(options)</code>. On permit the request continues and <code>req.authz</code> carries <code>{ claims, verdict, request }</code>. On deny nothing downstream runs and the response is the challenge.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>client</code> <span class="req">required</span></td><td class="d">AuthzenClient | AuthzenClientOptions</td><td>An existing client, or the options to build one.</td></tr>
+      <tr><td><code>map</code> <span class="req">required</span></td><td class="d">(req, claims) =&gt; EvaluationRequest | null</td><td>Map a request to an evaluation. Return <code>null</code> to let it through without asking the PDP, for health checks only: an unmapped route is a deny. Async, so it may look things up.</td></tr>
+      <tr><td><code>pep</code></td><td class="d">string</td><td>Label for this PEP in challenges and logs.</td></tr>
+      <tr><td><code>requireToken</code></td><td class="d">boolean · true</td><td>Deny when no token is present.</td></tr>
+      <tr><td><code>getToken</code></td><td class="d">(req) =&gt; string</td><td>Pull the compact token out of the request. Defaults to the Authorization header.</td></tr>
+      <tr><td><code>verifyToken</code></td><td class="d">(token, req) =&gt; Promise&lt;claims | null&gt;</td><td>Verify the token and return its claims. Strongly recommended: without it the middleware only decodes, and an unverified <code>sub</code> is an attacker-chosen <code>sub</code>. Plug in <code>jose</code>'s <code>jwtVerify</code>.</td></tr>
+      <tr><td><code>forwardHeaders</code></td><td class="d">boolean · false</td><td>Forward the decided identity upstream as <code>X-Auth-Principal</code>, <code>X-Auth-Agent</code>, <code>X-Auth-Scope</code>, <code>X-Auth-Acr</code>, as the gateways do.</td></tr>
+      <tr><td><code>onDecision</code></td><td class="d">({ req, verdict, claims }) =&gt; void</td><td>Observe every decision. Must not throw.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">string | (req) =&gt; string</td><td>The resource identifier discovery starts from; a function of the request for a multi-tenant API. Absent means the client's static PDP.</td></tr>
+      <tr><td><code>forwardAccessToken</code></td><td class="d">boolean · false</td><td>Forward the raw token as <code>context.access_token</code>.</td></tr>
+      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode on this route. A fail-open permit sets <code>X-PDP-Fail-Open</code> on the response.</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>pathMapper(rules, { fallthrough })</code> builds a <code>map</code> from route rules: <code>{ method, pattern, action, resourceType, resourceId?, resourceProperties?, context? }</code>. An unmatched route is a deny; pass <code>fallthrough: 'allow'</code> only for paths that carry no policy.</p>
+
+  <h2 id="mcp">McpGuard</h2>
+  <p><code>new McpGuard(options)</code>, then <code>checkToolCall({ rpc, claims, accessToken?, extraContext?, raw? })</code> or <code>guard.wrap(handler)</code>. Every MCP method is governed with <code>applyDefaultMappings</code>; unknown methods are denied so future ones fail closed.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>client</code> <span class="req">required</span></td><td class="d">AuthzenClient | AuthzenClientOptions</td><td>As above.</td></tr>
+      <tr><td><code>tools</code></td><td class="d">ToolDefinition[] | () =&gt; …</td><td>The tool definitions, when this process is the MCP server. No discovery round trip.</td></tr>
+      <tr><td><code>upstreamUrl</code></td><td class="d">string</td><td>The MCP streamable-HTTP endpoint to discover <code>tools/list</code> from, when guarding someone else's server. Ignored when <code>tools</code> is set.</td></tr>
+      <tr><td><code>discoveryTtlMs</code></td><td class="d">number · 60000</td><td>How long a discovered <code>tools/list</code> is reused.</td></tr>
+      <tr><td><code>discoveryHeaders</code></td><td class="d">Record&lt;string,string&gt;</td><td>Headers for the discovery call.</td></tr>
+      <tr><td><code>pep</code></td><td class="d">string</td><td>Label for this PEP.</td></tr>
+      <tr><td><code>applyDefaultMappings</code></td><td class="d">boolean · false</td><td>Authorise tools and methods that declare no mapping against the binding's default mapping, as it requires. Off retains pass-through, which is not conformant but is what existing routes expect.</td></tr>
+      <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>Conditions worth surfacing but not failing on, chiefly a mapping that overrides <code>subject.id</code>.</td></tr>
+      <tr><td><code>delegate</code></td><td class="d">{ url, apiKey?, config?, timeoutMs? }</td><td>Hand the whole check to a running coaz-pep over its HTTP check API: <code>url</code> is its base, <code>apiKey</code> its <code>CHECK_API_TOKEN</code>, <code>config</code> the per-route knobs. Use it when a mapping needs CEL beyond the SDK's subset. Requires <code>raw: { headers, body }</code> on each check.</td></tr>
+      <tr><td><code>fetch</code></td><td class="d">typeof fetch</td><td>Swapped out in tests.</td></tr>
+      <tr><td><code>onDecision</code></td><td class="d">({ tool, verdict }) =&gt; void</td><td>Observe every decision.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">string · upstreamUrl</td><td>The MCP server's identifier, which discovery starts from; passed to coaz-pep in delegate mode so both PEPs key off one identifier.</td></tr>
+      <tr><td><code>forwardAccessToken</code></td><td class="d">boolean · false</td><td>Forward the raw token (passed per call as <code>accessToken</code>). In delegate mode the flag is passed to coaz-pep.</td></tr>
+      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode for this guard. In delegate mode passed to coaz-pep.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Error codes are the profile's: <code>-32001</code> the PDP denied, with <code>error.data.authz_challenge</code> carrying the remedy; <code>-32602</code> the mapping could not be evaluated; <code>-32603</code> the PDP could not be reached. Send them with HTTP 200.</p>
+
+  <h2 id="entity">FederationEntity</h2>
+  <p><code>new FederationEntity(options)</code> holds a private key and serves the two documents a federated resource publishes: a minimal entity configuration (keys, <code>authorityHints</code>, the entity type; no policy, the controller maintains that) for a trust controller to onboard, and RFC 9728 metadata with <code>signed_metadata</code>.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>entityId</code> <span class="req">required</span></td><td class="d">string</td><td>The resource identifier, an absolute URL without query or fragment. A trailing slash is trimmed.</td></tr>
+      <tr><td><code>key</code> <span class="req">required</span></td><td class="d">KeyObject | JsonWebKey</td><td>The private key: EC P-256/384/521 (ES256/384/512) or RSA (RS256). A public key is refused.</td></tr>
+      <tr><td><code>authorityHints</code> <span class="req">required</span></td><td class="d">string[]</td><td>The superiors a trust controller may be reached through. At least one.</td></tr>
+      <tr><td><code>asserted</code></td><td class="d">Record&lt;string, unknown&gt; · {}</td><td>What the RFC 9728 document carries beyond <code>resource</code>, typically the PDP the service is configured with. The SDK has no chain resolver, so its document is self-asserted; put coaz-pep in front when the public document must be the controller's word.</td></tr>
+      <tr><td><code>lifetimeSeconds</code></td><td class="d">number · 86400</td><td>Lifetime of each entity configuration; re-minted after half of it.</td></tr>
+      <tr><td><code>now</code></td><td class="d">() =&gt; seconds</td><td>The clock, for tests.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Methods: <code>publicJwk()</code> (with an RFC 7638 thumbprint as <code>kid</code>), <code>paths()</code> (<code>{ federation, resource }</code> for this identifier), <code>configuration()</code>, <code>protectedResourceMetadata()</code>, and <code>handler()</code>, an Express-style middleware that serves both paths and passes everything else to <code>next</code>.</p>
+
+  <h2 id="verdicts">Verdicts and challenges</h2>
+  <p>A verdict is <code>{ allow, kind, reason, context?, request?, failedOpen? }</code>. When the PDP's decision context says how a deny can be resolved, the SDK renders it three consistent ways, the same as the gateways:</p>
+  <div class="wide"><table>
+    <thead><tr><th>Verdict kind</th><th>HTTP</th><th><code>WWW-Authenticate</code></th><th><code>authz_challenge.type</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>identity_proofing_required</code></td><td>401</td><td><code>identity_verification_required</code></td><td><code>identity_proofing</code></td></tr>
+      <tr><td><code>step_up_required</code></td><td>401</td><td><code>insufficient_scope</code> (RFC 9470)</td><td><code>resource_authorisation</code></td></tr>
+      <tr><td><code>unauthenticated</code></td><td>401</td><td><code>login_required</code></td><td><code>authn</code></td></tr>
+      <tr><td><code>denied</code></td><td>403</td><td>—</td><td>—</td></tr>
+      <tr><td><code>mapping_error</code></td><td>400</td><td>—</td><td>—</td></tr>
+      <tr><td><code>pdp_error</code></td><td>502</td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>pdp_error</code> is 502 on purpose: the PDP being down is our problem, and a 403 would send the caller chasing permissions they already have.</p>
+
+  <h2 id="samples">Complete samples</h2>
+  <h3>A REST API: verified tokens, discovery, layers, the federation face</h3>
+  <pre><code>import express from 'express';
+import { readFileSync } from 'node:fs';
+import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { AuthzenClient, FederationEntity } from '@id-partners/authzen-pep';
+import { authzenMiddleware, pathMapper } from '@id-partners/authzen-pep/express';
+
+const app = express();
+app.use(express.json());
+const jwks = createRemoteJWKSet(new URL('https://as.bank.example/jwks'));
+
+const client = new AuthzenClient({
+  url: process.env.AUTHZEN_URL!,                 <span class="c">// always the fallback, always permitted</span>
+  apiKey: process.env.AUTHZEN_API_KEY,           <span class="c">// bound to url; a discovered PDP never receives it</span>
+  discovery: {
+    mode: 'resource',
+    pdpAllowlist: ['https://pdp.bank.example', 'https://estate-pdp.bank.example'],
+    resourceAllowlist: ['https://api.bank.example'],
+    ttlMs: 300_000,
+  },
+  layers: ['https://estate-pdp.bank.example fail-open', 'resource'],
+  failMode: 'closed',
+  timeoutMs: 1500,
+  onTrace: (t) => log.debug(t),
+});
+
+<span class="c">// The resource's federation face: this service holds the key; the controller holds the policy.</span>
+const entity = new FederationEntity({
+  entityId: 'https://api.bank.example',
+  key: JSON.parse(readFileSync('/etc/bank-api/entity-key.json', 'utf8')),
+  authorityHints: ['https://federation.example'],
+  asserted: { authzen_policy_decision_points: [process.env.AUTHZEN_URL!] },
+});
+app.use(entity.handler());                       <span class="c">// /.well-known/openid-federation, /.well-known/oauth-protected-resource</span>
+
+app.use(authzenMiddleware({
+  client,
+  pep: 'api-edge',
+  verifyToken: async (token) => (await jwtVerify(token, jwks, { audience: 'https://api.bank.example' })).payload,
+  map: pathMapper([
+    { method: 'GET',  pattern: '/accounts/:id/balance', action: 'get_balance',  resourceType: 'account', resourceId: (p) => p.id },
+    { method: 'POST', pattern: '/payments',             action: 'make_payment', resourceType: 'payment',
+      resourceProperties: (_p, req) => ({ amount: (req.body as { amount?: number })?.amount }) },
+  ]),
+  resource: 'https://api.bank.example',
+  forwardAccessToken: true,                      <span class="c">// the PDP connection is TLS and authenticated</span>
+  forwardHeaders: true,
+  onDecision: ({ verdict }) => audit.log(verdict),
+}));
+
+app.get('/accounts/:id/balance', (req, res) => res.json({ balance: 12.5, decidedBy: req.authz?.verdict.reason }));
+app.listen(8070);</code></pre>
+
+  <h3>An MCP server guarding its own tools</h3>
+  <pre><code>import { McpGuard } from '@id-partners/authzen-pep/mcp';
+
+const guard = new McpGuard({
+  client: { url: process.env.AUTHZEN_URL!, apiKey: process.env.AUTHZEN_API_KEY },
+  tools,                                         <span class="c">// this process IS the MCP server</span>
+  pep: 'mcp-edge',
+  applyDefaultMappings: true,                    <span class="c">// every method governed, unknown ones denied</span>
+  resource: 'https://mcp.bank.example',
+  forwardAccessToken: true,
+  onDecision: ({ tool, verdict }) => audit.log(tool, verdict),
+});
+
+const handle = guard.wrap(async (rpc) => runTool(rpc));
+const result = await handle(rpc, claims);        <span class="c">// the JSON-RPC error on deny, sent with HTTP 200</span></code></pre>
+
+  <h3>An MCP gateway delegating to coaz-pep</h3>
+  <pre><code>const guard = new McpGuard({
+  client: { url: process.env.AUTHZEN_URL! },
+  delegate: {
+    url: 'http://coaz-pep:9192',
+    apiKey: process.env.CHECK_API_TOKEN,         <span class="c">// coaz-pep's CHECK_API_TOKEN</span>
+    config: { style: 'mcp', require_token: 'true', require_user_login: 'true', coaz_defaults: 'true' },
+  },
+  resource: 'https://mcp.bank.example',
+  forwardAccessToken: true,
+  failMode: 'closed',
+});
+await guard.checkToolCall({ rpc, claims, raw: { headers, body: rawBody } });</code></pre>
+  <p>The engine renders the JSON-RPC error and the SDK relays it verbatim; two renderings of one decision would drift.</p>
+
+  <h3>What the PDP receives</h3>
+  <pre><code>{
+  "subject":  { "type": "user", "id": "customer", "properties": { "client_id": "agent-1", "on_behalf_of": "customer" } },
+  "action":   { "name": "make_payment" },
+  "resource": { "type": "payment", "id": "…", "properties": { "amount": 50 } },
+  "context": {
+    "resource_metadata_source": "rfc9728",
+    "resource_metadata": { "resource": "https://api.bank.example",
+                           "<span class="g">scopes_supported</span>": ["accounts:read", "payments:write"],
+                           "<span class="g">acr_values_required</span>": ["urn:idp:loa:mfa"],
+                           "<span class="k">authzen_policy_decision_points</span>": ["https://pdp.bank.example"] },
+    "request":  { "method": "POST", "path": "/payments" },
+    "access_token": "eyJ…"
+  }
+}</code></pre>
+  <p>The SDK is tested with vitest (<code>sdk/node/test/</code>) and holds coverage floors of 97% lines, 90% branches, 100% functions.</p>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/sdk/node">sdk/node/</a> on GitHub</span>
+</div></footer>
+</body>
+</html>

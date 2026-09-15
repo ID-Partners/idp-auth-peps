@@ -87,9 +87,10 @@ echo "  the estate PDP:      $(curl -s "http://${PEP_HOST}:9098/.well-known/auth
 echo "  the rogue PDP:       $(curl -s "http://${PEP_HOST}:9003/.well-known/authzen-configuration")"
 echo "  plain (RFC 9728):    $(curl -s "http://${PEP_HOST}:9004/.well-known/oauth-protected-resource")"
 echo "  impostor (RFC 9728): $(curl -s "http://${PEP_HOST}:9005/.well-known/oauth-protected-resource")"
+echo "  bank-b (RFC 9728):   $(curl -s "http://${PEP_HOST}:9009/.well-known/oauth-protected-resource")"
 echo "  member's OWN doc:    $(curl -s "http://${PEP_HOST}:9001/.well-known/oauth-protected-resource")"
 echo "  member's entity configuration is a signed JWT; the anchor's policy for members is:"
-echo '      {"oauth_resource":{"authzen_policy_decision_points":{"subset_of":["'"$GOOD"'"]},"acr_values_required":{"value":["urn:idp:loa:mfa"]}}}'
+echo '      {"oauth_resource":{"authzen_policy_decision_points":{"subset_of":["'"$GOOD"'"]},"acr_values_required":{"value":["urn:idp:loa:mfa"]},"authzen_policy_layers":{"add":["'"$ESTATE"'"]}}}'
 
 say "1. Where the PDP comes from, and what it was told — a read-only token trying to pay"
 step "pep-static: told its PDP, reads no metadata"; SCOPE="accounts:read" check "$STATIC" "$PLAIN" POST /payments "$PAY50"
@@ -125,6 +126,14 @@ echo "  pdp_layers = $ESTATE, resource. Every layer must permit; the first that 
 step "agent-1 pays 50 on plain: estate, then Bank A"; LAYERS="$ESTATE,resource" check "$RESOURCE" "$PLAIN" POST /payments "$PAY50"
 step "agent-risky pays 50 on plain: the estate PDP stops it"; LAYERS="$ESTATE,resource" CLIENT=agent-risky check "$RESOURCE" "$PLAIN" POST /payments "$PAY50"
 echo "  ^ Bank A's PDP was never asked. The generic layer is a gate; the specific one only sees what gets through."
+echo "  The stack can be PUBLISHED instead of configured. bank-b's document carries authzen_policy_layers = [$ESTATE]:"
+echo "  the PDPs to ask in front of its own. Nothing is set on the route."
+step "agent-1 reads bank-b, no pdp_layers on the route: estate, then Bank B"; ACR=urn:idp:loa:mfa check "$RESOURCE" "$BANKB" GET /accounts/a1/balance
+step "agent-risky reads bank-b: the published gate stops it"; ACR=urn:idp:loa:mfa CLIENT=agent-risky check "$RESOURCE" "$BANKB" GET /accounts/a1/balance
+echo "  And a federation can MANDATE the stack. member's own document names no layers; the anchor's policy adds the estate PDP."
+step "agent-risky reads member in resource mode: nothing in front, Bank A permits"; ACR=urn:idp:loa:mfa CLIENT=agent-risky check "$RESOURCE" "$MEMBER" GET /accounts/a1/balance
+step "agent-risky reads member in federation mode: the anchor's gate stops it"; ACR=urn:idp:loa:mfa CLIENT=agent-risky check "$FEDERATION" "$MEMBER" GET /accounts/a1/balance
+echo "  ^ the same resource, the same token. The resolved document put the estate PDP first, and the member cannot take it out."
 
 say "5. Failing open, deliberately: the estate PDP goes down"
 echo "  Closed is the default: a layer whose PDP cannot be reached denies. A layer marked fail-open is skipped instead,"
@@ -149,7 +158,7 @@ for i in $(seq 1 40); do
   sleep 0.5
 done
 curl -s "$FEDERATION/.well-known/oauth-protected-resource" | jq -c 'del(.signed_metadata)'
-echo "  ^ the anchor's word, republished: Bank A's PDP, the scopes, MFA. The PEP maintained a key; the anchor maintained the rest."
+echo "  ^ the anchor's word, republished: Bank A's PDP with the estate PDP in front of it, the scopes, MFA. The PEP maintained a key; the anchor maintained the rest."
 ctl_entity offboard "$GATEWAY_ENTITY"
 
 say "7. The challenge contract survives discovery"

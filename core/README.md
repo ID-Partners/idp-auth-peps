@@ -82,7 +82,7 @@ docker run -p 9191:9191 -p 9192:9192 \
 | `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
 | `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for the climb to the anchor (Superiors' Entity Configurations and fetch endpoints); the resource's own is governed by `RESOURCE_METADATA_ALLOWLIST` | unset — **warns** |
 | `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
-| `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit | `resource` |
+| `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit. `resource` is the resource's PDP behind any layers its metadata publishes in `authzen_policy_layers` | `resource` |
 | `PDP_FAIL_MODE` | what a layer does when its PDP cannot be reached, unless the layer says for itself: `closed` denies, `open` skips it and marks the permit with `X-PDP-Fail-Open`. A deny or a refusal never opens | `closed` |
 | `FEDERATION_ENTITY_ID` | make this PEP the federation entity for the resource it fronts: a minimal Entity Configuration at `{id}/.well-known/openid-federation` for the controller to onboard, and RFC 9728 metadata at `/.well-known/oauth-protected-resource{path}` republishing what the federation resolved (self-asserted until onboarded) | — |
 | `FEDERATION_ENTITY_KEY_FILE` | the private JWK the entity signs with; `FEDERATION_ENTITY_KEY_GENERATE=true` mints a P-256 key into it when absent | — |
@@ -157,8 +157,11 @@ input, and matching a token to it is the PDP's decision. The reasoning is in
 A route may ask more than one PDP: `pdp_layers` (or the service's `PDP_LAYERS`) is an
 ordered list of `static`, `resource` or PDP identifiers, every one of which must permit,
 the first deny being the answer. That is how a generic estate PDP that judges the token
-and the client sits in front of the one that knows the resource; see
-[docs/architecture.md](../docs/architecture.md#layers-a-generic-pdp-first-the-resources-after).
+and the client sits in front of the one that knows the resource. The resource can publish
+that stack itself — `authzen_policy_layers` in its metadata names the PDPs to ask in front
+of its own, and a federation can `add` one for every member — in which case the `resource`
+layer runs them with nothing configured on the PEP; see
+[docs/architecture.md](../docs/architecture.md#layers-the-resource-publishes).
 
 The PEP can be the federation face of the resource it fronts. With `FEDERATION_ENTITY_ID`
 set it holds a key and publishes a minimal entity configuration — keys, `authority_hints`,

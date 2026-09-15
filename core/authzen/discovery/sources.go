@@ -60,10 +60,14 @@ func (s *RFC9728Source) Lookup(ctx context.Context, resource string) (ResourceMe
 	if err != nil {
 		return ResourceMetadata{}, err
 	}
+	layers, err := layerList(doc, wk)
+	if err != nil {
+		return ResourceMetadata{}, err
+	}
 	// The whole document travels to the PDP. The PEP does not know or care which other
 	// members are in it — scopes_supported, acr requirements, DPoP requirements — only
 	// that the resource published them and the PDP may want them.
-	return ResourceMetadata{Source: "rfc9728", Document: doc, PDPs: pdps}, nil
+	return ResourceMetadata{Source: "rfc9728", Document: doc, PDPs: pdps, Layers: layers}, nil
 }
 
 // FederationSource reads the resolved oauth_resource metadata from a Trust Chain.
@@ -97,13 +101,46 @@ func (s *FederationSource) Lookup(ctx context.Context, resource string) (Resourc
 	if err != nil {
 		return ResourceMetadata{}, err
 	}
+	// The same goes for the layers: a metadata_policy `add` on ParamPolicyLayers is
+	// how a federation puts its own PDP in front of every member's, and a member
+	// cannot take it out again by editing its own configuration.
+	layers, err := layerList(meta, "resolved metadata of "+resource)
+	if err != nil {
+		return ResourceMetadata{}, err
+	}
 	// What travels to the PDP is the RESOLVED metadata: what survived every superior's
 	// metadata_policy, not what the resource wrote. A federation that pins a floor on
 	// the acr a resource may require has pinned it for the PDP too.
-	return ResourceMetadata{Source: "federation", Document: meta, PDPs: pdps}, nil
+	return ResourceMetadata{Source: "federation", Document: meta, PDPs: pdps, Layers: layers}, nil
 }
 
 func pdpList(raw []any, from string) ([]string, error) {
+	out, err := identifiers(raw, from)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, ErrNoMetadata
+	}
+	return out, nil
+}
+
+// layerList reads ParamPolicyLayers out of a document: absent or empty is no layers,
+// anything that is not an array of PDP identifiers is an invalid document — a policy
+// the PEP cannot read is not one it may quietly narrow.
+func layerList(doc map[string]any, from string) ([]string, error) {
+	v, present := doc[ParamPolicyLayers]
+	if !present {
+		return nil, nil
+	}
+	raw, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s %s is not an array", ErrInvalid, from, ParamPolicyLayers)
+	}
+	return identifiers(raw, from)
+}
+
+func identifiers(raw []any, from string) ([]string, error) {
 	out := make([]string, 0, len(raw))
 	for _, v := range raw {
 		s, _ := v.(string)
@@ -112,9 +149,6 @@ func pdpList(raw []any, from string) ([]string, error) {
 			return nil, fmt.Errorf("%w: %s lists %q, which is not a PDP identifier", ErrInvalid, from, s)
 		}
 		out = append(out, strings.TrimRight(s, "/"))
-	}
-	if len(out) == 0 {
-		return nil, ErrNoMetadata
 	}
 	return out, nil
 }

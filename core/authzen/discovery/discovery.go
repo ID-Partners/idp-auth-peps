@@ -11,10 +11,11 @@
 //	  ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
 //	  └─ 404 / unreachable -> {pdp}/access/v1/evaluation (spec-permitted defaults)
 //
-// The protected-resource parameter that names the PDP is not standardised anywhere —
-// not in RFC 9728, AuthZEN 1.0, the MCP profile, or Federation 1.0 — so it is minted
-// here once, as ParamPolicyDecisionPoints, in a shape valid both in an RFC 9728
-// document and under metadata.oauth_resource in an Entity Statement.
+// The protected-resource parameters that name the PDP, and the PDPs to ask in front of
+// it, are not standardised anywhere — not in RFC 9728, AuthZEN 1.0, the MCP profile,
+// or Federation 1.0 — so they are minted here once, as ParamPolicyDecisionPoints and
+// ParamPolicyLayers, in a shape valid both in an RFC 9728 document and under
+// metadata.oauth_resource in an Entity Statement.
 //
 // One error is never swallowed: ErrNotAllowed. Everything else degrades — stale cache,
 // next source, static PDP — and only when nothing is left does Resolve fail, closed.
@@ -41,6 +42,14 @@ import (
 // policy_decision_point value, not an endpoint), first preferred. Provisional pending
 // an AuthZEN WG profile; renaming it is this one constant.
 const ParamPolicyDecisionPoints = "authzen_policy_decision_points"
+
+// ParamPolicyLayers is the protected-resource metadata parameter naming the PDPs to
+// ask BEFORE the resource's own: an ordered array of PDP identifiers, every one of
+// which must permit. It is the published form of a route's pdp_layers — the stack
+// travels with the resource instead of being typed into every PEP — and the slot a
+// federation uses to put an estate PDP in front of every member with a metadata_policy
+// `add`. As provisional as ParamPolicyDecisionPoints, and the same one constant.
+const ParamPolicyLayers = "authzen_policy_layers"
 
 const (
 	wellKnownResource  = "oauth-protected-resource"
@@ -125,6 +134,10 @@ type ResourceMetadata struct {
 	Document map[string]any
 	// PDPs is the ordered list read out of Document, first preferred.
 	PDPs []string
+	// Layers is what the document asks to run in front of PDPs, in order: the
+	// ParamPolicyLayers array. Empty when the document names none. Each is asked and
+	// must permit before the resource's own PDP is; ResolveLayers does the expansion.
+	Layers []string
 }
 
 // DefaultEndpoints is the spec-permitted shape for a PDP without metadata.
@@ -145,8 +158,9 @@ type Resolver interface {
 // Layer names. A route's policy is an ordered list of these; anything else in the list
 // is taken as a PDP identifier.
 const (
-	// LayerResource is the PDP discovery finds for the route's resource — federation,
-	// then RFC 9728, then static. The default, and today's single behaviour.
+	// LayerResource is what discovery finds for the route's resource — federation,
+	// then RFC 9728, then static — and that is the resource's PDP with whatever the
+	// resource's document put in front of it (ParamPolicyLayers). The default.
 	LayerResource = "resource"
 	// LayerStatic is the operator's configured PDP, asked regardless of what discovery
 	// finds: the slot for an estate-wide PDP that judges the token and the client.
@@ -176,6 +190,16 @@ type Resolved struct {
 // own metadata after it. Every layer must permit; the first that does not is the answer.
 // The PEP does the ordering and the folding, nothing else.
 //
+// The stack need not be configured on the PEP at all. When the resource layer's
+// document carries ParamPolicyLayers, each PDP named there is asked, in that order, in
+// front of the resource's own: the published layers are what "resource" means. They
+// pass the same PDP allowlist as a layer named in route configuration — a document is
+// as caller-supplied as anything else — and they take the resource entry's failure
+// mode, never one of their own: a document may say who decides, not what happens when
+// they cannot. A configured entry and a published one that name the same PDP are one
+// call, and the configured entry's own failure mode, if it set one, is the operator's
+// word about that PDP and wins.
+//
 // A layer that cannot be resolved fails the request, unless it is fail-open, in which
 // case it is skipped and named in Skipped. A refusal — ErrNotAllowed, which also wraps
 // an invalid federation chain — is never skipped: fail-open is about availability, and a
@@ -186,9 +210,33 @@ func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []La
 	}
 	var res Resolved
 	seen := map[string]int{}
+	explicit := map[string]bool{} // identifier -> its entry set a failure mode of its own
+	add := func(ep PDPEndpoints, open, own bool) {
+		ep.FailOpen = open
+		if i, dup := seen[ep.Identifier]; dup {
+			// The same PDP twice is one call. Keep the resource metadata if this
+			// occurrence carried it and the earlier one did not. On the failure mode,
+			// an entry's own setting beats an inherited default; between two of a kind
+			// the stricter wins.
+			if res.PDPs[i].Resource == nil && ep.Resource != nil {
+				res.PDPs[i].Resource = ep.Resource
+			}
+			switch {
+			case own && !explicit[ep.Identifier]:
+				res.PDPs[i].FailOpen = open
+			case own == explicit[ep.Identifier]:
+				res.PDPs[i].FailOpen = res.PDPs[i].FailOpen && open
+			}
+			explicit[ep.Identifier] = explicit[ep.Identifier] || own
+			return
+		}
+		seen[ep.Identifier] = len(res.PDPs)
+		explicit[ep.Identifier] = own
+		res.PDPs = append(res.PDPs, ep)
+	}
 	for _, layer := range layers {
-		open := failOpen
-		if layer.FailOpen != nil {
+		open, own := failOpen, layer.FailOpen != nil
+		if own {
 			open = *layer.FailOpen
 		}
 		var ep PDPEndpoints
@@ -208,22 +256,30 @@ func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []La
 			res.Skipped = append(res.Skipped, fmt.Sprintf("%s (%v)", layer.Name, err))
 			continue
 		}
-		ep.FailOpen = open
-		if i, dup := seen[ep.Identifier]; dup {
-			// The same PDP twice is one call. Keep the resource metadata if this
-			// occurrence carried it and the earlier one did not; the stricter failure
-			// mode wins.
-			if res.PDPs[i].Resource == nil && ep.Resource != nil {
-				res.PDPs[i].Resource = ep.Resource
+		if layer.Name == LayerResource && ep.Resource != nil {
+			// What the document put in front of its PDP, in the document's order.
+			for _, pdp := range ep.Resource.Layers {
+				gate, err := r.ResolvePDP(ctx, pdp)
+				if err != nil {
+					if errors.Is(err, ErrNotAllowed) || !open {
+						return Resolved{}, fmt.Errorf("layer %q: %s published layer %q: %w", layer.Name, resource, pdp, err)
+					}
+					res.Skipped = append(res.Skipped, fmt.Sprintf("%s (published by %s: %v)", pdp, resource, err))
+					continue
+				}
+				gate.Source = SourcePublished
+				add(gate, open, false)
 			}
-			res.PDPs[i].FailOpen = res.PDPs[i].FailOpen && open
-			continue
 		}
-		seen[ep.Identifier] = len(res.PDPs)
-		res.PDPs = append(res.PDPs, ep)
+		add(ep, open, own)
 	}
 	return res, nil
 }
+
+// SourcePublished is the Source of a PDP that a resource's document named as a layer
+// in front of its own (ParamPolicyLayers), as opposed to "layer" for one the operator
+// configured and the metadata sources for the resource's own.
+const SourcePublished = "published"
 
 // ResourceMetadataOf is the one document to forward for a layered call: whichever layer
 // read the resource's metadata. Nil when none did.

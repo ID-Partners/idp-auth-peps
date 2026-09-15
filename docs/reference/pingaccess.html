@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>PingAccess rule reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="pingaccess.html" aria-current="page">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#build">Build and install</a></li>
+    <li><a href="#screen">The rule in the console</a></li>
+    <li><a href="#fields">Every field</a>
+      <ol>
+        <li><a href="#f-pdp">The PDP</a></li>
+        <li><a href="#f-route">The route</a></li>
+        <li><a href="#f-coaz">coaz-pep</a></li>
+        <li><a href="#f-discovery">Discovery</a></li>
+        <li><a href="#f-layers">Layers</a></li>
+        <li><a href="#f-user">The user token</a></li>
+        <li><a href="#f-transport">Transport and compatibility</a></li>
+      </ol></li>
+    <li><a href="#api">The admin API</a></li>
+    <li><a href="#attach">Attaching it to an application</a></li>
+    <li><a href="#pa">What PingAccess does, and what the rule does</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">gateways/pingaccess/ · Java</span>
+  <h1>The PingAccess rule</h1>
+  <p class="lede"><code>AuthZEN PDP</code> is an Add-on SDK rule: the PingAccess counterpart of the Kong plugin, sending the PDP the same AuthZEN request and rendering the same challenges, so a client cannot tell from a deny which gateway said no. Token and actor-claim extraction, RFC 9470 challenges, REST and MCP mapping, RFC 9728 and AuthZEN discovery and policy layers are native Java; DPoP verification and per-tool-call COAZ authorisation are delegated to <a href="coaz-pep.html">coaz-pep</a>, as Kong does. It is configured in the PingAccess console or through the admin API, spelled the same as every other PEP here.</p>
+  <p>Not to be confused with PingAccess's built-in <em>PingAuthorize Policy Decision Access Control</em> and <em>PingAuthorize Access Control</em> rules. Those speak PingAuthorize's own APIs to PingAuthorize alone. This one speaks AuthZEN 1.0 to any conformant PDP, discovers which PDP decides for a resource, and returns resolvable challenges.</p>
+
+  <h2 id="build">Build and install</h2>
+  <p>The Add-on SDK is on no public Maven repository. Take it from a PingAccess install or, without one, from the public Docker image, which needs no licence to pull.</p>
+  <pre><code>cd gateways/pingaccess/authzen-pdp
+id=$(docker create pingidentity/pingaccess:9.1.0-latest)
+mkdir -p .pa/lib &amp;&amp; docker cp "$id:/opt/server/lib/pingaccess-sdk-9.1.0.1.jar" .pa/lib/ &amp;&amp; docker rm "$id"
+mvn verify                                    <span class="c"># tests, the coverage ratchet, the jar</span>
+<span class="c"># or, against an install:</span>
+mvn -Dpa.server.root=/opt/pingaccess -Dpa.sdk.version=9.1.0.1 verify</code></pre>
+  <p>The jar is <code>target/authzen-pdp-pingaccess-&lt;version&gt;.jar</code>; PingAccess supplies Jackson, jose4j and slf4j, so nothing is bundled. Built for Java 17 bytecode, it loads on PingAccess 8.x and 9.x. Copy it to <code>&lt;PA_HOME&gt;/deploy/</code> and restart; the DevOps image's local server profile is <code>/opt/in/instance/deploy/</code>. The rule then appears as <b>AuthZEN PDP</b> (class <code>com.idpartners.pa.authzen.AuthZenRule</code>) for Site and Agent destinations.</p>
+
+  <h2 id="screen">The rule in the console</h2>
+  <p>The console draws one form from the rule's descriptor: each field with a widget, a label, a default, a help note, and whether it is required or behind <b>Show Advanced Settings</b>. The same descriptor is what the admin API serves at <code>GET /pa-admin-api/v3/rules/descriptors/AuthZenPdpRule</code>. Captured from the demo's PingAccess (<code>docker compose --profile pingaccess</code>) as configured by its start-up hook.</p>
+  <figure><img src="img/pa-rules-list.png" alt="The PingAccess console's Access > Rules page listing the authzen-pdp rule of type AuthZEN PDP" loading="lazy"><figcaption><b>Access → Rules.</b> The rule is in the Access Control category, so it runs before any processing rule on the same policy.</figcaption></figure>
+  <figure><img src="img/pa-rule-properties.png" alt="The rule expanded in the list: its Properties tab showing every set value with the configuration key in brackets" loading="lazy"><figcaption><b>The saved rule.</b> Expanding the row shows its properties, each label with the configuration key in brackets, plus the applications and resources it is attached to. The pencil opens the form.</figcaption></figure>
+  <figure><img src="img/pa-rule-form.png" alt="The AuthZEN PDP rule's configuration form in the PingAccess console" loading="lazy"><figcaption><b>The rule's form.</b> The basic fields: the PDP, the route's style and requirements, discovery and layers. Every widget is a standard console control: text, concealed (secrets are stored encrypted and never returned in plain text), checkbox, select, or a multi-value list.</figcaption></figure>
+  <figure><img src="img/pa-rule-advanced.png" alt="The same form with Show Advanced Settings expanded" loading="lazy"><figcaption><b>Show Advanced Settings.</b> Nothing behind it is needed for a first rule; everything behind it is a tuning, a safety valve or a development-only switch.</figcaption></figure>
+  <figure><img src="img/pa-application-policy.png" alt="An application's API Policy tab in the PingAccess console with the rule attached" loading="lazy"><figcaption><b>Applications → the application's API Policy.</b> Where the rule is attached. Drag it towards the top, so a deny costs nothing further.</figcaption></figure>
+
+  <h2 id="fields">Every field</h2>
+  <p>Names are as saved under <code>configuration</code>; the console shows a label with the name in brackets. <span class="req">advanced</span> marks a field behind Show Advanced Settings.</p>
+
+  <h3 id="f-pdp">The PDP</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>authzen_url</code> <span class="req">required</span></td><td class="d">text</td><td>The static PDP: always the fallback, always permitted.</td></tr>
+      <tr><td><code>authzen_api_key</code></td><td class="d">concealed</td><td>Bearer key for <code>authzen_url</code>. A discovered PDP never receives it. Stored encrypted; the API returns <code>{"encryptedValue": "OBF:JWE:…"}</code>.</td></tr>
+      <tr><td><code>pdp_timeout_ms</code> <span class="req">advanced</span></td><td class="d">text · 10000</td><td>Timeout on PDP calls.</td></tr>
+      <tr><td><code>pdp_ssl_verify</code> <span class="req">advanced</span></td><td class="d">checkbox · true</td><td>TLS verification on every outbound call. Off is process-wide for JDK clients built afterwards: dev only.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-route">The route</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pep_label</code></td><td class="d">text · pingaccess-pep</td><td>Names this PEP in challenges and the <code>X-PDP-PEP</code> header.</td></tr>
+      <tr><td><code>style</code></td><td class="d">select · rest</td><td><code>rest</code> (resource server) or <code>mcp</code> (MCP edge).</td></tr>
+      <tr><td><code>require_token</code></td><td class="d">checkbox · true</td><td>Deny without a readable access token.</td></tr>
+      <tr><td><code>require_dpop</code></td><td class="d">checkbox · false</td><td>Delegate the RFC 9449 sender-constraint check to coaz-pep; needs <code>coaz_url</code>, and is refused at configuration time without it.</td></tr>
+      <tr><td><code>require_user_login</code></td><td class="d">checkbox · false</td><td>Deny without a valid <code>X-User-Token</code>, with a login challenge.</td></tr>
+      <tr><td><code>stepup_scope</code></td><td class="d">text</td><td>Scope named in a step-up challenge when the PDP's advice names none.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">text</td><td>The protected resource's identifier (RFC 8707), the key discovery starts from.</td></tr>
+      <tr><td><code>forward_access_token</code></td><td class="d">checkbox · false</td><td>Send the raw token to the PDP as <code>context.access_token</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-coaz">coaz-pep</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>coaz_url</code></td><td class="d">text</td><td>coaz-pep's HTTP check API.</td></tr>
+      <tr><td><code>coaz_api_key</code></td><td class="d">concealed</td><td>Its <code>CHECK_API_TOKEN</code>.</td></tr>
+      <tr><td><code>mcp_upstream_url</code></td><td class="d">text</td><td>Where <code>tools/list</code> lives; with <code>coaz_url</code>, enables per-tool-call COAZ on <code>mcp</code> routes.</td></tr>
+      <tr><td><code>federation_entity_url</code></td><td class="d">text</td><td>Relay the resource's two well-known documents from coaz-pep at this URL.</td></tr>
+      <tr><td><code>coaz_defaults</code> <span class="req">advanced</span></td><td class="d">checkbox · false</td><td>Apply the COAZ-MCP binding's default mappings to undeclared tools.</td></tr>
+      <tr><td><code>coaz_timeout_ms</code> <span class="req">advanced</span></td><td class="d">text · 15000</td><td>Timeout on coaz-pep calls.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-discovery">Discovery</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_discovery</code></td><td class="d">select · off</td><td><code>off</code>, <code>authzen</code> or <code>resource</code>. No federation mode; the same reason as Kong, and the same remedy: behind coaz-pep.</td></tr>
+      <tr><td><code>pdp_metadata_ttl</code> <span class="req">advanced</span></td><td class="d">text · 300</td><td>Cache TTL, seconds, for resource and PDP metadata.</td></tr>
+      <tr><td><code>pdp_allowlist</code></td><td class="d">list · any https</td><td>Permitted discovered-PDP prefixes; <code>authzen_url</code> is always permitted.</td></tr>
+      <tr><td><code>resource_metadata_allowlist</code></td><td class="d">list · any</td><td>Permitted <code>resource</code> prefixes for metadata fetches.</td></tr>
+      <tr><td><code>pdp_discovery_insecure</code> <span class="req">advanced</span></td><td class="d">checkbox · false</td><td>Allow http for discovered URLs (dev only).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-layers">Layers</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_layers</code></td><td class="d">list · ["resource"]</td><td>Ordered PDPs, every one of which must permit; <code> fail-open</code> / <code> fail-closed</code> per entry. An empty list means <code>resource</code>.</td></tr>
+      <tr><td><code>fail_mode</code></td><td class="d">select · closed</td><td>What a layer does when its PDP cannot be reached, unless it says for itself.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-user">The user token</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>user_token_jwks_url</code></td><td class="d">text</td><td>Verify <code>X-User-Token</code> against this JWKS (jose4j is on PingAccess's classpath). Unset, it is decoded only, and configuring the rule logs a warning.</td></tr>
+      <tr><td><code>user_token_issuer</code> <span class="req">advanced</span></td><td class="d">text</td><td>Expected <code>iss</code> when verifying.</td></tr>
+      <tr><td><code>user_token_audience</code> <span class="req">advanced</span></td><td class="d">text</td><td>Expected <code>aud</code> when verifying.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-transport">Transport and compatibility</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>legacy_subject_identity</code> <span class="req">advanced</span></td><td class="d">checkbox · true</td><td>Also send the non-standard <code>subject.identity</code> beside <code>subject.id</code>.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Saving validates twice: field constraints first, reported on the field under a <b>Save Failed</b> banner (the PDP URL must not be blank, the drop-downs must hold one of their options, the numbers must be numbers), then the rule's own <code>configure</code>, which refuses <code>require_dpop</code> without <code>coaz_url</code>. The descriptor sets <code>agentCachingDisabled: true</code>: an agent never caches this rule's verdict, because it depends on the token, the body and the PDP's current view.</p>
+
+  <h2 id="api">The admin API</h2>
+  <p>The same configuration as JSON, keyed by the names above. This is the repository's reference sample; <code>demo/pingaccess/hooks/81-after-start-process.sh</code> is the whole sequence, site and application included, as a script.</p>
+  <pre><code>curl -sk -u administrator:$PA_PASSWORD -H 'X-Xsrf-Header: PingAccess' -H 'Content-Type: application/json' \
+  https://pa-admin:9000/pa-admin-api/v3/rules -d '{
+  "name": "authzen-pdp",
+  "className": "com.idpartners.pa.authzen.AuthZenRule",
+  "supportedDestinations": ["Site", "Agent"],
+  "configuration": {
+    "authzen_url": "https://pdp.bank.example",
+    "authzen_api_key": "...",
+    "pep_label": "PEP#2 (Bank API edge)",
+    "style": "rest",
+    "require_token": true,
+    "pdp_discovery": "resource",
+    "resource": "https://api.bank.example",
+    "resource_metadata_allowlist": ["https://api.bank.example"],
+    "pdp_allowlist": ["https://pdp.bank.example"],
+    "pdp_layers": ["https://estate-pdp.example fail-open", "resource"],
+    "user_token_jwks_url": "https://as.bank.example/jwks"
+  }
+}'</code></pre>
+  <p>A saved rule reads back as <code>GET /pa-admin-api/v3/rules/{id}</code> with the form's values under <code>configuration</code>; concealed fields come back encrypted.</p>
+
+  <h2 id="attach">Attaching it to an application</h2>
+  <p>Then <code>POST /applications</code> with the rule in the API policy. The demo's hook creates the site, the virtual host and the application in that order and attaches the rule; this is the shape of the application.</p>
+  <pre><code>{
+  "name": "bank",
+  "contextRoot": "/bank",
+  "destination": "Site",
+  "siteId": 1,
+  "virtualHostIds": [1],
+  "accessValidatorId": 0,                     <span class="c"># unprotected: the demo's tokens are unsigned</span>
+  "enabled": true,
+  "policy": { "API": [ { "type": "Rule", "id": 1 } ] }
+}</code></pre>
+  <p>In the console: <b>Applications → Applications</b>, edit the application, the <b>API Policy</b> tab, drag <b>authzen-pdp</b> from Available Rules onto the policy. Applications are created disabled unless <code>enabled</code> is set. Unprotected applications still run rules, which is what lets the demo use unsigned tokens; a production application has an access token validator, and then PingAccess validates the bearer before the rule runs.</p>
+
+  <h2 id="pa">What PingAccess does, and what the rule does</h2>
+  <ul>
+    <li><b>The access token.</b> When the application is protected, PingAccess validates the bearer token before any rule runs: signature or introspection, expiry, audience. The rule reads what PingAccess established from the exchange's identity, and those attributes win over the token's own payload, which is also read when the token is a JWT, so <code>act</code>, <code>cnf</code> and <code>acr</code> are available whether PingAccess exposes them or not. Unprotected, only the payload is read, decoded and not verified, with the same caveat the Kong plugin carries.</li>
+    <li><b>DPoP.</b> PingAccess enforces DPoP natively when it validates the token (the application's <code>dpopSettings</code>); that is the place for it. <code>require_dpop</code> is for the unprotected case and for parity with Kong: the proof goes to coaz-pep's <code>/v1/dpop/verify</code>.</li>
+    <li><b>The user token.</b> Unlike Kong, the rule can verify <code>X-User-Token</code> itself, since jose4j is on the classpath. Set <code>user_token_jwks_url</code>.</li>
+    <li><b>The deny on the wire</b>, the forwarded context, layers and fail mode are the Kong plugin's, knob for knob. The long form of each is on the <a href="kong.html#fields">Kong page</a>; the reasoning is in <code>docs/pingaccess.md</code>.</li>
+  </ul>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/pingaccess">gateways/pingaccess/</a> on GitHub · <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/docs/pingaccess-console.md">the console form, field by field</a></span>
+</div></footer>
+</body>
+</html>

@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Envoy, Istio and agentgateway reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html" aria-current="page">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="pingaccess.html">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#how">How it attaches</a></li>
+    <li><a href="#knobs">The per-route knobs</a></li>
+    <li><a href="#envoy">Plain Envoy</a></li>
+    <li><a href="#istio">Istio</a></li>
+    <li><a href="#agentgateway">agentgateway</a></li>
+    <li><a href="#wellknown">The well-known documents</a></li>
+    <li><a href="#failure">Failure mode</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">gateways/envoy/ · YAML</span>
+  <h1>Envoy, Istio and agentgateway</h1>
+  <p class="lede">These gateways have no in-process plugin system. Their authorisation extension point is Envoy's external authorization filter, so the enforcement point is <a href="coaz-pep.html">coaz-pep</a> as a gRPC service, and configuring a route means two things: pointing the filter at it, and passing the route's knobs as <code>context_extensions</code>.</p>
+
+  <div class="noscreen"><b>There is no screen for this component.</b> Configuration is the gateway's own YAML, shown here in full for each of the three, and coaz-pep's environment, on <a href="coaz-pep.html#env">its page</a>.</div>
+
+  <h2 id="how">How it attaches</h2>
+  <pre><code>client ──▶ gateway ──ext_authz gRPC──▶ coaz-pep ──AuthZEN──▶ PDP
+              │                            │
+              ▼ PERMIT                     ▼ DENY
+        upstream service            401/403 + WWW-Authenticate, or a
+                                    JSON-RPC error for MCP — passed through verbatim</code></pre>
+  <p>One binary serves all three gateways; only the attachment differs. It is a one-to-one port of the Kong plugin, so both send the PDP identical evaluation requests:</p>
+  <div class="wide"><table>
+    <thead><tr><th>Kong plugin</th><th>Envoy-family equivalent</th></tr></thead>
+    <tbody>
+      <tr><td>per-route plugin <code>config</code></td><td>ext_authz <code>context_extensions</code></td></tr>
+      <tr><td>claim extraction (<code>sub</code>, <code>act.sub</code>, <code>scope</code>, <code>cnf.jkt</code>, <code>acr</code>)</td><td>same logic, in Go</td></tr>
+      <tr><td>DPoP sender constraint (RFC 9449)</td><td>same, verified in process</td></tr>
+      <tr><td>RFC 9470 step-up challenges</td><td>Envoy <code>DeniedHttpResponse</code>: status, <code>WWW-Authenticate</code> and body pass through unchanged</td></tr>
+      <tr><td><code>X-Auth-*</code> upstream headers</td><td><code>OkHttpResponse.headers</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="knobs">The per-route knobs</h2>
+  <p>Read from <code>context_extensions</code> on every request. Every value is a string, so booleans are <code>"true"</code> and <code>"false"</code>. Anything not set takes the default, and a route with no knobs at all is a plain REST resource server with <code>require_token</code> off.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pep_label</code></td><td class="d">coaz-pep</td><td>Identifies this PEP in challenges, logs and <code>X-PDP-PEP</code>.</td></tr>
+      <tr><td><code>style</code></td><td class="d">rest</td><td><code>rest</code> (resource server) or <code>mcp</code> (MCP edge).</td></tr>
+      <tr><td><code>require_token</code></td><td class="d">false</td><td>Deny without a readable access token.</td></tr>
+      <tr><td><code>require_dpop</code></td><td class="d">false</td><td>Enforce the <code>cnf.jkt</code> sender constraint.</td></tr>
+      <tr><td><code>require_user_login</code></td><td class="d">false</td><td>Deny without a valid <code>X-User-Token</code>, with a login challenge.</td></tr>
+      <tr><td><code>stepup_scope</code></td><td class="d">—</td><td>Scope demanded for <code>stepup_action</code>.</td></tr>
+      <tr><td><code>stepup_action</code></td><td class="d">make_payment</td><td>The action the step-up applies to.</td></tr>
+      <tr><td><code>mcp_upstream_url</code></td><td class="d">—</td><td>Set to enable COAZ: where to discover <code>tools/list</code>.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">—</td><td>The protected resource's identifier (RFC 8707), the key PDP discovery starts from. MCP routes default to <code>mcp_upstream_url</code>; REST routes without it use the static PDP.</td></tr>
+      <tr><td><code>forward_access_token</code></td><td class="d">false</td><td>Send the raw token to the PDP as <code>context.access_token</code>. Only over a TLS, authenticated PDP connection.</td></tr>
+      <tr><td><code>pdp_layers</code></td><td class="d"><code>PDP_LAYERS</code></td><td>Ordered PDPs to ask, comma-separated: <code>static</code>, <code>resource</code>, or a PDP identifier (which must be on <code>PDP_ALLOWLIST</code>), each optionally suffixed <code> fail-open</code> or <code> fail-closed</code>. Every layer must permit.</td></tr>
+      <tr><td><code>fail_mode</code></td><td class="d"><code>PDP_FAIL_MODE</code></td><td><code>closed</code> or <code>open</code> for this route's layers that say nothing for themselves. Open marks the permit with <code>X-PDP-Fail-Open</code>; a deny or a refusal never opens.</td></tr>
+      <tr><td><code>coaz_defaults</code></td><td class="d">false</td><td>Apply the COAZ binding's default mappings to undeclared methods.</td></tr>
+      <tr><td><code>legacy_subject_identity</code></td><td class="d">true</td><td>Also send <code>subject.identity</code> beside <code>subject.id</code>. Set <code>"false"</code> once policies read <code>subject.id</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="envoy">Plain Envoy</h2>
+  <p>The filter, configured directly, with per-route knobs in <code>ExtAuthzPerRoute</code>. This is a complete listener for two routes: a REST API with discovery, and an MCP edge with COAZ.</p>
+  <pre><code>static_resources:
+  listeners:
+    - name: edge
+      address: { socket_address: { address: 0.0.0.0, port_value: 8000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: edge
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: false        <span class="c"># fail closed</span>
+                      with_request_body: { max_request_bytes: 65536, allow_partial_message: true }
+                      grpc_service:
+                        envoy_grpc: { cluster_name: coaz_pep }
+                        timeout: 2s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: api
+                      domains: ["api.bank.example"]
+                      routes:
+                        <span class="c"># the resource's public documents: served by coaz-pep, not decided by it</span>
+                        - match: { prefix: "/.well-known/oauth-protected-resource" }
+                          route: { cluster: coaz_pep_http }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        - match: { path: "/.well-known/openid-federation" }
+                          route: { cluster: coaz_pep_http }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        <span class="c"># the API</span>
+                        - match: { prefix: "/" }
+                          route: { cluster: bank_api }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  pep_label: "PEP#2 (Bank API edge)"
+                                  style: rest
+                                  require_token: "true"
+                                  require_dpop: "true"
+                                  stepup_scope: "banking:payments:transfer"
+                                  stepup_action: "make_payment"
+                                  resource: "https://api.bank.example"
+                                  forward_access_token: "true"
+                                  pdp_layers: "https://estate-pdp.bank.example fail-open, resource"
+                    - name: mcp
+                      domains: ["mcp.bank.example"]
+                      routes:
+                        - match: { prefix: "/mcp" }
+                          route: { cluster: bank_mcp }
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions:
+                                  pep_label: "PEP#1 (MCP edge)"
+                                  style: mcp
+                                  require_token: "true"
+                                  require_user_login: "true"
+                                  mcp_upstream_url: "http://bank-mcp:8090/mcp"
+                                  coaz_defaults: "true"
+  clusters:
+    - name: coaz_pep
+      type: STRICT_DNS
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }
+      load_assignment:
+        cluster_name: coaz_pep
+        endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: coaz-pep, port_value: 9191 } } } }] }]
+    - name: coaz_pep_http
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: coaz_pep_http
+        endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: coaz-pep, port_value: 9192 } } } }] }]
+    - name: bank_api
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: bank_api
+        endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: bank-api, port_value: 8070 } } } }] }]
+    - name: bank_mcp
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: bank_mcp
+        endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: bank-mcp, port_value: 8090 } } } }] }]</code></pre>
+
+  <h2 id="istio">Istio</h2>
+  <p>Istio speaks the same gRPC. Four pieces, in order: the deployment and service, a mesh extension provider naming it (which lives in the <code>istio</code> ConfigMap and cannot be a CRD), an <code>AuthorizationPolicy</code> with <code>action: CUSTOM</code> on the workloads to guard, and an <code>EnvoyFilter</code> if a route needs knobs. This is <code>gateways/envoy/istio/coaz-pep.yaml</code> from the repository.</p>
+  <pre><code><span class="c"># kubectl -n istio-system edit configmap istio   (under data.mesh)</span>
+extensionProviders:
+  - name: coaz-pep
+    envoyExtAuthzGrpc:
+      service: coaz-pep.authz.svc.cluster.local
+      port: 9191
+      includeRequestBodyInCheck:
+        maxRequestBytes: 65536
+        allowPartialMessage: true</code></pre>
+  <pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: authz
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coaz-pep
+  namespace: authz
+  labels: { app: coaz-pep }
+spec:
+  replicas: 2 <span class="c"># fail-closed puts this in the request path: do not run one</span>
+  selector:
+    matchLabels: { app: coaz-pep }
+  template:
+    metadata:
+      labels: { app: coaz-pep }
+    spec:
+      containers:
+        - name: coaz-pep
+          image: ghcr.io/id-partners/coaz-pep:latest
+          ports:
+            - { name: grpc, containerPort: 9191 }
+            - { name: http, containerPort: 9192 }
+          env:
+            - name: AUTHZEN_URL
+              value: http://authzen-adapter.authz.svc.cluster.local:8080
+            - name: AUTHZEN_API_KEY
+              valueFrom:
+                secretKeyRef: { name: coaz-pep, key: authzen-api-key }
+            - name: COAZ_DISCOVERY_TTL
+              value: 60s
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coaz-pep
+  namespace: authz
+spec:
+  selector: { app: coaz-pep }
+  ports:
+    - { name: grpc, port: 9191, targetPort: 9191, appProtocol: grpc }
+    - { name: http, port: 9192, targetPort: 9192 }
+---
+<span class="c"># Guard one workload. `action: CUSTOM` hands the decision to the named provider;
+# `rules` narrows WHICH requests are sent for a decision, it does not decide them.</span>
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: bank-api-authzen
+  namespace: default
+spec:
+  selector:
+    matchLabels: { app: bank-api }
+  action: CUSTOM
+  provider:
+    name: coaz-pep
+  rules:
+    - to:
+        - operation:
+            notPaths: ['/healthz', '/metrics']
+---
+<span class="c"># Per-route knobs. AuthorizationPolicy has no field for context_extensions, so with the
+# three resources above every request arrives with the defaults: style=rest,
+# require_token=false, no COAZ. Enough for a REST service whose tokens a
+# RequestAuthentication validates; NOT enough for an MCP edge.</span>
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: coaz-pep-context-mcp
+  namespace: default
+spec:
+  workloadSelector:
+    labels: { app: bank-mcp }
+  configPatches:
+    - applyTo: HTTP_ROUTE
+      match:
+        context: SIDECAR_INBOUND
+        routeConfiguration:
+          vhost:
+            route:
+              name: default
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_authz:
+              '@type': type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+              check_settings:
+                context_extensions:
+                  pep_label: 'PEP#1 (MCP edge)'
+                  style: mcp
+                  require_token: 'true'
+                  require_dpop: 'false'
+                  require_user_login: 'true'
+                  mcp_upstream_url: http://bank-mcp.default.svc.cluster.local:8090/mcp</code></pre>
+  <div class="note"><p><b>The trap.</b> <code>AuthorizationPolicy</code> carries no knobs, so without the <code>EnvoyFilter</code> every request reaches the PEP with defaults. Fine for a plain REST service. Not fine for an MCP edge, where <code>style</code> and <code>mcp_upstream_url</code> have no sensible default. Either patch them in as above, or give the MCP edge its own provider pointing at its own coaz-pep service.</p></div>
+
+  <h2 id="agentgateway">agentgateway</h2>
+  <p>agentgateway (solo.io) attaches the same service through its <code>extAuthz</code> policy, and the per-route <code>context</code> map is delivered as <code>context_extensions</code>. This is the repository's <code>gateways/envoy/agentgateway/config.yaml.template</code>: one gateway fronting an MCP edge and a bank API, each with its own PEP label. The <code>__PLACEHOLDER__</code> tokens are substituted at container start by <code>docker-entrypoint.sh</code>, so the same image runs in compose and on Railway.</p>
+  <pre><code>binds:
+- port: 8000
+  listeners:
+  - protocol: HTTP
+    routes:
+    - name: mcp-route
+      matches:
+      - path:
+          pathPrefix: /mcp
+      policies:
+        extAuthz:
+          host: __EXTAUTHZ_HOST__          <span class="c"># coaz-pep:9191</span>
+          failureMode: deny               <span class="c"># fail closed if the PEP is unreachable</span>
+          includeRequestBody:
+            maxRequestBytes: 65536        <span class="c"># the PEP inspects JSON-RPC bodies</span>
+            allowPartialMessage: true
+          protocol:
+            grpc:
+              context:
+                pep_label: "PEP#1 (MCP edge)"
+                style: "mcp"
+                require_token: "true"
+                require_dpop: "false"
+                require_user_login: "true"
+                mcp_upstream_url: "http://__BANK_MCP_HOST__/mcp"
+      backends:
+      - host: __BANK_MCP_HOST__
+
+    - name: bank-route
+      matches:
+      - path:
+          pathPrefix: /bank
+      policies:
+        extAuthz:
+          host: __EXTAUTHZ_HOST__
+          failureMode: deny
+          includeRequestBody:
+            maxRequestBytes: 65536        <span class="c"># the PEP inspects payment bodies</span>
+            allowPartialMessage: true
+          protocol:
+            grpc:
+              context:
+                pep_label: "PEP#2 (Bank API edge)"
+                style: "rest"
+                require_token: "true"
+                require_dpop: "false"
+                stepup_scope: "banking:payments:transfer"
+                stepup_action: "make_payment"
+        urlRewrite:
+          path:
+            prefix: /                     <span class="c"># /bank/payments -> /payments upstream</span>
+      backends:
+      - host: __BANK_API_HOST__</code></pre>
+
+  <h2 id="wellknown">The well-known documents</h2>
+  <p>When coaz-pep is the federation entity for the resource it fronts (<code>FEDERATION_ENTITY_ID</code> on <a href="coaz-pep.html#env-entity">its page</a>), it serves <code>{path}/.well-known/openid-federation</code> and <code>/.well-known/oauth-protected-resource{path}</code> on its HTTP port. Route those two paths, on the resource's host, to that port as an ordinary upstream with the ext_authz filter disabled for them, as the plain Envoy sample does. They are public documents; the trust controller fetches the first to onboard the resource.</p>
+
+  <h2 id="failure">Failure mode</h2>
+  <div class="note warn"><p><b>Always fail closed at the gateway.</b> <code>failure_mode_allow: false</code> in Envoy, <code>failureMode: deny</code> in agentgateway, and Istio's CUSTOM action already denies when the provider is unreachable. A PEP that fails open at the gateway is not a PEP. The place to decide that an individual policy layer may be skipped when its PDP is down is coaz-pep's <code>pdp_layers</code> and <code>fail_mode</code>, which mark every such permit with <code>X-PDP-Fail-Open</code>; the gateway's own failure mode is about coaz-pep itself being unreachable, and that must deny.</p></div>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/envoy">gateways/envoy/</a> on GitHub</span>
+</div></footer>
+</body>
+</html>

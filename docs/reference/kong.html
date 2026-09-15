@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Kong plugin reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html" aria-current="page">Kong</a><a href="pingaccess.html">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#install">Install</a></li>
+    <li><a href="#screen">The plugin in Kong Manager</a></li>
+    <li><a href="#fields">Every field</a>
+      <ol>
+        <li><a href="#f-pdp">The PDP</a></li>
+        <li><a href="#f-route">The route</a></li>
+        <li><a href="#f-coaz">Delegation to coaz-pep</a></li>
+        <li><a href="#f-discovery">PDP discovery</a></li>
+        <li><a href="#f-layers">Layers and fail mode</a></li>
+        <li><a href="#f-compat">Transport and compatibility</a></li>
+      </ol></li>
+    <li><a href="#samples">Complete configurations</a></li>
+    <li><a href="#wire">What it puts on the wire</a></li>
+    <li><a href="#delegated">What is delegated, and why</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">gateways/kong/ · Lua</span>
+  <h1>The Kong plugin</h1>
+  <p class="lede"><code>authzen-pdp</code> is a Kong plugin that speaks AuthZEN 1.0 to a PDP on every request: REST and MCP request mapping, token and actor-claim extraction, RFC 9470 step-up challenges, and RFC 9728 and AuthZEN metadata discovery, natively in Lua. What needs a JOSE library, DPoP verification, per-tool-call COAZ authorisation and federation, it delegates to <a href="coaz-pep.html">coaz-pep</a>. Every knob is plugin configuration on a route or service, and Kong Manager shows it.</p>
+
+  <h2 id="install">Install</h2>
+  <p>DB-less: mount the plugin directory and tell Kong about it. The module path Kong looks for is <code>kong.plugins.authzen-pdp.handler</code>.</p>
+  <pre><code><span class="c"># kong.conf, or environment</span>
+KONG_PLUGINS=bundled,authzen-pdp
+KONG_LUA_PACKAGE_PATH=/opt/?.lua;;</code></pre>
+  <pre><code><span class="c"># compose: the demo's Kong, complete</span>
+kong:
+  image: kong:3.9
+  environment:
+    KONG_DATABASE: "off"
+    KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+    KONG_PLUGINS: bundled,authzen-pdp
+    KONG_LUA_PACKAGE_PATH: /opt/?.lua;;
+    KONG_PROXY_LISTEN: 0.0.0.0:8000
+    KONG_ADMIN_LISTEN: "off"
+    KONG_LOG_LEVEL: notice
+    KONG_PROXY_ERROR_LOG: /dev/stderr
+  volumes:
+    - ./kong/kong.yml:/kong/kong.yml:ro
+    - ../gateways/kong/authzen-pdp:/opt/kong/plugins/authzen-pdp:ro
+  ports:
+    - "8000:8000"</code></pre>
+
+  <h2 id="screen">The plugin in Kong Manager</h2>
+  <p>Kong Manager draws the plugin's form from <code>schema.lua</code>, so every field below appears here with its default pre-filled, and the required ones marked. Captured from the demo's Kong with Kong Manager OSS turned on (<code>KONG_ADMIN_GUI_LISTEN</code>), against the DB-less configuration below.</p>
+  <figure><img src="img/kong-manager-plugin-edit.png" alt="Kong Manager's edit form for the authzen-pdp plugin, every configuration field visible" loading="lazy"><figcaption><b>Edit Plugin: authzen-pdp.</b> The scope (a service, a route, a consumer, or global), then every configuration field. A red dot marks a required field: <code>authzen_url</code> and <code>authzen_api_key</code>. Kong Manager title-cases the names; the tables below use the names as written in configuration.</figcaption></figure>
+  <figure><img src="img/kong-manager-plugin-config.png" alt="Kong Manager's read view of the plugin with its plugin-specific configuration" loading="lazy"><figcaption><b>The saved plugin.</b> The same configuration as Kong holds it, with <b>Format</b> switchable between structured and raw JSON, and the service it is scoped to.</figcaption></figure>
+
+  <h2 id="fields">Every field</h2>
+  <p>Grouped as they are used, not as the schema lists them. Types are the schema's; <span class="req">ref</span> marks a field that accepts a Kong vault reference such as <code>{vault://env/authzen-url}</code> instead of a literal.</p>
+
+  <h3 id="f-pdp">The PDP</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>authzen_url</code> <span class="req">required · ref</span></td><td class="d">string</td><td>The static PDP's base URL. With discovery off the AuthZEN default paths are appended; with it, the fallback every mode ends at, and the one PDP that receives the key. Its origin is always permitted, even over http.</td></tr>
+      <tr><td><code>authzen_api_key</code> <span class="req">required · ref</span></td><td class="d">string</td><td>Sent as <code>Authorization: Bearer</code> to <code>authzen_url</code> only. A discovered PDP never receives it.</td></tr>
+      <tr><td><code>pdp_ssl_verify</code></td><td class="d">boolean · true</td><td>TLS verification on PDP and coaz-pep calls. A PEP that accepts any certificate has no integrity on the decision it enforces; set false only against self-signed certificates in development.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-route">The route</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pep_label</code></td><td class="d">string · kong-pep</td><td>Names this PEP in denials and the <code>X-PDP-PEP</code> response header, e.g. <code>PEP#2 (Bank API edge)</code>.</td></tr>
+      <tr><td><code>style</code></td><td class="d">rest | mcp · rest</td><td><code>rest</code> maps method and path to an evaluation; <code>mcp</code> treats the route as an MCP edge and authorises JSON-RPC.</td></tr>
+      <tr><td><code>require_token</code></td><td class="d">boolean · true</td><td>Reject a request that carries no readable access token.</td></tr>
+      <tr><td><code>require_dpop</code></td><td class="d">boolean · false</td><td>Enforce the RFC 9449 sender constraint. Needs <code>coaz_url</code>: the plugin cannot verify a proof signature, and configuration is refused without it.</td></tr>
+      <tr><td><code>require_user_login</code></td><td class="d">boolean · false</td><td>Require a logged-in end user (<code>X-User-Token</code>); absent, a 401 <code>login_required</code> challenge.</td></tr>
+      <tr><td><code>stepup_scope</code></td><td class="d">string</td><td>For <code>stepup_action</code>, the user's token must carry this scope; if not, a 401 <code>insufficient_scope</code> challenge.</td></tr>
+      <tr><td><code>stepup_action</code></td><td class="d">string · make_payment</td><td>The action the step-up applies to.</td></tr>
+      <tr><td><code>forward_access_token</code></td><td class="d">boolean · false</td><td>Forward the raw token to the PDP as <code>context.access_token</code>, so the PDP can verify the signature, read <code>cnf</code>, score the client. Only when the PDP connection is TLS and authenticated.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">string</td><td>The protected resource's identifier (RFC 8707), the key discovery starts from. An <code>mcp</code> route without one uses <code>mcp_upstream_url</code>; a <code>rest</code> route without one uses the static PDP.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-coaz">Delegation to coaz-pep</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>coaz_url</code></td><td class="d">string</td><td>coaz-pep's HTTP check API, e.g. <code>http://coaz-pep:9192</code>. On an <code>mcp</code> route, <code>tools/call</code> is authorised per the tool's mapping by the engine; also where DPoP proofs are verified.</td></tr>
+      <tr><td><code>coaz_api_key</code> <span class="req">ref</span></td><td class="d">string</td><td>The engine's <code>CHECK_API_TOKEN</code>, sent as a bearer.</td></tr>
+      <tr><td><code>mcp_upstream_url</code></td><td class="d">string</td><td>The MCP server whose <code>tools/list</code> declares the mappings; the engine reaches it directly for discovery, so it must be on the engine's <code>MCP_UPSTREAM_ALLOWLIST</code>.</td></tr>
+      <tr><td><code>federation_entity_url</code></td><td class="d">string</td><td>Makes the route the resource's federation face: <code>/.well-known/openid-federation</code> and <code>/.well-known/oauth-protected-resource</code> (with any identifier path) are relayed from coaz-pep at this URL, which holds the key. Everything else on the route is untouched.</td></tr>
+      <tr><td><code>coaz_defaults</code></td><td class="d">boolean · false</td><td>Authorise tools that declare no mapping against the COAZ-MCP binding's default mapping, as the binding requires. Off keeps the non-conformant pass-through deployed routes expect.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-discovery">PDP discovery</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_discovery</code></td><td class="d">off | authzen | resource · off</td><td><code>off</code>: the static PDP, default paths, no fetch. <code>authzen</code>: read <code>authzen_url</code>'s <code>/.well-known/authzen-configuration</code>. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code>, then that PDP's metadata, falling back to <code>authzen_url</code>. No <code>federation</code> mode: a trust chain cannot be validated without a JOSE verifier; a route that must take the federation's word belongs behind coaz-pep.</td></tr>
+      <tr><td><code>pdp_metadata_ttl</code></td><td class="d">number · 300</td><td>Cache TTL, seconds, for resource and PDP metadata. Must be greater than zero.</td></tr>
+      <tr><td><code>pdp_allowlist</code></td><td class="d">array of string</td><td>Prefixes a discovered PDP must match; <code>authzen_url</code> is always permitted. Empty means any https PDP a resource names.</td></tr>
+      <tr><td><code>resource_metadata_allowlist</code></td><td class="d">array of string</td><td>Prefixes a route's <code>resource</code> must match before its metadata is fetched. Empty means any.</td></tr>
+      <tr><td><code>pdp_discovery_insecure</code></td><td class="d">boolean · false</td><td>Allow http for discovered URLs. Dev only; <code>authzen_url</code>'s own origin is always trusted over http.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-layers">Layers and fail mode</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_layers</code></td><td class="d">array of string · ["resource"]</td><td>The ordered PDPs to ask, every one of which must permit: <code>static</code> (the configured <code>authzen_url</code>, regardless of discovery), <code>resource</code> (what discovery finds for this route's resource), or a PDP identifier. Each entry may carry its own failure mode: <code>"https://estate.example fail-open"</code>. The first that does not permit is the answer. An entry the plugin cannot read fails the route closed. Passed to coaz-pep on MCP routes.</td></tr>
+      <tr><td><code>fail_mode</code></td><td class="d">closed | open · closed</td><td>What a layer does when its PDP cannot be reached, unless the layer says for itself. <code>closed</code> denies with a 503. <code>open</code> skips the layer; if every layer was skipped the request is permitted, and any permit that skipped one carries <code>X-PDP-Fail-Open</code>. A refusal (allowlist) never opens; a deny is a decision, not a failure.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-compat">Transport and compatibility</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>protocols</code></td><td class="d">http, https, grpc, grpcs</td><td>Kong's own field: which protocols the plugin runs on.</td></tr>
+      <tr><td><code>legacy_subject_identity</code></td><td class="d">boolean · true</td><td>Also send the non-standard <code>subject.identity</code> beside AuthZEN's <code>subject.id</code>, so upgrading the gateway alone cannot break a policy still reading the old field. Set false once policies read <code>subject.id</code>.</td></tr>
+    </tbody>
+  </table></div>
+  <p>One cross-field check runs at configuration time: <code>require_dpop</code> without <code>coaz_url</code> is refused with the message <em>require_dpop needs coaz_url: this plugin cannot verify a DPoP proof signature itself, so verification is delegated to coaz-pep</em>.</p>
+
+  <h2 id="samples">Complete configurations</h2>
+  <h3>A REST API with discovery, layers and the federation face</h3>
+  <pre><code>_format_version: "3.0"
+services:
+  - name: bank-api
+    url: http://bank-api:8070
+    routes:
+      - name: bank
+        paths: ["/bank"]
+        strip_path: true
+    plugins:
+      - name: authzen-pdp
+        config:
+          authzen_url:     "{vault://env/authzen-url}"        <span class="c"># always the fallback, always permitted</span>
+          authzen_api_key: "{vault://env/authzen-api-key}"
+          pep_label: "PEP#2 (Bank API edge)"
+          style: rest
+          require_token: true
+          require_dpop: true                                 <span class="c"># verified by coaz-pep</span>
+          coaz_url: http://coaz-pep:9192
+          coaz_api_key: "{vault://env/coaz-api-key}"
+          stepup_scope: "banking:payments:transfer"
+          stepup_action: "make_payment"
+          pdp_discovery: resource
+          resource: https://api.bank.example
+          pdp_allowlist: ["https://pdp.bank.example", "https://estate-pdp.bank.example"]
+          resource_metadata_allowlist: ["https://api.bank.example"]
+          pdp_metadata_ttl: 300
+          forward_access_token: true
+          pdp_layers: ["https://estate-pdp.bank.example fail-open", "resource"]
+          fail_mode: closed
+          federation_entity_url: http://coaz-pep:9192       <span class="c"># the two well-known documents, relayed</span>
+          legacy_subject_identity: false</code></pre>
+
+  <h3>An MCP edge, delegating tool-call authorisation</h3>
+  <pre><code>  - name: bank-mcp
+    url: http://bank-mcp:8090
+    routes:
+      - name: mcp-edge
+        paths: ["/mcp"]
+        strip_path: false
+    plugins:
+      - name: authzen-pdp
+        config:
+          authzen_url:     "{vault://env/authzen-url}"
+          authzen_api_key: "{vault://env/authzen-api-key}"
+          pep_label: "PEP#1 (MCP edge)"
+          style: mcp
+          require_token: true
+          require_user_login: true
+          coaz_url: http://coaz-pep:9192                      <span class="c"># tools/call authorised per x-coaz-mapping by the engine</span>
+          coaz_api_key: "{vault://env/coaz-api-key}"
+          mcp_upstream_url: http://bank-mcp:8090/mcp
+          coaz_defaults: true
+          pdp_discovery: resource                              <span class="c"># the MCP server is the resource; mcp_upstream_url is its identifier</span>
+          pdp_allowlist: ["https://pdp.bank.example"]
+          resource_metadata_allowlist: ["http://bank-mcp:8090"]</code></pre>
+
+  <h3>The demo's Kong, as it runs</h3>
+  <p>The whole of <code>demo/kong/kong.yml</code>: one route in front of the <code>plain</code> stub, discovering the PDP from that resource's RFC 9728 document.</p>
+  <pre><code>_format_version: "3.0"
+
+services:
+  - name: plain-resource
+    url: http://stubs:9004
+    routes:
+      - name: bank
+        paths: ["/bank"]
+        strip_path: true
+    plugins:
+      - name: authzen-pdp
+        config:
+          authzen_url: http://stubs:9002
+          authzen_api_key: static-pdp-key
+          pep_label: "Kong (resource discovery)"
+          style: rest
+          require_token: true
+          pdp_discovery: resource
+          resource: http://stubs:9004
+          pdp_discovery_insecure: true
+          resource_metadata_allowlist: ["http://stubs:9004"]</code></pre>
+
+  <h2 id="wire">What it puts on the wire</h2>
+  <div class="wide"><table>
+    <thead><tr><th>Where</th><th>Header</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>proxied request, on permit</td><td><code>X-Auth-Principal</code>, <code>X-Auth-Agent</code>, <code>X-Auth-Scope</code>, <code>X-Auth-Acr</code></td><td>The decided identity and the authentication context the AS asserted, so a resource server records the delegation chain rather than inferring a channel from a username.</td></tr>
+      <tr><td>response</td><td><code>X-PDP-PEP</code>, <code>X-PDP-Decision</code>, <code>X-PDP-Action</code>, <code>X-PDP-Reason</code></td><td>Which PEP decided, what, for which action, and why.</td></tr>
+      <tr><td>response, on a fail-open permit</td><td><code>X-PDP-Fail-Open</code></td><td>The layers that were skipped.</td></tr>
+      <tr><td>response, on deny</td><td>status, <code>WWW-Authenticate</code>, JSON body</td><td>The same challenge vocabulary as every other PEP here: 401 <code>login_required</code>, <code>insufficient_scope</code> (RFC 9470), <code>invalid_token</code>; 403 for a plain deny; 503 when a PDP could not be reached or a refusal applied. Body <code>{"error":"authorization_failed","pep":…,"reason":…}</code>, or the JSON-RPC error coaz-pep rendered on an MCP route.</td></tr>
+      <tr><td>to the PDP</td><td><code>context.resource_metadata</code>, <code>context.resource_metadata_source</code>, <code>context.request</code>, <code>context.access_token</code></td><td>The resource's document verbatim and where it came from, the endpoint hit, and the raw token when the route allows. The plugin enforces none of it.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="delegated">What is delegated, and why</h2>
+  <ul>
+    <li><b>DPoP.</b> A Kong plugin has no JOSE verifier. Comparing the proof's JWK thumbprint to <code>cnf.jkt</code> without checking the proof's signature proves nothing, because the proof carries the very JWK being compared. So the proof goes to coaz-pep's <code>/v1/dpop/verify</code>.</li>
+    <li><b>COAZ tool calls.</b> Mappings are CEL-shaped and discovered from <code>tools/list</code>; one implementation of the profile for every gateway, so two renderings of one decision cannot drift. The plugin relays the engine's JSON-RPC error verbatim.</li>
+    <li><b>Federation.</b> Same reason as DPoP: no signature verification, no trust chain. Delegated <code>tools/call</code> checks already run the engine's discovery, federation included, and the plugin passes an explicit <code>resource</code> so both PEPs key off one identifier.</li>
+    <li><b>The federation face.</b> The plugin cannot sign, so it relays the two well-known documents from coaz-pep, which holds the key.</li>
+  </ul>
+  <p>The plugin is tested with busted against a mocked Kong (<code>gateways/kong/spec/</code>) and holds a coverage floor of 97%.</p>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong">gateways/kong/</a> on GitHub</span>
+</div></footer>
+</body>
+</html>

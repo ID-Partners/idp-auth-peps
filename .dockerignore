@@ -2,5 +2,6 @@
 **/node_modules
 sdk/
 gateways/
-docs/
+docs/*
+!docs/reference
 **/*.log

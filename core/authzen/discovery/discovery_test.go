@@ -430,6 +430,7 @@ type miniFed struct {
 	leafJWK        map[string]any
 	policy         map[string]any
 	leafPDPs       []any
+	leafLayers     []any
 	leafStatus     int
 	leafNoResource bool
 	breakLeafSig   bool
@@ -457,7 +458,11 @@ func newMiniFed(t *testing.T) *miniFed {
 		}
 		meta := map[string]any{}
 		if !f.leafNoResource {
-			meta["oauth_resource"] = map[string]any{ParamPolicyDecisionPoints: f.leafPDPs}
+			res := map[string]any{ParamPolicyDecisionPoints: f.leafPDPs}
+			if f.leafLayers != nil {
+				res[ParamPolicyLayers] = f.leafLayers
+			}
+			meta["oauth_resource"] = res
 		}
 		key := f.leafKey
 		if f.breakLeafSig {
@@ -820,6 +825,194 @@ func TestSourceErrorHandling(t *testing.T) {
 	t.Run("static source empty", func(t *testing.T) {
 		if _, err := (StaticSource{}).Lookup(ctx(), ""); !errors.Is(err, ErrNoMetadata) {
 			t.Fatal(err)
+		}
+	})
+}
+
+func idsOf(eps []PDPEndpoints) []string {
+	out := []string{}
+	for _, e := range eps {
+		out = append(out, e.Identifier)
+	}
+	return out
+}
+
+func TestResolveLayersPublished(t *testing.T) {
+	good := newPDP(t, fullConfig)
+	estate := newPDP(t, fullConfig)
+	second := newPDP(t, nil)
+	static := newPDP(t, nil)
+	res := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{estate.URL, second.URL + "/"}}
+	})
+	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL, APIKeys: map[string]string{estate.URL: "ek"}})
+
+	// Nothing configured: the document's layers run in front of the document's PDP,
+	// in the document's order, and are marked as published.
+	r, err := ResolveLayers(ctx(), c, res.URL, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, second.URL, good.URL}) {
+		t.Fatalf("order and identity: %v", idsOf(r.PDPs))
+	}
+	if r.PDPs[0].Source != SourcePublished || r.PDPs[0].APIKey != "ek" || r.PDPs[0].Evaluation != estate.URL+"/custom/eval" || r.PDPs[0].FailOpen {
+		t.Fatalf("published layer: %+v", r.PDPs[0])
+	}
+	if r.PDPs[2].Resource == nil || !reflect.DeepEqual(r.PDPs[2].Resource.Layers, []string{estate.URL, second.URL}) {
+		t.Fatalf("the resource's own PDP carries the document: %+v", r.PDPs[2].Resource)
+	}
+	if ResourceMetadataOf(r.PDPs) != r.PDPs[2].Resource {
+		t.Fatal("ResourceMetadataOf must find the document behind the published layers")
+	}
+	// The forwarded document still says what it said: the PDP can see the stack.
+	if got, _ := r.PDPs[2].Resource.Document[ParamPolicyLayers].([]any); len(got) != 2 {
+		t.Fatalf("document should carry the parameter verbatim: %v", got)
+	}
+
+	// Configured and published entries naming the same PDP are one call, wherever the
+	// configured one sits, and a configured entry's own failure mode is the operator's
+	// word about that PDP.
+	open := true
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: estate.URL, FailOpen: &open}, {Name: LayerResource}}, false)
+	if err != nil || !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, second.URL, good.URL}) || !r.PDPs[0].FailOpen || r.PDPs[1].FailOpen {
+		t.Fatalf("configured before published: %v %+v", err, r.PDPs)
+	}
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: LayerResource}, {Name: estate.URL, FailOpen: &open}}, false)
+	if err != nil || !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, second.URL, good.URL}) || !r.PDPs[0].FailOpen || r.PDPs[0].Source != SourcePublished {
+		t.Fatalf("published before configured: %v %+v", err, r.PDPs)
+	}
+	// A configured entry that set nothing takes the stricter of the two defaults.
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: estate.URL}, {Name: LayerResource, FailOpen: &open}}, false)
+	if err != nil || r.PDPs[0].FailOpen || !r.PDPs[2].FailOpen {
+		t.Fatalf("stricter default: %v %+v", err, r.PDPs)
+	}
+	// Published layers take the resource entry's mode: never one of their own.
+	r, err = ResolveLayers(ctx(), c, res.URL, []LayerSpec{{Name: LayerResource, FailOpen: &open}}, false)
+	if err != nil || !r.PDPs[0].FailOpen || !r.PDPs[1].FailOpen {
+		t.Fatalf("published layers inherit the resource entry's mode: %v %+v", err, r.PDPs)
+	}
+	// The resource's own PDP named as a published layer collapses too.
+	self := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{good.URL}}
+	})
+	if r, err := ResolveLayers(ctx(), c, self.URL, nil, false); err != nil || len(r.PDPs) != 1 || r.PDPs[0].Resource == nil {
+		t.Fatalf("%+v %v", r, err)
+	}
+	// The static layer and a static answer publish nothing.
+	if r, err := ResolveLayers(ctx(), c, res.URL, specs(LayerStatic), false); err != nil || len(r.PDPs) != 1 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if r, err := ResolveLayers(ctx(), Static(static.URL, ""), res.URL, nil, false); err != nil || len(r.PDPs) != 1 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	// Nothing published means what it always meant.
+	bare := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}}
+	})
+	if r, err := ResolveLayers(ctx(), c, bare.URL, nil, false); err != nil || len(r.PDPs) != 1 || r.PDPs[0].Resource.Layers != nil {
+		t.Fatalf("%+v %v", r, err)
+	}
+}
+
+func TestPublishedLayersFailureModes(t *testing.T) {
+	good := newPDP(t, fullConfig)
+	estate := newPDP(t, fullConfig)
+	static := newPDP(t, nil)
+	open := true
+
+	// A published layer off the PDP allowlist is a refusal: the request fails, whatever
+	// the mode says. A self-asserted document does not get to widen what this PEP will
+	// talk to.
+	res := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{estate.URL}}
+	})
+	strict := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL, PDPAllowed: func(u string) bool { return strings.HasPrefix(u, good.URL) || strings.HasPrefix(u, static.URL) }})
+	_, err := ResolveLayers(ctx(), strict, res.URL, []LayerSpec{{Name: LayerResource, FailOpen: &open}}, true)
+	if !errors.Is(err, ErrNotAllowed) || !strings.Contains(err.Error(), "published layer") {
+		t.Fatalf("%v", err)
+	}
+	if atomic.LoadInt32(&estate.hits) != 0 {
+		t.Fatal("a refused published layer must not be contacted")
+	}
+
+	// A published layer that cannot be resolved is an availability failure of the
+	// resource entry: closed by default, skipped and named when that entry is open.
+	res2 := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{"http://p.example/?x=1"}}
+	})
+	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL})
+	// ...except that an identifier with a query is rejected when the document is read,
+	// so the whole document is invalid and the operator's PDP is the fallback — the
+	// same path a malformed PDP list takes.
+	if r, err := ResolveLayers(ctx(), c, res2.URL, nil, false); err != nil || len(r.PDPs) != 1 || r.PDPs[0].Identifier != static.URL {
+		t.Fatalf("invalid document falls to static: %+v %v", r, err)
+	}
+	// A well-formed identifier nobody answers at is a PDP without metadata: AuthZEN's
+	// default paths, no failure at resolution. Resolution only fails when the fetch is
+	// refused or the identifier is unusable, and the refusal case is above.
+	res3 := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{"http://127.0.0.1:1"}}
+	})
+	if r, err := ResolveLayers(ctx(), c, res3.URL, nil, false); err != nil || len(r.PDPs) != 2 || r.PDPs[0].Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
+		t.Fatalf("%+v %v", r, err)
+	}
+
+	// Not an array: the document is unreadable, so it is not used.
+	res4 := newResource(t, func(self string) any {
+		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: "estate"}
+	})
+	if r, err := ResolveLayers(ctx(), c, res4.URL, nil, false); err != nil || len(r.PDPs) != 1 || r.PDPs[0].Identifier != static.URL {
+		t.Fatalf("non-array falls to static: %+v %v", r, err)
+	}
+}
+
+func TestFederationPublishedLayers(t *testing.T) {
+	good := newPDP(t, fullConfig)
+	estate := newPDP(t, fullConfig)
+	rogue := newPDP(t, fullConfig)
+	static := newPDP(t, nil)
+
+	t.Run("the anchor puts its PDP in front of every member", func(t *testing.T) {
+		f := newMiniFed(t)
+		f.leafPDPs = []any{good.URL}
+		// The member says nothing about layers; the federation adds one and makes it
+		// essential, so a member that somehow dropped it has an invalid document.
+		f.policy = map[string]any{"oauth_resource": map[string]any{ParamPolicyLayers: map[string]any{"add": []any{estate.URL}, "essential": true}}}
+		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
+		r, err := ResolveLayers(ctx(), c, f.leaf.URL, nil, false)
+		if err != nil || !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, good.URL}) {
+			t.Fatalf("%v %v", err, idsOf(r.PDPs))
+		}
+		if r.PDPs[0].Source != SourcePublished || r.PDPs[1].Resource == nil || r.PDPs[1].Resource.Source != "federation" {
+			t.Fatalf("%+v", r.PDPs)
+		}
+		// The forwarded, resolved document shows the PDP the stack it is part of.
+		if got, _ := r.PDPs[1].Resource.Document[ParamPolicyLayers].([]any); !reflect.DeepEqual(got, []any{estate.URL}) {
+			t.Fatalf("resolved document: %v", got)
+		}
+	})
+	t.Run("a member cannot smuggle a layer the policy does not allow", func(t *testing.T) {
+		f := newMiniFed(t)
+		f.leafPDPs = []any{good.URL}
+		f.leafLayers = []any{rogue.URL}
+		f.policy = map[string]any{"oauth_resource": map[string]any{ParamPolicyLayers: map[string]any{"add": []any{estate.URL}, "subset_of": []any{estate.URL}}}}
+		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
+		r, err := ResolveLayers(ctx(), c, f.leaf.URL, nil, false)
+		if err != nil || !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, good.URL}) {
+			t.Fatalf("%v %v", err, idsOf(r.PDPs))
+		}
+		if atomic.LoadInt32(&rogue.hits) != 0 {
+			t.Fatal("the rogue layer must never be contacted")
+		}
+	})
+	t.Run("a member's own layers survive when the policy is silent", func(t *testing.T) {
+		f := newMiniFed(t)
+		f.leafPDPs = []any{good.URL}
+		f.leafLayers = []any{estate.URL}
+		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
+		if r, err := ResolveLayers(ctx(), c, f.leaf.URL, nil, false); err != nil || !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, good.URL}) {
+			t.Fatalf("%v %v", err, idsOf(r.PDPs))
 		}
 	})
 }

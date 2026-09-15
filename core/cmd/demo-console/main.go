@@ -10,6 +10,7 @@
 // Environment:
 //
 //	LISTEN         address to serve on (default :8088)
+//	DOCS_DIR       serve the reference site from this directory at /docs/ (optional)
 //	STUBS_BASE     how this process and the PEPs reach the stubs (default http://localhost)
 //	STUBS_CONTROL  the stubs' event feed and control surface (default {STUBS_BASE}:9099)
 //	PEP_STATIC     HTTP check API of the no-discovery PEP     (default {…}:9192)
@@ -103,9 +104,9 @@ func main() {
 		},
 		resources: []resource{
 			{Key: "plain", Name: "plain (Bank A)", ID: base + ":9004", Blurb: "Not federated. Its own metadata names Bank A's PDP, which steps up payments over 1000."},
-			{Key: "bank-b", Name: "bank-b", ID: base + ":9009", Blurb: "Not federated. Its own metadata names Bank B's PDP — same product, stricter threshold: step-up over 100."},
+			{Key: "bank-b", Name: "bank-b", ID: base + ":9009", Blurb: "Not federated. Its own metadata names Bank B's PDP — same product, stricter threshold: step-up over 100 — and publishes the estate PDP as a layer in front of it, so the estate is asked first with nothing set on the route."},
 			{Key: "impostor", Name: "impostor", ID: base + ":9005", Blurb: "Not federated. Its own metadata names the ROGUE PDP."},
-			{Key: "member", Name: "member", ID: base + ":9001", Blurb: "Federated. Its own metadata names the rogue PDP first; the anchor's policy allows only Bank A's."},
+			{Key: "member", Name: "member", ID: base + ":9001", Blurb: "Federated. Its own metadata names the rogue PDP first and no layers; the anchor's policy allows only Bank A's, and puts the estate PDP in front of it."},
 			{Key: "broken", Name: "broken", ID: base + ":9006", Blurb: "Federated, but signed with a key the anchor never vouched for."},
 			{Key: "stray", Name: "stray", ID: base + ":9007", Blurb: "No metadata of any kind."},
 			{Key: "none", Name: "(no resource)", ID: "", Blurb: "The route names no resource, so every PEP uses the PDP it was configured with."},
@@ -157,6 +158,11 @@ func main() {
 			},
 		})
 	})
+	// The reference site, when the image carries it (DOCS_DIR): the same pages as
+	// docs/reference in the repository, served beside the console.
+	if dir := env("DOCS_DIR", ""); dir != "" {
+		mux.Handle("/docs/", http.StripPrefix("/docs/", http.FileServer(http.Dir(dir))))
+	}
 	mux.HandleFunc("/api/run", s.handleRun)
 	mux.HandleFunc("/api/fetch", s.handleFetch)
 	mux.HandleFunc("/api/control", s.handleControl)

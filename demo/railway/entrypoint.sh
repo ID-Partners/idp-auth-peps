@@ -52,7 +52,7 @@ for p in 9192 9193 9194; do ready "$p"; done
 
 LISTEN=":$port" STUBS_BASE="http://$host" STUBS_CONTROL="http://$host:9099" \
   PEP_STATIC=http://127.0.0.1:9192 PEP_RESOURCE=http://127.0.0.1:9193 PEP_FEDERATION=http://127.0.0.1:9194 \
-  GATEWAY_ENTITY="http://$host:9194" \
+  GATEWAY_ENTITY="http://$host:9194" DOCS_DIR=/srv/docs \
   demo-console &
 pids="$pids $!"
 echo "demo: console on :$port (stubs at http://$host, PEPs on 9192-9194)"

@@ -378,7 +378,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
     <ul class="rules">
       <li><b>A PDP moves and no gateway is touched.</b> Its metadata advertises the new base; every gateway that read it follows on its next refresh. The one told a URL by hand keeps posting to the old address.</li>
       <li><b>Many APIs, many PDPs, one gateway.</b> Two business units answer to two PDPs with different rules through the same enforcement point, because each API says whose policy applies.</li>
-      <li><b>A common PDP in front, the API's PDP after.</b> A route names an ordered list of layers. An estate-wide PDP that judges the token and the client goes first; every layer must permit; the first that does not is the answer. A layer may be marked fail-open, for the advisory PDP that is not worth an outage, and a permit that skipped one says so in a header.</li>
+      <li><b>A common PDP in front, the API's PDP after.</b> A route names an ordered list of layers, or the API's own document publishes it in <code>authzen_policy_layers</code>, and a federation can add its PDP to every member's. An estate-wide PDP that judges the token and the client goes first; every layer must permit; the first that does not is the answer. A layer may be marked fail-open, for the advisory PDP that is not worth an outage, and a permit that skipped one says so in a header.</li>
       <li><b>Capabilities, not guesses.</b> A batch is only sent to a PDP that advertises a batch endpoint; against one that does not, the gateway refuses rather than invent a path.</li>
     </ul>
   </div>
@@ -432,7 +432,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
 <footer>
   <div class="wrap">
     <span>ID Partners · Australian digital identity consultancy</span>
-    <span><a href="https://github.com/ID-Partners/idp-auth-peps">ID-Partners/idp-auth-peps</a> on GitHub</span>
+    <span><a href="https://github.com/ID-Partners/idp-auth-peps">ID-Partners/idp-auth-peps</a> on GitHub · <a href="reference/index.html">the configuration reference</a></span>
   </div>
 </footer>
 

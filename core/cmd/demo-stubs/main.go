@@ -10,7 +10,8 @@
 // Nothing here is production code: keys are generated at startup, everything is plain
 // http, and the "policy" is a handful of ifs.
 //
-//	:9000  anchor      Trust Anchor: entity configuration + fetch endpoint
+//	:9000  anchor      Trust Anchor: entity configuration + fetch endpoint. Its policy
+//	                   also puts the estate PDP in front of every member's own
 //	:9001  member      federated resource; its OWN metadata names the rogue PDP first,
 //	                   the anchor's policy allows only Bank A's PDP
 //	:9002  pdp-a       Bank A's PDP, at /tenants/bank-a. Denies mallory; steps up over 1000
@@ -20,7 +21,8 @@
 //	:9006  broken      federated, but signs with a key the anchor never vouched for
 //	:9007  stray       no metadata of any kind
 //	:9008  pdp-b       Bank B's PDP, at /tenants/bank-b. Same denials, steps up over 100
-//	:9009  bank-b      not federated; RFC 9728 metadata names Bank B's PDP
+//	:9009  bank-b      not federated; RFC 9728 metadata names Bank B's PDP, and
+//	                   PUBLISHES the estate PDP as a layer in front of it
 //	:9098  pdp-estate  a generic PDP for the whole estate: judges the token and the
 //	                   client, knows nothing about any resource. The first layer.
 //	:9099  control     the event feed the console traces, and the levers it pulls
@@ -42,6 +44,13 @@
 // input, and policy is the PDP's, where it can be weighed against things a gateway
 // never sees. In federation mode the document is the RESOLVED one, so the anchor can
 // raise a member's floor and the member cannot lower it.
+//
+// A resource can publish the STACK as well as the PDP: authzen_policy_layers is the
+// ordered list of PDPs to ask in front of its own. bank-b publishes the estate PDP
+// there itself, so a PEP with nothing configured asks the estate first. The anchor's
+// policy `add`s the estate PDP to every member's layers, so in federation mode the
+// member is gated whatever its own document says — the same lever that raises the
+// acr floor, pointed at who decides.
 //
 // Every endpoint here is AuthZEN's own: `/access/v1/evaluation` and
 // `/access/v1/evaluations`. Nothing invents a path. What differs between PDPs is the
@@ -84,7 +93,10 @@ import (
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
-const param = "authzen_policy_decision_points"
+const (
+	param       = "authzen_policy_decision_points"
+	paramLayers = "authzen_policy_layers"
+)
 
 // The endpoint names AuthZEN 1.0 defines. A PDP that publishes no metadata is assumed
 // to serve them directly under its identifier; a PDP that publishes metadata says where
@@ -169,6 +181,9 @@ type state struct {
 	pdpEval map[string]string
 	// resourcePDPs maps a resource's name to the PDP identifiers its metadata names.
 	resourcePDPs map[string][]string
+	// resourceLayers maps a resource's name to the PDPs its OWN metadata asks to run
+	// in front of those, in order (authzen_policy_layers). Most publish none.
+	resourceLayers map[string][]string
 	// requires maps a resource's name to what its OWN metadata says it requires.
 	requires map[string]requirements
 	// home is each PDP's identifier path — where its endpoints sit unless moved. The
@@ -227,6 +242,12 @@ func (s *state) pdps(resource string) []string {
 	return out
 }
 
+func (s *state) layers(resource string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.resourceLayers[resource]...)
+}
+
 func (s *state) snapshot() map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -237,6 +258,10 @@ func (s *state) snapshot() map[string]any {
 	res := map[string][]string{}
 	for k, v := range s.resourcePDPs {
 		res[k] = append([]string{}, v...)
+	}
+	layers := map[string][]string{}
+	for k, v := range s.resourceLayers {
+		layers[k] = append([]string{}, v...)
 	}
 	down := []string{}
 	for k, v := range s.down {
@@ -249,7 +274,7 @@ func (s *state) snapshot() map[string]any {
 		onboarded = append(onboarded, k)
 	}
 	sort.Strings(onboarded)
-	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res, "pdp_down": down, "onboarded": onboarded}
+	return map[string]any{"pdp_evaluation_path": eval, "pdp_home": s.home, "resource_pdps": res, "resource_layers": layers, "pdp_down": down, "onboarded": onboarded}
 }
 
 func main() {
@@ -286,6 +311,9 @@ func main() {
 		// policy strips the rogue AND raises the acr floor to MFA — so the same PDP
 		// gives different answers depending on which document the PEP forwarded.
 		resourcePDPs: map[string][]string{plain.name: {pdpA.id}, impostor.name: {rogue.id}, bankB.name: {pdpB.id}, member.name: {pdpA.id}, broken.name: {rogue.id}},
+		// Bank B publishes the stack itself: the estate PDP in front of its own. A PEP
+		// with nothing configured asks the estate first because the document said so.
+		resourceLayers: map[string][]string{bankB.name: {estate.id}},
 		// acr_values_required lists every acr the resource ACCEPTS — "one of these" —
 		// so a resource content with a password lists MFA as well, and only the strict
 		// ones list MFA alone. The demo PDPs check membership, nothing cleverer.
@@ -337,11 +365,15 @@ func main() {
 			}))
 		})
 		// The federation's constraints on every member: only Bank A's PDP may decide,
-		// and nothing less than MFA is acceptable — whatever the member says about
-		// itself. `value` overrides; the member's own acr_values_required is discarded.
+		// nothing less than MFA is acceptable, and the estate PDP is asked first —
+		// whatever the member says about itself. `value` overrides; the member's own
+		// acr_values_required is discarded. `add` puts the estate PDP into the member's
+		// layers whether or not the member published any, and `essential` makes a
+		// document without it invalid.
 		policy := map[string]any{"oauth_resource": map[string]any{
 			param:                 map[string]any{"subset_of": []any{pdpA.id}, "essential": true},
 			"acr_values_required": map[string]any{"value": []any{acrMFA}, "essential": true},
+			paramLayers:           map[string]any{"add": []any{estate.id}, "essential": true},
 		}}
 		// What the controller says about an onboarded resource — its PDP, its scopes,
 		// its acr — maintained here, never on the PEP that fronts it (§6.1.4.2: a
@@ -387,6 +419,9 @@ func main() {
 	document := func(e *entity, pdps []string) map[string]any {
 		req := st.requirementsOf(e.name)
 		doc := map[string]any{"resource": e.id, param: pdps, "bearer_methods_supported": []string{"header"}}
+		if layers := st.layers(e.name); len(layers) > 0 {
+			doc[paramLayers] = layers // the PDPs to ask in front of the ones above, in order
+		}
 		if req.Scopes != nil {
 			doc["scopes_supported"] = req.Scopes // RFC 9728 §2
 		}

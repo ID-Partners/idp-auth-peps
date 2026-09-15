@@ -166,7 +166,7 @@ const CLIENTS = [
   { key: 'agent-risky', name: 'agent-risky', blurb: "On the estate PDP's watch list. With the estate layer in front, nothing further is asked." },
 ];
 const layerChoices = (estate) => [
-  { key: 'resource', name: "the API's PDP alone", blurb: 'One PDP, found by discovery.' },
+  { key: 'resource', name: "whatever the API's document says", blurb: "The API's PDP, found by discovery, behind any layers its document publishes in authzen_policy_layers. bank-b publishes the estate PDP there itself; the anchor adds it to member's resolved document. Nothing is configured on the route." },
   { key: `${estate},resource`, name: "the estate PDP first, then the API's", blurb: 'A generic PDP that judges the token and the client, in front of the one that knows the API. Every layer must permit; the first that does not is the answer. Both layers are handed the same document.' },
   { key: `${estate} fail-open,resource`, name: 'the same, estate layer fail-open', blurb: 'Identical, except the estate layer may be skipped when it cannot be reached. Take it down with the lever and compare: fail-closed is a 503, fail-open is a permit that names what it skipped.' },
 ];
