@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Kong sideband plugin reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <div class="brand"><a class="idp" href="https://idpartners.com.au">ID<span>Partners</span></a><span class="site">idp-auth-peps · reference</span></div>
+  <nav class="pages" aria-label="Components">
+    <a href="index.html">Overview</a><a href="coaz-pep.html">coaz-pep</a><a href="envoy.html">Envoy · Istio · agentgateway</a><a href="kong.html">Kong</a><a href="kong-sideband.html" aria-current="page">Kong · sideband</a><a href="pingaccess.html">PingAccess</a><a href="node.html">Node SDK</a><a href="demo.html">Demo</a>
+  </nav>
+</div></header>
+
+<div class="wrap layout">
+<aside class="toc">
+  <p class="t">On this page</p>
+  <ol>
+    <li><a href="#install">Install</a></li>
+    <li><a href="#screen">The plugin in Kong Manager</a></li>
+    <li><a href="#fields">Every field</a>
+      <ol>
+        <li><a href="#f-pdp">PingAuthorize and its secret</a></li>
+        <li><a href="#f-route">The route</a></li>
+        <li><a href="#f-discovery">PDP discovery</a></li>
+        <li><a href="#f-switch">The federation switch</a></li>
+        <li><a href="#f-layers">Layers and their rules</a></li>
+        <li><a href="#f-credentials">Credentials</a></li>
+        <li><a href="#f-compat">Transport and compatibility</a></li>
+      </ol></li>
+    <li><a href="#samples">Complete configurations</a></li>
+    <li><a href="#wire">What it puts on the wire</a></li>
+    <li><a href="#notdone">What it does not do</a></li>
+  </ol>
+</aside>
+<main>
+  <span class="eyebrow">gateways/kong/sideband-pdp · Lua</span>
+  <h1>The Kong sideband plugin</h1>
+  <p class="lede"><code>sideband-pdp</code> is a Kong plugin that enforces through PingAuthorize's Sideband API — the whole HTTP request to <code>/sideband/request</code> in the access phase, the upstream's response to <code>/sideband/response</code> in the response phase — and finds the PDPs it calls from the resource it protects: the resource's RFC 9728 metadata, or, with the switch, a federation resolve endpoint. It is the <a href="kong.html">Kong plugin</a>'s discovery, layers and failure rules from the module the two share, in front of a PDP protocol where the policy owns the request mapping and the shape of a deny. Every knob is plugin configuration on a route or service.</p>
+
+  <h2 id="install">Install</h2>
+  <p>DB-less: mount <em>both</em> plugin directories and enable this one. The discovery module is <code>authzen-pdp</code>'s, required by name (<code>kong.plugins.authzen-pdp.discovery</code>), so that directory must be on the package path whether or not <code>authzen-pdp</code> is enabled. The rockspec lists the shared module.</p>
+  <pre><code><span class="c"># kong.conf, or environment</span>
+KONG_PLUGINS=bundled,sideband-pdp
+KONG_LUA_PACKAGE_PATH=/opt/?.lua;;</code></pre>
+  <pre><code><span class="c"># compose</span>
+kong:
+  image: kong:3.9
+  environment:
+    KONG_DATABASE: "off"
+    KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+    KONG_PLUGINS: bundled,sideband-pdp
+    KONG_LUA_PACKAGE_PATH: /opt/?.lua;;
+    KONG_PROXY_LISTEN: 0.0.0.0:8000
+    KONG_ADMIN_LISTEN: "off"
+  volumes:
+    - ./kong/kong.yml:/kong/kong.yml:ro
+    - ../gateways/kong/authzen-pdp:/opt/kong/plugins/authzen-pdp:ro      <span class="c"># for discovery.lua</span>
+    - ../gateways/kong/sideband-pdp:/opt/kong/plugins/sideband-pdp:ro
+  ports:
+    - "8000:8000"</code></pre>
+
+  <h2 id="screen">The plugin in Kong Manager</h2>
+  <p>Kong Manager draws the form from <code>schema.lua</code> exactly as it does for <code>authzen-pdp</code> — every field below, defaults pre-filled, the required ones marked: <code>service_url</code>, <code>shared_secret</code> and <code>secret_header_name</code>. The <a href="kong.html#screen">Kong page</a> shows what that looks like; this plugin has not been captured separately.</p>
+
+  <h2 id="fields">Every field</h2>
+  <p>Grouped as they are used, not as the schema lists them. Types are the schema's; <span class="req">ref</span> marks a field that accepts a Kong vault reference such as <code>{vault://env/paz-secret}</code> instead of a literal. The first group is Ping's <code>ping-auth</code> plugin's configuration, names and defaults unchanged, so a route configured for that plugin ports over by changing the plugin name.</p>
+
+  <h3 id="f-pdp">PingAuthorize and its secret</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>service_url</code> <span class="req">required · ref</span></td><td class="d">string</td><td>PingAuthorize's base URL, without <code>/sideband…</code> in the path: <code>/sideband/request</code> and <code>/sideband/response</code> are appended. The static PDP. With discovery on, the fallback every mode ends at, and the one PDP that is called with <code>shared_secret</code>. Its origin is always permitted, even over http.</td></tr>
+      <tr><td><code>shared_secret</code> <span class="req">required · ref</span></td><td class="d">string</td><td>The Sideband API shared secret PingAuthorize expects from this PEP. Sent to <code>service_url</code> only; a discovered PDP is called with what <code>pdp_credentials</code> names for it, or with nothing.</td></tr>
+      <tr><td><code>secret_header_name</code> <span class="req">required</span></td><td class="d">string</td><td>The header the secret travels in, as configured on the PingAuthorize Sideband API shared secret (commonly <code>CLIENT-TOKEN</code>). Also the default header for <code>pdp_credentials</code> entries.</td></tr>
+      <tr><td><code>connection_timeout_ms</code></td><td class="d">integer · 10000</td><td>Timeout on each sideband call.</td></tr>
+      <tr><td><code>connection_keepAlive_ms</code></td><td class="d">integer · 60000</td><td>Keep-alive on the connection pool to each PDP.</td></tr>
+      <tr><td><code>verify_service_certificate</code></td><td class="d">boolean · true</td><td>TLS verification on every sideband and metadata call. A PEP that accepts any certificate has no integrity on the decision it enforces; set false only against self-signed certificates in development.</td></tr>
+      <tr><td><code>enable_debug_logging</code></td><td class="d">boolean · false</td><td>Log each sideband call and its outcome at debug level.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-route">The route</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pep_label</code></td><td class="d">string · kong-sideband-pep</td><td>Names this PEP in its own denials and the <code>X-PDP-PEP</code> response header.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">string</td><td>The protected resource's identifier (RFC 8707), the key discovery starts from. A route without one uses <code>service_url</code>.</td></tr>
+      <tr><td><code>forward_client_certificate</code></td><td class="d">boolean · true</td><td>Send the client's TLS certificate as <code>client_certificate</code>: its public key as a JWK, the certificate in <code>x5c</code> — what PingAuthorize policy reads for a certificate-bound client. A certificate that cannot be parsed is a 400, as in <code>ping-auth</code>.</td></tr>
+      <tr><td><code>filter_response</code></td><td class="d">boolean · true</td><td>Make the <code>/sideband/response</code> calls, so policy can filter and rewrite the upstream's response. Off, the response phase does nothing. Kong buffers the whole upstream response on any route this plugin is on, on or off — see <a href="#f-compat">compatibility</a>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-discovery">PDP discovery</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_discovery</code></td><td class="d">off | resource | federation · off</td><td><code>off</code>: <code>service_url</code>, no fetch. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code> (the PDP that decides for it; the first this route may call wins) and <code>authzen_policy_layers</code> (the PDPs to ask in front of it), falling back to <code>service_url</code>. <code>federation</code>: read the same two parameters from the resource's <em>resolved</em> <code>oauth_resource</code> metadata, from a federation resolve endpoint, and never from the resource's own document. No PDP metadata is probed in any mode: a sideband endpoint has none, and an identifier is the base its endpoints hang off.</td></tr>
+      <tr><td><code>pdp_metadata_ttl</code></td><td class="d">number · 300</td><td>Cache TTL, seconds, for resource and resolved metadata; stale is served while a refresh fails. Must be greater than zero.</td></tr>
+      <tr><td><code>pdp_allowlist</code></td><td class="d">array of string</td><td>Prefixes a discovered or configured PDP must match; <code>service_url</code> is always permitted. Empty means any https PDP a resource, or the federation, names. A published layer passes this too.</td></tr>
+      <tr><td><code>resource_metadata_allowlist</code></td><td class="d">array of string</td><td>Prefixes a route's <code>resource</code> must match before its metadata is looked up, in either mode. Empty means any.</td></tr>
+      <tr><td><code>pdp_discovery_insecure</code></td><td class="d">boolean · false</td><td>Allow http for discovered URLs and the resolve endpoint. Dev only; <code>service_url</code>'s own origin is always trusted over http.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-switch">The federation switch</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>federation_resolve_url</code></td><td class="d">string</td><td>A federation resolve endpoint (OpenID Federation 1.0 §8.3), usually the trust anchor's. Required in <code>federation</code> mode. Called as <code>GET {url}?sub={resource}&amp;anchor={federation_trust_anchor}</code> with <code>Accept: application/resolve-response+jwt</code>. Configuration, not something discovered, so no allowlist bounds it; the URL policy still does.</td></tr>
+      <tr><td><code>federation_trust_anchor</code></td><td class="d">string</td><td>The trust anchor's entity identifier the resolver resolves under. Required in <code>federation</code> mode.</td></tr>
+    </tbody>
+  </table></div>
+  <p>What the switch is, and is not: <b>the resolver's word, taken on transport.</b> The resolve response is a JWT this plugin cannot verify — no JOSE verifier is available to a Kong plugin, the reason <code>authzen-pdp</code> delegates DPoP and COAZ to coaz-pep — so it is decoded, not verified. The plugin checks what it can: the response's <code>typ</code> is <code>resolve-response+jwt</code>, its <code>sub</code> is the resource asked about, it has not expired, and what it lists are PDP identifiers. The trust is TLS to a URL the operator configured, exactly the trust placed in <code>service_url</code>. That is a weaker claim than <a href="coaz-pep.html">coaz-pep</a>'s federation mode, which walks the chain and verifies every signature to an anchor key it holds; a route that needs that belongs behind coaz-pep.</p>
+  <div class="wide"><table>
+    <thead><tr><th>The resolver answers</th><th>Discovery does</th></tr></thead>
+    <tbody>
+      <tr><td><code>not_found</code>, or a 404</td><td>No metadata: <code>service_url</code> decides, as for a resource outside the federation.</td></tr>
+      <tr><td><code>invalid_trust_chain</code>, <code>invalid_metadata</code>, <code>invalid_subject</code>, <code>invalid_trust_anchor</code>, <code>invalid_request</code>, <code>unsupported_parameter</code>, any other 4xx</td><td>A refusal: the request fails with a 503 whatever the failure rule says. A resource that claims membership and fails validation is a signal, not an outage; a misconfigured resolver is not a reason to take the resource's own word instead.</td></tr>
+      <tr><td><code>server_error</code>, <code>temporarily_unavailable</code>, a 5xx, unreachable</td><td>Transient: the cached answer while there is one, then <code>service_url</code>.</td></tr>
+      <tr><td>a response that is not a JWS, has the wrong <code>typ</code>, has expired, or lists something that is not a PDP identifier</td><td>An invalid document: logged, not used; <code>service_url</code> decides.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-layers">Layers and their rules</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_layers</code></td><td class="d">array of string · ["resource"]</td><td>The ordered PDPs to ask, every one of which must permit; the first that does not is the answer. Each entry is <code>&lt;static | resource | PDP identifier&gt; [fail-open | fail-closed] [request-only]</code>. <code>static</code> is <code>service_url</code> regardless of discovery; <code>resource</code> is what discovery finds, behind whatever the document publishes in <code>authzen_policy_layers</code>; an identifier is a PDP. A published layer takes the <code>resource</code> entry's rule and passes <code>pdp_allowlist</code>; a configured entry naming the same PDP is one call, and its own rule wins. <code>request-only</code> skips the layer's <code>/sideband/response</code> call. An entry the plugin cannot read fails the route closed.</td></tr>
+      <tr><td><code>fail_mode</code></td><td class="d">closed | open · closed</td><td>What a layer does when its PDP cannot be reached — unreachable, erroring, rate-limiting, answering nonsense, refusing the call for want of a credential — unless the entry says for itself. <code>closed</code> denies with a 503 (a 429 with <code>Retry-After</code> when that is what the PDP said; that PDP is then not asked again until it has passed). <code>open</code> skips the layer; if every layer was skipped the request is permitted, and any permit that skipped one carries <code>X-PDP-Fail-Open</code>. A deny is a decision, never skipped; a refusal — the allowlist, an invalid chain — never opens.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-credentials">Credentials</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>pdp_credentials</code></td><td class="d">array of record</td><td>What a discovered or configured PDP is called with, by identifier: <code>pdp</code> (required), <code>shared_secret</code> (required · <span class="req">ref</span>), <code>secret_header_name</code> (defaults to the top-level one). <code>shared_secret</code> is bound to <code>service_url</code> and goes nowhere else. A PDP with no entry is called with nothing; PingAuthorize then answers 401, which is a failure under that layer's rule — closed by default, so a resource that names a PDP this gateway holds no secret for is a resource this gateway cannot serve, and says so.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 id="f-compat">Transport and compatibility</h3>
+  <div class="wide"><table>
+    <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>protocols</code></td><td class="d">http, https, grpc, grpcs</td><td>Kong's own field: which protocols the plugin runs on.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Two cross-field checks run at configuration time: <code>pdp_discovery: federation</code> without <code>federation_resolve_url</code> or without <code>federation_trust_anchor</code> is refused, each with a message saying which. <code>service_url</code> must be an http or https URL with a host.</p>
+  <p><b>REST routes only.</b> A plugin with a response phase makes Kong buffer the whole upstream response on every route it is on, <code>filter_response</code> on or off. That is incompatible with SSE, so an MCP route belongs behind <a href="kong.html">authzen-pdp</a> and coaz-pep. Kong also refuses to load a plugin that has both a response phase and a header filter, which is why the <code>X-PDP-*</code> headers ride on the plugin's exits rather than being set in a later phase. <code>Accept-Encoding</code> is dropped from the proxied request so the body the response phase reads is one the policy provider can read.</p>
+
+  <h2 id="samples">Complete configurations</h2>
+  <h3>A REST API with discovery, a published layer and per-PDP credentials</h3>
+  <pre><code>_format_version: "3.0"
+services:
+  - name: bank-api
+    url: http://bank-api:8070
+    routes:
+      - name: bank
+        paths: ["/bank"]
+        strip_path: true
+    plugins:
+      - name: sideband-pdp
+        config:
+          service_url:        "{vault://env/paz-url}"          <span class="c"># the fallback; the one PDP called with shared_secret</span>
+          shared_secret:      "{vault://env/paz-secret}"
+          secret_header_name: CLIENT-TOKEN
+          pep_label: "PEP#2 (Bank API edge)"
+          pdp_discovery: resource
+          resource: https://api.bank.example
+          pdp_allowlist: ["https://pdp.bank.example", "https://pdp.estate.example"]
+          resource_metadata_allowlist: ["https://api.bank.example"]
+          pdp_credentials:
+            - pdp: https://pdp.bank.example/tenants/bank
+              shared_secret: "{vault://env/bank-pdp-secret}"
+            - pdp: https://pdp.estate.example
+              shared_secret: "{vault://env/estate-pdp-secret}"
+              secret_header_name: X-Estate-Token
+          pdp_layers: ["resource"]                              <span class="c"># what the document publishes, then its own PDP</span>
+          fail_mode: closed</code></pre>
+
+  <h3>A route that takes the federation's word</h3>
+  <pre><code>      - name: sideband-pdp
+        config:
+          service_url:        "{vault://env/paz-url}"
+          shared_secret:      "{vault://env/paz-secret}"
+          secret_header_name: CLIENT-TOKEN
+          pdp_discovery: federation
+          resource: https://member.bank-federation.example
+          federation_resolve_url: https://anchor.bank-federation.example/resolve
+          federation_trust_anchor: https://anchor.bank-federation.example
+          pdp_allowlist: ["https://pdp.bank-a.example", "https://pdp.estate.example"]
+          pdp_credentials:
+            - pdp: https://pdp.estate.example
+              shared_secret: "{vault://env/estate-pdp-secret}"</code></pre>
+
+  <h3>An estate gate the route can live without</h3>
+  <pre><code>          pdp_layers: ["static fail-open request-only", "resource"]   <span class="c"># service_url first, as a gate; then the resource's stack</span>
+          fail_mode: closed</code></pre>
+
+  <h2 id="wire">What it puts on the wire</h2>
+  <div class="wide"><table>
+    <thead><tr><th>Where</th><th>What</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>to each PDP, access phase</td><td><code>POST {pdp}/sideband/request</code></td><td>The whole request: <code>source_ip</code>, <code>source_port</code>, <code>method</code>, <code>url</code>, <code>http_version</code>, <code>headers</code> (one pair per value), <code>body</code>, <code>client_certificate</code>; the PDP's secret in its header. Each layer sees the request as the previous one rewrote it. Back comes the request to forward, with a <code>state</code>, or under <code>response</code> the HTTP to send instead.</td></tr>
+      <tr><td>proxied request, on permit</td><td>the rewrites</td><td>Headers added, changed and removed; a new method, path, query or body — as the last layer left them. <code>Accept-Encoding</code> dropped.</td></tr>
+      <tr><td>to each permitting PDP, response phase</td><td><code>POST {pdp}/sideband/response</code></td><td>The upstream's <code>response_code</code>, <code>response_status</code>, <code>headers</code> and <code>body</code>, with that layer's <code>state</code> (or the request it saw, when it returned none), in reverse order, skipping <code>request-only</code> layers. Back comes the response to send; a header the policy provider left out is removed.</td></tr>
+      <tr><td>response</td><td><code>X-PDP-PEP</code>, <code>X-PDP-Decision</code>, <code>X-PDP-Layers</code>, <code>X-PDP-Layer</code>, <code>X-PDP-Source</code>, <code>X-PDP-Fail-Open</code></td><td>Which PEP; PERMIT or DENY; the PDPs that permitted, in order; on a deny, whose answer it was; where the resource's PDP came from (<code>static</code>, <code>rfc9728</code>, <code>federation</code>); the layers skipped and why.</td></tr>
+      <tr><td>response, on a policy deny</td><td>the policy's HTTP</td><td>Status, headers and body exactly as PingAuthorize returned them — the <code>WWW-Authenticate</code> a stepped-up agent needs is the policy's to write. A 413 from the sideband API is relayed the same way.</td></tr>
+      <tr><td>response, on the plugin's own deny</td><td>503, or 429 with <code>Retry-After</code>, or 400</td><td>A PDP that could not be resolved or reached under a closed rule; a PDP rate-limiting this gateway; a client certificate that could not be parsed. Body <code>{"error":"authorization_failed","pep":…,"reason":…}</code>, the shape every PEP here uses.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="notdone">What it does not do</h2>
+  <ul>
+    <li><b>Shape a challenge.</b> A deny is the policy's HTTP. If the policy answers a flat 403, the client gets a flat 403. The <a href="kong.html#wire">challenge vocabulary</a> the other PEPs render in code is, on this route, a contract the policy honours.</li>
+    <li><b>Verify a token, a DPoP proof, or a chain.</b> No JOSE. The token reaches PingAuthorize in the <code>authorization</code> header, where policy can validate it; DPoP and COAZ are what <code>authzen-pdp</code> delegates to coaz-pep, and an MCP route belongs there.</li>
+    <li><b>Read <code>signed_metadata</code></b> in an RFC 9728 document; coaz-pep does.</li>
+    <li><b>Serve the resource's federation face.</b> <code>authzen-pdp</code>'s <code>federation_entity_url</code> relays the two well-known documents from coaz-pep; put that plugin on the route for them.</li>
+  </ul>
+  <p>The plugin is tested with busted against a mocked Kong (<code>gateways/kong/spec/sideband-pdp_spec.lua</code>, with the discovery rules in <code>discovery_spec.lua</code>) under the same coverage floor as <code>authzen-pdp</code>, and was run through Kong DB-less with both plugin directories mounted, against a stub that answers the well-known document and the sideband endpoints.</p>
+</main>
+</div>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy</span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong/sideband-pdp">gateways/kong/sideband-pdp/</a> on GitHub</span>
+</div></footer>
+</body>
+</html>

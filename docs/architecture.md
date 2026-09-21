@@ -39,7 +39,7 @@ deny, whichever one said no.
 | Component | Where | What it does |
 | --- | --- | --- |
 | [`core/`](../core) | Go module | `coaz-pep`, the shared engine. Two front doors: Envoy `ext_authz` gRPC on :9191 and an HTTP check API on :9192. Everything with a spec behind it lives here once. |
-| [`gateways/kong/`](../gateways/kong) | Lua plugin | A Kong PEP. Native Lua for claims, REST mapping, challenges and PDP discovery; delegates DPoP verification and COAZ tool-call checks to `coaz-pep`, because a Kong plugin has no JOSE verifier and no CEL. |
+| [`gateways/kong/`](../gateways/kong) | Lua plugin | A Kong PEP. Native Lua for claims, REST mapping, challenges and PDP discovery; delegates DPoP verification and COAZ tool-call checks to `coaz-pep`, because a Kong plugin has no JOSE verifier and no CEL. Beside it, `sideband-pdp` puts the same discovery in front of PingAuthorize's Sideband API, where the policy owns the request mapping and the deny. |
 | [`gateways/envoy/`](../gateways/envoy) | YAML | How agentgateway, Istio and plain Envoy attach to `coaz-pep`. No code: the gateway only points at the engine. |
 | [`gateways/pingaccess/`](../gateways/pingaccess) | Java rule | A PingAccess PEP, as an Add-on SDK rule; explained in [pingaccess.md](pingaccess.md). The Kong plugin's split, in Java: claims, REST mapping, challenges and PDP discovery natively; DPoP and COAZ delegated to `coaz-pep`. Reads the identity PingAccess validated, and verifies `X-User-Token` itself. |
 | [`sdk/node/`](../sdk/node) | TypeScript | `@id-partners/authzen-pep`: an AuthZEN client, Express middleware, and an MCP guard for a process that is its own PEP. Evaluates a CEL subset itself; can delegate to `coaz-pep` for the rest. |
@@ -313,10 +313,10 @@ decides first.
 The forwarded `resource_metadata` carries the parameter verbatim, like everything else
 in the document, so every PDP in the stack can see the stack it is part of.
 
-Published layers are read by `coaz-pep` today. The Kong plugin, the PingAccess rule and
-the Node SDK still take their layers from configuration only; they read the same
-document and forward it unchanged, so a PDP behind them sees the parameter, but nothing
-acts on it there yet.
+Published layers are read by `coaz-pep` and by both Kong plugins. The PingAccess rule and
+the Node SDK still take their layers from configuration only; they read the same document
+and forward it unchanged, so a PDP behind them sees the parameter, but nothing acts on it
+there yet.
 
 ### Failing open, deliberately
 
@@ -411,9 +411,13 @@ in front when the public document must be the controller's word.
 - Allowlists are re-applied on every call, not only when a document is fetched, because a
   cache is shared and a policy is per route.
 
-Federation resolution lives only in Go. The Kong plugin, the PingAccess rule and the
-Node SDK implement the `resource` and `authzen` modes natively (there is no JOSE verifier
-in Kong; the SDK leaves a `sources` seam) and get federation by delegating to `coaz-pep`.
+Federation resolution — walking a Trust Chain and verifying every signature in it — lives
+only in Go. The Kong plugins, the PingAccess rule and the Node SDK implement the `resource`
+and `authzen` modes natively (there is no JOSE verifier in Kong; the SDK leaves a `sources`
+seam) and get verified federation by delegating to `coaz-pep`. `sideband-pdp` has a
+weaker alternative as its switch: it asks a federation resolve endpoint and takes the
+resolver's answer on transport, unverified — the trust it already places in its static
+PDP, and a different claim from a verified chain.
 
 ## What is deliberately not here
 

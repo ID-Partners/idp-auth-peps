@@ -1,0 +1,223 @@
+-- sideband-pdp: a Kong Policy Enforcement Point that enforces through PingAuthorize's
+-- Sideband API and finds the PDPs it calls from the resource it protects.
+--
+-- For every proxied request:
+--   1. resolve the PDPs: service_url as configured, or — with discovery on — what the
+--      resource's RFC 9728 metadata (or, with the switch, a federation resolve endpoint)
+--      names in authzen_policy_decision_points, behind whatever it publishes in
+--      authzen_policy_layers, behind whatever pdp_layers configures. One ordered list,
+--      each entry with its rules;
+--   2. POST the whole request to each layer's /sideband/request, in order, each layer
+--      seeing the request as the previous one rewrote it. The first layer whose answer is
+--      a response ends the request: that response goes to the client, verbatim. A layer
+--      that cannot be reached follows its rule — fail-closed denies, fail-open skips it;
+--   3. forward the request as the layers rewrote it;
+--   4. in the response phase, POST the upstream's response to each permitting layer's
+--      /sideband/response, in reverse order, skipping request-only layers, and send the
+--      client what comes back.
+--
+-- What the plugin does NOT do: decide anything, map the request to an action, or shape
+-- a challenge. The sideband API's contract is that PingAuthorize's policy does all three
+-- and hands back the HTTP to send, so the WWW-Authenticate a denied agent gets is the
+-- policy's to write. The challenge contract the other PEPs render in code is, on this
+-- route, a contract the policy honours.
+--
+-- The sideband half descends from Ping's ping-auth plugin (the ID-Partners-AU fork of
+-- pingidentity/kong-plugin-ping-auth); the discovery half is the module shared with
+-- authzen-pdp, so both plugins find PDPs by the same rules.
+
+local discovery = require "kong.plugins.authzen-pdp.discovery"
+local sideband = require "kong.plugins.sideband-pdp.sideband"
+
+local SidebandPDP = {
+  PRIORITY = 999, -- as ping-auth: after Kong's own authentication plugins
+  VERSION = "0.1.0",
+}
+
+-- The modifiers a layer entry may carry beyond the shared fail-open / fail-closed.
+local MODIFIERS = { ["request-only"] = "request_only" }
+
+local function trim_slash(s) return (tostring(s or ""):gsub("/+$", "")) end
+
+-- The response headers that say what happened, for the demo transcript and for anyone
+-- reading a trace. They ride on every exit this plugin makes: Kong will not load a plugin
+-- that has both a response phase and a header_filter, so there is no later phase to set
+-- them in.
+local function pdp_headers(c)
+  local h = { ["X-PDP-PEP"] = c.pep, ["X-PDP-Decision"] = c.decision }
+  local names = {}
+  for _, a in ipairs(c.asked or {}) do names[#names + 1] = a.ep.identifier end
+  if #names > 0 then h["X-PDP-Layers"] = table.concat(names, ", ") end
+  if c.layer then h["X-PDP-Layer"] = c.layer end
+  if c.source then h["X-PDP-Source"] = c.source end
+  if c.fail_open then h["X-PDP-Fail-Open"] = c.fail_open end
+  return h
+end
+
+-- The plugin's own denials: the same shape as authzen-pdp's, because they are the same
+-- events — a PDP that could not be found or reached. A policy deny never comes through
+-- here; that is the policy provider's response, relayed as it is.
+local function deny(c, status, reason, headers)
+  local h = pdp_headers(c)
+  h["Content-Type"] = "application/json"
+  for k, v in pairs(headers or {}) do h[k] = v end
+  return kong.response.exit(status, { error = "authorization_failed", pep = c.pep, reason = reason }, h)
+end
+
+-- The configuration the shared discovery module reads. service_url is the static PDP.
+-- No API key goes through discovery: a sideband secret is bound to an identifier below.
+local function discovery_conf(conf)
+  return {
+    authzen_url = conf.service_url,
+    authzen_api_key = "",
+    pdp_discovery = conf.pdp_discovery,
+    resource = conf.resource,
+    pdp_metadata_ttl = conf.pdp_metadata_ttl,
+    pdp_allowlist = conf.pdp_allowlist,
+    resource_metadata_allowlist = conf.resource_metadata_allowlist,
+    pdp_discovery_insecure = conf.pdp_discovery_insecure,
+    pdp_ssl_verify = conf.verify_service_certificate,
+    federation_resolve_url = conf.federation_resolve_url,
+    federation_trust_anchor = conf.federation_trust_anchor,
+  }
+end
+
+-- What a PDP is called with. The static secret is bound to service_url; a discovered
+-- PDP gets what pdp_credentials names for it, or nothing — PingAuthorize then refuses
+-- the call, and the layer's rule decides what that costs.
+local function credential_for(conf, identifier)
+  if identifier == trim_slash(conf.service_url) then
+    return { header = conf.secret_header_name, secret = conf.shared_secret }
+  end
+  for _, c in ipairs(conf.pdp_credentials or {}) do
+    if trim_slash(c.pdp) == identifier then
+      return { header = c.secret_header_name or conf.secret_header_name, secret = c.shared_secret }
+    end
+  end
+  return nil
+end
+
+local function debug(conf, ...)
+  if conf.enable_debug_logging then kong.log.debug(...) end
+end
+
+-- One layer's availability failure, under its rule: fail-open skips the layer and names
+-- it; fail-closed denies, with the reason a client can act on when there is one.
+local function fail_layer(c, ep, detail, skipped, phase)
+  if detail.kind == "rate_limited" then sideband.block(ep.identifier, detail.retry_after) end
+  if ep.fail_open then
+    kong.log.warn("PDP layer ", ep.identifier, " failed open (", phase, "): ", detail.msg)
+    skipped[#skipped + 1] = ep.identifier .. " (" .. detail.msg .. ")"
+    return
+  end
+  kong.log.err("PDP layer ", ep.identifier, " failed (", phase, "): ", detail.msg)
+  c.decision, c.layer = "DENY", ep.identifier
+  if detail.kind == "rate_limited" then
+    return deny(c, 429, "Authorization service is rate-limiting this gateway; denying (fail-closed).",
+      { ["Retry-After"] = tostring(detail.retry_after) })
+  end
+  return deny(c, 503, "Authorization service unreachable; denying (fail-closed).")
+end
+
+-- ask posts one payload to one layer, honouring a rate-limit block, and classifies the
+-- answer with `classify`.
+local function ask(conf, ep, path, payload, classify)
+  local who = ep.identifier
+  local wait = sideband.blocked_for(who)
+  if wait then
+    return "failure", { kind = "rate_limited", msg = who .. " rate-limited this PEP (retry after " .. wait .. "s)", retry_after = wait }
+  end
+  debug(conf, "sideband ", path, " to ", who, " (", ep.source, ")")
+  local res, err = sideband.post(who .. path, payload, conf, credential_for(conf, who))
+  return classify(res, err, who)
+end
+
+function SidebandPDP:access(conf)
+  local c = kong.ctx.plugin
+  c.pep = conf.pep_label or "kong-sideband-pep"
+
+  -- 1) which PDPs, in what order, under what rules. A discovery failure is a 503, like an
+  --    unreachable PDP: a request whose decider cannot be found is not one to let through.
+  local dconf = discovery_conf(conf)
+  local layers, derr = discovery.resolve_layers(dconf, discovery.resource_id(dconf), conf.pdp_layers,
+    conf.fail_mode == "open", { probe = false, modifiers = MODIFIERS })
+  if not layers then
+    kong.log.err("PDP discovery failed: ", derr.msg)
+    c.decision = "DENY"
+    return deny(c, 503, "Authorization service could not be resolved; denying (fail-closed).")
+  end
+  local eps, skipped = layers.pdps, layers.skipped
+  c.source = layers.meta and layers.meta.source or "static"
+
+  -- 2) the request as the client sent it, through every layer in order
+  local original, perr = sideband.request_payload(conf)
+  if not original then
+    kong.log.err("the sideband request could not be built: ", perr)
+    c.decision = "DENY"
+    return deny(c, 400, perr)
+  end
+  local current, asked = original, {}
+  for _, ep in ipairs(eps) do
+    local verdict, detail = ask(conf, ep, sideband.REQUEST_PATH, current, sideband.classify)
+    if verdict == "failure" then
+      fail_layer(c, ep, detail, skipped, "request")
+    elseif verdict == "deny" then
+      -- The policy's answer is the HTTP to send. Verbatim: what the client needs to
+      -- resolve this — a WWW-Authenticate challenge, a body it can read — is the
+      -- policy's to write, and this plugin does not second-guess it.
+      c.decision, c.layer, c.asked = "DENY", ep.identifier, asked
+      debug(conf, "denied by ", ep.identifier, " with ", detail.status)
+      local h = sideband.flatten_headers(detail.headers)
+      for k, v in pairs(pdp_headers(c)) do h[k] = v end
+      return kong.response.exit(detail.status, detail.body or "", h)
+    else
+      asked[#asked + 1] = { ep = ep, state = detail.state, request = current }
+      current = sideband.rewritten(current, detail)
+    end
+  end
+
+  -- 3) permitted: forward the request as the layers rewrote it
+  c.decision, c.asked, c.skipped = "PERMIT", asked, skipped
+  if #skipped > 0 then
+    kong.log.warn("permit failed open past: ", table.concat(skipped, ", "))
+    c.fail_open = table.concat(skipped, ", ")
+  end
+  sideband.apply_request(original, current, function(...) kong.log.warn(...) end)
+end
+
+-- 4) the upstream's response, back through every layer that permitted, in reverse. Kong
+--    runs this phase only after a permit, with the whole response buffered.
+function SidebandPDP:response(conf)
+  local c = kong.ctx.plugin
+  if not c or c.decision ~= "PERMIT" or conf.filter_response == false then return end
+  local asked, skipped = c.asked or {}, c.skipped or {}
+  local current = {
+    status = kong.response.get_status(),
+    headers = sideband.format_headers(kong.response.get_headers()),
+    body = kong.service.response.get_raw_body(),
+  }
+  local filtered = 0
+  for i = #asked, 1, -1 do
+    local a = asked[i]
+    if not a.ep.request_only then
+      local verdict, detail = ask(conf, a.ep, sideband.RESPONSE_PATH, sideband.response_payload(current, a), sideband.classify_response)
+      if verdict == "failure" then
+        fail_layer(c, a.ep, detail, skipped, "response")
+      else
+        current, filtered = detail, filtered + 1
+      end
+    end
+  end
+  if #skipped > 0 then c.fail_open = table.concat(skipped, ", ") end
+  -- Nothing filtered it: the upstream's response goes as it is, marked.
+  if filtered == 0 then
+    for k, v in pairs(pdp_headers(c)) do kong.response.set_header(k, v) end
+    return
+  end
+  return sideband.apply_response(current, pdp_headers(c))
+end
+
+-- Internals exposed for unit tests; Kong never reads this.
+SidebandPDP._TEST = { credential_for = credential_for, discovery_conf = discovery_conf, pdp_headers = pdp_headers }
+
+return SidebandPDP

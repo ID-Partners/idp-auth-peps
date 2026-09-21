@@ -175,12 +175,49 @@ function M.install(opts)
     logs = {},
   }
 
+  local headers = {}
+  for k, v in pairs(opts.headers or {}) do headers[k:lower()] = v end
+
+  -- The pieces of the nginx API the sideband plugin reaches for beyond the PDK: the
+  -- client's address, the raw request line, and the query-string helpers.
+  -- Two return values, as OpenResty's: a caller that feeds the result straight into
+  -- another one-argument function gets the same error it would get in Kong.
+  local function decode_args(str)
+    local out = {}
+    for pair in (str or ''):gmatch('[^&]+') do
+      local k, v = pair:match('^([^=]*)=?(.*)$')
+      if k and k ~= '' then out[k] = v end
+    end
+    return out, nil
+  end
+  local function encode_args(t, extra)
+    assert(extra == nil, 'expecting 1 argument but seen 2')
+    local keys = {}
+    for k in pairs(t or {}) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+      parts[#parts + 1] = (t[k] == true or t[k] == '') and k or (k .. '=' .. tostring(t[k]))
+    end
+    return table.concat(parts, '&')
+  end
   _G.ngx = {
     encode_base64 = encode_base64,
     decode_base64 = decode_base64,
     null = setmetatable({}, { __tostring = function() return 'null' end }),
     -- A settable clock, so cache expiry can be driven without sleeping.
     now = function() return state.now end,
+    var = { remote_addr = opts.remote_addr or '203.0.113.7', remote_port = opts.remote_port or 51234 },
+    req = {
+      get_method = function() return opts.method or 'GET' end,
+      get_headers = function() return headers end,
+      http_version = function() return opts.http_version or 1.1 end,
+    },
+    decode_args = decode_args,
+    encode_args = encode_args,
+    escape_uri = function(v)
+      return (tostring(v):gsub('[^%w%-_.~]', function(c) return string.format('%%%02X', c:byte()) end))
+    end,
   }
   state.now = opts.now or 1700000000
 
@@ -191,6 +228,15 @@ function M.install(opts)
   package.preload['kong.plugins.authzen-pdp.discovery'] = function()
     return assert(loadfile('authzen-pdp/discovery.lua'))()
   end
+  package.loaded['kong.plugins.sideband-pdp.sideband'] = nil
+  package.preload['kong.plugins.sideband-pdp.sideband'] = function()
+    return assert(loadfile('sideband-pdp/sideband.lua'))()
+  end
+  -- The client certificate parser. A test that forwards a certificate supplies its own
+  -- (opts.x509); by default nothing presents one, so nothing parses one.
+  package.loaded['resty.openssl.x509'] = opts.x509 or {
+    new = function() error('no client certificate in this test') end,
+  }
 
   package.loaded['cjson.safe'] = {
     decode = function(s)
@@ -231,19 +277,29 @@ function M.install(opts)
     end,
   }
 
-  local headers = {}
-  for k, v in pairs(opts.headers or {}) do headers[k:lower()] = v end
+  -- The upstream's answer, for the response phase: what the plugin sees as the
+  -- proxied response before it is filtered.
+  local upstream = opts.upstream or {}
+  state.response_status = upstream.status or 200
+  state.response_hdrs = {}
+  for k, v in pairs(upstream.headers or {}) do state.response_hdrs[k:lower()] = v end
 
   _G.kong = {
     request = {
       get_method = function() return opts.method or 'GET' end,
       get_path = function() return opts.path or '/' end,
       get_header = function(name) return headers[name:lower()] end,
+      get_headers = function() return headers end,
       get_raw_body = function() return opts.body end,
       get_body = function()
         if not opts.body then return nil end
         return (package.loaded['cjson.safe'].decode(opts.body))
       end,
+      get_raw_query = function() return opts.query or '' end,
+      get_forwarded_scheme = function() return opts.scheme or 'https' end,
+      get_forwarded_host = function() return opts.host or 'api.example' end,
+      get_forwarded_port = function() return opts.port or 443 end,
+      get_forwarded_path = function() return opts.path or '/' end,
     },
     response = {
       exit = function(status, body, hdrs)
@@ -251,10 +307,36 @@ function M.install(opts)
         error({ __kong_exit = true }, 0) -- Kong's exit is non-local; unwind like it does
       end,
       set_header = function(k, v) state.response_headers = state.response_headers or {}; state.response_headers[k] = v end,
+      get_status = function() return state.response_status end,
+      get_headers = function() return state.response_hdrs end,
+      get_header = function(k) return state.response_hdrs[k:lower()] end,
+      clear_header = function(k)
+        state.response_hdrs[k:lower()] = nil
+        state.cleared_response_headers = state.cleared_response_headers or {}
+        state.cleared_response_headers[#state.cleared_response_headers + 1] = k:lower()
+      end,
     },
     service = {
       request = {
         set_header = function(k, v) state.upstream_headers[k] = v end,
+        set_headers = function(t) for k, v in pairs(t) do state.upstream_headers[k] = v end end,
+        clear_header = function(k)
+          state.upstream_headers[k] = nil
+          state.cleared_upstream_headers = state.cleared_upstream_headers or {}
+          state.cleared_upstream_headers[#state.cleared_upstream_headers + 1] = k
+        end,
+        set_method = function(m) state.upstream_method = m end,
+        set_path = function(p) state.upstream_path = p end,
+        set_raw_query = function(q) state.upstream_query = q end,
+        set_raw_body = function(b) state.upstream_body = b end,
+      },
+      response = {
+        get_raw_body = function() return upstream.body end,
+      },
+    },
+    client = {
+      tls = {
+        get_full_client_certificate_chain = function() return opts.client_cert_pem end,
       },
     },
     log = setmetatable({}, {
@@ -270,6 +352,15 @@ end
 --- run the plugin's access phase, absorbing Kong's non-local exit.
 function M.run_access(handler, conf)
   local ok, err = pcall(handler.access, handler, conf)
+  if not ok and not (type(err) == 'table' and err.__kong_exit) then
+    error(err, 0)
+  end
+end
+
+--- run the plugin's response phase the same way. Kong runs it only when access did not
+--- exit; a test that calls it after a deny is asking the wrong question.
+function M.run_response(handler, conf)
+  local ok, err = pcall(handler.response, handler, conf)
   if not ok and not (type(err) == 'table' and err.__kong_exit) then
     error(err, 0)
   end

@@ -719,3 +719,178 @@ describe('discovery: through access()', function()
     assert.is_nil(mock.json_decode(state2.pdp_requests[1].body).config.resource)
   end)
 end)
+
+describe('discovery: published layers', function()
+  local ESTATE = 'https://estate.example'
+  local function routes(over)
+    local r = {
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD }, authzen_policy_layers = { ESTATE } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [ESTATE .. '/.well-known/authzen-configuration'] = pdp_config(ESTATE),
+    }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+
+  it('runs what the document publishes in front of the resource PDP, with nothing configured', function()
+    local D = load({ pdp = router(routes()) })
+    local r = D.resolve_layers(conf(), RES, nil)
+    assert.equal(2, #r.pdps)
+    assert.equal(ESTATE, r.pdps[1].identifier); assert.equal('published', r.pdps[1].source); assert.is_false(r.pdps[1].fail_open)
+    assert.equal(GOOD, r.pdps[2].identifier); assert.equal('rfc9728', r.pdps[2].source)
+    assert.same({ ESTATE }, r.meta.layers)
+    assert.same({ ESTATE }, r.meta.document.authzen_policy_layers)
+  end)
+
+  it('a published layer takes the resource entry\'s failure mode; a configured entry\'s own word wins', function()
+    local D = load({ pdp = router(routes()) })
+    local r = D.resolve_layers(conf(), RES, { 'resource fail-open' })
+    assert.is_true(r.pdps[1].fail_open); assert.is_true(r.pdps[2].fail_open)
+    r = D.resolve_layers(conf(), RES, nil, true)
+    assert.is_true(r.pdps[1].fail_open)
+    r = D.resolve_layers(conf(), RES, { ESTATE .. ' fail-closed', 'resource fail-open' })
+    assert.equal(2, #r.pdps)
+    assert.equal(ESTATE, r.pdps[1].identifier); assert.is_false(r.pdps[1].fail_open); assert.equal('layer', r.pdps[1].source)
+    r = D.resolve_layers(conf(), RES, { 'resource fail-open', ESTATE .. ' fail-closed' })
+    assert.equal(2, #r.pdps); assert.is_false(r.pdps[1].fail_open)
+  end)
+
+  it('a published layer passes the allowlist, and a refusal is never skipped', function()
+    local D = load({ pdp = router(routes()) })
+    local r, err = D.resolve_layers(conf({ pdp_allowlist = { GOOD } }), RES, { 'resource fail-open' }, true)
+    assert.is_nil(r); assert.equal('not_allowed', err.kind); assert.matches('published layer', err.msg)
+  end)
+
+  it('an unresolvable published layer fails the route, or is skipped under fail-open and named by its publisher', function()
+    local D = load({ pdp = router(routes({ [ESTATE .. '/.well-known/authzen-configuration'] = { policy_decision_point = 'https://someone.else', access_evaluation_endpoint = 'https://someone.else/e' } })) })
+    local r, err = D.resolve_layers(conf(), RES, nil)
+    assert.is_nil(r); assert.matches('published layer', err.msg)
+    r = D.resolve_layers(conf(), RES, { 'resource fail-open' })
+    assert.equal(1, #r.pdps); assert.equal(GOOD, r.pdps[1].identifier)
+    assert.equal(1, #r.skipped); assert.matches('published by', r.skipped[1])
+  end)
+
+  it('a document whose layers cannot be read is invalid, and the static PDP decides', function()
+    local D = load({ pdp = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD }, authzen_policy_layers = 'estate' } })) })
+    local r = D.resolve_layers(conf(), RES, nil)
+    assert.equal(1, #r.pdps); assert.equal(STATIC, r.pdps[1].identifier)
+  end)
+end)
+
+describe('discovery: caller options', function()
+  it('probe=false reads no PDP metadata and returns the default paths', function()
+    local fn, hits = router({ [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } } })
+    local D = load({ pdp = fn })
+    local r = D.resolve_layers(conf(), RES, { STATIC, 'resource' }, false, { probe = false })
+    assert.equal(2, #r.pdps)
+    assert.equal(GOOD .. '/access/v1/evaluation', r.pdps[2].evaluation)
+    assert.equal(0, count(hits, 'authzen-configuration'))
+    assert.equal(1, #hits)
+  end)
+
+  it('caller modifiers ride on the endpoints and survive a duplicate; unknown ones are still refused', function()
+    local D = load({ pdp = router({ [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } } }) })
+    local mods = { ['request-only'] = 'request_only' }
+    local r = D.resolve_layers(conf(), RES, { STATIC .. ' request-only', 'resource' }, false, { probe = false, modifiers = mods })
+    assert.is_true(r.pdps[1].request_only); assert.is_nil(r.pdps[2].request_only)
+    r = D.resolve_layers(conf(), RES, { GOOD, 'resource request-only' }, false, { probe = false, modifiers = mods })
+    assert.equal(1, #r.pdps); assert.is_true(r.pdps[1].request_only)
+    local spec, err = D.parse_layer('resource request-only')
+    assert.is_nil(spec); assert.matches('unknown modifier', err)
+    local nothing, nerr = D.resolve_layers(conf(), RES, { 'resource request-only' })
+    assert.is_nil(nothing); assert.equal('invalid', nerr.kind)
+  end)
+end)
+
+describe('discovery: federation via a resolve endpoint', function()
+  local ANCHOR = 'https://anchor.example'
+  local RESOLVE = ANCHOR .. '/resolve'
+  local function fconf(over)
+    return conf((function()
+      local o = { pdp_discovery = 'federation', federation_resolve_url = RESOLVE, federation_trust_anchor = ANCHOR }
+      for k, v in pairs(over or {}) do o[k] = v end
+      return o
+    end)())
+  end
+  local function resolved(claims, header)
+    local base = { iss = ANCHOR, sub = RES, iat = 1700000000, exp = 1700003600,
+      metadata = { oauth_resource = { authzen_policy_decision_points = { GOOD }, scopes_supported = { 'accounts:read' } } } }
+    for k, v in pairs(claims or {}) do base[k] = v end
+    return mock.jwt(base, header or { alg = 'ES256', typ = 'resolve-response+jwt' })
+  end
+  local function routes(over)
+    local r = {
+      [RESOLVE] = resolved(),
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [ROGUE .. '/.well-known/authzen-configuration'] = pdp_config(ROGUE),
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { ROGUE } },
+    }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+
+  it('reads the resolved oauth_resource metadata and never the resource\'s own document', function()
+    local fn, hits = router(routes())
+    local D = load({ pdp = fn })
+    local ep, err = D.resolve(fconf(), RES)
+    assert.is_nil(err)
+    assert.equal(GOOD, ep.identifier); assert.equal('federation', ep.source); assert.equal('federation', ep.resource.source)
+    assert.is_nil(ep.api_key)
+    assert.same({ 'accounts:read' }, ep.resource.document.scopes_supported)
+    assert.equal(0, count(hits, 'oauth-protected-resource'))
+    assert.equal('application/resolve-response+jwt', hits[1].headers.Accept)
+    assert.matches('sub=https%%3A%%2F%%2Fapi%.example', hits[1].url)
+    assert.matches('anchor=https%%3A%%2F%%2Fanchor%.example', hits[1].url)
+    -- a resource-mode route on the same worker gets the resource's own answer, not this one
+    local other = D.resolve(conf(), RES)
+    assert.equal(ROGUE, other.identifier); assert.equal('rfc9728', other.source)
+  end)
+
+  it('checks what it can without a verifier: typ, subject, expiry, and that the metadata is there', function()
+    local D = load({ pdp = router(routes()) })
+    local F, o = D._TEST.federation_lookup, D._TEST.options(fconf())
+    local function kind_of(routes_over)
+      local D2 = load({ pdp = router(routes(routes_over)) })
+      local _, err = D2._TEST.federation_lookup(RES, D2._TEST.options(fconf()))
+      return err and err.kind, err and err.msg
+    end
+    assert.is_table((F(RES, o)))
+    assert.equal('invalid', kind_of({ [RESOLVE] = resolved(nil, { alg = 'ES256', typ = 'entity-statement+jwt' }) }))
+    assert.equal('not_allowed', kind_of({ [RESOLVE] = resolved({ sub = 'https://other.example' }) }))
+    assert.equal('invalid', kind_of({ [RESOLVE] = resolved({ exp = 1600000000 }) }))
+    assert.equal('no_metadata', kind_of({ [RESOLVE] = resolved({ metadata = { federation_entity = {} } }) }))
+    assert.equal('no_metadata', kind_of({ [RESOLVE] = resolved({ metadata = { oauth_resource = { scopes_supported = {} } } }) }))
+    assert.equal('invalid', kind_of({ [RESOLVE] = 'not a jwt' }))
+    assert.equal('invalid', kind_of({ [RESOLVE] = resolved({ metadata = { oauth_resource = { authzen_policy_decision_points = { 'nope' } } } }) }))
+  end)
+
+  it('maps the resolver\'s error codes: unknown subject falls to static, an invalid chain is a refusal, its own trouble is transient', function()
+    local function kind_of(status, body)
+      local D2 = load({ pdp = router(routes({ [RESOLVE] = function() return { status = status, body = body } end })) })
+      local _, err = D2._TEST.federation_lookup(RES, D2._TEST.options(fconf()))
+      return err.kind
+    end
+    assert.equal('no_metadata', kind_of(404, json({ error = 'not_found' })))
+    assert.equal('no_metadata', kind_of(404, ''))
+    assert.equal('not_allowed', kind_of(400, json({ error = 'invalid_trust_chain', error_description = 'no path' })))
+    assert.equal('not_allowed', kind_of(400, json({ error = 'invalid_request' })))
+    assert.equal('not_allowed', kind_of(401, 'nope'))
+    assert.equal('transient', kind_of(503, json({ error = 'temporarily_unavailable' })))
+    assert.equal('transient', kind_of(500, ''))
+    -- through resolve(): not_found and transient end at the static PDP; a refusal ends the request
+    local D = load({ pdp = router(routes({ [RESOLVE] = function() return { status = 404, body = json({ error = 'not_found' }) } end })) })
+    local ep = D.resolve(fconf(), RES)
+    assert.equal(STATIC, ep.identifier); assert.equal('static-key', ep.api_key)
+    local D3 = load({ pdp = router(routes({ [RESOLVE] = function() return { status = 400, body = json({ error = 'invalid_trust_chain' }) } end })) })
+    local none, err = D3.resolve(fconf(), RES)
+    assert.is_nil(none); assert.equal('not_allowed', err.kind)
+  end)
+
+  it('needs its two settings, and an https resolver unless told otherwise', function()
+    local D = load({ pdp = router(routes()) })
+    local _, err = D._TEST.federation_lookup(RES, D._TEST.options(fconf({ federation_trust_anchor = '' })))
+    assert.equal('not_allowed', err.kind)
+    local _, herr = D._TEST.federation_lookup(RES, D._TEST.options(fconf({ federation_resolve_url = 'http://anchor.example/resolve' })))
+    assert.equal('not_allowed', herr.kind); assert.matches('not https', herr.msg)
+  end)
+end)

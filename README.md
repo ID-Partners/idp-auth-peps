@@ -13,6 +13,11 @@ Four enforcement surfaces, one decision contract:
 | [`gateways/pingaccess`](gateways/pingaccess) | PingAccess, as an Add-on SDK rule (Java) | REST + MCP |
 | [`sdk/node`](sdk/node) | In your Node process, as Express middleware or an MCP guard | REST + MCP |
 
+A fifth surface, [`gateways/kong/sideband-pdp`](gateways/kong/sideband-pdp), is the Kong
+plugin's discovery in front of PingAuthorize's Sideband API instead of AuthZEN: the same PDP
+resolution and the same layers, but a deny — and so a challenge — is the policy's HTTP, not
+this contract's.
+
 They share [`core/`](core) — the Go COAZ engine and the `coaz-pep` service that the
 gateway surfaces call. That is the point: **a client gets the same challenge whichever
 PEP denies it**, because there is one implementation of the decision and one of the
@@ -70,6 +75,7 @@ core/                        Go: the COAZ engine + the coaz-pep service
   cmd/demo-console/            the demo's clickable walkthrough
 gateways/
   kong/authzen-pdp/            Kong Lua plugin
+  kong/sideband-pdp/           Kong Lua plugin: PingAuthorize's Sideband API, the same discovery
   envoy/agentgateway/          agentgateway (solo.io) attachment
   envoy/istio/                 Istio CUSTOM AuthorizationPolicy + EnvoyFilter
   pingaccess/authzen-pdp/      PingAccess Add-on SDK rule (Java, Maven)
@@ -179,12 +185,12 @@ came from:
 | `core/coaz`, `core/cmd/coaz-pep` | `idp-authzen-adapter-go/coaz-pep`, with the newer engine, `types.go` and `pep.go` from `idp-agentic-demo/coaz-pep` (which had drifted ahead of the package repo) |
 | `core/go.mod`, `go.sum` | `idp-authzen-adapter-go` — it carried the Dependabot CVE bumps (grpc 1.79.3, x/net 0.55.0) the demo copy did not |
 | `gateways/kong/authzen-pdp` | `idp-agentic-demo/kong/plugins/authzen-pdp` (PDP-driven step-up, `acr` forwarding), plus the rockspec from `idp-authzen-adapter-go` |
+| `gateways/kong/sideband-pdp` | `ID-Partners-AU/kong-plugin-ping-auth` — Ping's `ping-auth` plugin, the sideband half; the discovery half is `authzen-pdp`'s module |
 | `gateways/envoy/agentgateway` | `idp-agentic-demo/agentgateway` |
 | `sdk/node` | New, seeded by the fail-closed `AuthzenPdpPlugin` in `mcp-interop/packages/shared` |
 
-Earlier ancestors: `ID-Partners/idp-paz-authzen-adapter` (archived), the standalone
-`authzen-coaz-pep`, and `ID-Partners-AU/kong-plugin-ping-auth` — Ping's official Kong
-plugin, which predates AuthZEN and MCP entirely and is not carried forward here.
+Earlier ancestors: `ID-Partners/idp-paz-authzen-adapter` (archived) and the standalone
+`authzen-coaz-pep`.
 
 The demo that exercises all of this end to end is
 [dphhyland/idp-agentic-demo](https://github.com/dphhyland/idp-agentic-demo).
@@ -207,7 +213,7 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 | `core/coaz` | 94.2% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `core/cmd/coaz-pep` | 95.6% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `sdk/node` | 96.8% stmts / 100% funcs | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
-| `gateways/kong` | 97.1% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
+| `gateways/kong` | 99.8% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
 | `gateways/pingaccess` | 98.4% lines / 91.2% branches | [`pom.xml`](gateways/pingaccess/authzen-pdp/pom.xml) (JaCoCo) |
 
 The target is **100% of what can be meaningfully tested, with the rest named** — not a

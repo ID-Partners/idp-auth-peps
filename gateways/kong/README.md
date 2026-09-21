@@ -5,6 +5,11 @@ AuthZEN PDP: token and actor-claim extraction (RFC 8693), DPoP sender-constraint
 (RFC 9449), RFC 9470 step-up challenges, REST and MCP request mapping, and — for MCP tools
 declaring `coaz: true` — per-tool-call authorisation under the OpenID AuthZEN MCP profile.
 
+Its sibling, [`sideband-pdp`](sideband-pdp/README.md), is the same discovery — and the same
+layers, rules and allowlists, from the module the two share — in front of PingAuthorize's
+Sideband API instead of AuthZEN: for a REST route where the policy, not the gateway, should
+own the request mapping and the shape of a deny.
+
 ## Install
 
 DB-less: mount the plugin directory and tell Kong about it.
@@ -63,12 +68,15 @@ branch:
 | `authzen` | `authzen_url`'s `/.well-known/authzen-configuration` | default paths |
 | `resource` | the route's resource's RFC 9728 document (`authzen_policy_decision_points`), then that PDP's metadata | `authzen_url` |
 
-There is **no `federation` mode here**. Resolving an OpenID Federation Trust Chain means
-verifying Entity Statement signatures, and no JOSE verifier is available to a Kong plugin
-— the same reason DPoP and COAZ are delegated. A route that must take the federation's
-word over the resource's own well-known belongs behind `coaz-pep`, which does that.
-Delegated `tools/call` checks already run the engine's discovery, federation included,
-and an explicit `resource` is passed to it so both PEPs key off the same identifier.
+There is **no `federation` mode in this plugin**. Resolving an OpenID Federation Trust Chain
+means verifying Entity Statement signatures, and no JOSE verifier is available to a Kong
+plugin — the same reason DPoP and COAZ are delegated. A route that must take the
+federation's word over the resource's own well-known belongs behind `coaz-pep`, which does
+that. Delegated `tools/call` checks already run the engine's discovery, federation
+included, and an explicit `resource` is passed to it so both PEPs key off the same
+identifier. (The shared module can also ask a federation *resolve endpoint* and take the
+resolver's answer on transport, unverified; `sideband-pdp` offers that as its switch, with
+the caveats spelled out in [its README](sideband-pdp/README.md#the-switch-resolving-through-the-federation).)
 
 ```yaml
 config:
@@ -89,7 +97,10 @@ else the PDP knows. See [docs/architecture.md](../../docs/architecture.md#what-t
 `pdp_layers` is the ordered list of PDPs to ask — `static`, `resource`, or a PDP
 identifier — every one of which must permit; the first deny is the answer. It is how a
 generic estate PDP that judges the token and the client sits in front of the resource's
-own. Default `["resource"]`. An entry may carry its own failure mode
+own. Default `["resource"]`: the resource's PDP behind whatever its document publishes in
+`authzen_policy_layers`, which take the `resource` entry's failure mode and pass the same
+`pdp_allowlist` (a configured entry naming the same PDP is one call, and its own failure
+mode wins), as in `coaz-pep`. An entry may carry its own failure mode
 (`"https://estate.example fail-open"`); `fail_mode` (`closed`, the default, or `open`)
 is the route's default for entries that say nothing. A fail-open layer whose PDP cannot
 be reached is skipped and the permit carries `X-PDP-Fail-Open`; a deny or a refusal never
@@ -189,4 +200,6 @@ into the PDP (the policy compares the payment amount to the threshold and return
 The rockspec came from `idp-authzen-adapter-go`.
 
 Not to be confused with `ID-Partners-AU/kong-plugin-ping-auth` — our fork of Ping's
-official Kong plugin, which predates AuthZEN and MCP and is unrelated to this.
+official Kong plugin, which predates AuthZEN and MCP. That one lives on as the sideband
+half of [`sideband-pdp`](sideband-pdp/README.md), which shares this plugin's discovery
+module.
