@@ -29,6 +29,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -93,7 +94,11 @@ func main() {
 		gateway: gateway,
 		control: env("STUBS_CONTROL", base+":9099"),
 		token:   env("CHECK_API_TOKEN", "demo"),
-		client:  &http.Client{Timeout: 15 * time.Second},
+		// Nothing the console talks to redirects; refusing redirects keeps /api/fetch on
+		// the hosts fetchAllowed checked.
+		client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
 		peps: []pep{
 			{Key: "static", Name: "pep-static", Mode: "off", url: env("PEP_STATIC", base+":9192"),
 				Blurb: "Told where the PDP is. No metadata is fetched at all."},
@@ -358,8 +363,7 @@ func (s *server) check(ctx context.Context, p pep, res resource, act action, in 
 // out of the trace.
 func (s *server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("url")
-	fromGateway := s.gateway != "" && (raw == s.gateway || strings.HasPrefix(raw, s.gateway+"/") || strings.HasPrefix(strings.Replace(raw, "/.well-known/oauth-protected-resource", "", 1), s.gateway))
-	if !strings.HasPrefix(raw, s.base+":") && !strings.HasPrefix(raw, s.base+"/") && !fromGateway {
+	if !s.fetchAllowed(raw) {
 		http.Error(w, `{"error":"not a stub"}`, http.StatusBadRequest)
 		return
 	}
@@ -378,6 +382,25 @@ func (s *server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	writeJSON(w, map[string]any{"status": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "body": string(body),
 		"source": resp.Header.Get("X-Resource-Metadata-Source")})
+}
+
+// fetchAllowed reports whether raw names the stubs' host (any port) or the gateway's
+// entity. It compares the parsed scheme, host and port, never a string prefix: a prefix
+// check is defeated by userinfo, since "http://stubs:x@elsewhere/" starts with
+// "http://stubs:" and fetches elsewhere.
+func (s *server) fetchAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Opaque != "" || u.Host == "" {
+		return false
+	}
+	if b, err := url.Parse(s.base); err == nil && u.Scheme == b.Scheme && strings.EqualFold(u.Hostname(), b.Hostname()) {
+		return true
+	}
+	if s.gateway == "" {
+		return false
+	}
+	g, err := url.Parse(s.gateway)
+	return err == nil && u.Scheme == g.Scheme && strings.EqualFold(u.Host, g.Host)
 }
 
 // handleControl relays the console's levers to the stubs: move a PDP's advertised

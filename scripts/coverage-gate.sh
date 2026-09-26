@@ -17,6 +17,9 @@ floor_for() {
     */core/authzen/discovery) echo 97 ;;
     */core/internal/ttlcache)  echo 98 ;;
     */core/internal/metafetch) echo 94 ;;
+    # The console's handlers are exercised by the demo run; the unit tests guard the
+    # /api/fetch host check, which is what a public deployment exposes.
+    */core/cmd/demo-console)   echo 3 ;;
     *)                    echo "" ;;
   esac
 }
