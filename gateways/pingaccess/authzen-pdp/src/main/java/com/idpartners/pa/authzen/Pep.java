@@ -276,7 +276,7 @@ final class Pep {
             ch.put("reason", reason);
             ch.put("pep", pep);
             return Verdict.respond(401, headers(JSON, "WWW-Authenticate",
-                "Bearer error=\"identity_verification_required\", doctype=\"" + doctype + "\""), Json.bytes(out), rh);
+                "Bearer error=\"identity_verification_required\", doctype=\"" + HeaderValues.quoted(doctype) + "\""), Json.bytes(out), rh);
         }
 
         // Step-up advice: this payment is over the threshold and the user has not
@@ -297,7 +297,7 @@ final class Pep {
             ch.put("reason", reason);
             ch.put("pep", pep);
             return Verdict.respond(401, headers(JSON, "WWW-Authenticate",
-                "Bearer error=\"insufficient_scope\", scope=\"" + scopeReq + "\""), Json.bytes(out), rh);
+                "Bearer error=\"insufficient_scope\", scope=\"" + HeaderValues.quoted(scopeReq) + "\""), Json.bytes(out), rh);
         }
 
         if (!decision) {
@@ -305,7 +305,7 @@ final class Pep {
         }
 
         // PERMIT: pass the delegation identity to the upstream for its audit trail.
-        return Verdict.permit(upstream, rh);
+        return permit(pep, upstream, rh);
     }
 
     // ---------- asking a PDP ----------
@@ -388,8 +388,13 @@ final class Pep {
         JsonNode verdict = Json.parse(res.body());
         JsonNode valid = verdict == null ? null : verdict.get("valid");
         if (!(verdict instanceof ObjectNode) || valid == null || !valid.isBoolean() || !valid.booleanValue()) {
+            // The verifier's reason is about the client's own proof, so the client gets
+            // it, briefly and cleaned; anything longer is the log's.
             String reason = Json.text(verdict, "reason");
-            return deny(pep, 401, reason != null ? reason : "DPoP proof is not valid for this request.", null);
+            if (reason != null) {
+                log.warn("DPoP proof rejected: {}", HeaderValues.brief(reason, 500));
+            }
+            return deny(pep, 401, reason != null ? HeaderValues.brief(reason, 120) : "DPoP proof is not valid for this request.", null);
         }
         return null;
     }
@@ -510,12 +515,12 @@ final class Pep {
             // Every X-Auth-* header the client sent goes; coaz-pep's upstream_headers say
             // which come back, an empty value meaning "leave it off".
             Map<String, String> upstream = authHeaders(null, null, null, null);
-            upstream.putAll(stringMap(verdict.get("upstream_headers")));
+            upstream.putAll(forwardable(stringMap(verdict.get("upstream_headers"))));
             Map<String, String> rh = stringMap(verdict.get("response_headers"));
             Map<String, String> out = pdpHeaders(pep, "PERMIT", headerOr(rh, "X-PDP-Action", fallbackAction),
                 headerOr(rh, "X-PDP-Reason", null), headerOr(rh, "X-PDP-Fail-Open", null));
             relayable(rh).forEach(out::putIfAbsent);
-            return Verdict.permit(upstream, out);
+            return permit(pep, upstream, out);
         }
         // A deny is coaz-pep's rendering, relayed as it is (for a tools/call, the COAZ
         // JSON-RPC error at HTTP 200); one with no rendering is a plain deny.
@@ -529,6 +534,34 @@ final class Pep {
         String respBody = Json.text(resp, "body");
         return Verdict.respond(status, relayable(rh), (respBody == null ? "" : respBody).getBytes(StandardCharsets.UTF_8),
             pdpHeaders(pep, "DENY", headerOr(rh, "X-PDP-Action", fallbackAction), headerOr(rh, "X-PDP-Reason", null), null));
+    }
+
+    /**
+     * What of coaz-pep's upstream_headers may go on the request to the upstream: header
+     * names that are names, no framing headers, the identity headers under their own
+     * names (so they replace the removals) and kept as they are for permit() to judge,
+     * every other value cleaned.
+     */
+    private static Map<String, String> forwardable(Map<String, String> in) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : in.entrySet()) {
+            String k = e.getKey();
+            if (!HeaderValues.name(k) || HOP.contains(k.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            String identity = null;
+            for (String x : X_AUTH) {
+                if (x.equalsIgnoreCase(k)) {
+                    identity = x;
+                }
+            }
+            if (identity != null) {
+                out.put(identity, e.getValue());
+            } else {
+                out.put(k, HeaderValues.clean(e.getValue()));
+            }
+        }
+        return out;
     }
 
     private static String headerOr(Map<String, String> headers, String name, String otherwise) {
@@ -545,15 +578,16 @@ final class Pep {
         "keep-alive", "upgrade", "te", "trailer", "proxy-connection", "host");
 
     /**
-     * What of a coaz-pep header map may be put on a response: not the framing headers,
-     * and not X-PDP-*, which the rule sets itself so each appears once.
+     * What of a coaz-pep header map may be put on a message: a header name that is one,
+     * not a framing header, not X-PDP-* (the rule sets those itself so each appears
+     * once), and a value cleaned for a header.
      */
     private static Map<String, String> relayable(Map<String, String> in) {
         Map<String, String> out = new LinkedHashMap<>();
         for (Map.Entry<String, String> e : in.entrySet()) {
             String k = e.getKey().toLowerCase(Locale.ROOT);
-            if (!HOP.contains(k) && !k.startsWith("x-pdp-")) {
-                out.put(e.getKey(), e.getValue());
+            if (HeaderValues.name(e.getKey()) && !HOP.contains(k) && !k.startsWith("x-pdp-")) {
+                out.put(e.getKey(), HeaderValues.clean(e.getValue()));
             }
         }
         return out;
@@ -652,20 +686,43 @@ final class Pep {
         return Verdict.respond(status, headers(JSON), Json.bytes(body), responseHeaders);
     }
 
-    /** The response headers the demo transcript reads. Present only once a decision was made. */
+    /**
+     * The response headers the demo transcript reads. Present only once a decision was
+     * made. The reason is the PDP's text and the action may be coaz-pep's, so every
+     * value is cleaned for a header.
+     */
     static Map<String, String> pdpHeaders(String pep, String decision, String action, String reason, String failOpen) {
         Map<String, String> h = new LinkedHashMap<>();
-        h.put("X-PDP-PEP", pep);
+        h.put("X-PDP-PEP", HeaderValues.clean(pep));
         h.put("X-PDP-Decision", decision);
         if (failOpen != null) {
-            h.put("X-PDP-Fail-Open", failOpen);
+            h.put("X-PDP-Fail-Open", HeaderValues.clean(failOpen));
         }
-        h.put("X-PDP-Action", action == null ? "" : action);
+        h.put("X-PDP-Action", action == null ? "" : HeaderValues.clean(action));
         if (reason != null) {
-            h.put("X-PDP-Reason", reason);
+            h.put("X-PDP-Reason", HeaderValues.clean(reason));
         }
         return h;
     }
+
+    /**
+     * A permit, unless an identity header would reach the upstream mangled. A principal
+     * with a control character or a character past Latin-1 cannot be carried in a header
+     * as it is, and cleaning it could turn one principal into another, so the request is
+     * refused instead.
+     */
+    private static Verdict permit(String pep, Map<String, String> upstream, Map<String, String> responseHeaders) {
+        for (String k : X_AUTH) {
+            if (!HeaderValues.faithful(upstream.get(k))) {
+                log.error("authzen-pdp '{}': {} cannot be carried in a header as it is; denying", pep, k);
+                return deny(pep, 403, "The caller's identity cannot be forwarded to the upstream intact.", null);
+            }
+        }
+        return Verdict.permit(upstream, responseHeaders);
+    }
+
+    /** The identity headers every permit sets or removes on the request to the upstream. */
+    static final List<String> X_AUTH = List.of("X-Auth-Principal", "X-Auth-Agent", "X-Auth-Scope", "X-Auth-Acr");
 
     private static Map<String, String> authHeaders(String sub, String act, String scope, String acr) {
         Map<String, String> h = new LinkedHashMap<>();

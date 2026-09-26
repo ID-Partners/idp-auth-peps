@@ -48,7 +48,7 @@ final class JsonRpc {
             if (e.problem == StrictJson.Problem.NOT_JSON) {
                 throw new Refusal(400, PARSE_ERROR, "Parse error", null);
             }
-            throw new Refusal(400, INVALID_REQUEST, "Invalid Request: " + e.getMessage(), null);
+            throw new Refusal(400, INVALID_REQUEST, "Invalid Request: " + HeaderValues.brief(e.getMessage(), 80), null);
         }
         if (root.isArray()) {
             throw new Refusal(400, INVALID_REQUEST, "Invalid Request: batch requests are not supported", null);
@@ -64,13 +64,14 @@ final class JsonRpc {
         // decoder upstream would still read it as the method. So would "Params", "Name".
         String variant = caseVariant(root, MEMBERS);
         if (variant != null) {
-            throw new Refusal(400, INVALID_REQUEST, "Invalid Request: " + variant + " is not a JSON-RPC member name", id);
+            throw new Refusal(400, INVALID_REQUEST, "Invalid Request: " + HeaderValues.brief(variant, 40) + " is not a JSON-RPC member name", id);
         }
         JsonNode params = root.get("params");
         if (params != null && params.isObject()) {
             variant = caseVariant(params, PARAMS);
             if (variant != null) {
-                throw new Refusal(400, INVALID_REQUEST, "Invalid Request: params." + variant + " differs only in case from a member the policy reads", id);
+                throw new Refusal(400, INVALID_REQUEST, "Invalid Request: params." + HeaderValues.brief(variant, 40)
+                    + " differs only in case from a member the policy reads", id);
             }
         }
         JsonNode method = root.get("method");

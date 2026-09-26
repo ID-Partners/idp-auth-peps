@@ -322,7 +322,8 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
         exchange.getProperty(VERDICT).filter(v -> v.permit).ifPresent(v -> {
             Response r = exchange.getResponse();
             if (r != null && r.getHeaders() != null) {
-                v.responseHeaders.forEach((k, val) -> r.getHeaders().setFirstValue(k, val));
+                // The upstream does not get to answer for the PDP.
+                v.responseHeaders.forEach((k, val) -> replace(r.getHeaders(), k, val));
             }
         });
         return CompletableFuture.completedFuture(null);
@@ -332,15 +333,33 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
      * A permit puts the X-Auth-* headers on the request and continues; the X-PDP-*
      * headers wait for {@link #handleResponse}. Anything else is parked for the error
      * callback and the chain is stopped.
+     *
+     * <p>Every identity header the client sent is removed first, in whatever case it
+     * was spelled, so the upstream sees only what the PEP asserts. An empty value means
+     * the PEP asserts nothing for that header, and it stays off.
      */
     Outcome apply(Exchange exchange, Verdict v) {
         exchange.setProperty(VERDICT, v);
         if (v.permit) {
             Headers h = exchange.getRequest().getHeaders();
-            v.upstreamHeaders.forEach(h::setFirstValue);
+            List<HeaderField> sent = h.getHeaderFields() == null ? List.of() : new ArrayList<>(h.getHeaderFields());
+            for (HeaderField f : sent) {
+                String name = f.getHeaderName().toString();
+                if (Pep.X_AUTH.stream().anyMatch(name::equalsIgnoreCase)) {
+                    h.removeFields(name);
+                }
+            }
+            v.upstreamHeaders.forEach((k, val) -> replace(h, k, val));
             return Outcome.CONTINUE;
         }
         return Outcome.RETURN;
+    }
+
+    private static void replace(Headers h, String name, String value) {
+        h.removeFields(name);
+        if (value != null && !value.isEmpty()) {
+            h.add(name, value);
+        }
     }
 
     /** Everything the pipeline needs, taken from the Exchange on the engine's thread. */

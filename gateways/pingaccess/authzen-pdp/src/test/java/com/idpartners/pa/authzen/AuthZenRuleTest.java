@@ -65,7 +65,11 @@ class AuthZenRuleTest {
         }
     }
 
-    /** A minimal exchange: properties in a map, a request with headers and a body. */
+    /**
+     * A minimal exchange: properties in a map, a request with a body and a live list of
+     * header fields that removeFields and add change, as PingAccess's do, so a test sees
+     * what the upstream would receive.
+     */
     static final class Fixture {
         final Exchange exchange = mock(Exchange.class);
         final Request request = mock(Request.class);
@@ -73,19 +77,27 @@ class AuthZenRuleTest {
         final Body body = mock(Body.class);
         final Map<ExchangeProperty<?>, Object> props = new HashMap<>();
         final Map<String, String> setHeaders = new HashMap<>();
+        final List<HeaderField> sent;
         final AtomicReference<Response> response = new AtomicReference<>();
 
         Fixture(String method, String uri, List<HeaderField> fields, byte[] content, Identity identity) {
+            sent = new java.util.ArrayList<>(fields);
             when(exchange.getRequest()).thenReturn(request);
             when(exchange.getIdentity()).thenReturn(identity);
             when(request.getMethod()).thenReturn(method == null ? null : Method.forName(method));
             when(request.getUri()).thenReturn(uri);
             when(request.getHeaders()).thenReturn(headers);
-            when(headers.getHeaderFields()).thenReturn(fields);
+            when(headers.getHeaderFields()).thenAnswer(inv -> sent);
+            org.mockito.Mockito.doAnswer(inv -> {
+                String name = inv.getArgument(0);
+                setHeaders.remove(name);
+                return sent.removeIf(f -> f.getHeaderName().toString().equalsIgnoreCase(name));
+            }).when(headers).removeFields(org.mockito.ArgumentMatchers.anyString());
             org.mockito.Mockito.doAnswer(inv -> {
                 setHeaders.put(inv.getArgument(0), inv.getArgument(1));
+                sent.add(new HeaderField((String) inv.getArgument(0), (String) inv.getArgument(1)));
                 return null;
-            }).when(headers).setFirstValue(any(), any());
+            }).when(headers).add(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString());
             when(request.getBody()).thenReturn(body);
             try {
                 when(body.isRead()).thenReturn(content != null);
@@ -392,8 +404,10 @@ class AuthZenRuleTest {
         when(r.getHeaders()).thenReturn(rh);
         when(f.exchange.getResponse()).thenReturn(r);
         rule.handleResponse(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS);
-        verify(rh).setFirstValue("X-PDP-Decision", "PERMIT");
-        verify(rh).setFirstValue("X-PDP-PEP", "rule-pep");
+        // The upstream's own X-PDP-* go first: it does not get to answer for the PDP.
+        verify(rh).removeFields("X-PDP-Decision");
+        verify(rh).add("X-PDP-Decision", "PERMIT");
+        verify(rh).add("X-PDP-PEP", "rule-pep");
         // And copes with there being no response, or no headers, or no verdict.
         when(f.exchange.getResponse()).thenReturn(null);
         rule.handleResponse(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS);
@@ -402,6 +416,37 @@ class AuthZenRuleTest {
         rule.handleResponse(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS);
         Fixture none = new Fixture("GET", "/x", fields(), null, null);
         rule.handleResponse(none.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void theUpstreamSeesOnlyTheIdentityThePepAsserts() throws Exception {
+        FakeTransport t = new FakeTransport().route("http://pdp:8080/access/v1/evaluation", obj("decision", true));
+        AuthZenRule rule = new AuthZenRule(t, DIRECT, new CapturingResponses(), () -> 0L);
+        rule.configure(conf());
+        // A client's own copies, in any case, twice over: none may survive.
+        Fixture f = new Fixture("GET", "/accounts/a1/balance", fields(
+            "Authorization", "Bearer " + jwt(obj("sub", "alice", "scope", "accounts:read")),
+            "X-Auth-Principal", "admin", "x-auth-principal", "root", "X-AUTH-AGENT", "trusted-agent", "X-Auth-Acr", "urn:staff",
+            "X-Other", "kept"), null, null);
+        assertEquals(Outcome.CONTINUE, rule.handleRequest(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
+        Map<String, List<String>> seen = new HashMap<>();
+        for (HeaderField h : f.sent) {
+            seen.computeIfAbsent(h.getHeaderName().toString().toLowerCase(java.util.Locale.ROOT), k -> new java.util.ArrayList<>()).add(h.getValue());
+        }
+        assertEquals(List.of("alice"), seen.get("x-auth-principal"));
+        assertEquals(List.of("accounts:read"), seen.get("x-auth-scope"));
+        // The token names no agent and no acr, so the PEP asserts none, and none arrives.
+        assertNull(seen.get("x-auth-agent"));
+        assertNull(seen.get("x-auth-acr"));
+        assertEquals(List.of("kept"), seen.get("x-other"));
+        // A deny touches nothing on the request.
+        FakeTransport no = new FakeTransport().route("http://pdp:8080/access/v1/evaluation", obj("decision", false));
+        AuthZenRule denying = new AuthZenRule(no, DIRECT, new CapturingResponses(), () -> 0L);
+        denying.configure(conf());
+        Fixture d = new Fixture("GET", "/accounts/a1/balance", fields("Authorization", "Bearer " + jwt(obj("sub", "alice")),
+            "X-Auth-Principal", "admin"), null, null);
+        assertEquals(Outcome.RETURN, denying.handleRequest(d.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
+        verify(d.headers, never()).removeFields(org.mockito.ArgumentMatchers.anyString());
     }
 
     @Test

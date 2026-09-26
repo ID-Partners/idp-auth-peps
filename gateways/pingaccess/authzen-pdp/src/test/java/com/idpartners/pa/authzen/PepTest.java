@@ -796,6 +796,61 @@ class PepTest {
         assertEquals("unknown-agent", sent(t2).get("subject").get("id").asText());
     }
 
+    // ---------- what the PDP says is someone else's text ----------
+
+    @Test
+    void cleansAndQuotesEveryHeaderBuiltFromWhatThePdpSaid() {
+        // A step-up scope that tries to close the quoted-string and start a header.
+        FakeTransport t = pdp(obj("decision", false, "context", obj("reason", "no\r\nX-Evil: 1 一",
+            "step_up_required", true, "step_up_scope", "a\" error=\"x\r\nX-Evil: 1\\")));
+        Verdict v = pep(baseConf(), t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"from_account\":\"a\",\"amount\":5}"));
+        assertEquals("Bearer error=\"insufficient_scope\", scope=\"a\\\" error=\\\"xX-Evil: 1\\\\\"", v.header("WWW-Authenticate"));
+        assertEquals("noX-Evil: 1 ", v.responseHeaders.get("X-PDP-Reason"), "no CR, no LF, nothing past Latin-1");
+        // The JSON body keeps the PDP's words as they were: JSON has no header rules.
+        assertEquals("no\r\nX-Evil: 1 一", body(v).get("reason").asText());
+        FakeTransport d = pdp(obj("decision", false, "context", obj("identity_proofing_required", true, "identity_proofing_doctype", "org.\"x\"\r\n")));
+        Verdict dv = pep(baseConf(), d).decide(req("POST", "/accounts", Map.of("authorization", bearer(obj("sub", "alice"))), "{}"));
+        assertEquals("Bearer error=\"identity_verification_required\", doctype=\"org.\\\"x\\\"\"", dv.header("WWW-Authenticate"));
+        // Even the rule's own label, which an administrator typed.
+        AuthZenRuleConfiguration c = baseConf();
+        c.pep_label = "edge\r\nX-Evil: 1";
+        assertEquals("edgeX-Evil: 1", pep(c, pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance",
+            Map.of("authorization", bearer(obj("sub", "alice"))), null)).responseHeaders.get("X-PDP-PEP"));
+    }
+
+    @Test
+    void neverForwardsAnIdentityItCannotCarryIntact() {
+        // Cleaning "ad一min" would make it "admin": refused instead, on both paths.
+        for (String sub : new String[]{"ad一min", "alice\r\nX-Auth-Principal: admin", "bob\u0000"}) {
+            Verdict v = pep(baseConf(), pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance",
+                Map.of("authorization", bearer(obj("sub", sub))), null));
+            assertFalse(v.permit, sub);
+            assertEquals(403, v.status);
+        }
+        assertTrue(pep(baseConf(), pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance",
+            Map.of("authorization", bearer(obj("sub", "zoë"))), null)).permit, "Latin-1 is carried as it is");
+        Verdict mcp = (Verdict) mcpRoute(obj("decision", true, "upstream_headers", obj("X-Auth-Principal", "ad一min")), null)[0];
+        assertEquals(403, mcp.status);
+    }
+
+    @Test
+    void takesOnlyHeadersThatAreHeadersFromCoazPep() {
+        Verdict v = (Verdict) mcpRoute(obj("decision", true, "upstream_headers", obj("x-auth-principal", "alice", "X-Custom", "a\r\nb",
+            "Content-Length", "0", "Host", "evil.example", "Bad Header", "x")), null)[0];
+        assertTrue(v.permit);
+        assertEquals("alice", v.upstreamHeaders.get("X-Auth-Principal"), "under its own name, replacing the removal");
+        assertFalse(v.upstreamHeaders.containsKey("x-auth-principal"));
+        assertEquals("ab", v.upstreamHeaders.get("X-Custom"));
+        assertFalse(v.upstreamHeaders.containsKey("Content-Length"));
+        assertFalse(v.upstreamHeaders.containsKey("Host"));
+        assertFalse(v.upstreamHeaders.containsKey("Bad Header"));
+        Verdict deny = (Verdict) mcpRoute(obj("decision", false, "response", obj("status", 403, "body", "{}",
+            "headers", obj("WWW-Authenticate", "Bearer\r\nSet-Cookie: s=1", "Bad Header", "x", "X-PDP-Reason", "why\r\n"))), null)[0];
+        assertEquals("BearerSet-Cookie: s=1", deny.header("WWW-Authenticate"));
+        assertNull(deny.header("Bad Header"));
+        assertEquals("why", deny.responseHeaders.get("X-PDP-Reason"));
+    }
+
     // ---------- an identity PingAccess did not establish is not an identity ----------
 
     @Test
