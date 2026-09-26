@@ -34,7 +34,7 @@
          these are bundled either. -->
     <jackson.version>2.21.1</jackson.version>
     <jakarta.validation.version>3.1.1</jakarta.validation.version>
-    <slf4j.version>1.7.36</slf4j.version>
+    <slf4j.version>2.0.20</slf4j.version>
     <jose4j.version>0.9.6</jose4j.version>
 
     <!-- Coverage floor, set just under the number on the day it was added. A change
