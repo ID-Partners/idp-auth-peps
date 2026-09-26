@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 )
 
 // pdpServing answers every evaluation and evaluations call with a fixed body.
@@ -117,22 +119,29 @@ func TestEvaluateRejectsUnusablePDPResponses(t *testing.T) {
 	}
 }
 
-func TestCheckToolCallIgnoresNonToolsCallBodies(t *testing.T) {
-	pdp := pdpServing(t, `{"decision":false}`, 200)
+func TestCheckToolCallRefusesBodiesItCannotRead(t *testing.T) {
+	pdp, reqs := recordingPDP(t, `{"decision":true}`)
 	mcp := mcpServing(t, `[]`)
 	e := NewEngine(Options{PDP: PDPConfig{URL: pdp.URL}})
 
-	// Not JSON at all: nothing to authorize, and not this engine's business.
-	v := e.CheckToolCall(context.Background(), mcp.URL, "", []byte("not json"),
-		map[string]any{"sub": "a"}, nil, CallOptions{})
-	if !v.Decision || v.CoazTool {
-		t.Fatalf("a non-JSON body should pass through, got %+v", v)
+	// A body the engine cannot read is one it cannot vouch for: refused with a 400, and
+	// never handed to the PDP — let alone waved through, which is what an upstream that
+	// reads the bytes differently would exploit.
+	for name, body := range map[string]string{
+		"not JSON":        "not json",
+		"batch":           `[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer"}}]`,
+		"nameless call":   `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`,
+		"folded params":   `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer"},"Params":{"name":"x"}}`,
+		"truncated":       `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_cust`,
+		"trailing object": `{"jsonrpc":"2.0","id":1,"method":"ping"}{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_customer"}}`,
+	} {
+		v := e.CheckToolCall(context.Background(), mcp.URL, "", []byte(body), map[string]any{"sub": "a"}, nil, CallOptions{})
+		if v.Decision || v.PassThrough || v.HTTPStatus != http.StatusBadRequest || len(v.JSONRPCError) == 0 {
+			t.Fatalf("%s: must be refused with a 400 JSON-RPC error, got %+v", name, v)
+		}
 	}
-
-	// A tools/call with no tool name has nothing to look up.
-	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{}})
-	if v := e.CheckToolCall(context.Background(), mcp.URL, "", body, map[string]any{"sub": "a"}, nil, CallOptions{}); !v.Decision {
-		t.Fatalf("a nameless tools/call should pass through, got %+v", v)
+	if len(*reqs) != 0 {
+		t.Fatalf("a refused body must never reach the PDP, got %d calls", len(*reqs))
 	}
 }
 
@@ -280,4 +289,146 @@ func TestV1MappingProcessingRules(t *testing.T) {
 			t.Fatal("a token reference nested inside a list inside a map still counts")
 		}
 	})
+}
+
+// Fail-open covers the PDP being unavailable, never the PDP refusing. A 401 from a
+// rotated key, or a 413 a client provoked with an oversized argument, must not switch a
+// fail-open layer off.
+func TestFailOpenSkipsOnlyAnUnavailablePDP(t *testing.T) {
+	mcp := mcpServing(t, singleTool)
+	own := pdpServing(t, `{"decision":true}`, 200)
+	open := true
+	cases := map[string]struct {
+		status  int
+		body    string
+		skipped bool
+	}{
+		"503":          {503, `{}`, true},
+		"500":          {500, `{}`, true},
+		"429":          {429, `{}`, true},
+		"400":          {400, `{}`, false},
+		"401":          {401, `{}`, false},
+		"403":          {403, `{}`, false},
+		"404":          {404, `{}`, false},
+		"413":          {413, `{}`, false},
+		"302":          {302, `{}`, false},
+		"garbage 200":  {200, `<html>`, false},
+		"string true":  {200, `{"decision":"true"}`, false},
+		"numeric true": {200, `{"decision":1}`, false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			layer := pdpServing(t, c.body, c.status)
+			fr := &fakeResolver{
+				ep: discovery.PDPEndpoints{Identifier: own.URL, Evaluation: own.URL + "/e"},
+				layerEP: func(pdp string) discovery.PDPEndpoints {
+					return discovery.PDPEndpoints{Identifier: pdp, Evaluation: pdp + "/e"}
+				},
+			}
+			e := NewEngine(Options{Resolver: fr})
+			v := e.CheckToolCall(context.Background(), mcp.URL, "", singleCall(), map[string]any{"sub": "alice", "client_id": "c"}, nil,
+				CallOptions{Layers: []discovery.LayerSpec{{Name: layer.URL, FailOpen: &open}, {Name: "resource"}}})
+			if c.skipped {
+				if !v.Decision || len(v.FailedOpen) != 1 || v.FailedOpen[0] != layer.URL {
+					t.Fatalf("an unavailable fail-open layer is skipped and named, got %+v", v)
+				}
+				return
+			}
+			if v.Decision || !hasCode(v, CodePDPError) {
+				t.Fatalf("a refusal must fail closed even on a fail-open layer, got %+v", v)
+			}
+		})
+	}
+}
+
+func TestFailOpenSkipsAnUnreachablePDPAndNamesItWithoutDetail(t *testing.T) {
+	mcp := mcpServing(t, singleTool)
+	own := pdpServing(t, `{"decision":true}`, 200)
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close() // connection refused
+	fr := &fakeResolver{
+		ep: discovery.PDPEndpoints{Identifier: own.URL, Evaluation: own.URL + "/e"},
+		layerEP: func(pdp string) discovery.PDPEndpoints {
+			return discovery.PDPEndpoints{Identifier: pdp, Evaluation: pdp + "/e"}
+		},
+	}
+	open := true
+	v := NewEngine(Options{Resolver: fr}).CheckToolCall(context.Background(), mcp.URL, "", singleCall(),
+		map[string]any{"sub": "alice", "client_id": "c"}, nil,
+		CallOptions{Layers: []discovery.LayerSpec{{Name: gone.URL, FailOpen: &open}, {Name: "resource"}}})
+	if !v.Decision || len(v.FailedOpen) != 1 || v.FailedOpen[0] != gone.URL {
+		t.Fatalf("an unreachable fail-open layer is skipped and named by identifier only, got %+v", v)
+	}
+}
+
+func TestLayerNamesDropsTheDetail(t *testing.T) {
+	got := LayerNames([]string{"https://pdp.example (dial tcp 10.0.0.9:443: refused)", "static", "https://b.example (published by https://r: x)"})
+	want := []string{"https://pdp.example", "static", "https://b.example"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("LayerNames = %v, want %v", got, want)
+		}
+	}
+	if LayerNames(nil) != nil {
+		t.Fatal("no skipped layers is nil, so a permit carries no marker")
+	}
+}
+
+// Every MCP message is decided: with defaults on, methods other than tools/call go to
+// the PDP through their default mappings, responses and pings pass, and a method the
+// binding does not know is denied.
+func TestCheckMCPDecidesEveryMethod(t *testing.T) {
+	pdp, reqs := recordingPDP(t, `{"decision":true}`)
+	mcp := mcpServing(t, singleTool)
+	e := NewEngine(Options{PDP: PDPConfig{URL: pdp.URL}})
+	claims := map[string]any{"sub": "alice", "aud": "https://mcp.example", "client_id": "c"}
+	on := CallOptions{ApplyDefaultMappings: true}
+	check := func(body string, opts CallOptions) Verdict {
+		return e.CheckToolCall(context.Background(), mcp.URL, "", []byte(body), claims, nil, opts)
+	}
+
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","id":1,"result":{"action":"accept"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"ping"}`,
+	} {
+		if v := check(body, on); !v.Decision || !v.PassThrough {
+			t.Fatalf("%s passes through, got %+v", body, v)
+		}
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("pass-through messages never reach the PDP, got %d calls", len(*reqs))
+	}
+
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"file:///x"}}`,
+	} {
+		before := len(*reqs)
+		if v := check(body, on); !v.Decision || v.PassThrough || len(*reqs) != before+1 {
+			t.Fatalf("%s must be decided by the PDP, got %+v", body, v)
+		}
+	}
+
+	if v := check(`{"jsonrpc":"2.0","id":6,"method":"future/method"}`, on); v.Decision || !hasCode(v, CodeDeniedV2) {
+		t.Fatalf("an unknown method is denied, got %+v", v)
+	}
+
+	// The explicit opt-out keeps the old pass-through for everything but declared tools.
+	if v := check(`{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"file:///x"}}`, CallOptions{}); !v.Decision || !v.PassThrough {
+		t.Fatalf("defaults off passes resources/read through, got %+v", v)
+	}
+}
+
+// With no upstream to read declarations from, a tools/call is judged by the default
+// mapping rather than waved through.
+func TestToolsCallWithoutAnUpstreamUsesTheDefaultMapping(t *testing.T) {
+	pdp, reqs := recordingPDP(t, `{"decision":false}`)
+	e := NewEngine(Options{PDP: PDPConfig{URL: pdp.URL}})
+	v := e.CheckToolCall(context.Background(), "", "", toolsCallBody("pay", map[string]any{"amount": 5}),
+		map[string]any{"sub": "alice", "client_id": "c"}, nil, CallOptions{ApplyDefaultMappings: true})
+	if v.Decision || len(*reqs) != 1 {
+		t.Fatalf("a tools/call with no upstream is asked of the PDP by the default mapping, got %+v (%d calls)", v, len(*reqs))
+	}
 }

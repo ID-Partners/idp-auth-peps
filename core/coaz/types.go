@@ -8,7 +8,11 @@
 // Spec: https://github.com/openid/authzen/blob/main/profiles/authzen-mcp-profile-1_0.md
 package coaz
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"log"
+	"reflect"
+)
 
 // JSON-RPC error codes defined (or adopted) by the COAZ profile.
 const (
@@ -44,19 +48,30 @@ type Tool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-// Verdict is the outcome of a COAZ check for one tools/call.
+// Verdict is the outcome of a COAZ check for one MCP message.
 type Verdict struct {
-	// CoazTool is false when the tool does not declare coaz:true — the caller
-	// should apply its non-COAZ (legacy) behaviour.
+	// CoazTool is true when the engine decided the message: a PDP was asked, or it was
+	// refused before one could be. False means no PDP was consulted and the message
+	// may proceed — see PassThrough.
 	CoazTool bool
-	// Decision is the PDP outcome (only meaningful when CoazTool).
+	// Decision is true when the message may proceed.
 	Decision bool
-	// JSONRPCError is the profile-mandated protocol error response body to
-	// return to the MCP client (HTTP 200, application/json) when the call must
-	// not proceed. Nil on permit.
+	// PassThrough is true when the message proceeds without a PDP call: ping,
+	// notifications, a client's response to a server-initiated request, or — on a
+	// route that turned default mappings off — anything the binding would have mapped.
+	PassThrough bool
+	// JSONRPCError is the JSON-RPC error response body to return to the MCP client
+	// when the message must not proceed. Nil on permit.
 	JSONRPCError json.RawMessage
-	// Reason is a human-readable summary for logs / decision headers.
+	// HTTPStatus is the status that carries JSONRPCError. Zero means 200, which is how
+	// the binding returns a policy denial; a body the PEP cannot parse is a 400.
+	HTTPStatus int
+	// Reason is a summary for logs. It may name internal URLs and upstream errors, so
+	// it is not for the client — see ClientReason.
 	Reason string
+	// ClientReason is what may be told to the client: the JSON-RPC error's message on
+	// a deny, the PDP's reason on a permit.
+	ClientReason string
 	// PDPRequest is the AuthZEN request that was sent (for transcripts/tests).
 	PDPRequest json.RawMessage
 	// FailedOpen names the policy layers that failed and were skipped because they
@@ -104,4 +119,19 @@ func jsonRPCErrorData(id any, code int, message string, data any) json.RawMessag
 	}
 	raw, _ := json.Marshal(resp)
 	return raw
+}
+
+// assertContext writes the context the PEP asserts over what a mapping produced. The
+// mapping is authored by the MCP server and can draw values from the caller's params —
+// `"context": "$params.arguments.meta"` hands the caller every key — so a mapping key
+// must never stand in for the verified user's scope or consent, the resource's metadata,
+// or the endpoint hit. An override that changes a value is logged: it means a mapping is
+// trying to say something the PEP already knows.
+func assertContext(ctx, asserted map[string]any, tool string) {
+	for k, v := range asserted {
+		if prev, set := ctx[k]; set && !reflect.DeepEqual(prev, v) {
+			log.Printf("coaz: tool %q's mapping set context.%s; the PEP's value replaces it", tool, k)
+		}
+		ctx[k] = v
+	}
 }

@@ -188,8 +188,8 @@ func normaliseSubject(inner map[string]any) (bool, error) {
 
 // Build resolves the mapping against one operation and returns the AuthZEN request.
 //
-// The envelope alone decides evaluation vs evaluations. extraContext fills only context
-// keys the mapping did not set, so a declared mapping always wins.
+// The envelope alone decides evaluation vs evaluations. extraContext is what the PEP
+// asserts, and it wins over any context key the mapping produced — see assertContext.
 func (cm *CompiledMappingV2) Build(params, token map[string]any, extraContext map[string]any) (*BuiltRequest, error) {
 	resolved, err := cm.body.eval(params, token)
 	if err != nil {
@@ -259,11 +259,7 @@ func (cm *CompiledMappingV2) Build(params, token map[string]any, extraContext ma
 			ctx = map[string]any{}
 			req["context"] = ctx
 		}
-		for k, v := range extraContext {
-			if _, exists := ctx[k]; !exists {
-				ctx[k] = v
-			}
-		}
+		assertContext(ctx, extraContext, cm.ToolName)
 	}
 
 	count := 1

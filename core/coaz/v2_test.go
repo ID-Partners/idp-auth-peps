@@ -263,28 +263,32 @@ func TestDeniedCodePerDialect(t *testing.T) {
 	}
 }
 
-func TestV2ExtraContextDoesNotOverrideTheMapping(t *testing.T) {
+func TestV2AssertedContextWinsOverTheMapping(t *testing.T) {
+	// The mapping hands the caller's params to context wholesale. Whatever the caller
+	// put there, the PEP's own assertions are what reach the PDP.
 	cm := mustMappingV2(t, "t", `{
 	  "evaluation": {
 	    "subject":  { "type": "identity", "id": "$token.sub" },
 	    "action":   { "name": "t" },
 	    "resource": { "type": "customer", "id": "c1" },
-	    "context":  { "agent": "$token.?client_id" }
+	    "context":  "$params.arguments.meta"
 	  }
 	}`)
-	built, err := cm.Build(map[string]any{}, v2Token,
-		map[string]any{"agent": "IGNORED", "channel": "ai-agent"})
+	params := map[string]any{"arguments": map[string]any{"meta": map[string]any{
+		"user_scope": "payments:unlimited", "consented_amount": 1e9, "note": "kept",
+	}}}
+	built, err := cm.Build(params, v2Token, map[string]any{"user_scope": "openid", "consented_amount": 50.0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got map[string]any
 	_ = json.Unmarshal(built.Body, &got)
 	ctx := got["context"].(map[string]any)
-	if ctx["agent"] != "http://agentprovider.com/agent-app-id" {
-		t.Fatalf("gateway context overrode a declared value: %v", ctx["agent"])
+	if ctx["user_scope"] != "openid" || ctx["consented_amount"] != 50.0 {
+		t.Fatalf("a caller-supplied context key replaced the PEP's assertion: %v", ctx)
 	}
-	if ctx["channel"] != "ai-agent" {
-		t.Fatalf("gateway context not merged into unset keys: %v", ctx)
+	if ctx["note"] != "kept" {
+		t.Fatalf("keys the PEP does not assert stay as the mapping produced them: %v", ctx)
 	}
 }
 

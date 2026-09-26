@@ -8,8 +8,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -134,52 +136,87 @@ func forwardedContext(base map[string]any, meta *discovery.ResourceMetadata, opt
 	return out
 }
 
+// CheckToolCall parses one MCP message strictly and decides it — see CheckMCP. A body
+// ParseRequest refuses is denied with a 400, never waved through: a body this PEP reads
+// one way and the upstream another is the bypass.
 func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any, opts CallOptions) Verdict {
-	var rpc struct {
-		ID     any            `json:"id"`
-		Method string         `json:"method"`
-		Params map[string]any `json:"params"`
+	rpc, err := ParseRequest(rpcBody)
+	if err != nil {
+		return Refused(err)
 	}
-	if err := json.Unmarshal(rpcBody, &rpc); err != nil {
-		return Verdict{CoazTool: false, Decision: true, Reason: "not a JSON-RPC request"}
+	return e.CheckMCP(ctx, upstreamURL, authorization, rpc, tokenClaims, extraContext, opts)
+}
+
+// Refused is the verdict for a body ParseRequest would not accept.
+func Refused(err error) Verdict {
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		pe = &ParseError{Code: CodeInvalidRequest, Message: "Invalid Request"}
+	}
+	return Verdict{CoazTool: true, HTTPStatus: http.StatusBadRequest, JSONRPCError: pe.JSONRPCError(),
+		Reason: pe.Message, ClientReason: pe.Message}
+}
+
+// passThrough is a message that proceeds without a PDP call.
+func passThrough(reason string) Verdict {
+	return Verdict{Decision: true, PassThrough: true, Reason: reason, ClientReason: reason}
+}
+
+// denied is a deny the engine reached. message is what the client is told; reason, which
+// may name internal URLs or upstream errors, is for the logs.
+func denied(id any, code int, message, reason string) Verdict {
+	return Verdict{CoazTool: true, JSONRPCError: jsonRPCError(id, code, message), Reason: reason, ClientReason: message}
+}
+
+// CheckMCP decides one parsed MCP message:
+//
+//	a response, ping, notifications/*  pass through without a PDP call;
+//	server-initiated methods           pass through (out of the binding's scope);
+//	tools/call                         the tool's declared mapping, else the default one;
+//	any other method                   its default mapping; a method with none is denied.
+//
+// A route that turns default mappings off passes through everything that is not a
+// declared tool call — the pre-binding behaviour, kept only as an explicit opt-out.
+// With no upstream URL there is no tools/list to read declarations from, so every
+// tools/call gets the default mapping.
+func (e *Engine) CheckMCP(ctx context.Context, upstreamURL, authorization string, rpc *Request, tokenClaims map[string]any, extraContext map[string]any, opts CallOptions) Verdict {
+	if rpc.Kind == KindResponse {
+		return passThrough("a client's response to a server-initiated request")
 	}
 	if rpc.Method != "tools/call" {
 		// Every other method is governed by its own default mapping — tools/call is not
 		// special, it is merely the one that can also be declared per tool.
 		return e.checkByDefaultMapping(ctx, rpc.ID, rpc.Method, rpc.Params, tokenClaims, extraContext, opts)
 	}
-	toolName, _ := rpc.Params["name"].(string)
-	if toolName == "" {
-		return Verdict{CoazTool: false, Decision: true, Reason: "tools/call without a tool name"}
-	}
 
-	dt, err := e.disco.lookup(ctx, upstreamURL, authorization, toolName)
-	if err != nil {
-		// Cannot know whether the tool is COAZ — fail closed per the
-		// profile's PDP-communication semantics.
-		return Verdict{CoazTool: true, Decision: false,
-			Reason:       fmt.Sprintf("COAZ discovery failed: %v", err),
-			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization check unavailable: tool discovery failed")}
+	var dt *discoveredTool
+	if upstreamURL != "" {
+		found, err := e.disco.lookup(ctx, upstreamURL, authorization, rpc.ToolName)
+		if err != nil {
+			// Cannot know whether the tool is COAZ — fail closed per the
+			// profile's PDP-communication semantics.
+			return denied(rpc.ID, CodePDPError, "Authorization check unavailable: tool discovery failed",
+				fmt.Sprintf("COAZ discovery failed: %v", err))
+		}
+		dt = found
 	}
 	if !dt.declared() {
 		if !(opts.ApplyDefaultMappings || e.applyDefaults) {
-			return Verdict{CoazTool: false, Decision: true, Reason: "tool declares no mapping (defaults disabled)"}
+			return passThrough("tool declares no mapping (defaults disabled)")
 		}
 		def, err := CompiledDefault("tools/call")
 		if err != nil {
-			return Verdict{CoazTool: true, Decision: false,
-				Reason:       fmt.Sprintf("COAZ default mapping error: %v", err),
-				JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ default mapping error: %v", err))}
+			msg := fmt.Sprintf("COAZ default mapping error: %v", err)
+			return denied(rpc.ID, CodeMappingError, msg, msg)
 		}
-		dt = &discoveredTool{tool: dt.tool, dialect: DialectV2, mappingV2: def}
+		dt = &discoveredTool{tool: Tool{Name: rpc.ToolName}, dialect: DialectV2, mappingV2: def}
 	}
 	// The denial code differs per dialect, so it is resolved once here and used for
 	// every deny below.
 	deniedCode := dt.dialect.DeniedCode()
 	if dt.mappingErr != nil {
-		return Verdict{CoazTool: true, Decision: false,
-			Reason:       fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr),
-			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr))}
+		msg := fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr)
+		return denied(rpc.ID, CodeMappingError, msg, msg)
 	}
 
 	// The PDPs are resolved before the request is built, because part of what they get
@@ -187,9 +224,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 	// straddle a PDP that moved.
 	layers, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers, opts.FailOpen)
 	if err != nil {
-		return Verdict{CoazTool: true, Decision: false,
-			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
-			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
+		return denied(rpc.ID, CodePDPError, "Authorization service unavailable", fmt.Sprintf("PDP error: PDP discovery: %v", err))
 	}
 	eps := layers.PDPs
 	extraContext = forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts)
@@ -202,16 +237,15 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 		built, err = dt.mapping.Build(rpc.Params, tokenClaims, extraContext)
 	}
 	if err != nil {
-		return Verdict{CoazTool: true, Decision: false,
-			Reason:       fmt.Sprintf("COAZ mapping error: %v", err),
-			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
+		msg := fmt.Sprintf("COAZ mapping error: %v", err)
+		return denied(rpc.ID, CodeMappingError, msg, msg)
 	}
 
 	out, err := e.evaluateLayers(ctx, eps, built, layers.Skipped)
 	if err != nil {
-		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
-			Reason:       fmt.Sprintf("PDP error: %v", err),
-			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
+		v := denied(rpc.ID, CodePDPError, "Authorization service unavailable", fmt.Sprintf("PDP error: %v", err))
+		v.PDPRequest = built.Body
+		return v
 	}
 	decision, reason := out.Decision, out.Reason
 	if !decision {
@@ -228,7 +262,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			if reason != "" {
 				msg += " :: " + reason
 			}
-			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg, ClientReason: msg,
 				JSONRPCError: jsonRPCErrorData(rpc.ID, deniedCode, msg, map[string]any{
 					"authz_challenge": AuthzChallenge{Type: "identity_proofing", Doctype: doctype,
 						Reason: reason, PEP: "mcp-edge"}})}
@@ -245,7 +279,7 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			if reason != "" {
 				msg += " :: " + reason
 			}
-			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg, ClientReason: msg,
 				JSONRPCError: jsonRPCErrorData(rpc.ID, deniedCode, msg, map[string]any{
 					"authz_challenge": AuthzChallenge{Type: "resource_authorisation", Scope: scope,
 						Reason: reason, PEP: "mcp-edge"}})}
@@ -254,13 +288,13 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 		if reason != "" {
 			msg = "Access denied: " + reason
 		}
-		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg, ClientReason: msg,
 			JSONRPCError: jsonRPCError(rpc.ID, deniedCode, msg)}
 	}
 	if reason == "" {
 		reason = "Permitted by policy."
 	}
-	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason, FailedOpen: out.FailedOpen}
+	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason, ClientReason: reason, FailedOpen: out.FailedOpen}
 }
 
 // pdpOutcome carries the PDP decision plus the policy's challenge advice: the RFC 9470
@@ -307,24 +341,57 @@ func mergePermit(acc, layer pdpOutcome) pdpOutcome {
 	return out
 }
 
+// ErrPDPUnavailable marks a PDP call that failed for want of the PDP: a transport error, a
+// timeout, a 5xx or a 429. It is the only failure a fail-open layer may skip. Anything
+// else that stops a decision — a 3xx or 4xx, an answer that is not a decision, a request
+// that could not be built — is a refusal, and fails closed whatever the layer says: a
+// rotated key's 401, or a 413 a client provoked with an oversized argument, must not
+// switch a layer off.
+var ErrPDPUnavailable = errors.New("PDP unavailable")
+
+// PDPStatusError classifies a non-2xx status from a PDP.
+func PDPStatusError(status int) error {
+	if status >= 500 || status == http.StatusTooManyRequests {
+		return fmt.Errorf("%w: PDP returned %d", ErrPDPUnavailable, status)
+	}
+	return fmt.Errorf("PDP refused the request with %d", status)
+}
+
+// LayerNames strips the diagnostic detail from skipped-layer entries ("id (why)"),
+// leaving the identifiers a client may see in X-PDP-Fail-Open. The detail belongs in the
+// logs: it can carry internal addresses and upstream error text.
+func LayerNames(skipped []string) []string {
+	if len(skipped) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(skipped))
+	for _, s := range skipped {
+		name, _, _ := strings.Cut(s, " (")
+		out = append(out, name)
+	}
+	return out
+}
+
 // evaluateLayers asks each PDP in order with the same request. Every layer must
 // permit; the first that does not is the answer, advice and all, and later layers are
 // not consulted — a generic layer is a gate in front of a specific one.
 //
-// A PDP error in a layer fails closed, unless the layer is fail-open, in which case it
-// is skipped and named. If every layer was skipped the request is permitted — that is
-// what fail-open means, and the operator chose it per layer — with the permit marked so
-// it can be seen and counted. A deny is never skipped: it is a decision, not a failure.
+// A PDP failure in a layer fails closed. Only when the PDP was unavailable
+// (ErrPDPUnavailable) and the layer is fail-open is it skipped and named. If every layer
+// was skipped the request is permitted — that is what fail-open means, and the operator
+// chose it per layer — with the permit marked so it can be seen and counted. A deny is
+// never skipped: it is a decision, not a failure; nor is a refusal.
 func (e *Engine) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, built *BuiltRequest, skipped []string) (pdpOutcome, error) {
 	var out pdpOutcome
 	decided := false
 	for _, ep := range eps {
 		o, err := e.evaluate(ctx, ep, built)
 		if err != nil {
-			if !ep.FailOpen {
+			if !ep.FailOpen || !errors.Is(err, ErrPDPUnavailable) {
 				return out, fmt.Errorf("%s: %w", ep.Identifier, err)
 			}
-			skipped = append(skipped, fmt.Sprintf("%s (%v)", ep.Identifier, err))
+			log.Printf("coaz: fail-open layer %s skipped: %v", ep.Identifier, err)
+			skipped = append(skipped, ep.Identifier)
 			continue
 		}
 		decided = true
@@ -333,10 +400,10 @@ func (e *Engine) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoint
 		}
 		out = mergePermit(out, o)
 	}
-	out.FailedOpen = skipped
+	out.FailedOpen = LayerNames(skipped)
 	if !decided {
 		out.Decision = true
-		out.Reason = "fail-open: no policy layer could be reached (" + strings.Join(skipped, "; ") + ")"
+		out.Reason = "fail-open: no policy layer could be reached (" + strings.Join(out.FailedOpen, ", ") + ")"
 	}
 	return out, nil
 }
@@ -356,7 +423,7 @@ func (e *Engine) evaluate(ctx context.Context, ep discovery.PDPEndpoints, built 
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(built.Body))
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("PDP request could not be built: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if ep.APIKey != "" {
@@ -364,15 +431,15 @@ func (e *Engine) evaluate(ctx context.Context, ep discovery.PDPEndpoints, built 
 	}
 	resp, err := e.pdpc.Do(req)
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("%w: %v", ErrPDPUnavailable, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("%w: reading the answer: %v", ErrPDPUnavailable, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return out, fmt.Errorf("PDP returned %d", resp.StatusCode)
+		return out, PDPStatusError(resp.StatusCode)
 	}
 
 	type decision struct {
@@ -406,8 +473,10 @@ func (e *Engine) evaluate(ctx context.Context, ep discovery.PDPEndpoints, built 
 	if err := json.Unmarshal(raw, &batch); err != nil {
 		return out, fmt.Errorf("bad PDP evaluations response: %w", err)
 	}
-	if len(batch.Evaluations) == 0 {
-		return out, fmt.Errorf("PDP evaluations response was empty")
+	// One answer per question, or it is not an answer: a short list would permit the
+	// entries the PDP never evaluated.
+	if len(batch.Evaluations) != built.Count {
+		return out, fmt.Errorf("PDP answered %d evaluations for %d asked", len(batch.Evaluations), built.Count)
 	}
 	for _, d := range batch.Evaluations {
 		if !d.Decision {
@@ -432,16 +501,16 @@ func (e *Engine) checkByDefaultMapping(
 	opts CallOptions,
 ) Verdict {
 	if IsPassThrough(method) {
-		return Verdict{CoazTool: false, Decision: true, Reason: "pass-through method: " + method}
+		return passThrough("pass-through method: " + method)
 	}
 	if IsServerInitiated(method) {
 		// Out of scope for the binding: authorizing these with the client's token would
 		// be asking about the wrong identity.
-		return Verdict{CoazTool: false, Decision: true, Reason: "server-initiated request, out of scope: " + method}
+		return passThrough("server-initiated request, out of scope: " + method)
 	}
 	if !(opts.ApplyDefaultMappings || e.applyDefaults) {
-		// Pre-v2 behaviour, retained so enabling defaults is a deliberate migration.
-		return Verdict{CoazTool: false, Decision: true, Reason: "defaults disabled: " + method}
+		// The pre-binding behaviour, kept only as an explicit per-route opt-out.
+		return passThrough("defaults disabled: " + method)
 	}
 
 	cm, err := CompiledDefault(method)
@@ -450,40 +519,37 @@ func (e *Engine) checkByDefaultMapping(
 		// future MCP versions or extensions fail closed rather than bypassing
 		// authorization."
 		msg := "Method not permitted: " + method
-		return Verdict{CoazTool: true, Decision: false, Reason: msg,
-			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
+		return denied(id, CodeDeniedV2, msg, msg)
 	}
 
 	layers, err := discovery.ResolveLayers(ctx, e.resolver, opts.Resource, opts.Layers, opts.FailOpen)
 	if err != nil {
-		return Verdict{CoazTool: true, Decision: false,
-			Reason:       fmt.Sprintf("PDP error: PDP discovery: %v", err),
-			JSONRPCError: jsonRPCError(id, CodePDPError, "Authorization service unavailable")}
+		return denied(id, CodePDPError, "Authorization service unavailable", fmt.Sprintf("PDP error: PDP discovery: %v", err))
 	}
 	eps := layers.PDPs
 	built, err := cm.Build(params, tokenClaims, forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts))
 	if err != nil {
 		msg := fmt.Sprintf("COAZ mapping error: %v", err)
-		return Verdict{CoazTool: true, Decision: false, Reason: msg,
-			JSONRPCError: jsonRPCError(id, CodeMappingError, msg)}
+		return denied(id, CodeMappingError, msg, msg)
 	}
 	out, err := e.evaluateLayers(ctx, eps, built, layers.Skipped)
 	if err != nil {
-		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
-			Reason:       fmt.Sprintf("PDP error: %v", err),
-			JSONRPCError: jsonRPCError(id, CodePDPError, "Authorization service unavailable")}
+		v := denied(id, CodePDPError, "Authorization service unavailable", fmt.Sprintf("PDP error: %v", err))
+		v.PDPRequest = built.Body
+		return v
 	}
 	if !out.Decision {
 		msg := "Access denied"
 		if out.Reason != "" {
 			msg = "Access denied: " + out.Reason
 		}
-		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
-			JSONRPCError: jsonRPCError(id, CodeDeniedV2, msg)}
+		v := denied(id, CodeDeniedV2, msg, msg)
+		v.PDPRequest = built.Body
+		return v
 	}
 	reason := out.Reason
 	if reason == "" {
 		reason = "Permitted by policy."
 	}
-	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason, FailedOpen: out.FailedOpen}
+	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason, ClientReason: reason, FailedOpen: out.FailedOpen}
 }

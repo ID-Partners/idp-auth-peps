@@ -16,25 +16,25 @@ import (
 
 // --- v1 mapping (build.go) ---
 
-func TestV1BuildMergesExtraContextWithoutOverriding(t *testing.T) {
+func TestV1BuildAssertedContextWinsOverTheMapping(t *testing.T) {
 	cm := mustMapping(t, "t", `{
 	  "subject":  [{"type": "'user'", "id": "token.sub"}],
 	  "resource": [{"type": "'r'", "id": "'x'"}],
-	  "context":  [{"agent": "token.client_id"}]
+	  "context":  [{"agent": "token.client_id", "user_scope": "params.scope"}]
 	}`)
-	built, err := cm.Build(map[string]any{}, specToken,
-		map[string]any{"agent": "IGNORED", "user_scope": "openid"})
+	built, err := cm.Build(map[string]any{"scope": "payments:unlimited"}, specToken,
+		map[string]any{"user_scope": "openid"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got map[string]any
 	_ = json.Unmarshal(built.Body, &got)
 	ctx := got["context"].(map[string]any)
-	if ctx["agent"] == "IGNORED" {
-		t.Fatal("a declared context field must win over extraContext")
-	}
 	if ctx["user_scope"] != "openid" {
-		t.Fatalf("extraContext should fill unset keys: %v", ctx)
+		t.Fatalf("the PEP's user_scope must replace one a mapping drew from params: %v", ctx)
+	}
+	if ctx["agent"] != specToken["client_id"] {
+		t.Fatalf("keys the PEP does not assert stay as the mapping produced them: %v", ctx)
 	}
 }
 

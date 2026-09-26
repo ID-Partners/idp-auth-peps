@@ -142,20 +142,13 @@ func (cm *CompiledMapping) Build(params, token map[string]any, extraContext map[
 	if err != nil {
 		return nil, err
 	}
-	// Merge gateway-supplied context the mapping can't derive itself (e.g. user_scope
-	// from the logged-in user's X-User-Token, needed by amount/step-up policies). Only
-	// fills keys the mapping didn't set, so declared mappings always win.
-	if len(extraContext) > 0 {
-		for _, cv := range context {
-			m, ok := cv.(map[string]any)
-			if !ok {
-				continue
-			}
-			for k, v := range extraContext {
-				if _, exists := m[k]; !exists {
-					m[k] = v
-				}
-			}
+	// Merge the context the PEP asserts (e.g. user_scope from the verified X-User-Token,
+	// the resource's metadata, the endpoint hit). It wins over the mapping: a mapping is
+	// authored by the MCP server and may draw values from caller-supplied params, so a
+	// mapping key must not be able to stand in for something the PEP verified.
+	for _, cv := range context {
+		if m, ok := cv.(map[string]any); ok {
+			assertContext(m, extraContext, cm.ToolName)
 		}
 	}
 	var action []any
