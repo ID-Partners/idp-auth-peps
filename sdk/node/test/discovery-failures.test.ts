@@ -184,19 +184,51 @@ describe('PDP metadata that goes missing serves the last good copy', () => {
     });
   }
 
-  it('with no good copy yet, uses the default paths for now without caching them as the answer', async () => {
+  it('with no good copy yet, the PDP is unavailable, never a guess at its paths', async () => {
     let now = 1_700_000_000_000;
     const table: Record<string, Route> = { [`${STATIC}/.well-known/authzen-configuration`]: 503 };
     const r = router(table);
     const d = new PdpDiscovery({ mode: 'authzen', staticPdp: STATIC, fetch: r.fetch, now: () => now, ...quiet });
-    expect((await d.resolve()).evaluation).toBe(`${STATIC}/access/v1/evaluation`);
+    const kindOf = () => d.resolve().then(() => 'ok', (e: DiscoveryError) => e.kind);
+    expect(await kindOf()).toBe('transient');
     expect(d.status().pdps[STATIC]).toMatchObject({ cached: false });
     // Within the retry window nothing is fetched again.
-    expect((await d.resolve()).evaluation).toBe(`${STATIC}/access/v1/evaluation`);
+    expect(await kindOf()).toBe('transient');
     expect(r.count('authzen-configuration')).toBe(1);
     table[`${STATIC}/.well-known/authzen-configuration`] = custom;
     now += 31_000;
     expect((await d.resolve()).evaluation).toBe(`${STATIC}/custom/eval`);
+  });
+
+  it('serves the last good copy for one more TTL, and no longer', async () => {
+    const start = 1_700_000_000_000;
+    let now = start;
+    const table: Record<string, Route> = { [`${STATIC}/.well-known/authzen-configuration`]: custom };
+    const r = router(table);
+    const d = new PdpDiscovery({ mode: 'authzen', staticPdp: STATIC, fetch: r.fetch, now: () => now, ...quiet });
+    expect((await d.resolve()).evaluation).toBe(`${STATIC}/custom/eval`);
+    table[`${STATIC}/.well-known/authzen-configuration`] = 503;
+    now = start + 599_000;
+    expect((await d.resolve()).evaluation).toBe(`${STATIC}/custom/eval`);
+    now = start + 600_000;
+    expect(await d.resolve().then(() => 'ok', (e: DiscoveryError) => e.kind)).toBe('transient');
+    expect(d.status().pdps[STATIC]).toMatchObject({ cached: false });
+  });
+
+  it('a refusal on refresh ends the last good copy at once', async () => {
+    let now = 1_700_000_000_000;
+    const table: Record<string, Route> = { [`${STATIC}/.well-known/authzen-configuration`]: custom };
+    const r = router(table);
+    const d = new PdpDiscovery({ mode: 'authzen', staticPdp: STATIC, fetch: r.fetch, now: () => now, pdpAllowlist: [GOOD], ...quiet });
+    const kindOf = () => d.resolve().then(() => 'ok', (e: DiscoveryError) => e.kind);
+    expect((await d.resolve()).evaluation).toBe(`${STATIC}/custom/eval`);
+    // The PDP now advertises an endpoint the allowlist refuses: an answer, not an outage.
+    table[`${STATIC}/.well-known/authzen-configuration`] = { ...custom, access_evaluation_endpoint: 'https://elsewhere.example/eval' };
+    now += 301_000;
+    expect(await kindOf()).toBe('not_allowed');
+    // Nothing is left to ride out an outage on.
+    table[`${STATIC}/.well-known/authzen-configuration`] = 503;
+    expect(await kindOf()).toBe('transient');
   });
 
   it('a 404 is still the default paths, remembered', async () => {

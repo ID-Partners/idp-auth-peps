@@ -206,7 +206,7 @@ export interface MetadataSource {
 export interface PdpDiscoveryOptions {
   /** Default `off`: static PDP, default paths, no HTTP. */
   mode?: DiscoveryMode;
-  /** The configured PDP base URL — always the fallback, always permitted. */
+  /** The configured PDP base URL: decides for a resource that publishes nothing; always permitted. */
   staticPdp: string;
   /** PDP identifier -> bearer. Seed `{ [staticPdp]: apiKey }`. */
   apiKeys?: Record<string, string>;
@@ -313,6 +313,8 @@ interface Entry<T> {
   val?: T;
   ok: boolean;
   expires: number;
+  /** When the last good value stops being served through failed refreshes: one more TTL. */
+  staleUntil: number;
   lastAttempt: number;
   lastErr?: DiscoveryError;
   negUntil: number;
@@ -320,8 +322,9 @@ interface Entry<T> {
 }
 
 /**
- * Bounded TTL cache: serves a stale value while a refresh fails, throttles retries,
- * negatively caches a transient failure, and shares one in-flight fetch per key.
+ * Bounded TTL cache: serves a stale value while a refresh fails, for up to one more TTL,
+ * throttles retries, negatively caches a transient failure, and shares one in-flight
+ * fetch per key. A refusal ends the stale value at once: it is an answer, not an outage.
  */
 class TtlCache<T> {
   private readonly entries = new Map<string, Entry<T>>();
@@ -338,6 +341,12 @@ class TtlCache<T> {
     const e = this.entryFor(key);
     if (!e) return fetch(key); // full of live entries: serve uncached
     const t = this.now();
+    if (e.ok && t >= e.staleUntil) {
+      // A whole extra TTL of failed refreshes: past that the last good value is not
+      // served, and the failure becomes the caller's.
+      e.ok = false;
+      e.val = undefined;
+    }
     if (e.ok && t < e.expires) return e.val as T;
     if (!e.ok && e.lastErr && t < e.negUntil) throw e.lastErr;
     if (e.ok && e.lastErr && t - e.lastAttempt < this.minRefresh) return e.val as T;
@@ -349,6 +358,7 @@ class TtlCache<T> {
         e.val = val;
         e.ok = true;
         e.expires = this.now() + this.ttl;
+        e.staleUntil = e.expires + this.ttl;
         e.lastErr = undefined;
         e.negUntil = 0;
         e.inflight = undefined;
@@ -358,7 +368,10 @@ class TtlCache<T> {
         e.inflight = undefined;
         const derr = err instanceof DiscoveryError ? err : new DiscoveryError('transient', String(err));
         e.lastErr = derr;
-        if (e.ok) return e.val as T; // stale beats failing every request
+        if (e.ok && derr.kind !== 'not_allowed') return e.val as T; // stale beats failing every request
+        // A refusal is an answer, not an outage: what was trusted is trusted no longer.
+        e.ok = false;
+        e.val = undefined;
         // A policy refusal cost no fetch and belongs to the caller's allowlist; do not
         // let it stand in for the next caller.
         if (this.negativeTtl > 0 && derr.kind !== 'not_allowed') e.negUntil = this.now() + this.negativeTtl;
@@ -378,7 +391,7 @@ class TtlCache<T> {
       }
       if (this.entries.size >= this.maxEntries) return null;
     }
-    const e: Entry<T> = { ok: false, expires: 0, lastAttempt: 0, negUntil: 0 };
+    const e: Entry<T> = { ok: false, expires: 0, staleUntil: 0, lastAttempt: 0, negUntil: 0 };
     this.entries.set(key, e);
     return e;
   }
@@ -543,7 +556,7 @@ export class PdpDiscovery implements PdpResolver {
       } catch (err) {
         const derr = asDiscoveryError(err);
         if (derr.kind === 'not_allowed') throw derr;
-        this.warn(`pdp discovery: ${pdp}: ${derr.message}`);
+        this.warnOnce(`pdp ${pdp}`, `pdp discovery: ${pdp}: ${derr.message}`);
         last = derr;
       }
     }
@@ -586,19 +599,12 @@ export class PdpDiscovery implements PdpResolver {
 
   /**
    * A PDP's endpoints. A transient failure serves the last good metadata (the cache does
-   * that); with none yet, this call uses the spec's default paths and nothing is cached,
-   * so the next call after the retry window reads the metadata again rather than living
-   * with a guess for a whole TTL.
+   * that); with none, the PDP is unavailable. The default paths are for a PDP that
+   * publishes no metadata (404), never a guess at one whose metadata cannot be read: it
+   * may have moved its endpoints, and a layer whose PDP is down fails by its own mode.
    */
   private async pdpEndpoints(pdp: string): Promise<PdpEndpoints> {
-    try {
-      return await this.pdps.get(pdp, (key) => this.fetchConfig(key));
-    } catch (err) {
-      const derr = asDiscoveryError(err);
-      if (derr.kind !== 'transient') throw derr;
-      this.warnOnce(`pdp ${pdp}`, `pdp discovery: ${derr.message}; using the default AuthZEN paths until ${pdp}'s metadata can be read`);
-      return defaultEndpoints(pdp);
-    }
+    return this.pdps.get(pdp, (key) => this.fetchConfig(key));
   }
 
   /**

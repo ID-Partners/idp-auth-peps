@@ -62,6 +62,7 @@ import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
       <tr><td>Delegate mode needs <code>upstreamUrl</code> and <code>delegate.apiKey</code>, and sends every MCP request to coaz-pep.</td><td>Add both. Before, coaz-pep was never told which server to read <code>tools/list</code> from, and permitted every <code>tools/call</code>.</td></tr>
       <tr><td>Resource-mode discovery needs <code>pdpAllowlist</code> and <code>resourceAllowlist</code>.</td><td>List the PDPs a resource may name and the resources whose documents are read.</td></tr>
       <tr><td>Only a resource that publishes nothing (404) falls back to the static PDP; an outage or an invalid document fails its layer by its own mode.</td><td>Nothing, unless you relied on a broken document quietly meaning "use the static PDP".</td></tr>
+      <tr><td>A PDP whose metadata cannot be read is unavailable, not called at the default paths. The last good copy of either document is served for up to one more TTL.</td><td>Nothing, unless a PDP's metadata endpoint is down while its evaluation endpoint is up: fix the metadata endpoint, or mark that layer fail-open.</td></tr>
       <tr><td>Fail-open covers an unavailable PDP only. A 3xx, a 4xx, an answer that is not a decision and a request that cannot be encoded never open.</td><td>Nothing: a refusal used to be skipped as an outage.</td></tr>
       <tr><td>A permit is the JSON boolean <code>true</code>; a boxcar answer needs one decision per evaluation sent.</td><td>Nothing, unless your PDP answers <code>"true"</code>.</td></tr>
       <tr><td>A PDP failure's <code>reason</code> is a fixed phrase; the specifics are in <code>verdict.detail</code>. <code>failedOpen</code> and <code>X-PDP-Fail-Open</code> carry layer identifiers only.</td><td>Log <code>detail</code> from <code>onDecision</code> if you logged <code>reason</code> for diagnosis.</td></tr>
@@ -77,7 +78,7 @@ import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
   <div class="wide"><table>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>url</code> <span class="req">required</span></td><td class="d">string</td><td>The static PDP's base URL, absolute http(s). Without <code>discovery</code> the AuthZEN default paths are appended; with it, the PDP every mode falls back to.</td></tr>
+      <tr><td><code>url</code> <span class="req">required</span></td><td class="d">string</td><td>The static PDP's base URL, absolute http(s). Without <code>discovery</code> the AuthZEN default paths are appended; with it, the PDP a resource that publishes nothing falls back to.</td></tr>
       <tr><td><code>apiKey</code></td><td class="d">string</td><td>Sent as <code>Authorization: Bearer</code> to <code>url</code>. A discovered PDP never receives it.</td></tr>
       <tr><td><code>discovery</code></td><td class="d">ClientDiscoveryOptions | PdpResolver</td><td>PDP discovery, below, or a resolver of your own (<code>{ resolve(resource), resolvePdp(pdp) }</code>). Absent means off: no HTTP beyond the evaluation itself.</td></tr>
       <tr><td><code>layers</code></td><td class="d">Array&lt;string | LayerSpec&gt; · ['resource']</td><td>The ordered PDPs every call asks unless it overrides them: <code>'static'</code> (this client's <code>url</code>, regardless of discovery), <code>'resource'</code> (what discovery finds for the call's resource), or a PDP identifier, each optionally suffixed <code> fail-open</code> or <code> fail-closed</code>, or as <code>{ name, failOpen }</code> with a boolean <code>failOpen</code>. Every layer must permit; the first that does not is the verdict. An entry that cannot be read throws, fail-open or not.</td></tr>
@@ -96,13 +97,13 @@ import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>mode</code></td><td class="d">'off' | 'authzen' | 'resource' · 'off'</td><td><code>authzen</code> reads the static PDP's <code>/.well-known/authzen-configuration</code>; <code>resource</code> follows a call's <code>resource</code> to its RFC 9728 document for the PDP that decides for it, then that PDP's metadata. A resource that publishes nothing (404, or a document naming no PDP) gets the static PDP; one whose document cannot be read — an outage, or an invalid document — fails its layer by its own mode. No federation mode in the SDK; <code>sources</code> is the seam for one.</td></tr>
-      <tr><td><code>staticPdp</code> <span class="req">required on PdpDiscovery</span></td><td class="d">string</td><td>The configured PDP: always the fallback, always permitted. The client fills it from <code>url</code>.</td></tr>
+      <tr><td><code>staticPdp</code> <span class="req">required on PdpDiscovery</span></td><td class="d">string</td><td>The configured PDP: decides for a resource that publishes nothing, and is always permitted. The client fills it from <code>url</code>.</td></tr>
       <tr><td><code>apiKeys</code></td><td class="d">Record&lt;identifier, bearer&gt;</td><td>Which bearer goes to which PDP. The client seeds <code>{ [url]: apiKey }</code>.</td></tr>
       <tr><td><code>pdpAllowlist</code> <span class="req">required in resource mode</span></td><td class="d">string[]</td><td>The PDPs a resource may name, and the layers a route may, as prefixes matched at a path boundary. <code>staticPdp</code> is always permitted. An entry with a path permits its own well-known.</td></tr>
       <tr><td><code>resourceAllowlist</code> <span class="req">required in resource mode</span></td><td class="d">string[]</td><td>The resources whose metadata is read, as prefixes.</td></tr>
       <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>The escape hatch, for development: allows http for discovered URLs (same-origin http as <code>staticPdp</code> always is) and lets resource mode start without its allowlists. Logged once at construction.</td></tr>
       <tr><td><code>ttlMs</code></td><td class="d">number · 300000</td><td>Cache TTL for resource and PDP metadata.</td></tr>
-      <tr><td><code>minRefreshMs</code></td><td class="d">number · 30000</td><td>How long a failure is remembered before it is retried. The last good document is served through it; a PDP never read yet uses the default paths meanwhile, without caching them.</td></tr>
+      <tr><td><code>minRefreshMs</code></td><td class="d">number · 30000</td><td>How long a failure is remembered before it is retried. The last good document is served through it, for up to one more TTL; a PDP whose metadata has never been read is unavailable meanwhile, never guessed at with the default paths.</td></tr>
       <tr><td><code>maxEntries</code></td><td class="d">number · 1024</td><td>Cache bound.</td></tr>
       <tr><td><code>timeoutMs</code></td><td class="d">number · 3000</td><td>Per metadata fetch. A document over 1 MiB, a redirect or a 4xx other than 404 is refused rather than taken for an outage.</td></tr>
       <tr><td><code>sources</code></td><td class="d">MetadataSource[]</td><td>Overrides the mode-derived sources. Each is <code>{ name, lookup(resource) }</code>.</td></tr>
@@ -252,7 +253,7 @@ app.use(express.json());
 const jwks = createRemoteJWKSet(new URL('https://as.bank.example/jwks'));
 
 const client = new AuthzenClient({
-  url: process.env.AUTHZEN_URL!,                 <span class="c">// always the fallback, always permitted</span>
+  url: process.env.AUTHZEN_URL!,                 <span class="c">// the static PDP, always permitted</span>
   apiKey: process.env.AUTHZEN_API_KEY,           <span class="c">// bound to url; a discovered PDP never receives it</span>
   discovery: {
     mode: 'resource',

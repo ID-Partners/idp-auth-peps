@@ -156,10 +156,12 @@ describe('discovery: off and authzen modes', () => {
     await expect(new PdpDiscovery({ mode: 'authzen', staticPdp: '', fetch: router({}).fetch, ...quiet }).resolve()).rejects.toThrow('no PDP configured');
   });
 
-  it('falls back to the default paths on 404, 500 and a network failure', async () => {
-    for (const r of [404, 500, false] as Route[]) {
-      const { d } = disco({ [STATIC]: r }, { mode: 'authzen' });
-      expect((await d.resolve()).evaluation).toBe(`${STATIC}/access/v1/evaluation`);
+  it('uses the default paths for a PDP with no metadata (404), and never for one it cannot reach', async () => {
+    const { d } = disco({ [STATIC]: 404 }, { mode: 'authzen' });
+    expect((await d.resolve()).evaluation).toBe(`${STATIC}/access/v1/evaluation`);
+    for (const r of [500, false] as Route[]) {
+      const { d: down } = disco({ [STATIC]: r }, { mode: 'authzen' });
+      expect(await kind(down.resolve())).toBe('transient');
     }
   });
 
@@ -168,7 +170,7 @@ describe('discovery: off and authzen modes', () => {
     try {
       const r = router({ [STATIC]: 500 });
       const d = new PdpDiscovery({ mode: 'authzen', staticPdp: STATIC, fetch: r.fetch });
-      await d.resolve();
+      await d.resolve().catch(() => {});
       expect(spy).toHaveBeenCalled();
     } finally {
       spy.mockRestore();
@@ -214,7 +216,7 @@ describe('discovery: off and authzen modes', () => {
     }
   });
 
-  it('times out a slow metadata fetch and uses the defaults', async () => {
+  it('times out a slow metadata fetch: the PDP is unavailable, not guessed at', async () => {
     const slow = (_u: string, init?: RequestInit) =>
       new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => {
@@ -224,7 +226,7 @@ describe('discovery: off and authzen modes', () => {
         });
       });
     const { d } = disco({ [STATIC]: slow }, { mode: 'authzen', timeoutMs: 5 });
-    expect((await d.resolve()).evaluation).toBe(`${STATIC}/access/v1/evaluation`);
+    expect(await kind(d.resolve())).toBe('transient');
   });
 });
 
@@ -315,6 +317,27 @@ describe('discovery: resource mode', () => {
     now += 31_000;
     expect((await d.resolve(RES)).identifier).toBe(GOOD);
     expect(d.status().resources[RES]?.lastError).toBeUndefined();
+  });
+
+  it('serves the last good list for one more TTL, and no longer', async () => {
+    const start = 1_700_000_000_000;
+    let now = start;
+    const r = routes();
+    const { d } = disco(r, { now: () => now });
+    expect((await d.resolve(RES)).identifier).toBe(GOOD);
+    r[`${RES}/.well-known/oauth-protected-resource`] = 503;
+    now = start + 301_000;
+    expect((await d.resolve(RES)).identifier).toBe(GOOD);
+    now = start + 599_000;
+    expect((await d.resolve(RES)).identifier).toBe(GOOD);
+    now = start + 600_000;
+    expect(await kind(d.resolve(RES))).toBe('transient');
+    expect(d.status().resources[RES]).toMatchObject({ cached: false });
+    // Its layer is unavailable: [static, resource] never quietly becomes [static].
+    await expect(resolveLayers(d, RES, ['static', 'resource'], false)).rejects.toThrow(/^layer resource: /);
+    const skipped = await resolveLayers(d, RES, ['static', 'resource fail-open'], false);
+    expect(skipped.pdps.map((p) => p.identifier)).toEqual([STATIC]);
+    expect(skipped.skipped).toEqual(['resource']);
   });
 
   it('fails closed on a disallowed resource without fetching it', async () => {

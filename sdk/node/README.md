@@ -41,6 +41,9 @@ Most of it is invisible, but these change what you write or what you get back:
 - **A resource whose metadata cannot be read is not the static PDP.** Only a resource
   that publishes nothing (404) falls back to it; an outage or an invalid document fails
   that layer by its own mode.
+- **A PDP whose metadata cannot be read is unavailable**, not called at guessed default
+  paths; those are for a PDP that publishes no metadata (404). The last good copy of
+  either document is served for up to one more TTL.
 - **Fail-open covers an unavailable PDP only** — a network error, a timeout, a 5xx, a
   429, or a PDP with no batch endpoint asked for a boxcar. A 3xx or 4xx, an answer that
   is not a decision and a request that cannot be encoded never open.
@@ -332,7 +335,7 @@ PEP and the Kong plugin walk (see [`core/README.md`](../../core/README.md#pdp-di
 
 ```ts
 const client = new AuthzenClient({
-  url: process.env.AUTHZEN_URL!,            // always the fallback, always permitted
+  url: process.env.AUTHZEN_URL!,            // the static PDP, always permitted
   apiKey: process.env.AUTHZEN_API_KEY,      // bound to `url`; a discovered PDP never receives it
   discovery: {
     mode: 'resource',
@@ -364,9 +367,10 @@ by the static PDP, by design. A resource whose document cannot be read is not th
 thing: an outage, or a document that is invalid (the wrong `resource`, entries that are
 not PDP identifiers, not JSON), makes the resource layer unavailable, and it fails by its
 own mode — closed unless you said otherwise, and marked when skipped. An outage of either
-document serves the last good copy while there is one; a PDP whose metadata has never
-been read uses the default paths for now, without caching them as the answer. Failures
-are remembered for `minRefreshMs` rather than retried in every request, and warned about
+document serves the last good copy for up to one more TTL, and a refusal ends it at once;
+after that, or with no good copy yet, the layer is unavailable. A PDP's metadata falls
+back to the default paths only when the PDP publishes none (404), never as a guess while
+it cannot be read. Failures are remembered for `minRefreshMs` rather than retried in every request, and warned about
 once per window.
 
 Whatever document named the PDP is forwarded to it verbatim as `context.resource_metadata`
