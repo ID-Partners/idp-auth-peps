@@ -91,6 +91,10 @@ return {
           -- whole upstream response on any route this plugin is on, on or off: that is
           -- what a response phase costs, and why this plugin is for REST routes.
           { filter_response = { type = "boolean", default = true } },
+          -- The largest request body, in bytes, sent to the policy provider. A body Kong
+          -- buffered to disk is read back up to this (Kong 3.9+); a larger one is refused
+          -- with a 413, never sent without its body.
+          { max_request_body_size = { type = "integer", default = 1048576, gt = 0 } },
           -- Names this PEP in its own denials and in the X-PDP-PEP response header.
           { pep_label = { type = "string", default = "kong-sideband-pep" } },
           -- PDP discovery (see ../README.md). "off" is service_url. "resource" reads the

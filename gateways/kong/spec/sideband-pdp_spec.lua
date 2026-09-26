@@ -154,6 +154,106 @@ describe('what the policy provider is sent', function()
   end)
 end)
 
+describe('the policy provider judges the request Kong forwards', function()
+  -- PAZ was sent a different request from the one Kong forwarded: the URL from
+  -- X-Forwarded-*, which a client in trusted_ips sets to anything; a body over 8 KiB as
+  -- nothing; headers and query arguments past the first hundred dropped.
+  local function sent(opts, over)
+    local fn, hits = router({ [PAZ .. '/sideband/request'] = permit() })
+    opts.pdp = fn
+    local _, state = drive(over or {}, opts)
+    return hits[1] and mock.json_decode(hits[1].body), state, hits
+  end
+
+  it('builds the URL from what Kong routed on, never from X-Forwarded-*', function()
+    local body = sent({ method = 'DELETE', path = '/admin/users/1', trusted_proxy = true, headers = {
+      ['x-forwarded-path'] = '/public/status', ['x-forwarded-host'] = 'public.example',
+      ['x-forwarded-proto'] = 'http', ['x-forwarded-port'] = '80' } })
+    assert.equal('https://api.example:443/admin/users/1', body.url)
+    assert.equal('DELETE', body.method)
+  end)
+
+  it('uses the normalised path Kong matched and forwards, escaped for a URL', function()
+    local body = sent({ method = 'GET', raw_path = '/public/../admin/users/1', path = '/admin/users/1' })
+    assert.equal('https://api.example:443/admin/users/1', body.url)
+    body = sent({ method = 'GET', path = '/files/a b\195\184%2F' })
+    assert.equal('https://api.example:443/files/a%20b%C3%B8%2F', body.url)
+  end)
+
+  it('reads the body whole, or refuses the request', function()
+    local big = string.rep('x', 9 * 1024)
+    local body = sent({ method = 'POST', path = '/upload', body = big })
+    assert.equal(big, body.body)
+    local none, state, hits = sent({ method = 'POST', path = '/upload', body = big, kong_version_num = 3007001 })
+    assert.is_nil(none)
+    assert.equal(413, state.exited.status)
+    assert.equal(0, #hits)
+    local _, capped = sent({ method = 'POST', path = '/upload', body = big }, { max_request_body_size = 4096 })
+    assert.equal(413, capped.exited.status)
+  end)
+
+  it('sends every header and query argument, or refuses the request', function()
+    local headers = {}
+    for i = 1, 150 do headers['x-h' .. i] = tostring(i) end
+    local body = sent({ method = 'GET', path = '/a', headers = headers, query = string.rep('k=v&', 1) .. 'k150=v' })
+    assert.equal('150', header_value(body.headers, 'x-h150'))
+    for i = 151, 1001 do headers['x-h' .. i] = tostring(i) end
+    local _, too_many = sent({ method = 'GET', path = '/a', headers = headers })
+    assert.equal(431, too_many.exited.status)
+    local args = {}
+    for i = 1, 1001 do args[#args + 1] = 'a' .. i .. '=1' end
+    local _, long = sent({ method = 'GET', path = '/a', query = table.concat(args, '&') })
+    assert.equal(414, long.exited.status)
+  end)
+
+  it('refuses a header it cannot put in the sideband shape', function()
+    local _, state, hits = sent({ method = 'GET', path = '/a', headers = { ['x-nested'] = { { 'a' } } } })
+    assert.equal(400, state.exited.status)
+    assert.equal(0, #hits)
+  end)
+end)
+
+describe('only the permit shape permits', function()
+  -- A 2xx {} used to permit. A permit is the request to forward, echoed: method and url
+  -- as strings, headers as a list of single-pair objects. Anything else is a refusal.
+  local function answered(answer)
+    local fn = router({ [PAZ .. '/sideband/request'] = function() return { status = 200, body = answer } end })
+    local _, state = drive({ fail_mode = 'open' }, { method = 'GET', path = '/a', pdp = fn })
+    return state
+  end
+
+  it('refuses an answer that is neither a permit nor a deny, whatever the layer\'s rule', function()
+    for _, answer in ipairs({ '{}', '{"method":"GET"}', '{"method":"GET","url":"https://api.example:443/a"}',
+      '{"method":"GET","url":"https://api.example:443/a","headers":{}}',
+      '{"method":"GET","url":"https://api.example:443/a","headers":[["x"]]}',
+      '{"method":"GET","url":"https://api.example:443/a","headers":[{"x":{"y":1}}]}',
+      '{"method":7,"url":"https://api.example:443/a","headers":[]}',
+      '{"method":"GET","url":"https://api.example:443/a","headers":[],"body":{"x":1}}',
+      '{"response":{"response_code":"200","headers":{}}}' }) do
+      local state = answered(answer)
+      assert.equal(503, state.exited.status, answer)
+      assert.matches('refused', table.concat(state.logs, '\n'), 1, true)
+    end
+  end)
+
+  it('a deny with no usable status is a 403; a response-phase answer with none is refused', function()
+    local state = answered('{"response":{"response_code":"teapot","headers":[],"body":"no"}}')
+    assert.equal(403, state.exited.status)
+    assert.equal('no', state.exited.body)
+    local fn = router({ [PAZ .. '/sideband/request'] = permit(),
+      [PAZ .. '/sideband/response'] = function() return { status = 200, body = '{"response_code":"1000","headers":[]}' } end })
+    local plugin, st, c = drive({}, { method = 'GET', path = '/a', pdp = fn })
+    mock.run_response(plugin, c)
+    assert.is_true(st.exited.status >= 500)
+  end)
+
+  it('permits on the shape, with a null where a field may be absent', function()
+    local state = answered('{"method":"GET","url":"https://api.example:443/a","headers":[],"body":null,"state":null,"response":null}')
+    assert.is_nil(state.exited)
+    assert.is_nil(state.upstream_body)
+  end)
+end)
+
 describe('a permit', function()
   it('applies the rewritten request to the upstream and marks the response', function()
     local fn = router({ [PAZ .. '/sideband/response'] = echo_response, [PAZ .. '/sideband/request'] = permit(function(out)
@@ -493,8 +593,8 @@ describe('discovery through the plugin', function()
       [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { BANKPDP }, authzen_policy_layers = { ESTATE } },
       [ESTATE .. '/sideband/request'] = permit(nil, 'e'),
       [BANKPDP .. '/sideband/request'] = permit(nil, 'b'),
-      [ESTATE .. '/sideband/response'] = function(_, req) return { status = 200, body = json({ response_code = '200', headers = {}, body = mock.json_decode(req.body).body }) } end,
-      [BANKPDP .. '/sideband/response'] = function(_, req) return { status = 200, body = json({ response_code = '200', headers = {}, body = mock.json_decode(req.body).body }) } end,
+      [ESTATE .. '/sideband/response'] = function(_, req) return { status = 200, body = json({ response_code = '200', headers = mock.array(), body = mock.json_decode(req.body).body }) } end,
+      [BANKPDP .. '/sideband/response'] = function(_, req) return { status = 200, body = json({ response_code = '200', headers = mock.array(), body = mock.json_decode(req.body).body }) } end,
     }
     for k, v in pairs(over or {}) do r[k] = v end
     return r

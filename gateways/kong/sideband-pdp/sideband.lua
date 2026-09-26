@@ -30,13 +30,20 @@ for _, name in ipairs(S.AUTH_HEADERS) do AUTH[name:lower()] = true end
 -- Response headers kept even when the policy provider leaves them out of its answer.
 local KEEP = { ["content-length"] = true, date = true, connection = true, vary = true }
 
+-- How many headers and query arguments are read to put in the payload. Past these the
+-- request is refused: a payload missing some of them is not the request Kong forwards.
+S.MAX_HEADERS = 1000
+S.MAX_ARGS = 1000
+
+local function given(v) return v ~= nil and v ~= cjson.null end
+
 -- ---------- headers ----------
 
 --- Kong's name -> value | {values} into the sideband API's list of single-pair objects,
 --- one per value, names lower-cased, in a stable order. Returns nil, err for a nested
 --- value, which the API has no shape for.
 function S.format_headers(headers)
-  local out, names = {}, {}
+  local out, names = setmetatable({}, cjson.array_mt), {} -- a list, even when empty
   for k in pairs(headers or {}) do names[#names + 1] = k end
   table.sort(names)
   for _, k in ipairs(names) do
@@ -119,26 +126,54 @@ local function client_certificate()
   return jwk
 end
 
---- The request as the client sent it, in the sideband API's shape. A permit comes back in
---- the same shape, so this is also what travels from one layer to the next. Returns the
---- payload, or nil and {status, reason (for the client), detail (for the log)}.
+-- A normalised path as it goes in a URL: kong.request.get_path decodes what RFC 3986
+-- lets it, and whatever is not safe on the wire is escaped again, as Kong escapes the
+-- path it forwards.
+local function escape_path(path)
+  return (path:gsub("[^%w!#%$&'%(%)%*%+,/:;=%?@%[%]%-_%.~%%]", function(c)
+    return string.format("%%%02X", c:byte())
+  end))
+end
+
+--- The request as Kong will forward it, in the sideband API's shape. A permit comes back
+--- in the same shape, so this is also what travels from one layer to the next. Returns
+--- the payload, or nil and {status, reason (for the client), detail (for the log)}.
+---
+--- It must be the request Kong forwards, or the policy judges another one: so the URL is
+--- the one Kong routed on (scheme, host, port, and the normalised path it matched), never
+--- X-Forwarded-*, which a client in trusted_ips may set to anything; the body is read
+--- whole or the request is refused; and every header and query argument is sent, or the
+--- request is refused.
 function S.request_payload(conf)
+  local body, berr = contract.read_body(conf.max_request_body_size)
+  if not body then
+    return nil, { status = 413, reason = "The request body is too large for the gateway to authorise.", detail = berr }
+  end
+  local raw_headers, herr = kong.request.get_headers(S.MAX_HEADERS)
+  if herr == "truncated" then
+    return nil, { status = 431, reason = "The request carries more headers than the gateway will authorise.",
+      detail = "more than " .. S.MAX_HEADERS .. " headers" }
+  end
+  -- decode_args returns (args, err); the query is normalised through both, as Ping did.
+  local args, aerr = ngx.decode_args(kong.request.get_raw_query() or "", S.MAX_ARGS)
+  if aerr == "truncated" then
+    return nil, { status = 414, reason = "The request carries more query parameters than the gateway will authorise.",
+      detail = "more than " .. S.MAX_ARGS .. " query arguments" }
+  end
   local p = {
     source_ip = ngx.var.remote_addr,
     source_port = tonumber(ngx.var.remote_port),
     method = kong.request.get_method(),
     http_version = tostring(ngx.req.http_version()),
-    body = kong.request.get_raw_body(),
+    body = body,
   }
-  local url = kong.request.get_forwarded_scheme() .. "://" .. kong.request.get_forwarded_host() .. ":"
-    .. tostring(kong.request.get_forwarded_port()) .. kong.request.get_forwarded_path()
-  -- decode_args returns (args, err); the query is normalised through both, as Ping did.
-  local args = ngx.decode_args(kong.request.get_raw_query() or "", 100)
+  local url = kong.request.get_scheme() .. "://" .. kong.request.get_host() .. ":"
+    .. tostring(kong.request.get_port()) .. escape_path(kong.request.get_path())
   local query = ngx.encode_args(args)
   if query ~= "" then url = url .. "?" .. query end
   p.url = url
   local all = {}
-  for name, v in pairs(kong.request.get_headers()) do
+  for name, v in pairs(raw_headers) do
     if not AUTH[name:lower()] then all[name] = v end
   end
   local headers, herr = S.format_headers(all)
@@ -158,15 +193,19 @@ end
 --- answered. A field the answer leaves out is unchanged — except the body, which the
 --- answer clears by leaving out, as Ping's plugin reads it.
 function S.rewritten(current, answer)
+  local function pick(field)
+    if given(answer[field]) then return answer[field] end
+    return current[field]
+  end
   return {
-    source_ip = answer.source_ip or current.source_ip,
-    source_port = answer.source_port or current.source_port,
+    source_ip = pick("source_ip"),
+    source_port = pick("source_port"),
     http_version = current.http_version,
-    client_certificate = answer.client_certificate or current.client_certificate,
-    method = answer.method or current.method,
-    url = answer.url or current.url,
-    headers = answer.headers or current.headers,
-    body = answer.body,
+    client_certificate = pick("client_certificate"),
+    method = pick("method"),
+    url = pick("url"),
+    headers = pick("headers"),
+    body = contract.str(answer.body),
   }
 end
 
@@ -234,11 +273,32 @@ local function too_large(res)
   return { status = 413, headers = { { ["content-type"] = "application/json" } }, body = contract.str(res.body) or "" }
 end
 
+-- The sideband API's header list: single-pair objects, a string name to a string value.
+local function header_list(list)
+  if not contract.is_array(list) then return false end
+  for _, pair in ipairs(list) do
+    if not contract.is_object(pair) then return false end
+    for k, v in pairs(pair) do
+      if type(k) ~= "string" or (type(v) ~= "string" and type(v) ~= "number") then return false end
+    end
+  end
+  return true
+end
+
+local function http_status(v)
+  local n = tonumber(v)
+  if n and n % 1 == 0 and n >= 100 and n <= 599 then return n end
+  return nil
+end
+
 --- What a /sideband/request answer means. Returns one of
 ---   "permit",      request  the request to forward, as the policy provider returned it
 ---   "deny",        response {status, headers (a list), body} to send the client instead
 ---   "unavailable", {msg, retry_after} for the layer's rule
 ---   "refusal",     {msg} closed, whatever the layer's rule
+--- A permit must have the permit's shape — the request echoed, a method and a URL as
+--- strings and the headers as a list — so an empty object, or anything else the plugin
+--- cannot apply, is a refusal and never a permit.
 function S.classify(res, err, who, unencodable)
   local kind, detail = outcome(res, err, who, unencodable)
   if kind == "too_large" then return "deny", too_large(res) end
@@ -247,10 +307,20 @@ function S.classify(res, err, who, unencodable)
   if not contract.is_object(body) then
     return "refusal", { msg = who .. " returned an unreadable body" }
   end
-  if contract.is_object(body.response) then
+  if given(body.response) then
     local r = body.response
-    return "deny", { status = tonumber(r.response_code) or 403, headers = r.headers or {}, body = r.body }
+    if not contract.is_object(r) or (given(r.headers) and not header_list(r.headers))
+      or (given(r.body) and type(r.body) ~= "string") then
+      return "refusal", { msg = who .. " returned a response it cannot be relayed as" }
+    end
+    return "deny", { status = http_status(r.response_code) or 403,
+      headers = given(r.headers) and r.headers or {}, body = contract.str(r.body) }
   end
+  if type(body.method) ~= "string" or type(body.url) ~= "string" or not header_list(body.headers)
+    or (given(body.body) and type(body.body) ~= "string") then
+    return "refusal", { msg = who .. " returned neither the request to forward nor a response" }
+  end
+  if not given(body.state) then body.state = nil end
   return "permit", body
 end
 
@@ -261,10 +331,13 @@ function S.classify_response(res, err, who, unencodable)
   if kind == "too_large" then return "response", too_large(res) end
   if kind ~= "answer" then return kind, detail end
   local body = type(res.body) == "string" and cjson.decode(res.body) or nil
-  if not contract.is_object(body) or not tonumber(body.response_code) then
-    return "refusal", { msg = who .. " returned an unreadable body" }
+  if not contract.is_object(body) or not http_status(body.response_code)
+    or (given(body.headers) and not header_list(body.headers))
+    or (given(body.body) and type(body.body) ~= "string") then
+    return "refusal", { msg = who .. " returned an unreadable response" }
   end
-  return "response", { status = tonumber(body.response_code), headers = body.headers or {}, body = body.body }
+  return "response", { status = http_status(body.response_code),
+    headers = given(body.headers) and body.headers or {}, body = contract.str(body.body) }
 end
 
 --- The status strings the sideband API expects beside a code (Ping's table).
