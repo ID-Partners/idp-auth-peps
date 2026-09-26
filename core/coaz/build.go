@@ -64,6 +64,11 @@ func CompileMapping(toolName string, raw map[string]any) (*CompiledMapping, erro
 		}
 	}
 
+	all := append(append(append(append([]*compiledNode{}, cm.subject...), cm.resource...), cm.context...), cm.action...)
+	if err := checkLeaves(all...); err != nil {
+		return nil, err
+	}
+
 	// "At least one field across the subject and context parameters MUST be
 	// derived from the token input variable."
 	derived := false
@@ -118,10 +123,12 @@ type BuiltRequest struct {
 //     at top level as defaults, multi-element fields are zipped element-wise
 //     into the evaluations array.
 func (cm *CompiledMapping) Build(params, token map[string]any, extraContext map[string]any) (*BuiltRequest, error) {
+	ctx, cancel := evalBudget()
+	defer cancel()
 	evalField := func(nodes []*compiledNode) ([]any, error) {
 		out := make([]any, len(nodes))
 		for i, n := range nodes {
-			v, err := n.eval(params, token)
+			v, err := n.eval(ctx, params, token)
 			if err != nil {
 				return nil, err
 			}

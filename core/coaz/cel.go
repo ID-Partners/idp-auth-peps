@@ -8,8 +8,10 @@ package coaz
 //   - at least one field across subject+context MUST derive from `token`.
 
 import (
+	"context"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/google/cel-go/cel"
 	celast "github.com/google/cel-go/common/ast"
@@ -19,12 +21,22 @@ import (
 
 var celEnv = mustEnv()
 
-// Bounds on evaluating one mapping leaf. The limit is generous for the field access and
-// concatenation real mappings use, and far below anything that could stall a request.
+// Bounds on evaluating a mapping. The cost limit is per leaf, and generous for the field
+// access and concatenation real mappings use; but the upstream writes the mapping and
+// chooses how many leaves it has, so the leaves are counted too, and one mapping's whole
+// evaluation runs against a deadline that comprehensions check (ContextEval honours the
+// interrupt frequency; Eval ignores it).
 const (
 	celCostLimit               = 1_000_000
 	celInterruptCheckFrequency = 1_000
+	celBuildBudget             = 250 * time.Millisecond
+	maxMappingLeaves           = 256
 )
+
+// evalBudget is the context one mapping's evaluation runs under.
+func evalBudget() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), celBuildBudget)
+}
 
 func mustEnv() *cel.Env {
 	env, err := cel.NewEnv(
@@ -118,8 +130,8 @@ func walkIdents(e celast.Expr, fn func(name string)) {
 	}
 }
 
-func (c *compiledExpr) eval(params, token map[string]any) (any, error) {
-	out, _, err := c.prg.Eval(map[string]any{"params": params, "token": token})
+func (c *compiledExpr) eval(ctx context.Context, params, token map[string]any) (any, error) {
+	out, _, err := c.prg.ContextEval(ctx, map[string]any{"params": params, "token": token})
 	if err != nil {
 		return nil, fmt.Errorf("CEL expression %q failed: %w", c.src, err)
 	}
@@ -182,14 +194,14 @@ func compileNode(v any) (*compiledNode, error) {
 	}
 }
 
-func (n *compiledNode) eval(params, token map[string]any) (any, error) {
+func (n *compiledNode) eval(ctx context.Context, params, token map[string]any) (any, error) {
 	switch {
 	case n.expr != nil:
-		return n.expr.eval(params, token)
+		return n.expr.eval(ctx, params, token)
 	case n.object != nil:
 		out := make(map[string]any, len(n.object))
 		for k, c := range n.object {
-			v, err := c.eval(params, token)
+			v, err := c.eval(ctx, params, token)
 			if err != nil {
 				return nil, err
 			}
@@ -204,7 +216,7 @@ func (n *compiledNode) eval(params, token map[string]any) (any, error) {
 	case n.array != nil:
 		out := make([]any, len(n.array))
 		for i, c := range n.array {
-			v, err := c.eval(params, token)
+			v, err := c.eval(ctx, params, token)
 			if err != nil {
 				return nil, err
 			}
@@ -234,4 +246,37 @@ func (n *compiledNode) usesToken() bool {
 		}
 	}
 	return false
+}
+
+// leaves counts the CEL expressions in a compiled tree.
+func (n *compiledNode) leaves() int {
+	switch {
+	case n.expr != nil:
+		return 1
+	case n.object != nil:
+		total := 0
+		for _, c := range n.object {
+			total += c.leaves()
+		}
+		return total
+	case n.array != nil:
+		total := 0
+		for _, c := range n.array {
+			total += c.leaves()
+		}
+		return total
+	}
+	return 0
+}
+
+// checkLeaves refuses a mapping with more expressions than any real one needs.
+func checkLeaves(nodes ...*compiledNode) error {
+	total := 0
+	for _, n := range nodes {
+		total += n.leaves()
+	}
+	if total > maxMappingLeaves {
+		return fmt.Errorf("mapping has %d expressions, more than the %d accepted", total, maxMappingLeaves)
+	}
+	return nil
 }

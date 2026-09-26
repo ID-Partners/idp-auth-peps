@@ -130,6 +130,9 @@ func CompileMappingV2(toolName string, raw map[string]any) (*CompiledMappingV2, 
 	}
 
 	body, err := compileNodeV2(inner)
+	if err == nil {
+		err = checkLeaves(body)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +194,9 @@ func normaliseSubject(inner map[string]any) (bool, error) {
 // The envelope alone decides evaluation vs evaluations. extraContext is what the PEP
 // asserts, and it wins over any context key the mapping produced — see assertContext.
 func (cm *CompiledMappingV2) Build(params, token map[string]any, extraContext map[string]any) (*BuiltRequest, error) {
-	resolved, err := cm.body.eval(params, token)
+	ctx, cancel := evalBudget()
+	defer cancel()
+	resolved, err := cm.body.eval(ctx, params, token)
 	if err != nil {
 		return nil, err
 	}

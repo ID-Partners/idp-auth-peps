@@ -78,7 +78,11 @@ func (d *discoveryCache) evictLocked(now time.Time) bool {
 
 func newDiscoveryCache(ttl time.Duration, httpc *http.Client) *discoveryCache {
 	if httpc == nil {
-		httpc = &http.Client{Timeout: 15 * time.Second}
+		// Discovery is a request to the governed MCP server, carrying the caller's
+		// credential: never followed somewhere else.
+		httpc = &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
 	}
 	return &discoveryCache{ttl: ttl, entries: map[string]*discoveryEntry{}, httpc: httpc, maxEntries: maxDiscoveryEntries}
 }
@@ -89,7 +93,7 @@ func newDiscoveryCache(ttl time.Duration, httpc *http.Client) *discoveryCache {
 // tailors tools/list per caller. The credential is hashed, never stored.
 func cacheKey(upstreamURL, authorization string) string {
 	sum := sha256.Sum256([]byte(authorization))
-	return upstreamURL + "\x00" + base64.RawURLEncoding.EncodeToString(sum[:8])
+	return upstreamURL + "\x00" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // lookup returns the COAZ view of one tool on the given MCP upstream.
@@ -129,60 +133,98 @@ func (d *discoveryCache) lookup(ctx context.Context, upstreamURL, authorization,
 	return entry.tools[toolName], nil
 }
 
+// maxToolsPages bounds tools/list pagination. A server with more pages than this is
+// refused rather than half-read: a declared mapping on an unread page would be treated
+// as absent.
+const maxToolsPages = 20
+
+func listRequest(id int, cursor string) map[string]any {
+	req := map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/list"}
+	if cursor != "" {
+		req["params"] = map[string]any{"cursor": cursor}
+	}
+	return req
+}
+
 func (d *discoveryCache) fetchTools(ctx context.Context, upstreamURL, authorization string) (map[string]*discoveredTool, error) {
-	result, err := d.rpc(ctx, upstreamURL, authorization, "", map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": "tools/list",
-	})
+	session := ""
+	result, err := d.rpc(ctx, upstreamURL, authorization, "", listRequest(1, ""))
 	if err != nil {
 		// Server may require a session: run the initialize handshake.
-		result, err = d.fetchWithSession(ctx, upstreamURL, authorization)
+		session, err = d.initialize(ctx, upstreamURL, authorization)
+		if err == nil {
+			result, err = d.rpc(ctx, upstreamURL, authorization, session, listRequest(2, ""))
+		}
 		if err != nil {
 			return nil, fmt.Errorf("tools/list discovery from %s failed: %w", upstreamURL, err)
 		}
 	}
 
-	var listed struct {
-		Tools []json.RawMessage `json:"tools"`
-	}
-	if err := json.Unmarshal(result, &listed); err != nil {
-		return nil, fmt.Errorf("tools/list result malformed: %w", err)
-	}
-	tools := make(map[string]*discoveredTool, len(listed.Tools))
-	for _, raw := range listed.Tools {
-		var t Tool
-		if err := json.Unmarshal(raw, &t); err != nil || t.Name == "" {
-			continue
+	tools := map[string]*discoveredTool{}
+	for page := 1; ; page++ {
+		var listed struct {
+			Tools      []json.RawMessage `json:"tools"`
+			NextCursor string            `json:"nextCursor"`
 		}
-		dt := &discoveredTool{tool: t}
-		// v2 first: a tool carrying x-authzen-mapping is declared against the current
-		// drafts, whatever else it says. The v1 `coaz: true` marker no longer exists,
-		// so its presence is the only thing that selects the superseded dialect.
-		if rawV2, ok := t.InputSchema["x-authzen-mapping"].(map[string]any); ok {
-			dt.dialect = DialectV2
-			dt.mappingV2, dt.mappingErr = CompileMappingV2(t.Name, rawV2)
-			if dt.mappingErr == nil && !dt.mappingV2.Anchored() {
-				// Not fatal — the binding permits it — but a gateway is enforcing a
-				// mapping the MCP server authored, and an unanchored subject means that
-				// server is asserting who the caller is.
-				log.Printf("coaz: tool %q sets subject.id from a source that cannot be "+
-					"verified against the token; its identity is asserted by the mapping author", t.Name)
-			}
-		} else if t.Coaz {
-			dt.dialect = DialectV1
-			rawMapping, ok := t.InputSchema["x-coaz-mapping"].(map[string]any)
-			if !ok {
-				dt.mappingErr = fmt.Errorf("tool %q declares coaz but inputSchema has no x-coaz-mapping object", t.Name)
-			} else {
-				dt.mapping, dt.mappingErr = CompileMapping(t.Name, rawMapping)
-			}
+		if err := json.Unmarshal(result, &listed); err != nil {
+			return nil, fmt.Errorf("tools/list result malformed: %w", err)
 		}
-		tools[t.Name] = dt
+		for _, raw := range listed.Tools {
+			var t Tool
+			if err := json.Unmarshal(raw, &t); err != nil || t.Name == "" {
+				continue
+			}
+			if prev, dup := tools[t.Name]; dup {
+				// Two declarations of one name: which one governs is anyone's guess, so
+				// neither does — every call to it is a mapping error.
+				prev.mappingErr = fmt.Errorf("tool %q is listed more than once", t.Name)
+				continue
+			}
+			tools[t.Name] = indexTool(t)
+		}
+		if listed.NextCursor == "" {
+			return tools, nil
+		}
+		if page >= maxToolsPages {
+			return nil, fmt.Errorf("tools/list from %s runs past %d pages", upstreamURL, maxToolsPages)
+		}
+		result, err = d.rpc(ctx, upstreamURL, authorization, session, listRequest(page+2, listed.NextCursor))
+		if err != nil {
+			return nil, fmt.Errorf("tools/list page %d from %s failed: %w", page+1, upstreamURL, err)
+		}
 	}
-	return tools, nil
 }
 
-func (d *discoveryCache) fetchWithSession(ctx context.Context, upstreamURL, authorization string) (json.RawMessage, error) {
-	var session string
+// indexTool reads one tool's COAZ declaration, in whichever dialect it uses.
+func indexTool(t Tool) *discoveredTool {
+	dt := &discoveredTool{tool: t}
+	// v2 first: a tool carrying x-authzen-mapping is declared against the current
+	// drafts, whatever else it says. The v1 `coaz: true` marker no longer exists,
+	// so its presence is the only thing that selects the superseded dialect.
+	if rawV2, ok := t.InputSchema["x-authzen-mapping"].(map[string]any); ok {
+		dt.dialect = DialectV2
+		dt.mappingV2, dt.mappingErr = CompileMappingV2(t.Name, rawV2)
+		if dt.mappingErr == nil && !dt.mappingV2.Anchored() {
+			// Not fatal — the binding permits it — but a gateway is enforcing a
+			// mapping the MCP server authored, and an unanchored subject means that
+			// server is asserting who the caller is.
+			log.Printf("coaz: tool %q sets subject.id from a source that cannot be "+
+				"verified against the token; its identity is asserted by the mapping author", t.Name)
+		}
+	} else if t.Coaz {
+		dt.dialect = DialectV1
+		rawMapping, ok := t.InputSchema["x-coaz-mapping"].(map[string]any)
+		if !ok {
+			dt.mappingErr = fmt.Errorf("tool %q declares coaz but inputSchema has no x-coaz-mapping object", t.Name)
+		} else {
+			dt.mapping, dt.mappingErr = CompileMapping(t.Name, rawMapping)
+		}
+	}
+	return dt
+}
+
+// initialize runs the MCP handshake and returns the session id.
+func (d *discoveryCache) initialize(ctx context.Context, upstreamURL, authorization string) (string, error) {
 	_, session, err := d.rpcWithSession(ctx, upstreamURL, authorization, "", map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
 		"params": map[string]any{
@@ -192,16 +234,13 @@ func (d *discoveryCache) fetchWithSession(ctx context.Context, upstreamURL, auth
 		},
 	})
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	// best-effort; some servers require it before serving requests
 	_, _, _ = d.rpcWithSession(ctx, upstreamURL, authorization, session, map[string]any{
 		"jsonrpc": "2.0", "method": "notifications/initialized",
 	})
-	result, _, err := d.rpcWithSession(ctx, upstreamURL, authorization, session, map[string]any{
-		"jsonrpc": "2.0", "id": 2, "method": "tools/list",
-	})
-	return result, err
+	return session, nil
 }
 
 func (d *discoveryCache) rpc(ctx context.Context, url, authorization, session string, payload map[string]any) (json.RawMessage, error) {
@@ -240,8 +279,9 @@ func (d *discoveryCache) rpcWithSession(ctx context.Context, url, authorization,
 		return nil, newSession, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newSession, fmt.Errorf("MCP upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		// A little of the body helps whoever reads the log; it never reaches the client.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return nil, newSession, fmt.Errorf("MCP upstream returned %d: %q", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	ct := resp.Header.Get("Content-Type")

@@ -109,6 +109,10 @@ type CallOptions struct {
 	// FailOpen is the route's default failure mode; a layer's own setting overrides
 	// it. Off, a PDP that cannot be reached denies the request. On, it is skipped.
 	FailOpen bool
+	// RequireV2 refuses tools that declare only the superseded `coaz: true` mapping. Its
+	// subject can come from the caller's params, so on a route that wants the subject
+	// anchored to the token, a v1 declaration is a mapping error.
+	RequireV2 bool
 }
 
 // forwardedContext is what every PDP call carries beyond the mapped subject, action and
@@ -216,6 +220,10 @@ func (e *Engine) CheckMCP(ctx context.Context, upstreamURL, authorization string
 	deniedCode := dt.dialect.DeniedCode()
 	if dt.mappingErr != nil {
 		msg := fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr)
+		return denied(rpc.ID, CodeMappingError, msg, msg)
+	}
+	if opts.RequireV2 && dt.dialect == DialectV1 {
+		msg := fmt.Sprintf("COAZ mapping error: tool %q declares only a superseded coaz:true mapping; this route requires x-authzen-mapping", rpc.ToolName)
 		return denied(rpc.ID, CodeMappingError, msg, msg)
 	}
 
