@@ -194,16 +194,21 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 
 | | Coverage | Floor set in |
 | --- | --- | --- |
-| `core/coaz` | 94.2% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
-| `core/cmd/coaz-pep` | 95.6% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
-| `sdk/node` | 96.8% stmts / 100% funcs | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
-| `gateways/kong` | 99.8% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
-| `gateways/pingaccess` | 98.4% lines / 91.2% branches | [`pom.xml`](gateways/pingaccess/authzen-pdp/pom.xml) (JaCoCo) |
+| `core/coaz` | 96.0% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/cmd/coaz-pep` | 95.5% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/federation` | 98.8% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/jose` | 98.2% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/authzen/discovery` | 98.5% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/internal/ttlcache` | 100% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/internal/metafetch` | 97.1% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `sdk/node` | 99.8% stmts / 96.3% branches / 100% funcs | [`vitest.config.ts`](sdk/node/vitest.config.ts) |
+| `gateways/kong` | 100% | [`scripts/lua-coverage-gate.sh`](scripts/lua-coverage-gate.sh) |
+| `gateways/pingaccess` | 99.6% lines / 96.1% branches | [`pom.xml`](gateways/pingaccess/authzen-pdp/pom.xml) (JaCoCo) |
 
 The target is **100% of what can be meaningfully tested, with the rest named** — not a
 coverage-number fetish. Two things are deliberately excluded from the Go gate, and only
-these two (the PingAccess gate names its own two, for the same reason: they need the
-running engine or a TLS peer):
+these two (the PingAccess gate excludes one class, `PaResponses`, for the same reason: it
+needs the running engine, and the demo exercises it):
 
 - **`main()` itself.** Its configuration is `buildServer` and `grpcServerOptions`, tested
   across the configuration matrix, and serving and draining is `run`, tested with a real
