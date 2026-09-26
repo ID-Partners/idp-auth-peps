@@ -112,7 +112,10 @@ export function parseLayer(entry: string | LayerSpec): LayerSpec {
 /** What resolving a layer list produced: the PDPs to ask, and the fail-open layers that were skipped. */
 export interface ResolvedLayers {
   pdps: PdpEndpoints[];
+  /** The identifiers of the skipped layers — safe to put on the wire. */
   skipped: string[];
+  /** One line per skipped layer saying why, for logs. */
+  detail: string[];
 }
 
 /**
@@ -134,6 +137,7 @@ export async function resolveLayers(
   const specs = (layers && layers.length > 0 ? layers : [LAYER_RESOURCE]).map(parseLayer);
   const out: PdpEndpoints[] = [];
   const skipped: string[] = [];
+  const detail: string[] = [];
   const seen = new Map<string, number>();
   for (const spec of specs) {
     const open = spec.failOpen ?? failOpen;
@@ -143,7 +147,8 @@ export async function resolveLayers(
     } catch (err) {
       const derr = asDiscoveryError(err);
       if (derr.kind === 'not_allowed' || !open) throw new DiscoveryError(derr.kind, `layer ${spec.name}: ${derr.message}`);
-      skipped.push(`${spec.name} (${derr.message})`);
+      skipped.push(spec.name);
+      detail.push(`${spec.name}: ${derr.message}`);
       continue;
     }
     const at = seen.get(ep.identifier);
@@ -155,7 +160,7 @@ export async function resolveLayers(
     seen.set(ep.identifier, out.length);
     out.push({ ...ep, failOpen: open });
   }
-  return { pdps: out, skipped };
+  return { pdps: out, skipped, detail };
 }
 
 /** The one resource document to forward for a layered call: whichever layer read it. */

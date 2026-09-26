@@ -5,6 +5,16 @@
  *
  * Everything here FAILS CLOSED: a timeout, a non-2xx, an unparseable body and a
  * network error all produce a deny, never a throw into the caller's request path.
+ *
+ * A PDP exchange ends one of four ways, and only one of them may be skipped by a
+ * fail-open layer:
+ *
+ *   permit       the answer is the JSON boolean `true` (every one, for a boxcar)
+ *   deny         the answer is `false` — a decision, never skipped
+ *   refusal      a 3xx or 4xx, a 2xx that is not a readable decision, a request that
+ *                could not be encoded, a URL that cannot be used — never skipped
+ *   unavailable  a transport error, a timeout, a 5xx or a 429 — the only outcome a
+ *                fail-open layer may skip
  */
 
 import type {
@@ -21,9 +31,19 @@ import type {
 } from './types.js';
 import { foldDecision } from './challenge.js';
 import { PdpDiscovery, resolveLayers, resourceMetadataOf, type LayerSpec, type PdpDiscoveryOptions, type PdpEndpoints, type PdpResolver, type ResolvedLayers, type ResourceMetadata } from './discovery.js';
+import { BodyTooLargeError, encodeJson, isHttpUrl, readCapped } from './http.js';
 
 /** Discovery knobs a client accepts; the static PDP, its key and fetch come from the client. */
 export type ClientDiscoveryOptions = Omit<PdpDiscoveryOptions, 'staticPdp' | 'apiKeys' | 'fetch'>;
+
+/** How one PDP exchange ended. See the file header. */
+export type PdpOutcome = 'permit' | 'deny' | 'refusal' | 'unavailable';
+
+/** What a client says to a caller when the PDP could not decide. The detail is logged, never sent. */
+export const PDP_UNAVAILABLE_REASON = 'Authorization service unreachable; denying (fail-closed).';
+
+/** The most a PDP answer may be. A boxcar of a few hundred decisions is a few KiB. */
+const MAX_PDP_ANSWER_BYTES = 1_048_576;
 
 /** Per-call options for evaluate / evaluateAll. */
 export interface EvaluateOptions {
@@ -72,11 +92,12 @@ export interface AuthzenClientOptions {
    */
   layers?: Array<string | LayerSpec>;
   /**
-   * What a layer does when its PDP cannot be reached, unless the layer says for itself.
+   * What a layer does when its PDP is unavailable, unless the layer says for itself.
    * `'closed'` (default) makes the verdict a `pdp_error`. `'open'` skips the layer; if
    * every layer was skipped the verdict is a permit, with `failedOpen` naming what was
-   * skipped. A refusal (allowlist, invalid chain) never opens; a deny is a decision,
-   * not a failure.
+   * skipped. Only unavailability opens — a transport error, a timeout, a 5xx or a 429.
+   * A refusal (a 4xx, a redirect, an answer that is not a decision, an allowlist miss)
+   * never does, and a deny is a decision, not a failure.
    */
   failMode?: 'open' | 'closed';
   /** Per-request timeout. Default 1500ms — a PEP sits in the request path. */
@@ -95,14 +116,24 @@ export interface PdpTrace {
   status?: number;
   response?: unknown;
   error?: string;
+  /**
+   * How the exchange ended, so a refusal and an outage are logged apart. Always set on a
+   * failure; on a 2xx, set for an evaluation and absent for a search, which answers with
+   * results rather than a decision.
+   */
+  outcome?: PdpOutcome;
   durationMs: number;
 }
 
-/** Thrown only by the raw `post` helper; the evaluate* methods never let it escape. */
+/**
+ * A PDP exchange that produced no decision. `outcome` says whether a fail-open layer
+ * may skip it: only `unavailable` can be.
+ */
 export class PdpError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    readonly outcome: 'refusal' | 'unavailable' = 'refusal',
   ) {
     super(message);
     this.name = 'PdpError';
@@ -119,10 +150,11 @@ export class AuthzenClient {
   constructor(private readonly opts: AuthzenClientOptions) {
     if (!opts.url) throw new Error('AuthzenClient requires a PDP url');
     this.url = opts.url.replace(/\/+$/, '');
+    if (!isHttpUrl(this.url)) throw new Error(`AuthzenClient url ${JSON.stringify(opts.url)} is not an absolute http(s) URL`);
     this.timeoutMs = opts.timeoutMs ?? 1500;
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     if (typeof this.fetchImpl !== 'function') {
-      throw new Error('No fetch implementation available (Node 20+ or pass opts.fetch)');
+      throw new Error('No fetch implementation available (Node 22+ or pass opts.fetch)');
     }
     const apiKeys = opts.apiKey ? { [this.url]: opts.apiKey } : {};
     this.resolver =
@@ -136,82 +168,67 @@ export class AuthzenClient {
    */
   async evaluate(request: EvaluationRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
-      const { pdps: eps, skipped } = await this.resolveAll(options);
-      request = withForwardedContext(request, resourceMetadataOf(eps), options);
+      const layers = await this.resolveAll(options);
+      request = withForwardedContext(request, resourceMetadataOf(layers.pdps), options);
       // Every layer must permit; the first that does not is the verdict, advice and all.
-      // A layer whose PDP fails is skipped only if it is fail-open; a deny never is.
+      // A layer whose PDP is unavailable is skipped only if it is fail-open; a deny and a
+      // refusal never are.
       let verdict: Verdict | undefined;
-      for (const ep of eps) {
+      for (const ep of layers.pdps) {
         let res: EvaluationResponse;
         try {
-          res = await this.postTo<EvaluationResponse>(ep.evaluation, request, ep.apiKey);
+          res = readDecision(await this.exchange(ep.evaluation, request, ep.apiKey, true), ep.identifier);
         } catch (err) {
-          if (!ep.failOpen) throw err;
-          skipped.push(`${ep.identifier} (${describe(err)})`);
+          if (!skippable(ep, err)) throw err;
+          skip(layers, ep.identifier, err);
           continue;
         }
         verdict = mergePermit(verdict, { ...foldDecision(res), request });
         if (!verdict.allow) break;
       }
-      return finishFold(verdict, skipped, request);
+      return finishFold(verdict, layers, request);
     } catch (err) {
-      return {
-        allow: false,
-        kind: 'pdp_error',
-        reason: describe(err),
-        request,
-      };
+      return pdpError(err, request);
     }
   }
 
   /**
    * POST to the evaluations (boxcar) endpoint. Folds to a single Verdict: every decision
-   * must permit, and the FIRST deny is the one reported, so its advice survives the fold.
-   * A PDP that advertises no evaluations endpoint is a pdp_error — a batch is never sent
-   * to a guessed path.
+   * must permit, there must be exactly one per request sent, and the FIRST deny is the
+   * one reported, so its advice survives the fold. A PDP that advertises no evaluations
+   * endpoint is a pdp_error — a batch is never sent to a guessed path.
    */
   async evaluateAll(request: EvaluationsRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
-      const { pdps: all, skipped } = await this.resolveAll(options);
-      // A layer that advertises no batch endpoint cannot take this call: a
-      // capability failure, treated like any other — fatal unless the layer is
-      // fail-open. Checked before anything is sent, so a batch is never half-done.
-      const eps = all.filter((ep) => {
-        if (ep.evaluations) return true;
-        if (!ep.failOpen) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
-        skipped.push(`${ep.identifier} (advertises no access_evaluations_endpoint)`);
-        return false;
-      });
-      request = withForwardedContext(request, resourceMetadataOf(all), options);
+      const sent = Array.isArray(request?.evaluations) ? request.evaluations.length : 0;
+      if (sent === 0) throw new PdpError('an evaluations request must carry at least one evaluation');
+      const layers = await this.resolveAll(options);
+      // A layer that advertises no batch endpoint cannot take this call. That is not an
+      // outage, so it is refused even on a fail-open layer — skipping it would leave
+      // every batch unjudged by that layer for as long as the configuration stands.
+      // Checked before anything is sent, so a batch is never half-done.
+      for (const ep of layers.pdps) {
+        if (!ep.evaluations) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
+      }
+      request = withForwardedContext(request, resourceMetadataOf(layers.pdps), options);
       let verdict: Verdict | undefined;
-      for (const ep of eps) {
-        let res: EvaluationsResponse;
+      for (const ep of layers.pdps) {
+        let list: EvaluationResponse[];
         try {
-          res = await this.postTo<EvaluationsResponse>(ep.evaluations!, request, ep.apiKey);
+          list = readEvaluations(await this.exchange(ep.evaluations!, request, ep.apiKey, true), sent, ep.identifier);
         } catch (err) {
-          if (!ep.failOpen) throw err;
-          skipped.push(`${ep.identifier} (${describe(err)})`);
+          if (!skippable(ep, err)) throw err;
+          skip(layers, ep.identifier, err);
           continue;
         }
-        const list = Array.isArray(res?.evaluations) ? res.evaluations : [];
-        if (list.length === 0) {
-          if (!ep.failOpen) return { allow: false, kind: 'pdp_error', reason: 'PDP evaluations response was empty', request };
-          skipped.push(`${ep.identifier} (empty evaluations response)`);
-          continue;
-        }
-        let layerVerdict: Verdict = { allow: true, kind: 'ok', reason: 'permit', request };
-        for (const d of list) {
-          if (!d?.decision) {
-            layerVerdict = { ...foldDecision(d), request };
-            break;
-          }
-        }
+        const firstDeny = list.find((d) => d.decision !== true);
+        const layerVerdict: Verdict = firstDeny ? { ...foldDecision(firstDeny), request } : { allow: true, kind: 'ok', reason: 'permit', request };
         verdict = mergePermit(verdict, layerVerdict);
         if (!verdict.allow) break;
       }
-      return finishFold(verdict, skipped, request);
+      return finishFold(verdict, layers, request);
     } catch (err) {
-      return { allow: false, kind: 'pdp_error', reason: describe(err), request };
+      return pdpError(err, request);
     }
   }
 
@@ -231,8 +248,8 @@ export class AuthzenClient {
   }
 
   private async resolveAll(options: EvaluateOptions): Promise<ResolvedLayers> {
+    const failOpen = (options.failMode ?? this.opts.failMode) === 'open';
     try {
-      const failOpen = (options.failMode ?? this.opts.failMode) === 'open';
       return await resolveLayers(this.resolver, options.resource, options.layers ?? this.opts.layers, failOpen);
     } catch (err) {
       throw new PdpError(`PDP discovery: ${describe(err)}`);
@@ -247,11 +264,18 @@ export class AuthzenClient {
     return this.postTo<T>(this.url + path, body, this.opts.apiKey);
   }
 
-  /** Raw POST to an absolute endpoint with the key bound to it. Throws PdpError. */
-  async postTo<T>(endpoint: string, body: unknown, apiKey?: string): Promise<T> {
+  /**
+   * Raw POST to an absolute endpoint with the key bound to it. Throws a PdpError whose
+   * `outcome` says whether the PDP was unavailable or the exchange was refused. A
+   * redirect is never followed: it is a refusal, like any other 3xx, so a request
+   * carrying a forwarded token cannot be steered off the allowlist.
+   */
+  postTo<T>(endpoint: string, body: unknown, apiKey?: string): Promise<T> {
+    return this.exchange(endpoint, body, apiKey, false) as Promise<T>;
+  }
+
+  private async exchange(endpoint: string, body: unknown, apiKey: string | undefined, decision: boolean): Promise<unknown> {
     const started = Date.now();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     const trace = (extra: Partial<PdpTrace>) => {
       if (!this.opts.onTrace) return;
       try {
@@ -260,45 +284,120 @@ export class AuthzenClient {
         /* a broken tracer must not break the request path */
       }
     };
+    const fail = (message: string, outcome: 'refusal' | 'unavailable', status?: number): never => {
+      trace({ ...(status !== undefined ? { status } : {}), error: message, outcome });
+      throw new PdpError(message, status, outcome);
+    };
+
+    if (!isHttpUrl(endpoint)) fail(`PDP endpoint ${JSON.stringify(endpoint)} is not an absolute http(s) URL`, 'refusal');
+    let encoded = '';
     try {
-      const res = await this.fetchImpl(endpoint, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-          ...this.opts.headers,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      const text = await res.text();
-      if (!res.ok) {
-        trace({ status: res.status, error: text.slice(0, 512) });
-        throw new PdpError(`PDP returned ${res.status}`, res.status);
-      }
-      let parsed: T;
-      try {
-        parsed = JSON.parse(text) as T;
-      } catch {
-        trace({ status: res.status, error: 'unparseable PDP response' });
-        throw new PdpError('PDP returned a body that is not JSON', res.status);
-      }
-      trace({ status: res.status, response: parsed });
-      return parsed;
+      encoded = encodeJson(body);
     } catch (err) {
-      if (err instanceof PdpError) throw err;
-      if (err instanceof Error && err.name === 'AbortError') {
-        trace({ error: `timeout after ${this.timeoutMs}ms` });
-        throw new PdpError(`PDP timed out after ${this.timeoutMs}ms`);
+      fail(`the request could not be encoded: ${describe(err)}`, 'refusal');
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      let res: Response;
+      try {
+        res = await this.fetchImpl(endpoint, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json',
+            ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+            ...this.opts.headers,
+          },
+          body: encoded,
+          redirect: 'manual',
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return fail(`PDP ${endpoint} timed out after ${this.timeoutMs}ms`, 'unavailable');
+        return fail(`PDP ${endpoint} could not be reached: ${describe(err)}`, 'unavailable');
       }
-      trace({ error: describe(err) });
-      throw new PdpError(describe(err));
+      const status = res.status;
+      if (status >= 500 || status === 429) {
+        await res.body?.cancel().catch(() => {});
+        return fail(`PDP ${endpoint} returned ${status}`, 'unavailable', status);
+      }
+      if (status < 200 || status >= 300) {
+        await res.body?.cancel().catch(() => {});
+        return fail(`PDP ${endpoint} returned ${status}${status >= 300 && status < 400 ? ' (redirects are not followed)' : ''}`, 'refusal', status);
+      }
+      let text: string;
+      try {
+        text = await readCapped(res, MAX_PDP_ANSWER_BYTES);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) return fail(`PDP ${endpoint} answer exceeds ${MAX_PDP_ANSWER_BYTES} bytes`, 'refusal', status);
+        if (err instanceof Error && err.name === 'AbortError') return fail(`PDP ${endpoint} timed out after ${this.timeoutMs}ms`, 'unavailable', status);
+        return fail(`PDP ${endpoint} answer broke off: ${describe(err)}`, 'unavailable', status);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return fail(`PDP ${endpoint} returned a body that is not JSON`, 'refusal', status);
+      }
+      trace({ status, response: parsed, ...(decision ? { outcome: outcomeOf(parsed) } : {}) });
+      return parsed;
     } finally {
       clearTimeout(timer);
     }
   }
 }
+
+/** The outcome a parsed answer will have once it is read: for the trace only. */
+function outcomeOf(parsed: unknown): PdpOutcome {
+  if (isObject(parsed) && typeof parsed['decision'] === 'boolean') return parsed['decision'] ? 'permit' : 'deny';
+  if (isObject(parsed) && Array.isArray(parsed['evaluations'])) {
+    const list = parsed['evaluations'] as unknown[];
+    if (list.length > 0 && list.every((d) => isObject(d) && typeof d['decision'] === 'boolean')) {
+      return list.every((d) => (d as Record<string, unknown>)['decision'] === true) ? 'permit' : 'deny';
+    }
+  }
+  return 'refusal';
+}
+
+/**
+ * One AuthZEN decision, read strictly: an object whose `decision` is a JSON boolean.
+ * Anything else — `"true"`, `1`, `{}`, a missing member — is a refusal. A `context` that
+ * is not an object is advice nobody can read, so it is dropped rather than trusted.
+ */
+function readDecision(raw: unknown, pdp: string): EvaluationResponse {
+  if (!isObject(raw) || typeof raw['decision'] !== 'boolean') {
+    throw new PdpError(`PDP ${pdp} answered without a boolean decision`);
+  }
+  const context = raw['context'];
+  return isObject(context) ? { decision: raw['decision'], context: context as DecisionContext } : { decision: raw['decision'] };
+}
+
+/** A boxcar answer, read strictly: exactly one boolean decision per evaluation sent. */
+function readEvaluations(raw: unknown, sent: number, pdp: string): EvaluationResponse[] {
+  const list = isObject(raw) ? raw['evaluations'] : undefined;
+  if (!Array.isArray(list)) throw new PdpError(`PDP ${pdp} answered without an evaluations array`);
+  if (list.length !== sent) throw new PdpError(`PDP ${pdp} answered ${list.length} evaluations for ${sent} sent`);
+  return list.map((d) => readDecision(d, pdp));
+}
+
+/** May this layer be skipped for this error? Only an unavailable PDP on a fail-open layer. */
+function skippable(ep: PdpEndpoints, err: unknown): boolean {
+  return Boolean(ep.failOpen) && err instanceof PdpError && err.outcome === 'unavailable';
+}
+
+function skip(layers: ResolvedLayers, identifier: string, err: unknown): void {
+  layers.skipped.push(identifier);
+  layers.detail.push(`${identifier}: ${describe(err)}`);
+}
+
+function pdpError(err: unknown, request: EvaluationRequest | EvaluationsRequest): Verdict {
+  return { allow: false, kind: 'pdp_error', reason: PDP_UNAVAILABLE_REASON, detail: describe(err), request };
+}
+
+/** The context keys the PEP owns. Nothing a caller or a mapping supplies may set them. */
+const FORWARDED_KEYS = ['access_token', 'resource_metadata', 'resource_metadata_source', 'request'] as const;
 
 /**
  * What the PEP forwards for the PDP to reason with, beyond the mapped subject, action
@@ -306,25 +405,42 @@ export class AuthzenClient {
  * (when the caller allows) the raw token. The SDK enforces none of it. Comparing a
  * token's scope or acr to what a resource requires is a policy decision, and policy is
  * offloaded to the PDP, where it can weigh them alongside things a PEP never sees.
- * Keys already present in the request's context win: a caller's explicit context is
- * not overwritten.
+ *
+ * Those keys are the PEP's alone. A mapping's context is built from tool arguments the
+ * caller controls, so a key it supplies is removed — at the top level and in every
+ * boxcar entry, where an entry's context would otherwise override the top level's —
+ * and only what the PEP itself forwards is set. Every other key passes through.
  */
-function withForwardedContext<T extends { context?: Record<string, unknown> }>(
+function withForwardedContext<T extends { context?: Record<string, unknown>; evaluations?: unknown }>(
   request: T,
   meta: ResourceMetadata | undefined,
   options: EvaluateOptions,
 ): T {
-  const extra: Record<string, unknown> = {};
+  const forwarded: Record<string, unknown> = {};
   if (meta) {
-    extra['resource_metadata'] = meta.document;
-    extra['resource_metadata_source'] = meta.source;
+    forwarded['resource_metadata'] = meta.document;
+    forwarded['resource_metadata_source'] = meta.source;
   }
-  if (options.request) extra['request'] = options.request;
-  if (options.accessToken) extra['access_token'] = options.accessToken;
-  if (Object.keys(extra).length === 0) return request;
-  const context = { ...extra, ...(request.context ?? {}) };
-  // A boxcar carries its context at the top level too; either way, the merge is the same.
-  return { ...request, context };
+  if (options.request) forwarded['request'] = options.request;
+  if (options.accessToken) forwarded['access_token'] = options.accessToken;
+
+  const out: Record<string, unknown> = { ...request };
+  if (request.context !== undefined || Object.keys(forwarded).length > 0) {
+    out['context'] = { ...withoutForwarded(request.context), ...forwarded };
+  }
+  if (Array.isArray(request.evaluations)) {
+    out['evaluations'] = request.evaluations.map((e: unknown) =>
+      isObject(e) && isObject(e['context']) ? { ...e, context: withoutForwarded(e['context']) } : e,
+    );
+  }
+  return out as T;
+}
+
+function withoutForwarded(context: unknown): Record<string, unknown> {
+  if (!isObject(context)) return {};
+  const out = { ...context };
+  for (const k of FORWARDED_KEYS) delete out[k];
+  return out;
 }
 
 /**
@@ -359,15 +475,19 @@ function mergePermit(acc: Verdict | undefined, layer: Verdict): Verdict {
  * a permit — what fail-open means, chosen per layer — marked so it can be seen and
  * counted. Otherwise the verdict stands, with the skipped layers attached.
  */
-function finishFold(verdict: Verdict | undefined, skipped: string[], request: EvaluationRequest | EvaluationsRequest): Verdict {
+function finishFold(verdict: Verdict | undefined, layers: ResolvedLayers, request: EvaluationRequest | EvaluationsRequest): Verdict {
+  const { skipped, detail } = layers;
   if (!verdict) {
-    return { allow: true, kind: 'ok', reason: `fail-open: no policy layer could be reached (${skipped.join('; ')})`, request, failedOpen: skipped };
+    return { allow: true, kind: 'ok', reason: 'fail-open: no policy layer could be reached', detail: detail.join('; '), request, failedOpen: skipped };
   }
-  return skipped.length > 0 ? { ...verdict, failedOpen: skipped } : verdict;
+  return skipped.length > 0 ? { ...verdict, failedOpen: skipped, detail: detail.join('; ') } : verdict;
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 function describe(err: unknown): string {
-  if (err instanceof PdpError) return err.message;
   if (err instanceof Error) return err.message;
   return String(err);
 }

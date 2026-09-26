@@ -130,15 +130,25 @@ export type DenialKind =
 export interface Verdict {
   allow: boolean;
   kind: DenialKind;
-  /** Human-readable, safe to log and to put in a challenge body. */
+  /**
+   * Safe to put in front of the caller: a PDP's own reason for a policy decision, or a
+   * fixed phrase for a failure. Never carries an internal URL, a status code from
+   * behind the PEP or an upstream's error text — that goes in `detail`.
+   */
   reason: string;
+  /**
+   * What actually happened, for logs and `onDecision`: which PDP, which status, which
+   * error. Never sent to a client.
+   */
+  detail?: string;
   /** Whatever context the PDP returned, untouched. */
   context?: DecisionContext;
   /** The request that was sent to the PDP — for transcripts and tests. */
   request?: EvaluationRequest | EvaluationsRequest;
   /**
-   * The policy layers that failed and were skipped because they were allowed to.
-   * Non-empty on a permit means fewer PDPs judged this call than the policy asked for.
+   * The identifiers of the policy layers that could not be reached and were skipped
+   * because they were allowed to fail open. Non-empty on a permit means fewer PDPs
+   * judged this call than the policy asked for.
    */
   failedOpen?: string[];
 }

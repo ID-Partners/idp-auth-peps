@@ -73,7 +73,7 @@ describe('AuthzenClient', () => {
     const v = await client.evaluate({ subject: { type: 'user', id: 'u' }, action: { name: 'x' }, resource: { type: 'r' } });
     expect(v.allow).toBe(false);
     expect(v.kind).toBe('pdp_error');
-    expect(v.reason).toMatch(/timed out/);
+    expect(v.detail).toMatch(/timed out/);
   });
 
   it('reports the first deny in a boxcar so its advice survives', async () => {
@@ -873,7 +873,7 @@ describe('AuthzenClient — the paths that only matter when things go wrong', ()
     }) as unknown as typeof globalThis.fetch;
     const v = await new AuthzenClient({ url: 'http://pdp', fetch: fetchImpl }).evaluate(req);
     expect(v.allow).toBe(false);
-    expect(v.reason).toMatch(/ECONNREFUSED/);
+    expect(v.detail).toMatch(/ECONNREFUSED/);
   });
 
   it('rejects construction without a url, and strips a trailing slash', async () => {
@@ -1693,7 +1693,7 @@ describe('coverage completeness: fallbacks and branch tails', () => {
   it('stringifies a non-Error rejection from fetch', async () => {
     const fetchImpl = vi.fn(async () => { throw 'a bare string, not an Error'; }) as unknown as typeof globalThis.fetch;
     const v = await new AuthzenClient({ url: 'http://pdp', fetch: fetchImpl }).evaluate({ subject: { type: 'u', id: 'x' }, action: { name: 'a' }, resource: { type: 'r' } });
-    expect(v.reason).toContain('a bare string');
+    expect(v.detail).toContain('a bare string');
   });
 });
 

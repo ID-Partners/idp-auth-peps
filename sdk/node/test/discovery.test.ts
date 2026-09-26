@@ -473,9 +473,9 @@ describe('discovery: through the client, middleware and guard', () => {
     await client.evaluate(req, { request: { method: 'GET', path: '/y' } });
     const plain = seen[1] as { context: Record<string, unknown> };
     expect(plain.context).toEqual({ request: { method: 'GET', path: '/y' } });
-    // A caller's own context key is never overwritten.
+    // The PEP's own keys are the PEP's: a caller's context cannot pre-empt what it forwards.
     await client.evaluate({ ...req, context: { request: 'mine' } }, { request: { method: 'GET', path: '/z' } });
-    expect((seen[2] as { context: Record<string, unknown> }).context['request']).toBe('mine');
+    expect((seen[2] as { context: Record<string, unknown> }).context['request']).toEqual({ method: 'GET', path: '/z' });
   });
 
   it('the middleware forwards the endpoint, and the token only when told to', async () => {
@@ -542,11 +542,11 @@ describe('discovery: through the client, middleware and guard', () => {
     const rogueRes = router({ ...routes(), [`${GOOD}/.well-known/authzen-configuration`]: { policy_decision_point: GOOD, access_evaluation_endpoint: `${GOOD}/e` } });
     const c2 = new AuthzenClient({ url: STATIC, fetch: rogueRes.fetch, discovery: { mode: 'resource', ...quiet }, layers: [STATIC, 'resource'] });
     const b = await c2.evaluateAll({ evaluations: [req] }, { resource: RES });
-    expect(b).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('access_evaluations_endpoint') });
+    expect(b).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('access_evaluations_endpoint') });
     expect(rogueRes.hits.filter((h) => h.method === 'POST')).toHaveLength(0);
     // A layer that cannot be resolved is a pdp_error.
     const v3 = await client.evaluate(req, { resource: RES, layers: ['http://127.0.0.1:1'] });
-    expect(v3).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('layer') });
+    expect(v3).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('layer') });
   });
 
   it('resolves layers and explicit PDPs at the discovery level', async () => {
@@ -593,7 +593,7 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(dflt.pdps[0]?.failOpen).toBe(false);
     await expect(resolveLayers(d, RES, [`${bad} fail-closed`], true)).rejects.toThrow(DiscoveryError);
     // Everything skipped is still a resolution, with nothing to ask.
-    expect(await resolveLayers(d, RES, [bad], true)).toEqual({ pdps: [], skipped: [expect.stringContaining(bad)] });
+    expect(await resolveLayers(d, RES, [bad], true)).toEqual({ pdps: [], skipped: [bad], detail: [expect.stringContaining(bad)] });
     // A duplicate takes the stricter mode.
     const dup = await resolveLayers(d, RES, [`${GOOD} fail-open`, 'resource fail-closed']);
     expect(dup.pdps).toHaveLength(1);
@@ -633,7 +633,7 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(await lax.evaluate(req, { resource: RES, layers: ['resource'] })).not.toHaveProperty('failedOpen');
   });
 
-  it('a batch fails open past a layer that cannot take one, or that fails, only when told', async () => {
+  it('a batch fails open past a layer that is down, only when told, and never past one that cannot take a batch', async () => {
     const NOBATCH = 'https://nobatch.example';
     const DOWN = 'https://down.example';
     const { fetch, hits } = router({
@@ -645,11 +645,12 @@ describe('discovery: through the client, middleware and guard', () => {
     });
     const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'authzen', ...quiet } });
     const batch = { evaluations: [req] };
-    expect(await client.evaluateAll(batch, { layers: [NOBATCH, 'static'] })).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('access_evaluations_endpoint') });
+    expect(await client.evaluateAll(batch, { layers: [NOBATCH, 'static'] })).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('access_evaluations_endpoint') });
     expect(hits.filter((h) => h.method === 'POST')).toHaveLength(0);
-    expect(await client.evaluateAll(batch, { layers: [`${NOBATCH} fail-open`, 'static'] })).toMatchObject({ allow: true, failedOpen: [expect.stringContaining(NOBATCH)] });
-    expect(hits.filter((h) => h.method === 'POST')).toHaveLength(1);
-    expect(await client.evaluateAll(batch, { layers: [DOWN, 'static'], failMode: 'open' })).toMatchObject({ allow: true, failedOpen: [expect.stringContaining(DOWN)] });
+    // A PDP that cannot take a batch is not an outage: fail-open does not cover it.
+    expect(await client.evaluateAll(batch, { layers: [`${NOBATCH} fail-open`, 'static'] })).toMatchObject({ allow: false, kind: 'pdp_error' });
+    expect(hits.filter((h) => h.method === 'POST')).toHaveLength(0);
+    expect(await client.evaluateAll(batch, { layers: [DOWN, 'static'], failMode: 'open' })).toMatchObject({ allow: true, failedOpen: [DOWN] });
     expect(await client.evaluateAll(batch, { layers: [DOWN], failMode: 'open' })).toMatchObject({ allow: true, reason: expect.stringMatching(/^fail-open:/) });
     expect(await client.evaluateAll(batch, { layers: [DOWN], failMode: 'closed' })).toMatchObject({ allow: false, kind: 'pdp_error' });
   });
@@ -692,14 +693,14 @@ describe('discovery: through the client, middleware and guard', () => {
     });
     const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'authzen', ...quiet } });
     const v = await client.evaluateAll({ evaluations: [req] });
-    expect(v).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('access_evaluations_endpoint') });
+    expect(v).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('access_evaluations_endpoint') });
     expect(hits.filter((h) => h.method === 'POST')).toHaveLength(0);
   });
 
   it('a discovery failure is a pdp_error verdict', async () => {
     const { fetch } = router(routes());
     const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', resourceAllowlist: ['https://only.example'], ...quiet } });
-    expect(await client.evaluate(req, { resource: RES })).toMatchObject({ allow: false, kind: 'pdp_error', reason: expect.stringContaining('PDP discovery') });
+    expect(await client.evaluate(req, { resource: RES })).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('PDP discovery') });
   });
 
   it('accepts a resolver of its own', async () => {
