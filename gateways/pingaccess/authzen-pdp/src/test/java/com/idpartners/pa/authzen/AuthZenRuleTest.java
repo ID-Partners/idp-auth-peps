@@ -35,6 +35,7 @@ import static com.idpartners.pa.authzen.FakeTransport.obj;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -329,7 +330,7 @@ class AuthZenRuleTest {
     }
 
     @Test
-    void runsOnItsOwnWorkersAndTheSharedPoolIsBounded() throws Exception {
+    void runsOnItsOwnWorkersAndEachRuleHasItsOwnBoundedPool() throws Exception {
         ExecutorService pool = AuthZenRule.newExecutor(2);
         try {
             FakeTransport t = new FakeTransport().route("http://pdp:8080", obj("decision", true));
@@ -337,11 +338,79 @@ class AuthZenRuleTest {
             rule.configure(conf());
             Fixture f = new Fixture("GET", "/x", fields("authorization", "Bearer " + jwt(obj("sub", "alice"))), null, null);
             assertEquals(Outcome.CONTINUE, rule.handleRequest(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
-            AuthZenRule real = new AuthZenRule();
-            assertNotNull(real);
         } finally {
             pool.shutdownNow();
         }
+        // Two rules, two pools: one rule's stuck PDP cannot starve the other.
+        AuthZenRule a = new AuthZenRule();
+        AuthZenRule b = new AuthZenRule();
+        assertNotSame(a.executor(), b.executor());
+        java.util.concurrent.ThreadPoolExecutor ex = (java.util.concurrent.ThreadPoolExecutor) a.executor();
+        assertEquals(AuthZenRule.THREADS_PER_RULE, ex.getMaximumPoolSize());
+        assertEquals(256, ex.getQueue().remainingCapacity());
+        assertTrue(ex.allowsCoreThreadTimeOut(), "an idle rule holds no threads");
+    }
+
+    @Test
+    void aStuckPdpBehindOneRuleDoesNotStarveAnother() throws Exception {
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        FakeTransport stuck = new FakeTransport().route("http://pdp:8080", (java.util.function.Function<Transport.Request, Transport.Response>) r -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FakeTransport.json(200, obj("decision", true));
+        });
+        ExecutorService onePool = AuthZenRule.newExecutor(1);
+        ExecutorService otherPool = AuthZenRule.newExecutor(1);
+        try {
+            AuthZenRule slow = new AuthZenRule(stuck, onePool, new CapturingResponses(), () -> 0L);
+            slow.configure(conf());
+            AuthZenRule fine = new AuthZenRule(new FakeTransport().route("http://pdp:8080", obj("decision", true)), otherPool, new CapturingResponses(), () -> 0L);
+            fine.configure(conf());
+            List<HeaderField> auth = fields("authorization", "Bearer " + jwt(obj("sub", "alice")));
+            CompletableFuture<Outcome> held = slow.handleRequest(new Fixture("GET", "/x", auth, null, null).exchange).toCompletableFuture();
+            assertEquals(Outcome.CONTINUE, fine.handleRequest(new Fixture("GET", "/x", auth, null, null).exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
+            assertFalse(held.isDone());
+            release.countDown();
+            assertEquals(Outcome.CONTINUE, held.get(5, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            onePool.shutdownNow();
+            otherPool.shutdownNow();
+        }
+    }
+
+    @Test
+    void anErrorAnywhereStillAnswersTheRequest() throws Exception {
+        CapturingResponses responses = new CapturingResponses();
+        List<HeaderField> auth = fields("authorization", "Bearer " + jwt(obj("sub", "alice")));
+        // An Error from deep in the pipeline: a 500 deny, not a stage that never completes.
+        Transport erroring = r -> {
+            throw new AssertionError("boom");
+        };
+        AuthZenRule rule = new AuthZenRule(erroring, DIRECT, responses, () -> 0L);
+        rule.configure(conf());
+        Fixture f = new Fixture("GET", "/x", auth, null, null);
+        CompletableFuture<Outcome> out = rule.handleRequest(f.exchange).toCompletableFuture();
+        assertEquals(Outcome.RETURN, out.get(5, TimeUnit.SECONDS));
+        rule.getErrorHandlingCallback().writeErrorResponse(f.exchange);
+        assertEquals(500, responses.last.status);
+        // An Error from the pool itself (no thread to be had).
+        Executor noThreads = r -> {
+            throw new OutOfMemoryError("unable to create native thread");
+        };
+        AuthZenRule starved = new AuthZenRule(new FakeTransport(), noThreads, responses, () -> 0L);
+        starved.configure(conf());
+        Fixture g = new Fixture("GET", "/x", auth, null, null);
+        assertEquals(Outcome.RETURN, starved.handleRequest(g.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
+        starved.getErrorHandlingCallback().writeErrorResponse(g.exchange);
+        assertEquals(500, responses.last.status);
+        // An exchange that cannot even be read.
+        Fixture h = new Fixture("GET", "/x", auth, null, null);
+        when(h.request.getHeaders()).thenThrow(new IllegalStateException("gone"));
+        assertEquals(Outcome.RETURN, rule.handleRequest(h.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
     }
 
     // ---------- reading the exchange ----------

@@ -60,7 +60,9 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
     private static final Set<String> DISCOVERY = Set.of("off", "authzen", "resource");
     private static final Set<String> FAIL_MODES = Set.of("closed", "open");
     private static final AtomicInteger THREADS = new AtomicInteger();
-    private static final ExecutorService SHARED_EXECUTOR = newExecutor(Integer.getInteger("authzen.pdp.threads", 64));
+    /** Workers per rule instance. Each rule has its own pool, so one rule's stuck PDP cannot starve another's. */
+    static final int THREADS_PER_RULE = Integer.getInteger("authzen.pdp.threads", 64);
+    static final String FAILED = "The authorization rule failed; denying (fail-closed).";
 
     private final Transport transport;
     private final Executor executor;
@@ -69,7 +71,7 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
     private volatile Pep pep;
 
     public AuthZenRule() {
-        this(JdkTransport.shared(), SHARED_EXECUTOR, new PaResponses(), () -> System.currentTimeMillis() / 1000);
+        this(JdkTransport.shared(), newExecutor(THREADS_PER_RULE), new PaResponses(), () -> System.currentTimeMillis() / 1000);
     }
 
     AuthZenRule(Transport transport, Executor executor, ResponseFactory responses, LongSupplier clockSeconds) {
@@ -79,7 +81,11 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
         this.clock = clockSeconds;
     }
 
-    /** A bounded pool of daemon threads; saturation is a 503, not a queue that grows without end. */
+    /**
+     * A bounded pool of daemon threads; saturation is a 503, not a queue that grows
+     * without end. Threads start on demand and die when idle, so a rule instance that
+     * never decides (PingAccess builds one on the admin node too) costs nothing.
+     */
     static ExecutorService newExecutor(int threads) {
         ThreadPoolExecutor ex = new ThreadPoolExecutor(threads, threads, 60, TimeUnit.SECONDS, new LinkedBlockingQueue<>(256), r -> {
             Thread t = new Thread(r, "authzen-pdp-" + THREADS.incrementAndGet());
@@ -157,42 +163,60 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
     public ErrorHandlingCallback getErrorHandlingCallback() {
         return exchange -> {
             Verdict v = exchange.getProperty(VERDICT).filter(x -> !x.permit)
-                .orElseGet(() -> Pep.deny(labelOf(exchange), 500, "The authorization rule failed; denying (fail-closed).", null));
+                .orElseGet(() -> Pep.deny(labelOf(exchange), 500, FAILED, null));
             exchange.setResponse(responses.build(v));
         };
     }
 
+    /**
+     * Hands the decision to this rule's workers. Whatever happens, the stage completes:
+     * with the verdict, with a deny when the pipeline threw anything at all (an Error
+     * included), or exceptionally when the verdict cannot even be parked on the exchange.
+     * A stage that never completes is a request that hangs.
+     */
     @Override
     public CompletionStage<Outcome> handleRequest(Exchange exchange) {
+        CompletableFuture<Outcome> out = new CompletableFuture<>();
         Pep p = pep;
         if (p == null) {
             log.error("authzen-pdp: handleRequest before configure; denying");
-            return CompletableFuture.completedFuture(apply(exchange,
-                Pep.deny("pingaccess-pep", 500, "The authorization rule is not configured; denying (fail-closed).", null)));
+            settle(out, exchange, Pep.deny("pingaccess-pep", 500, "The authorization rule is not configured; denying (fail-closed).", null));
+            return out;
         }
-        PepRequest req = read(exchange);
-        CompletableFuture<Outcome> out = new CompletableFuture<>();
-        Runnable task = () -> {
-            Verdict v;
-            try {
-                v = p.decide(req);
-            } catch (RuntimeException e) {
-                log.error("authzen-pdp '{}': unexpected failure, denying", p.label(), e);
-                v = Pep.deny(p.label(), 500, "The authorization rule failed; denying (fail-closed).", null);
-            }
-            try {
-                out.complete(apply(exchange, v));
-            } catch (RuntimeException e) {
-                out.completeExceptionally(e);
-            }
-        };
         try {
+            PepRequest req = read(exchange);
+            Runnable task = () -> {
+                Verdict v;
+                try {
+                    v = p.decide(req);
+                } catch (Throwable e) {
+                    log.error("authzen-pdp '{}': unexpected failure, denying", p.label(), e);
+                    v = Pep.deny(p.label(), 500, FAILED, null);
+                }
+                settle(out, exchange, v);
+            };
             executor.execute(task);
         } catch (RejectedExecutionException e) {
             log.error("authzen-pdp '{}': worker pool saturated, denying", p.label());
-            out.complete(apply(exchange, Pep.deny(p.label(), 503, "The authorization rule is saturated; denying (fail-closed).", null)));
+            settle(out, exchange, Pep.deny(p.label(), 503, "The authorization rule is saturated; denying (fail-closed).", null));
+        } catch (Throwable e) {
+            log.error("authzen-pdp '{}': the rule failed before it could decide, denying", p.label(), e);
+            settle(out, exchange, Pep.deny(p.label(), 500, FAILED, null));
         }
         return out;
+    }
+
+    private void settle(CompletableFuture<Outcome> out, Exchange exchange, Verdict v) {
+        try {
+            out.complete(apply(exchange, v));
+        } catch (Throwable e) {
+            out.completeExceptionally(e);
+        }
+    }
+
+    /** Test seam: this rule's own worker pool. */
+    Executor executor() {
+        return executor;
     }
 
     @Override
