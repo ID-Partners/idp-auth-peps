@@ -59,9 +59,19 @@ const pdpConfig = (self: string, evaluation = `${self}/custom/eval`, evaluations
 
 const quiet = { onWarning: () => {} };
 
+/**
+ * Resource mode refuses to start without both allowlists. These are broad enough for
+ * every host the tests below use; a test that means to be strict sets its own.
+ */
+const open = {
+  pdpAllowlist: [GOOD, ROGUE, 'https://x.example', 'https://estate.example', 'https://down.example', 'https://deny.example', 'https://nobatch.example', 'https://batch.example', 'https://p.example'],
+  resourceAllowlist: [RES, 'https://r2.example', 'https://r3.example', 'https://r.example', 'http://r.example', 'https://mcp.example'],
+};
+
 function disco(routes: Record<string, Route>, over: Partial<ConstructorParameters<typeof PdpDiscovery>[0]> = {}) {
   const r = router(routes);
-  const d = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, apiKeys: { [STATIC]: 'static-key' }, fetch: r.fetch, ...quiet, ...over });
+  const lists = (over.mode ?? 'resource') === 'resource' ? open : {};
+  const d = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, apiKeys: { [STATIC]: 'static-key' }, fetch: r.fetch, ...lists, ...quiet, ...over });
   return { d, ...r };
 }
 
@@ -195,11 +205,12 @@ describe('discovery: off and authzen modes', () => {
     expect(await kind(ftp.resolve())).toBe('not_allowed');
   });
 
-  it('treats a redirect or an oversized body as a transport failure', async () => {
+  it('refuses a redirected or oversized metadata document rather than guessing past it', async () => {
     const big = 'x'.repeat(1_048_577);
     for (const r of [302, () => new Response(big, { status: 200 })] as Route[]) {
       const { d } = disco({ [STATIC]: r }, { mode: 'authzen' });
-      expect((await d.resolve()).evaluation).toBe(`${STATIC}/access/v1/evaluation`);
+      expect(await kind(d.resolve())).toBe('transient');
+      await expect(d.resolve()).rejects.toThrow(/no PDP could be resolved/);
     }
   });
 
@@ -247,36 +258,44 @@ describe('discovery: resource mode', () => {
     expect(count(RES)).toBe(0);
   });
 
-  it('falls to the static PDP when the resource has no usable metadata', async () => {
+  it('falls to the static PDP when the resource publishes nothing', async () => {
     const cases: Record<string, Route> = {
       '404': 404,
       'no parameter': { resource: RES },
-      'echo mismatch': { resource: 'https://impostor.example', [PARAM_POLICY_DECISION_POINTS]: [GOOD] },
-      'bad entries': { resource: RES, [PARAM_POLICY_DECISION_POINTS]: ['not a url', 1] },
-      'entry with query': { resource: RES, [PARAM_POLICY_DECISION_POINTS]: [`${GOOD}/?x`] },
       'empty list': { resource: RES, [PARAM_POLICY_DECISION_POINTS]: [] },
-      'not JSON': '<html>',
     };
     for (const [name, doc] of Object.entries(cases)) {
       const { d } = disco(routes({ [`${RES}/.well-known/oauth-protected-resource`]: doc }));
       expect((await d.resolve(RES)).identifier, name).toBe(STATIC);
       expect((await d.resolve(RES)).apiKey, name).toBe('static-key');
     }
-    const { d } = disco(routes());
-    expect(await kind(d.resolve('https://r.example/?x'))).toBe('ok');
-    expect((await d.resolve('https://r.example/?x')).identifier).toBe(STATIC);
   });
 
-  it('falls to the static PDP on a transient failure without caching it as the answer', async () => {
+  it('does not fall to the static PDP when the resource published something unusable', async () => {
+    const cases: Record<string, Route> = {
+      'echo mismatch': { resource: 'https://impostor.example', [PARAM_POLICY_DECISION_POINTS]: [GOOD] },
+      'bad entries': { resource: RES, [PARAM_POLICY_DECISION_POINTS]: ['not a url', 1] },
+      'entry with query': { resource: RES, [PARAM_POLICY_DECISION_POINTS]: [`${GOOD}/?x`] },
+      'not JSON': '<html>',
+    };
+    for (const [name, doc] of Object.entries(cases)) {
+      const { d } = disco(routes({ [`${RES}/.well-known/oauth-protected-resource`]: doc }));
+      expect(await kind(d.resolve(RES)), name).toBe('invalid');
+    }
+    const { d } = disco(routes());
+    expect(await kind(d.resolve('https://r.example/?x'))).toBe('invalid');
+  });
+
+  it('does not fall to the static PDP on an outage, and remembers it for the retry window', async () => {
     let now = 1_700_000_000_000;
     const { d, hits } = disco(routes({ [`${RES}/.well-known/oauth-protected-resource`]: 500 }), { now: () => now });
-    expect((await d.resolve(RES)).identifier).toBe(STATIC);
+    expect(await kind(d.resolve(RES))).toBe('transient');
     expect(d.status().resources[RES]).toMatchObject({ cached: false, lastError: expect.stringContaining('500') });
     const before = hits.length;
-    await d.resolve(RES);
+    expect(await kind(d.resolve(RES))).toBe('transient');
     expect(hits.length).toBe(before); // negatively cached
     now += 31_000;
-    await d.resolve(RES);
+    await d.resolve(RES).catch(() => {});
     expect(hits.length).toBeGreaterThan(before);
   });
 
@@ -307,7 +326,7 @@ describe('discovery: resource mode', () => {
   it('fails closed when the named PDP is outside the allowlist, even from another caller\'s cache', async () => {
     const { d, count } = disco(routes());
     expect((await d.resolve(RES)).identifier).toBe(GOOD);
-    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router(routes()).fetch, pdpAllowlist: ['https://pdp.example'], ...quiet });
+    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router(routes()).fetch, pdpAllowlist: ['https://pdp.example'], resourceAllowlist: open.resourceAllowlist, ...quiet });
     expect(await kind(strict.resolve(RES))).toBe('not_allowed');
     expect(count(GOOD)).toBe(1);
     expect((await strict.resolve()).identifier).toBe(STATIC); // always permitted
@@ -315,9 +334,9 @@ describe('discovery: resource mode', () => {
 
   it('re-checks cached endpoints against a stricter allowlist', async () => {
     const shared = router(routes({ [`${GOOD}/.well-known/authzen-configuration`]: pdpConfig(GOOD, `${GOOD}/eval`, 'https://batch.example/evals') }));
-    const lax = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: shared.fetch, ...quiet });
+    const lax = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: shared.fetch, ...open, ...quiet });
     expect((await lax.resolve(RES)).evaluations).toBe('https://batch.example/evals');
-    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: shared.fetch, pdpAllowlist: [GOOD], ...quiet });
+    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: shared.fetch, pdpAllowlist: [GOOD], resourceAllowlist: open.resourceAllowlist, ...quiet });
     expect(await kind(strict.resolve(RES))).toBe('not_allowed');
   });
 
@@ -347,9 +366,9 @@ describe('discovery: resource mode', () => {
     }, { staticPdp: '' });
     await expect(d.resolve(RES)).rejects.toThrow('no PDP could be resolved');
     const { d: nothing } = disco({}, { staticPdp: '' });
-    await expect(nothing.resolve(RES)).rejects.toThrow('no PDP could be resolved');
+    await expect(nothing.resolve(RES)).rejects.toThrow('no metadata names a PDP');
     const { d: down } = disco({ [RES]: 500 }, { staticPdp: '' });
-    await expect(down.resolve(RES)).rejects.toThrow('no PDP could be resolved');
+    await expect(down.resolve(RES)).rejects.toThrow('returned 500');
     await expect(nothing.resolve()).rejects.toThrow('no PDP configured');
   });
 
@@ -394,7 +413,7 @@ describe('discovery: resource mode', () => {
     expect(Object.keys(d.status().resources)).toEqual(['https://r2.example']);
     // A negative entry past its window is evictable too.
     now += 301_000;
-    await d.resolve('https://r3.example');
+    expect(await kind(d.resolve('https://r3.example'))).toBe('transient');
     now += 31_000;
     await d.resolve(RES);
     expect(Object.keys(d.status().resources)).toEqual([RES]);
@@ -409,9 +428,10 @@ describe('discovery: resource mode', () => {
     expect(viaFake.identifier).toBe(GOOD);
     expect(viaFake.resource).toMatchObject({ source: 'fake', document: { from: 'fake' } });
 
+    // A source that throws is an outage, not a resource that publishes nothing.
     const boom: MetadataSource = { name: 'boom', lookup: async () => { throw new Error('boom'); } };
     const { d: transient } = disco(routes(), { sources: [boom] });
-    expect((await transient.resolve(RES)).identifier).toBe(STATIC);
+    expect(await kind(transient.resolve(RES))).toBe('transient');
     expect(transient.status().resources[RES]).toMatchObject({ cached: false });
 
     const empty: MetadataSource = { name: 'empty', lookup: async () => meta([]) };
@@ -442,7 +462,7 @@ describe('discovery: through the client, middleware and guard', () => {
 
   it('the client resolves per call and sends the key only to the static PDP', async () => {
     const { fetch, hits } = router(routes());
-    const client = new AuthzenClient({ url: STATIC, apiKey: 'k', fetch, discovery: { mode: 'resource', ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, apiKey: 'k', fetch, discovery: { mode: 'resource', ...open, ...quiet } });
     expect((await client.evaluate(req, { resource: RES })).allow).toBe(true);
     const evalHit = hits.find((h) => h.url === `${GOOD}/custom/eval`);
     expect(evalHit?.headers['authorization']).toBeUndefined();
@@ -459,7 +479,7 @@ describe('discovery: through the client, middleware and guard', () => {
       [`${GOOD}/custom/eval`]: (_u: string, init?: RequestInit) => { seen.push(JSON.parse(String(init?.body))); return new Response('{"decision":true}', { status: 200 }); },
       [`${STATIC}/access/v1/evaluation`]: (_u: string, init?: RequestInit) => { seen.push(JSON.parse(String(init?.body))); return new Response('{"decision":true}', { status: 200 }); },
     });
-    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch, discovery: { mode: 'resource', ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch, discovery: { mode: 'resource', ...open, ...quiet } });
     await client.evaluate({ ...req, context: { mine: 1 } }, { resource: RES, accessToken: 'tok', request: { method: 'GET', path: '/x' } });
     const sent = seen[0] as { context: Record<string, unknown> };
     expect(sent.context).toMatchObject({
@@ -526,7 +546,7 @@ describe('discovery: through the client, middleware and guard', () => {
       [`${ESTATE}/evals`]: { evaluations: [{ decision: true }] },
       [`${GOOD}/custom/eval`]: () => { order.push('resource'); return new Response('{"decision":true}', { status: 200 }); },
     });
-    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch, discovery: { mode: 'resource', ...quiet }, layers: [ESTATE, 'resource'] });
+    const client = new AuthzenClient({ url: STATIC, fetch: r.fetch, discovery: { mode: 'resource', ...open, ...quiet }, layers: [ESTATE, 'resource'] });
     expect((await client.evaluate(req, { resource: RES })).allow).toBe(true);
     expect(order).toEqual(['estate', 'resource']);
     order.length = 0;
@@ -540,7 +560,7 @@ describe('discovery: through the client, middleware and guard', () => {
     // Batch: every layer must advertise a batch endpoint, checked before anything is sent.
     expect((await client.evaluateAll({ evaluations: [req] }, { resource: RES })).allow).toBe(true);
     const rogueRes = router({ ...routes(), [`${GOOD}/.well-known/authzen-configuration`]: { policy_decision_point: GOOD, access_evaluation_endpoint: `${GOOD}/e` } });
-    const c2 = new AuthzenClient({ url: STATIC, fetch: rogueRes.fetch, discovery: { mode: 'resource', ...quiet }, layers: [STATIC, 'resource'] });
+    const c2 = new AuthzenClient({ url: STATIC, fetch: rogueRes.fetch, discovery: { mode: 'resource', ...open, ...quiet }, layers: [STATIC, 'resource'] });
     const b = await c2.evaluateAll({ evaluations: [req] }, { resource: RES });
     expect(b).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('access_evaluations_endpoint') });
     expect(rogueRes.hits.filter((h) => h.method === 'POST')).toHaveLength(0);
@@ -564,7 +584,7 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(dup).toHaveLength(1);
     expect(dup[0]?.resource).toBeDefined();
     // Explicit layers obey the PDP allowlist; off mode reads nothing.
-    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router({}).fetch, pdpAllowlist: ['https://pdp.example'], ...quiet });
+    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router({}).fetch, pdpAllowlist: ['https://pdp.example'], resourceAllowlist: open.resourceAllowlist, ...quiet });
     await expect(strict.resolvePdp(ESTATE)).rejects.toThrow(DiscoveryError);
     const off = new PdpDiscovery({ staticPdp: STATIC, ...quiet });
     expect(await off.resolvePdp(`${ESTATE}/`)).toMatchObject({ evaluation: `${ESTATE}/access/v1/evaluation`, source: 'layer' });
@@ -579,14 +599,17 @@ describe('discovery: through the client, middleware and guard', () => {
   });
 
   it('a fail-open layer that cannot be resolved is skipped; a refusal never is', async () => {
-    const { d } = disco(routes());
-    const bad = 'https://p.example/?x=1'; // invalid identifier: fails at resolution
+    // A PDP whose metadata describes some other PDP: it resolves to nothing usable.
+    const bad = 'https://p.example';
+    const { d } = disco({ ...routes(), [`${bad}/.well-known/authzen-configuration`]: pdpConfig('https://x.example') });
     await expect(resolveLayers(d, RES, [bad, 'resource'])).rejects.toThrow(/layer/);
     const r = await resolveLayers(d, RES, [`${bad} fail-open`, 'resource']);
     expect(r.pdps.map((e) => e.identifier)).toEqual([GOOD]);
     expect(r.pdps[0]?.failOpen).toBe(false);
-    expect(r.skipped).toHaveLength(1);
-    expect(r.skipped[0]).toMatch(new RegExp(`^${bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    expect(r.skipped).toEqual([bad]);
+    expect(r.detail[0]).toMatch(/policy_decision_point/);
+    // An entry that cannot be read is refused before anything is resolved, fail-open or not.
+    await expect(resolveLayers(d, RES, ['https://p.example/?x=1 fail-open'], true)).rejects.toThrow(DiscoveryError);
     // The default applies to layers that say nothing; the layer's own word wins.
     const dflt = await resolveLayers(d, RES, [bad, { name: 'resource', failOpen: false }], true);
     expect(dflt.skipped).toHaveLength(1);
@@ -599,7 +622,7 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(dup.pdps).toHaveLength(1);
     expect(dup.pdps[0]?.failOpen).toBe(false);
     // The allowlist is a refusal, not an outage.
-    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router(routes()).fetch, pdpAllowlist: ['https://pdp.example'], ...quiet });
+    const strict = new PdpDiscovery({ mode: 'resource', staticPdp: STATIC, fetch: router(routes()).fetch, pdpAllowlist: ['https://pdp.example'], resourceAllowlist: open.resourceAllowlist, ...quiet });
     await expect(resolveLayers(strict, RES, [`${GOOD} fail-open`], true)).rejects.toMatchObject({ kind: 'not_allowed' });
   });
 
@@ -613,7 +636,7 @@ describe('discovery: through the client, middleware and guard', () => {
       [`${DENY}/.well-known/authzen-configuration`]: 404,
       [`${DENY}/access/v1/evaluation`]: { decision: false, context: { reason: 'no' } },
     });
-    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...open, ...quiet } });
     // Closed by default.
     expect(await client.evaluate(req, { resource: RES, layers: [DOWN, 'resource'] })).toMatchObject({ allow: false, kind: 'pdp_error' });
     // Open on the layer: skipped, named, the rest decides.
@@ -624,7 +647,7 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(await client.evaluate(req, { resource: RES, layers: [DOWN, 'resource'], failMode: 'open' })).toMatchObject({ allow: true, failedOpen: [expect.any(String)] });
     expect(await client.evaluate(req, { resource: RES, layers: [`${DOWN} fail-closed`, 'resource'], failMode: 'open' })).toMatchObject({ allow: false, kind: 'pdp_error' });
     // Open on the client; everything skipped is a permit that says so.
-    const lax = new AuthzenClient({ url: STATIC, fetch, failMode: 'open', layers: [DOWN], discovery: { mode: 'resource', ...quiet } });
+    const lax = new AuthzenClient({ url: STATIC, fetch, failMode: 'open', layers: [DOWN], discovery: { mode: 'resource', ...open, ...quiet } });
     const all = await lax.evaluate(req, { resource: RES });
     expect(all).toMatchObject({ allow: true, reason: expect.stringMatching(/^fail-open:/), failedOpen: [expect.stringContaining(DOWN)] });
     // A deny is a decision: never skipped.
@@ -658,7 +681,7 @@ describe('discovery: through the client, middleware and guard', () => {
   it('the middleware marks a fail-open permit on the wire; the guard tells the delegate', async () => {
     const DOWN = 'https://down.example';
     const { fetch } = router({ ...routes(), [`${DOWN}/.well-known/authzen-configuration`]: 404, [`${DOWN}/access/v1/evaluation`]: 503 });
-    const client = new AuthzenClient({ url: STATIC, fetch, layers: [DOWN, 'resource'], discovery: { mode: 'resource', ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, fetch, layers: [DOWN, 'resource'], discovery: { mode: 'resource', ...open, ...quiet } });
     const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
     const next = vi.fn();
     const r: PepRequest = { method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'u1' })}` } };
@@ -699,7 +722,7 @@ describe('discovery: through the client, middleware and guard', () => {
 
   it('a discovery failure is a pdp_error verdict', async () => {
     const { fetch } = router(routes());
-    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', resourceAllowlist: ['https://only.example'], ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', resourceAllowlist: ['https://only.example'], pdpAllowlist: open.pdpAllowlist, ...quiet } });
     expect(await client.evaluate(req, { resource: RES })).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('PDP discovery') });
   });
 
@@ -715,7 +738,7 @@ describe('discovery: through the client, middleware and guard', () => {
 
   it('the middleware passes a static or per-request resource', async () => {
     const { fetch, hits } = router(routes());
-    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...open, ...quiet } });
     const run = async (resource: AuthzenMiddlewareResource) => {
       const mw = authzenMiddleware({ client, map: () => req, resource });
       const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
@@ -738,7 +761,7 @@ describe('discovery: through the client, middleware and guard', () => {
       'https://mcp.example/.well-known/oauth-protected-resource/mcp': { resource: mcp, [PARAM_POLICY_DECISION_POINTS]: [GOOD] },
       ...routes(),
     });
-    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...quiet } });
+    const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...open, ...quiet } });
     const guard = new McpGuard({ client, tools, upstreamUrl: mcp });
     const v = await guard.checkToolCall({ rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 't', arguments: {} } }, claims: { sub: 'u1' } });
     expect(v.allow).toBe(true);
