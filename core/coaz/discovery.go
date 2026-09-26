@@ -25,7 +25,9 @@ import (
 	"time"
 )
 
-const mcpProtocolVersion = "2025-03-26"
+// mcpProtocolVersion is what the PEP's own discovery client speaks. 2025-06-18 is the
+// revision that dropped JSON-RPC batching — the PEP refuses batches anyway.
+const mcpProtocolVersion = "2025-06-18"
 
 type discoveredTool struct {
 	tool    Tool
@@ -136,7 +138,7 @@ func (d *discoveryCache) lookup(ctx context.Context, upstreamURL, authorization,
 // maxToolsPages bounds tools/list pagination. A server with more pages than this is
 // refused rather than half-read: a declared mapping on an unread page would be treated
 // as absent.
-const maxToolsPages = 20
+const maxToolsPages = 32
 
 func listRequest(id int, cursor string) map[string]any {
 	req := map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/list"}
