@@ -1,6 +1,12 @@
 # DB-less Kong config for the demo: one route in front of the `plain` resource stub,
 # with the authzen-pdp plugin discovering the PDP from that resource's RFC 9728
 # metadata. `curl -H "Authorization: Bearer <jwt>" http://localhost:8000/bank/accounts/a1/balance`.
+#
+# The route is decided natively, on the claims of the demo's unsigned tokens, and it
+# discovers over plain http: both are things the plugin refuses unless told otherwise,
+# and allow_insecure is how the demo tells it (Kong logs what it relaxes at startup). A
+# real route puts an openid-connect or jwt plugin in front and sets
+# access_token_verified_upstream instead, or sets coaz_url.
 _format_version: "3.0"
 
 services:
@@ -22,3 +28,9 @@ services:
           resource: http://stubs:9004
           pdp_discovery_insecure: true
           resource_metadata_allowlist: ["http://stubs:9004"]
+          # Bank A's PDP, and Bank B's for when the console hands the resource over.
+          pdp_allowlist: ["http://stubs:9002", "http://stubs:9008"]
+          # The demo PDPs examine the token themselves (acr, scope) against what the
+          # resource publishes; without it they deny every request.
+          forward_access_token: true
+          allow_insecure: true
