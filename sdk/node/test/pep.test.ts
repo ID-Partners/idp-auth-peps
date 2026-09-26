@@ -1211,23 +1211,24 @@ describe('McpGuard — discovery and delegation', () => {
 
     const guard = new McpGuard({
       client: { url: 'http://pdp', fetch: fetchImpl },
+      upstreamUrl: 'http://mcp/mcp',
       delegate: { url: 'http://coaz-pep:9192/', apiKey: 'k' },
       fetch: fetchImpl,
     });
-    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
+    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: JSON.stringify(call) } });
     expect(v.allow).toBe(false);
     expect(v.jsonRpcError).toEqual(engineError);
   });
 
   it('permits on a delegated permit', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ decision: true }), { status: 200 })) as unknown as typeof globalThis.fetch;
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, delegate: { url: 'http://coaz-pep:9192' }, fetch: fetchImpl });
-    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, upstreamUrl: 'http://mcp/mcp', delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' }, fetch: fetchImpl });
+    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: JSON.stringify(call) } });
     expect(v.allow).toBe(true);
   });
 
   it('needs the raw request in delegate mode, and says so', async () => {
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: true }) }, delegate: { url: 'http://coaz-pep:9192' } });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: true }) }, upstreamUrl: 'http://mcp/mcp', delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' } });
     const v = await guard.checkToolCall({ rpc: call, claims: token });
     expect(v.jsonRpcError?.error.code).toBe(CODE_MAPPING_ERROR);
     expect(v.verdict.reason).toMatch(/raw request/);
@@ -1235,8 +1236,8 @@ describe('McpGuard — discovery and delegation', () => {
 
   it('points at the shared secret when the engine answers 401', async () => {
     const fetchImpl = vi.fn(async () => new Response('', { status: 401 })) as unknown as typeof globalThis.fetch;
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, delegate: { url: 'http://coaz-pep:9192' }, fetch: fetchImpl });
-    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, upstreamUrl: 'http://mcp/mcp', delegate: { url: 'http://coaz-pep:9192', apiKey: 'stale' }, fetch: fetchImpl });
+    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: JSON.stringify(call) } });
     expect(v.verdict.detail).toMatch(/CHECK_API_TOKEN/);
   });
 
@@ -1596,14 +1597,16 @@ describe('coverage completeness: v1 builder, delegate permit, numeric CEL', () =
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ decision: true }), { status: 200 })) as unknown as typeof globalThis.fetch;
     const guard = new McpGuard({
       client: { url: 'http://pdp', fetch: fetchImpl },
+      upstreamUrl: 'http://mcp/mcp',
       delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' },
       onDecision: ({ tool }) => seen.push(tool),
       fetch: fetchImpl,
     });
+    const rpc = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x' } };
     const v = await guard.checkToolCall({
-      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x' } },
+      rpc,
       claims: token,
-      raw: { headers: { authorization: 'Bearer t' }, body: '{}' },
+      raw: { headers: { authorization: 'Bearer t' }, body: JSON.stringify(rpc) },
     });
     expect(v.allow).toBe(true);
     expect(v.verdict.reason).toMatch(/delegated/);

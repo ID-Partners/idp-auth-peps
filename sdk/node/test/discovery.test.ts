@@ -526,8 +526,8 @@ describe('discovery: through the client, middleware and guard', () => {
     expect((seen[2] as { context: Record<string, unknown> }).context['access_token']).toBe('tok2');
 
     const delegated = router({ 'http://coaz-pep:9192/v1/mcp/check': { decision: true } });
-    await new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192' }, forwardAccessToken: true, fetch: delegated.fetch })
-      .checkToolCall({ rpc, claims: { sub: 'u1' }, raw: { headers: {}, body: '{}' } });
+    await new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' }, upstreamUrl: 'https://mcp.example/mcp', forwardAccessToken: true, fetch: delegated.fetch })
+      .checkToolCall({ rpc, claims: { sub: 'u1' }, raw: { headers: {}, body: JSON.stringify(rpc) } });
     const sent = JSON.parse(String((delegated.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls[0]?.[1]?.body)) as { config: Record<string, string> };
     expect(sent.config.forward_access_token).toBe('true');
   });
@@ -694,7 +694,7 @@ describe('discovery: through the client, middleware and guard', () => {
 
     const delegated = router({ ['http://coaz-pep:9192/v1/mcp/check']: { decision: true, upstream_headers: {} } });
     const rpc = { jsonrpc: '2.0' as const, id: 1, method: 'tools/call', params: { name: 't', arguments: {} } };
-    await new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192' }, failMode: 'open', fetch: delegated.fetch }).checkToolCall({ rpc, claims: { sub: 'u1' }, raw: { headers: {}, body: '{}' } });
+    await new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' }, upstreamUrl: 'https://mcp.example/mcp', failMode: 'open', fetch: delegated.fetch }).checkToolCall({ rpc, claims: { sub: 'u1' }, raw: { headers: {}, body: JSON.stringify(rpc) } });
     const sent = JSON.parse(String((delegated.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls[0]?.[1]?.body)) as { config: Record<string, string> };
     expect(sent.config.fail_mode).toBe('open');
     // In-process, the guard folds the same way.
@@ -768,13 +768,13 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(hits.some((h) => h.url === `${GOOD}/custom/eval`)).toBe(true);
 
     const delegated = router({ 'http://coaz-pep:9192/v1/mcp/check': { decision: true } });
-    const g2 = new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192' }, resource: RES, fetch: delegated.fetch });
-    const raw = { headers: {}, body: '{}' };
+    const g2 = new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' }, upstreamUrl: mcp, resource: RES, fetch: delegated.fetch });
     const rpc = { jsonrpc: '2.0' as const, id: 1, method: 'tools/call', params: { name: 't', arguments: {} } };
+    const raw = { headers: {}, body: JSON.stringify(rpc) };
     expect((await g2.checkToolCall({ rpc, claims: { sub: 'u1' }, raw })).allow).toBe(true);
     const sent = JSON.parse(String((delegated.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls[0]?.[1]?.body)) as { config: Record<string, string> };
     expect(sent.config.resource).toBe(RES);
-    const g3 = new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192' }, fetch: delegated.fetch });
+    const g3 = new McpGuard({ client, delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' }, upstreamUrl: mcp, fetch: delegated.fetch });
     await g3.checkToolCall({ rpc, claims: { sub: 'u1' }, raw });
     const sent2 = JSON.parse(String((delegated.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls[1]?.[1]?.body)) as { config: Record<string, string> };
     expect(sent2.config.resource).toBeUndefined();

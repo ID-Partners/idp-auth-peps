@@ -35,8 +35,8 @@
 import { AuthzenClient, PDP_UNAVAILABLE_REASON, type AuthzenClientOptions } from './client.js';
 import { toChallenge } from './challenge.js';
 import { extractClaims, type PepClaims } from './claims.js';
-import { sanitizeHeaderValue } from './http.js';
-import { CODE_INVALID_REQUEST, CODE_PARSE_ERROR, parseBody, readMessage, type RpcId, type RpcRefusal } from './jsonrpc.js';
+import { BodyTooLargeError, isHttpUrl, readCapped, sanitizeHeaderValue } from './http.js';
+import { CODE_INVALID_REQUEST, CODE_PARSE_ERROR, headerValue, isPlainObject, parseBody, readMessage, type RpcId, type RpcRefusal } from './jsonrpc.js';
 import type { EvaluationRequest, EvaluationsRequest, Verdict } from './types.js';
 
 export { CODE_INVALID_REQUEST, CODE_PARSE_ERROR };
@@ -295,21 +295,35 @@ export interface McpGuardOptions {
   /**
    * Hand the whole check to a running Go `coaz-pep` (this repo's `core/`) over its HTTP
    * check API. Use this when a mapping needs CEL beyond the subset above — it is exactly
-   * what the Kong plugin does, and for the same reason. Requires `raw` on each check.
+   * what the Kong plugin does, and for the same reason.
+   *
+   * Every MCP request goes to coaz-pep, whatever its method, and its answer is enforced:
+   * nothing is passed through here. Requires `upstreamUrl` (coaz-pep reads that server's
+   * tools/list to run COAZ) and `raw` on each check. `tools` is ignored.
    */
   delegate?: {
     /** Base URL of the coaz-pep HTTP check API, e.g. `http://coaz-pep:9192`. */
     url: string;
     /**
-     * Shared secret for that endpoint — its `CHECK_API_TOKEN`. Set it: the endpoint
-     * takes a caller-supplied upstream URL and relays a caller-supplied Authorization
-     * header, so it authenticates its callers.
+     * Shared secret for that endpoint — its `CHECK_API_TOKEN`. Required unless
+     * `allowInsecure`: the endpoint takes a caller-supplied upstream URL and relays a
+     * caller-supplied Authorization header, so it authenticates its callers.
      */
     apiKey?: string;
-    /** Per-route knobs, the same map the ext_authz `context_extensions` carries. */
+    /**
+     * Per-route knobs, the same map the ext_authz `context_extensions` carries. The guard
+     * sets `style`, `mcp_upstream_url` and `coaz_defaults` itself; a value here that says
+     * otherwise is a configuration error.
+     */
     config?: Record<string, string>;
+    /** Per check. Default 2000ms. */
     timeoutMs?: number;
   };
+  /**
+   * The escape hatch, for development only: lets delegate mode start without
+   * `delegate.apiKey`. Logged once, at construction.
+   */
+  allowInsecure?: boolean;
   fetch?: typeof globalThis.fetch;
   onDecision?: (info: { tool: string; verdict: Verdict }) => void;
   /**
@@ -355,6 +369,32 @@ export class McpGuard {
     if (!opts.tools && !opts.upstreamUrl && !opts.delegate) {
       throw new Error('McpGuard needs `tools`, `upstreamUrl`, or `delegate`');
     }
+    if (opts.delegate) this.checkDelegateConfig(opts.delegate);
+  }
+
+  /** Refuse a delegate configuration that would let coaz-pep permit what it never judged. */
+  private checkDelegateConfig(d: NonNullable<McpGuardOptions['delegate']>): void {
+    if (!isHttpUrl(d.url)) throw new Error(`delegate.url ${JSON.stringify(d.url)} is not an absolute http(s) URL`);
+    // Without mcp_upstream_url coaz-pep has no tools/list to read, never runs COAZ, and
+    // permits every tools/call. The guard sends it; the guard needs it.
+    if (!this.opts.upstreamUrl) throw new Error('delegate mode needs upstreamUrl: coaz-pep reads that server\'s tools/list to run COAZ');
+    if (!d.apiKey) {
+      if (this.opts.allowInsecure !== true) {
+        throw new Error('delegate mode needs delegate.apiKey (coaz-pep\'s CHECK_API_TOKEN). Set allowInsecure: true only for development.');
+      }
+      this.warn('allowInsecure is set — delegate mode is calling coaz-pep without delegate.apiKey');
+    }
+    for (const [key, want] of Object.entries(this.ownedConfig())) {
+      const got = d.config?.[key];
+      if (got === undefined) continue;
+      const same = key === 'mcp_upstream_url' ? got.replace(/\/+$/, '') === want.replace(/\/+$/, '') : got.toLowerCase() === want;
+      if (!same) throw new Error(`delegate.config.${key} is ${JSON.stringify(got)}, but the guard says ${JSON.stringify(want)}`);
+    }
+  }
+
+  /** The route knobs the guard itself decides, and coaz-pep must be told. */
+  private ownedConfig(): Record<string, string> {
+    return { style: 'mcp', mcp_upstream_url: this.opts.upstreamUrl ?? '', coaz_defaults: String(this.defaults) };
   }
 
   /**
@@ -393,10 +433,13 @@ export class McpGuard {
   }
 
   private async check(args: McpCheckArgs): Promise<McpVerdict> {
+    // Delegate mode decides nothing here: every request, whatever its method, is
+    // coaz-pep's to judge, and its answer is enforced.
+    if (this.opts.delegate) return this.checkViaDelegate(args);
     const token = claimsMap(args.claims);
 
     let value: unknown = args.rpc;
-    if (args.raw && !this.opts.delegate) {
+    if (args.raw) {
       const parsed = parseBody(args.raw.body, args.raw.headers);
       if (!parsed.ok) return this.refuse(parsed.refusal, '');
       // The rpc a caller hands the handler must be the message that was judged.
@@ -432,13 +475,6 @@ export class McpGuard {
     }
 
     const toolName = params['name'] as string;
-    if (this.opts.delegate) {
-      if (!args.raw) {
-        return this.deny(id, CODE_MAPPING_ERROR, { allow: false, kind: 'mapping_error', reason: 'delegate mode needs the raw request (headers + body) to forward' }, toolName, rpc);
-      }
-      return this.checkViaDelegate(id, toolName, args.raw, token, rpc);
-    }
-
     let tool: ToolDefinition | undefined;
     try {
       tool = (await this.resolveTools()).get(toolName);
@@ -604,64 +640,109 @@ export class McpGuard {
   }
 
   /**
-   * Forward to the Go engine's HTTP check API and relay its verdict. On a deny the
-   * engine has already rendered the profile's JSON-RPC error body, so it is passed
-   * through verbatim rather than re-derived here — two renderings would drift.
+   * Hand the request to the Go engine's HTTP check API and enforce its answer. Nothing is
+   * decided here: every request goes, whatever its method, and only `decision === true`
+   * permits. A permit relays the headers coaz-pep asks to set upstream and on the
+   * response; a deny relays the response it rendered, verbatim — two renderings of one
+   * decision would drift, and its 401 challenge is its to make.
    */
-  private async checkViaDelegate(
-    id: RpcId,
-    toolName: string,
-    raw: McpRawRequest,
-    token: Record<string, unknown>,
-    rpc: JsonRpcRequest,
-  ): Promise<McpVerdict> {
+  private async checkViaDelegate(args: McpCheckArgs): Promise<McpVerdict> {
     const d = this.opts.delegate!;
+    const given = isPlainObject(args.rpc) ? args.rpc : undefined;
+    if (!args.raw) {
+      return this.deny(rpcIdOf(given), CODE_MAPPING_ERROR, { allow: false, kind: 'mapping_error', reason: 'delegate mode needs the raw request (headers + body) to forward' }, toolOf(given));
+    }
+    const text = decodeBody(args.raw.body);
+    if (text === null) return this.refuse({ status: 400, code: CODE_PARSE_ERROR, message: 'Parse error', id: null }, toolOf(given));
+    // Read only to name the call in logs and errors, and to hold the caller to it: the
+    // strict reading is coaz-pep's, and this lenient one decides nothing.
+    let parsed: unknown = NOT_JSON;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      /* coaz-pep will say so */
+    }
+    if (args.rpc !== undefined && parsed !== NOT_JSON && !sameJson(args.rpc, parsed)) {
+      return this.refuse({ status: 400, code: CODE_INVALID_REQUEST, message: 'Invalid Request: the parsed request does not match the raw body', id: null }, toolOf(given));
+    }
+    const seen = isPlainObject(parsed) ? parsed : given;
+    const id = rpcIdOf(seen);
+    const tool = toolOf(seen);
+    const rpc = seen as JsonRpcRequest | undefined;
+    const fail = (detail: string) => this.deny(id, CODE_PDP_ERROR, { allow: false, kind: 'pdp_error', reason: PDP_UNAVAILABLE_REASON, detail }, tool, rpc);
+
+    const timeoutMs = d.timeoutMs ?? 2000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), d.timeoutMs ?? 2000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let out: unknown;
     try {
       const res = await this.fetchImpl(`${d.url.replace(/\/+$/, '')}/v1/mcp/check`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
+          accept: 'application/json',
           ...(d.apiKey ? { authorization: `Bearer ${d.apiKey}` } : {}),
         },
         body: JSON.stringify({
           config: {
             pep_label: this.pep,
-            style: 'mcp',
             ...(this.opts.resource ? { resource: this.opts.resource } : {}),
             ...(this.opts.forwardAccessToken ? { forward_access_token: 'true' } : {}),
             ...(this.opts.failMode ? { fail_mode: this.opts.failMode } : {}),
             ...d.config,
+            ...this.ownedConfig(),
           },
-          method: raw.method ?? 'POST',
-          path: raw.path ?? '/mcp',
-          headers: raw.headers,
-          body: typeof raw.body === 'string' ? raw.body : Buffer.from(raw.body).toString('utf8'),
+          method: args.raw.method ?? 'POST',
+          path: args.raw.path ?? '/mcp',
+          headers: forwardedHeaders(args.raw.headers),
+          body: text,
         }),
+        redirect: 'manual',
         signal: controller.signal,
       });
       if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
         const hint = res.status === 401 ? ' (set delegate.apiKey to its CHECK_API_TOKEN)' : '';
-        return this.deny(id, CODE_PDP_ERROR, { allow: false, kind: 'pdp_error', reason: PDP_UNAVAILABLE_REASON, detail: `coaz-pep check returned ${res.status}${hint}` }, toolName, rpc);
+        return fail(`coaz-pep check returned ${res.status}${hint}`);
       }
-      const out = (await res.json()) as {
-        decision?: boolean;
-        response?: { status?: number; body?: string };
-      };
-      if (out.decision) return this.permit({ allow: true, kind: 'ok', reason: 'permit (delegated)' }, token, rpc, true, toolName);
-      const relayed = safeJson(out.response?.body ?? '') as JsonRpcErrorResponse | null;
-      const reason = relayed?.error?.message ?? 'Access denied.';
-      const verdict: Verdict = { allow: false, kind: 'denied', reason };
-      this.report(toolName, verdict);
-      const error = relayed ?? jsonRpcError(id, CODE_DENIED, reason);
-      return { allow: false, coazTool: true, verdict, jsonRpcError: error, response: jsonResponse(200, error), message: rpc };
+      try {
+        out = JSON.parse(await readCapped(res, MAX_CHECK_ANSWER_BYTES));
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) return fail(`coaz-pep answer exceeds ${MAX_CHECK_ANSWER_BYTES} bytes`);
+        if (err instanceof SyntaxError) return fail('coaz-pep answered with something that is not JSON');
+        throw err;
+      }
     } catch (err) {
-      const why = err instanceof Error && err.name === 'AbortError' ? 'coaz-pep check timed out' : message(err);
-      return this.deny(id, CODE_PDP_ERROR, { allow: false, kind: 'pdp_error', reason: PDP_UNAVAILABLE_REASON, detail: why }, toolName, rpc);
+      return fail(err instanceof Error && err.name === 'AbortError' ? `coaz-pep check timed out after ${timeoutMs}ms` : message(err));
     } finally {
       clearTimeout(timer);
     }
+
+    if (!isPlainObject(out) || typeof out['decision'] !== 'boolean') return fail('coaz-pep answered without a boolean decision');
+    if (out['decision'] === true) {
+      const upstream = headerMap(out['upstream_headers']);
+      const response = headerMap(out['response_headers']);
+      if (upstream === null || response === null) return fail('coaz-pep permitted with headers that are not a map of strings');
+      const verdict: Verdict = { allow: true, kind: 'ok', reason: 'permit (delegated)' };
+      this.report(tool, verdict);
+      return {
+        allow: true,
+        coazTool: true,
+        verdict,
+        ...(rpc ? { message: rpc } : {}),
+        upstreamHeaders: withAuthRemovals(upstream),
+        ...(Object.keys(response).length > 0 ? { responseHeaders: response } : {}),
+      };
+    }
+
+    const rendered = renderedResponse(out['response']);
+    const relayed = rendered ? jsonRpcErrorOf(rendered.body) : null;
+    const kind = relayedKind(relayed, rendered?.status);
+    const reason = relayed?.error.message ?? reasonOf(rendered?.body) ?? (kind === 'unauthenticated' ? 'Authentication required.' : 'Access denied.');
+    const verdict: Verdict = { allow: false, kind, reason };
+    this.report(tool, verdict);
+    const error = relayed ?? jsonRpcError(id, kind === 'pdp_error' ? CODE_PDP_ERROR : kind === 'mapping_error' ? CODE_MAPPING_ERROR : CODE_DENIED_V2, reason);
+    return { allow: false, coazTool: true, verdict, jsonRpcError: error, response: rendered ?? jsonResponse(200, error), ...(rpc ? { message: rpc } : {}) };
   }
 
   private async resolveTools(): Promise<Map<string, ToolDefinition>> {
@@ -722,6 +803,111 @@ function sameJson(a: unknown, b: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+// ---------- delegate mode ----------
+
+/** The most coaz-pep's answer may be; it carries one rendered response at most. */
+const MAX_CHECK_ANSWER_BYTES = 1_048_576;
+
+/** The headers coaz-pep reads from the request; nothing else is sent to it. */
+const DELEGATED_HEADERS = ['authorization', 'x-user-token', 'dpop', 'content-type', 'content-encoding'] as const;
+
+const NOT_JSON = Symbol('not JSON');
+
+/** The body as text. Bytes that are not UTF-8 cannot travel in the check request: null. */
+function decodeBody(body: unknown): string | null {
+  if (typeof body === 'string') return body;
+  if (!(body instanceof Uint8Array)) return null;
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(body);
+  } catch {
+    return null;
+  }
+}
+
+function rpcIdOf(message: Record<string, unknown> | undefined): RpcId {
+  const id = message?.['id'];
+  return id === null || typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id)) ? (id as RpcId) : null;
+}
+
+/** What onDecision calls this request: the tool for a tools/call, the method otherwise. */
+function toolOf(message: Record<string, unknown> | undefined): string {
+  const method = message?.['method'];
+  const params = message?.['params'];
+  if (method === 'tools/call' && isObject(params) && typeof params['name'] === 'string') return params['name'];
+  return typeof method === 'string' ? method : '';
+}
+
+function forwardedHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of DELEGATED_HEADERS) {
+    const v = headerValue(headers, name);
+    if (v !== '') out[name] = v;
+  }
+  return out;
+}
+
+/** A map of header values, sanitised; absent is empty; anything but strings is null. */
+function headerMap(v: unknown): Record<string, string> | null {
+  if (v === undefined || v === null) return {};
+  if (!isPlainObject(v)) return null;
+  const out: Record<string, string> = {};
+  for (const [k, value] of Object.entries(v)) {
+    if (typeof value !== 'string') return null;
+    out[k] = sanitizeHeaderValue(value);
+  }
+  return out;
+}
+
+/** coaz-pep's upstream headers, with a removal for any X-Auth-* it did not mention. */
+function withAuthRemovals(upstream: Record<string, string>): Record<string, string> {
+  const named = new Set(Object.keys(upstream).map((k) => k.toLowerCase()));
+  const removals = Object.fromEntries(AUTH_HEADERS.filter((h) => !named.has(h.toLowerCase())).map((h) => [h, '']));
+  return { ...upstream, ...removals };
+}
+
+/** The response coaz-pep rendered for a deny, or null when there is none worth relaying. */
+function renderedResponse(v: unknown): McpHttpResponse | null {
+  if (!isPlainObject(v)) return null;
+  const { status, body } = v;
+  const headers = headerMap(v['headers']);
+  if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return null;
+  if (typeof body !== 'string' || headers === null) return null;
+  return { status, headers, body };
+}
+
+function jsonRpcErrorOf(body: string): JsonRpcErrorResponse | null {
+  const v = safeJson(body);
+  if (!isPlainObject(v) || !isPlainObject(v['error'])) return null;
+  const { code, message: msg } = v['error'];
+  if (typeof code !== 'number' || typeof msg !== 'string') return null;
+  return v as unknown as JsonRpcErrorResponse;
+}
+
+/** What kind of deny coaz-pep rendered, read from its JSON-RPC error or its HTTP status. */
+function relayedKind(error: JsonRpcErrorResponse | null, status: number | undefined): Verdict['kind'] {
+  if (error) {
+    const code = error.error.code;
+    if (code === CODE_PDP_ERROR) return 'pdp_error';
+    if (code === CODE_MAPPING_ERROR || code === CODE_INVALID_REQUEST || code === CODE_PARSE_ERROR) return 'mapping_error';
+    const challenge = error.error.data?.['authz_challenge'];
+    const type = isObject(challenge) ? challenge['type'] : undefined;
+    if (type === 'resource_authorisation') return 'step_up_required';
+    if (type === 'identity_proofing') return 'identity_proofing_required';
+    if (type === 'authn') return 'unauthenticated';
+    return 'denied';
+  }
+  if (status === 401) return 'unauthenticated';
+  if (status === 400 || status === 413 || status === 415) return 'mapping_error';
+  if (status !== undefined && status >= 500) return 'pdp_error';
+  return 'denied';
+}
+
+/** The `reason` of a JSON body coaz-pep rendered, when it has one. */
+function reasonOf(body: string | undefined): string | undefined {
+  const v = body === undefined ? undefined : safeJson(body);
+  return isPlainObject(v) && typeof v['reason'] === 'string' ? v['reason'] : undefined;
 }
 
 // ---------------------------------------------------------------------------
