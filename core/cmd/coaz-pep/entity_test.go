@@ -110,6 +110,16 @@ func TestFederationEntityOnTheService(t *testing.T) {
 		if err := jose.VerifyJWS(signed, f.leafJWK, "ES256"); err != nil {
 			t.Fatalf("signed_metadata: %v", err)
 		}
+		// The document names the key its signed_metadata verifies against, and the PEP
+		// serves it — so a resource-mode PEP reading this document can check the signature.
+		jwksURI, _ := doc["jwks_uri"].(string)
+		if !strings.HasSuffix(jwksURI, "/.well-known/oauth-protected-resource/jwks.json") {
+			t.Fatalf("jwks_uri: %q", jwksURI)
+		}
+		resp, keys := get(ts, "/.well-known/oauth-protected-resource/jwks.json")
+		if resp.StatusCode != 200 || !strings.Contains(keys, f.leafJWK["kid"].(string)) || strings.Contains(keys, `"d"`) {
+			t.Fatalf("the entity's public key set: %d %s", resp.StatusCode, keys)
+		}
 		if resp, _ := get(ts, "/.well-known/nothing"); resp.StatusCode != 404 {
 			t.Fatal(resp.StatusCode)
 		}

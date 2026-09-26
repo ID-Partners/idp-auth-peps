@@ -23,7 +23,7 @@ ready 9099
 
 # What every PEP shares. PDP_METADATA_TTL is short so the console's trace shows the
 # fetches on every run; the shipped default is 5m.
-export AUTHZEN_URL="http://$host:9002/tenants/bank-a" AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo PEP_ALLOW_INSECURE=true
+export AUTHZEN_URL="http://$host:9002/tenants/bank-a" AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo PEP_ALLOW_INSECURE=true PDP_DISCOVERY_INSECURE=true
 export HTTP_ADDR=127.0.0.1 PDP_METADATA_TTL=15s
 export MCP_UPSTREAM_ALLOWLIST="http://$host:9001,http://$host:9004,http://$host:9005,http://$host:9006,http://$host:9009"
 # Allowlists match scheme + host + port at a path boundary, so each stub is listed.

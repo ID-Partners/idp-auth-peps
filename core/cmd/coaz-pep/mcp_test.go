@@ -18,6 +18,7 @@ import (
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
+	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
 )
 
@@ -349,6 +350,7 @@ func TestServiceFailOpenSkipsOnlyAnUnavailablePDP(t *testing.T) {
 	for status, skipped := range map[int]bool{503: true, 429: true, 401: false, 413: false, 400: false} {
 		layer := newPDPStub(t, map[string]any{}, status)
 		s := newServer(t, own.URL)
+		s.resolver, _ = discovery.New(discovery.Options{Mode: discovery.ModeOff, StaticPDP: own.URL, AllowInsecure: true})
 		conf := restConf(map[string]string{"pdp_layers": layer.URL + " fail-open, static"})
 		resp := s.check(context.Background(), conf, "GET", "/accounts/a1/balance",
 			map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}, "")

@@ -228,9 +228,23 @@ func TestLayersOnTheService(t *testing.T) {
 			t.Fatalf("want 503 for an off-list layer, got %d", deniedStatus(resp))
 		}
 	})
-	t.Run("off mode never fetches, even for an explicit layer", func(t *testing.T) {
+	t.Run("off mode refuses a plain-http layer it was not told to allow", func(t *testing.T) {
 		s := newServer(t, static.URL)
 		s.resolver = discovery.Static(static.URL, "k")
+		resp := s.check(context.Background(), restConf(map[string]string{"pdp_layers": "static," + estate.URL}), "GET", "/accounts/a1/balance", headers, "")
+		if resp.GetOkResponse() != nil {
+			t.Fatal("an http layer on another origin is a refusal in off mode too")
+		}
+	})
+	t.Run("off mode never fetches, even for an explicit layer", func(t *testing.T) {
+		s := newServer(t, static.URL)
+		// Off mode still refuses a plain-http layer on another origin unless told otherwise.
+		off, err := discovery.New(discovery.Options{Mode: discovery.ModeOff, StaticPDP: static.URL,
+			APIKeys: map[string]string{static.URL: "k"}, AllowInsecure: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.resolver = off
 		before := atomic.LoadInt32(&estate.hits)
 		resp := s.check(context.Background(), restConf(map[string]string{"pdp_layers": "static," + estate.URL}), "GET", "/accounts/a1/balance", headers, "")
 		if resp.GetDeniedResponse() != nil || atomic.LoadInt32(&estate.hits) != before+1 || estate.paths[len(estate.paths)-1] != "/access/v1/evaluation" {
@@ -505,6 +519,7 @@ func newFedFixture(t *testing.T) *fedFixture {
 		return []byte(tok)
 	}
 	f.leaf = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/entity-statement+jwt")
 		key := f.leafKey
 		if f.breakLeaf {
 			key = f.anchorKey
@@ -518,6 +533,7 @@ func newFedFixture(t *testing.T) *fedFixture {
 	}))
 	t.Cleanup(f.leaf.Close)
 	f.anchor = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/entity-statement+jwt")
 		if r.URL.Path == "/fetch" {
 			claims := map[string]any{
 				"iss": f.anchor.URL, "sub": f.leaf.URL, "iat": now - 10, "exp": now + 3600,

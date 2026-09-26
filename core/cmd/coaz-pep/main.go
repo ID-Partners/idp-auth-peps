@@ -53,10 +53,13 @@ package main
 //   FEDERATION_ENTITY_KEY_FILE   private JWK (EC or RSA) the entity signs with; required with an id
 //   FEDERATION_ENTITY_KEY_GENERATE  `true` to mint a P-256 key into that file when it is absent
 //   FEDERATION_AUTHORITY_HINTS   comma-separated superiors the trust controller is reached through
+//   FEDERATION_ENTITY_METADATA_LIFETIME  how long each signed_metadata is valid (default 10m)
+//   PDP_METADATA_MAX_STALE       how long past its TTL metadata or a chain is served while
+//                                refreshes fail (default: one more TTL); never past its own expiry
+//   PDP_METADATA_FETCH_TIMEOUT   bound on one detached metadata or chain refresh (default 30s)
 
 import (
 	"context"
-	"crypto"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -250,7 +253,10 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		fedPath, resPath := ent.Paths()
 		mux.Handle(fedPath, ent.Handler())
 		mux.Handle(resPath, ent.Handler())
-		log.Printf("federation entity %s: entity configuration at %s, protected resource metadata at %s", id, fedPath, resPath)
+		// The key signed_metadata is verified against, advertised as the document's jwks_uri.
+		mux.Handle(ent.JWKSPath(), ent.Handler())
+		log.Printf("federation entity %s: entity configuration at %s, protected resource metadata at %s, keys at %s",
+			id, fedPath, resPath, ent.JWKSPath())
 		if fed == nil {
 			slog.Warn(fmt.Sprintf("FEDERATION_TRUST_ANCHORS_FILE is unset — %s publishes the PDP it is configured "+
 				"with, not what a federation resolves for it. Set the anchors so the RFC 9728 document is the controller's word.", id))
@@ -311,6 +317,16 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 	if err != nil {
 		return nil, nil, err
 	}
+	// How long past the TTL cached metadata and chains are served while refreshes fail
+	// (default: one more TTL), and how long one detached refresh may take.
+	maxStale, err := durationEnv(getenv, "PDP_METADATA_MAX_STALE", 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	fetchTimeout, err := durationEnv(getenv, "PDP_METADATA_FETCH_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
 	allowHTTP := strings.EqualFold(getenv("PDP_DISCOVERY_INSECURE"), "true")
 	resAllow := parseAllowlist(getenv("RESOURCE_METADATA_ALLOWLIST"))
 
@@ -320,6 +336,8 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 		APIKeys:       map[string]string{authzenURL: getenv("AUTHZEN_API_KEY")},
 		HTTPClient:    httpc,
 		TTL:           metaTTL,
+		MaxStale:      maxStale,
+		FetchTimeout:  fetchTimeout,
 		AllowInsecure: allowHTTP,
 	}
 	// The static PDP is the operator's own and is always permitted, and so is any PDP
@@ -349,7 +367,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 	// may run in any discovery mode.
 	var fed *federation.Resolver
 	if mode == discovery.ModeFederation || getenv("FEDERATION_TRUST_ANCHORS_FILE") != "" {
-		f, err := buildFederation(getenv, httpc, allowHTTP, opts.ResourceAllowed, metaTTL, insecure)
+		f, err := buildFederation(getenv, httpc, allowHTTP, opts.ResourceAllowed, metaTTL, maxStale, fetchTimeout, insecure)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -358,8 +376,9 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 			opts.Federation = fed
 		}
 	}
-	if mode != discovery.ModeOff && allowHTTP {
-		insecure("PDP_DISCOVERY_INSECURE is set: discovered http URLs are accepted")
+	// Even with discovery off it lets a route's layers name plain-http PDPs.
+	if allowHTTP {
+		insecure("PDP_DISCOVERY_INSECURE is set: discovered and route-named http URLs are accepted")
 	}
 	chain, err := discovery.New(opts)
 	if err != nil {
@@ -378,7 +397,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 }
 
 // buildFederation loads the Trust Anchors and builds the chain resolver.
-func buildFederation(getenv func(string) string, httpc *http.Client, allowHTTP bool, resourceAllowed func(string) bool, ttl time.Duration, insecure func(string, ...any)) (*federation.Resolver, error) {
+func buildFederation(getenv func(string) string, httpc *http.Client, allowHTTP bool, resourceAllowed func(string) bool, ttl, maxStale, fetchTimeout time.Duration, insecure func(string, ...any)) (*federation.Resolver, error) {
 	path := getenv("FEDERATION_TRUST_ANCHORS_FILE")
 	if path == "" {
 		return nil, fmt.Errorf("PDP_DISCOVERY=federation requires FEDERATION_TRUST_ANCHORS_FILE")
@@ -399,7 +418,8 @@ func buildFederation(getenv func(string) string, httpc *http.Client, allowHTTP b
 	}
 	// The resource allowlist governs the subject's own Entity Configuration; the fetch
 	// allowlist governs the climb from there to the anchor.
-	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: allowHTTP, SubjectAllowed: resourceAllowed}
+	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: allowHTTP, SubjectAllowed: resourceAllowed,
+		MaxStale: maxStale, FetchTimeout: fetchTimeout}
 	// PDP_METADATA_TTL bounds a resolved chain as it bounds any other metadata, and a
 	// short one also shortens how long a failed chain is remembered — so an entity
 	// onboarded a moment ago is seen a moment later.
@@ -446,50 +466,25 @@ func buildEntity(getenv func(string) string, id, authzenURL string, fed *federat
 	if path == "" {
 		return nil, fmt.Errorf("FEDERATION_ENTITY_ID needs FEDERATION_ENTITY_KEY_FILE")
 	}
-	key, err := loadOrGenerateKey(path, strings.EqualFold(getenv("FEDERATION_ENTITY_KEY_GENERATE"), "true"))
+	key, created, err := jose.LoadOrCreateKey(path, strings.EqualFold(getenv("FEDERATION_ENTITY_KEY_GENERATE"), "true"))
+	if err != nil {
+		return nil, fmt.Errorf("FEDERATION_ENTITY_KEY_FILE: %w", err)
+	}
+	if created {
+		jwk, _ := jose.PublicJWK(key)
+		slog.Warn(fmt.Sprintf("minted a new federation entity key into %s (kid %s) — the trust controller "+
+			"must onboard this key before the chain resolves.", path, jwk["kid"]))
+	}
+	lifetime, err := durationEnv(getenv, "FEDERATION_ENTITY_METADATA_LIFETIME", 0)
 	if err != nil {
 		return nil, err
 	}
 	return &federation.Entity{
-		ID: id, Key: key, AuthorityHints: hints, Resolver: fed, Logf: log.Printf,
+		ID: id, Key: key, AuthorityHints: hints, Resolver: fed, Logf: log.Printf, MetadataLifetime: lifetime,
 		// Before the controller has spoken, the document says only what this PEP is
 		// configured with.
 		Asserted: map[string]any{discovery.ParamPolicyDecisionPoints: []any{authzenURL}},
 	}, nil
-}
-
-// loadOrGenerateKey reads a private JWK, or mints a P-256 one into the file when asked.
-func loadOrGenerateKey(path string, generate bool) (crypto.Signer, error) {
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) && generate {
-		key, err := jose.GenerateKey()
-		if err != nil {
-			return nil, err
-		}
-		jwk, err := jose.PrivateJWK(key)
-		if err != nil {
-			return nil, err
-		}
-		out, _ := json.MarshalIndent(jwk, "", "  ")
-		if err := os.WriteFile(path, out, 0o600); err != nil {
-			return nil, fmt.Errorf("writing FEDERATION_ENTITY_KEY_FILE: %w", err)
-		}
-		slog.Warn(fmt.Sprintf("minted a new federation entity key into %s (kid %s) — the trust controller "+
-			"must onboard this key before the chain resolves.", path, jwk["kid"]))
-		return key, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("reading FEDERATION_ENTITY_KEY_FILE: %w", err)
-	}
-	var jwk map[string]any
-	if err := json.Unmarshal(raw, &jwk); err != nil {
-		return nil, fmt.Errorf("FEDERATION_ENTITY_KEY_FILE is not a JWK: %w", err)
-	}
-	key, err := jose.PrivateKeyFromJWK(jwk)
-	if err != nil {
-		return nil, fmt.Errorf("FEDERATION_ENTITY_KEY_FILE: %w", err)
-	}
-	return key, nil
 }
 
 // main is the listen shell: it binds real sockets and waits for a signal, so it is the

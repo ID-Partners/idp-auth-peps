@@ -234,6 +234,7 @@ func (e *Engine) CheckMCP(ctx context.Context, upstreamURL, authorization string
 	if err != nil {
 		return denied(rpc.ID, CodePDPError, "Authorization service unavailable", fmt.Sprintf("PDP error: PDP discovery: %v", err))
 	}
+	logSkipped(layers)
 	eps := layers.PDPs
 	extraContext = forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts)
 
@@ -363,6 +364,14 @@ func PDPStatusError(status int) error {
 		return fmt.Errorf("%w: PDP returned %d", ErrPDPUnavailable, status)
 	}
 	return fmt.Errorf("PDP refused the request with %d", status)
+}
+
+// logSkipped records why discovery skipped a fail-open layer: the client sees the
+// layer's name in X-PDP-Fail-Open, the reason belongs in the log.
+func logSkipped(layers discovery.Resolved) {
+	for _, why := range layers.SkippedReasons {
+		log.Printf("coaz: fail-open layer skipped: %s", why)
+	}
 }
 
 // LayerNames strips the diagnostic detail from skipped-layer entries ("id (why)"),
@@ -536,6 +545,7 @@ func (e *Engine) checkByDefaultMapping(
 	if err != nil {
 		return denied(id, CodePDPError, "Authorization service unavailable", fmt.Sprintf("PDP error: PDP discovery: %v", err))
 	}
+	logSkipped(layers)
 	eps := layers.PDPs
 	built, err := cm.Build(params, tokenClaims, forwardedContext(extraContext, discovery.ResourceMetadataOf(eps), opts))
 	if err != nil {

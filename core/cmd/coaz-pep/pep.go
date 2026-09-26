@@ -640,6 +640,9 @@ func (s *server) decide(ctx context.Context, conf pepConfig, m mapped, method, p
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
 			"Authorization service unavailable; denying (fail-closed).", nil)
 	}
+	for _, why := range layers.SkippedReasons {
+		log.Printf("[%s] fail-open layer skipped: %s", pep, why)
+	}
 	eps := layers.PDPs
 	if meta := discovery.ResourceMetadataOf(eps); meta != nil {
 		m.ctx["resource_metadata"] = meta.Document

@@ -44,6 +44,9 @@ services:
       # The demo's tokens are unsigned and its PEPs have no JWKS. Every relaxation this
       # allows is logged at boot. Never set it anywhere real.
       PEP_ALLOW_INSECURE: "true"
+      # Plain http between containers — including the estate PDP the console names as a
+      # layer, which even the no-discovery PEP must be told it may ask.
+      PDP_DISCOVERY_INSECURE: "true"
       MCP_UPSTREAM_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9009
       # Short so the console's trace shows the fetches on every run. The shipped
       # default is 5m, and production wants that or longer.

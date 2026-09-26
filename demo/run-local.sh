@@ -26,7 +26,7 @@ until curl -sf http://localhost:9000/healthz >/dev/null; do sleep 0.2; done
 # PDP_METADATA_TTL is short so the console's trace shows fetches on every run; the
 # shipped default is 5m. PEP_ALLOW_INSECURE because the demo's tokens are unsigned and
 # nothing verifies them — coaz-pep refuses to start that way without it.
-common=(AUTHZEN_URL=http://localhost:9002/tenants/bank-a AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo PEP_ALLOW_INSECURE=true \
+common=(AUTHZEN_URL=http://localhost:9002/tenants/bank-a AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo PEP_ALLOW_INSECURE=true PDP_DISCOVERY_INSECURE=true \
   MCP_UPSTREAM_ALLOWLIST=http://localhost:9001,http://localhost:9004,http://localhost:9005,http://localhost:9006,http://localhost:9009 HTTP_ADDR=127.0.0.1 PDP_METADATA_TTL=15s)
 env "${common[@]}" PORT=9291 HTTP_PORT=9192 "$OUT/coaz-pep" >"$OUT/pep-static.log" 2>&1 &
 pids+=($!)
