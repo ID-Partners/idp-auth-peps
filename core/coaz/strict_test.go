@@ -119,3 +119,13 @@ func TestMergePermitKeepsEarlierObligations(t *testing.T) {
 		t.Fatalf("a later plain permit must not erase an earlier obligation: %+v", out)
 	}
 }
+
+// A PDP that cannot take a batch cannot be asked one: a fail-open layer may be skipped
+// for it, a fail-closed one fails.
+func TestNoBatchEndpointCountsAsUnavailable(t *testing.T) {
+	built := &BuiltRequest{Body: []byte(`{}`), Count: 2, Batch: true}
+	_, err := NewEngine(Options{}).evaluate(context.Background(), discovery.PDPEndpoints{Identifier: "p", Evaluation: "http://p/e"}, built)
+	if !errors.Is(err, ErrPDPUnavailable) {
+		t.Fatalf("got %v", err)
+	}
+}

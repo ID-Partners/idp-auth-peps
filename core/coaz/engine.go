@@ -424,8 +424,10 @@ func (e *Engine) evaluate(ctx context.Context, ep discovery.PDPEndpoints, built 
 	if built.Batch {
 		if ep.Evaluations == "" {
 			// The PDP advertises no batch endpoint; guessing a path would send a batch
-			// somewhere the PDP never said it would answer one.
-			return out, fmt.Errorf("PDP %s advertises no access_evaluations_endpoint", ep.Identifier)
+			// somewhere the PDP never said it would answer one. It cannot be asked, which
+			// is the one way short of an outage a layer counts as unavailable: a
+			// fail-open layer may be skipped for it, as it would be were the PDP down.
+			return out, fmt.Errorf("%w: PDP %s advertises no access_evaluations_endpoint", ErrPDPUnavailable, ep.Identifier)
 		}
 		endpoint = ep.Evaluations
 	}
