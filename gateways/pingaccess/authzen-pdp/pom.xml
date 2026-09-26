@@ -32,10 +32,10 @@
     <!-- What PingAccess 9.1 ships in lib/. Compiled against the same versions so the
          classes seen at compile time are the ones on the engine's classpath; none of
          these are bundled either. -->
-    <jackson.version>2.21.1</jackson.version>
+    <jackson.version>2.22.3</jackson.version>
     <jakarta.validation.version>3.1.1</jakarta.validation.version>
     <slf4j.version>1.7.36</slf4j.version>
-    <jose4j.version>0.9.6</jose4j.version>
+    <jose4j.version>0.9.7</jose4j.version>
 
     <!-- Coverage floor, set just under the number on the day it was added. A change
          that drops coverage fails the build; one that raises it needs nothing here.
@@ -89,7 +89,7 @@
     <dependency>
       <groupId>org.mockito</groupId>
       <artifactId>mockito-core</artifactId>
-      <version>5.14.2</version>
+      <version>5.23.0</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -106,7 +106,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.13.0</version>
+        <version>3.16.0</version>
         <configuration>
           <compilerArgs>
             <arg>-Xlint:all,-processing,-serial</arg>
@@ -116,7 +116,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.5</version>
+        <version>3.6.0</version>
         <configuration>
           <!-- Mockito's inline mock maker attaches an agent; newer JDKs want it said. -->
           <argLine>@{argLine} -XX:+EnableDynamicAgentLoading</argLine>
@@ -125,7 +125,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>3.4.1</version>
+        <version>3.5.1</version>
         <configuration>
           <archive>
             <manifestEntries>
@@ -153,7 +153,7 @@
       <plugin>
         <groupId>org.jacoco</groupId>
         <artifactId>jacoco-maven-plugin</artifactId>
-        <version>0.8.12</version>
+        <version>0.8.15</version>
         <executions>
           <execution>
             <id>prepare-agent</id>
