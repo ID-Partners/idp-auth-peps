@@ -10,8 +10,8 @@
  * which PEP said no.
  */
 
-export { AuthzenClient, PdpError } from './client.js';
-export type { AuthzenClientOptions, ClientDiscoveryOptions, EvaluateOptions, PdpTrace } from './client.js';
+export { AuthzenClient, PDP_UNAVAILABLE_REASON, PdpError } from './client.js';
+export type { AuthzenClientOptions, ClientDiscoveryOptions, EvaluateOptions, PdpOutcome, PdpTrace } from './client.js';
 
 export {
   DiscoveryError,
@@ -70,7 +70,9 @@ export type {
 export {
   CODE_DENIED,
   CODE_DENIED_V2,
+  CODE_INVALID_REQUEST,
   CODE_MAPPING_ERROR,
+  CODE_PARSE_ERROR,
   CODE_PDP_ERROR,
   McpGuard,
   buildRequest,
@@ -91,7 +93,10 @@ export type {
   JsonRpcErrorResponse,
   JsonRpcRequest,
   MappingElement,
+  McpCheckArgs,
   McpGuardOptions,
+  McpHttpResponse,
+  McpRawRequest,
   McpVerdict,
   ToolDefinition,
 } from './mcp.js';

@@ -428,8 +428,8 @@ describe('McpGuard', () => {
     expect(v.jsonRpcError?.id).toBe(7);
   });
 
-  it('lets a tool without coaz:true through', async () => {
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: false }) }, tools });
+  it('lets a tool without a mapping through when defaults are turned off', async () => {
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: false }) }, tools, applyDefaultMappings: false });
     const v = await guard.checkToolCall({ rpc: call('ping'), claims: { sub: 'u' } });
     expect(v.allow).toBe(true);
     expect(v.coazTool).toBe(false);
@@ -634,7 +634,7 @@ describe('COAZ v2 — defaults and anchoring warnings', () => {
 
   it('passes an undeclared tool through when defaults are off', async () => {
     const fetchMock = pdp({ decision: false });
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchMock }, tools: [{ name: 'weather' }] });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchMock }, tools: [{ name: 'weather' }], applyDefaultMappings: false });
     const v = await guard.checkToolCall({ rpc: call('weather'), claims: token });
     expect(v.allow).toBe(true);
     expect(v.coazTool).toBe(false);
@@ -1189,6 +1189,7 @@ describe('McpGuard — discovery and delegation', () => {
     const guard = new McpGuard({
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       tools: () => list as never,
+      applyDefaultMappings: false,
     });
     expect((await guard.checkToolCall({ rpc: call, claims: token })).coazTool).toBe(false);
     list = [declared];
@@ -1236,7 +1237,7 @@ describe('McpGuard — discovery and delegation', () => {
     const fetchImpl = vi.fn(async () => new Response('', { status: 401 })) as unknown as typeof globalThis.fetch;
     const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, delegate: { url: 'http://coaz-pep:9192' }, fetch: fetchImpl });
     const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
-    expect(v.verdict.reason).toMatch(/CHECK_API_TOKEN/);
+    expect(v.verdict.detail).toMatch(/CHECK_API_TOKEN/);
   });
 
   it('accepts PepClaims as well as a bare claims map', async () => {
