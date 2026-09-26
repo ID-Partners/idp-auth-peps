@@ -45,6 +45,11 @@ class PepTest {
     static final String EVAL = PDP + "/access/v1/evaluation";
     static final String COAZ = "http://coaz-pep:9192";
 
+    /**
+     * The decision path as the demo drives it: unsigned tokens on an unprotected
+     * application, which only allow_insecure admits. What the default refuses is pinned
+     * by its own tests below.
+     */
     static AuthZenRuleConfiguration baseConf() {
         AuthZenRuleConfiguration c = new AuthZenRuleConfiguration();
         c.authzen_url = PDP;
@@ -56,6 +61,7 @@ class PepTest {
         c.require_user_login = false;
         c.stepup_action = "make_payment";
         c.pdp_ssl_verify = true;
+        c.allow_insecure = true;
         return c;
     }
 
@@ -438,7 +444,7 @@ class PepTest {
         JsonNode sentBody = Json.parse(t.hits.get(0).body());
         assertEquals("mcp", sentBody.get("config").get("style").asText());
         assertEquals("http://mcp:8090/mcp", sentBody.get("config").get("mcp_upstream_url").asText());
-        assertEquals("false", sentBody.get("config").get("coaz_defaults").asText());
+        assertEquals("true", sentBody.get("config").get("coaz_defaults").asText(), "the binding's default table is on unless turned off");
         assertEquals("test-pep", sentBody.get("config").get("pep_label").asText());
         assertEquals("resource", sentBody.get("config").get("pdp_layers").asText());
         assertFalse(sentBody.get("config").has("fail_mode"));
@@ -535,7 +541,7 @@ class PepTest {
         c.fail_mode = "open";
         c.resource = "https://api.example";
         c.forward_access_token = true;
-        c.coaz_defaults = true;
+        c.coaz_defaults = false;
         Object[] r = mcpRoute(obj("decision", true), c);
         assertTrue(((Verdict) r[0]).permit);
         JsonNode cfg = Json.parse(((FakeTransport) r[1]).hits.get(0).body()).get("config");
@@ -543,7 +549,7 @@ class PepTest {
         assertEquals("open", cfg.get("fail_mode").asText());
         assertEquals("https://api.example", cfg.get("resource").asText());
         assertEquals("true", cfg.get("forward_access_token").asText());
-        assertEquals("true", cfg.get("coaz_defaults").asText());
+        assertEquals("false", cfg.get("coaz_defaults").asText(), "only an explicit opt-out turns the default table off");
         // Header sanity: the engine call is authenticated when a key is configured.
         c.coaz_api_key = "demo";
         Object[] r2 = mcpRoute(obj("decision", true), c);
@@ -644,6 +650,47 @@ class PepTest {
         FakeTransport t2 = pdp(obj("decision", true));
         pep(baseConf(), t2).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
         assertEquals("unknown-agent", sent(t2).get("subject").get("id").asText());
+    }
+
+    // ---------- an identity PingAccess did not establish is not an identity ----------
+
+    @Test
+    void anAccessTokenPingAccessDidNotValidateIsRefusedByDefault() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.allow_insecure = false;
+        FakeTransport t = pdp(obj("decision", true));
+        // An unsigned token on an unprotected application: its claims are the client's word.
+        Verdict v = pep(c, t).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "admin"))), null));
+        assertEquals(401, v.status);
+        assertFalse(v.upstreamHeaders.containsKey("X-Auth-Principal"));
+        assertEquals(0, t.hits.size(), "never reached the PDP");
+        // The same request on a protected application: PingAccess's identity is the subject.
+        PepRequest validated = new PepRequest("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "admin"))), null,
+            obj("sub", "alice"));
+        Verdict ok = pep(c, t).decide(validated);
+        assertTrue(ok.permit);
+        assertEquals("alice", ok.upstreamHeaders.get("X-Auth-Principal"));
+        // No token at all on a route that allows it: anonymous, no claims to take on trust.
+        c.require_token = false;
+        Verdict anon = pep(c, pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance", Map.of(), null));
+        assertTrue(anon.permit);
+        assertEquals("", anon.upstreamHeaders.get("X-Auth-Principal"));
+    }
+
+    @Test
+    void anUnverifiedUserTokenOpensNoGateAndCarriesNoScope() {
+        FakeTransport t = pdp(obj("decision", true));
+        AuthZenRuleConfiguration c = baseConf();
+        Pep ignoring = new Pep(c, t, new Discovery(t, () -> 1_000_000L), UserTokens.ignored());
+        String forged = jwt(obj("sub", "alice", "scope", "payments:approve"));
+        ignoring.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", forged),
+            "{\"from_account\":\"a\",\"amount\":5000}"));
+        assertEquals("", sent(t).get("context").get("user_scope").asText(), "a forged approval never reaches the PDP");
+        c.require_user_login = true;
+        Verdict v = new Pep(c, t, new Discovery(t, () -> 1_000_000L), UserTokens.ignored()).decide(req("GET", "/accounts/a/balance",
+            Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", forged), null));
+        assertEquals(401, v.status);
+        assertEquals("login_required", body(v).get("error").asText());
     }
 
     // ---------- what PingAccess established wins ----------
@@ -882,31 +929,114 @@ class PepTest {
         server.start();
         try {
             String jwksUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/jwks";
-            UserTokens.Reader reader = UserTokens.verified(jwksUrl, "https://as.example", "https://api.example");
+            UserTokens.Reader reader = UserTokens.verified(jwksUrl, "https://as.example", "https://api.example", new JdkTransport(), true);
             AuthZenRuleConfiguration c = baseConf();
             c.require_user_login = true;
             FakeTransport t = pdp(obj("decision", true));
             Pep p = new Pep(c, t, new Discovery(t, () -> 1_000_000L), reader);
+            long exp = System.currentTimeMillis() / 1000 + 600;
+            String claims = ",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}";
 
-            String good = sign(key, "{\"sub\":\"alice\",\"scope\":\"payments:approve\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}");
-            Verdict ok = p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", good), "{\"amount\":5}"));
+            String good = sign(key, "{\"sub\":\"alice\",\"scope\":\"payments:approve\"" + claims);
+            Verdict ok = p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", good), "{\"from_account\":\"a\",\"amount\":5}"));
             assertTrue(ok.permit);
             assertEquals("payments:approve", sent(t).get("context").get("user_scope").asText());
 
-            String forged = sign(other, "{\"sub\":\"alice\",\"scope\":\"payments:approve\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}");
+            String forged = sign(other, "{\"sub\":\"alice\",\"scope\":\"payments:approve\"" + claims);
             assertEquals(401, p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", forged), "{}")).status);
-            String wrongIssuer = sign(key, "{\"sub\":\"alice\",\"iss\":\"https://evil.example\",\"aud\":\"https://api.example\"}");
+            String wrongIssuer = sign(key, "{\"sub\":\"alice\",\"iss\":\"https://evil.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}");
             assertEquals(401, p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", wrongIssuer), "{}")).status);
             String none = jwt(obj("sub", "alice", "iss", "https://as.example", "aud", "https://api.example"));
             assertEquals(401, p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", none), "{}")).status, "alg none is refused");
             assertNull(reader.claims(null));
 
-            // Without an expected issuer or audience, only the signature and times gate.
-            UserTokens.Reader lax = UserTokens.verified(jwksUrl, null, null);
-            assertEquals("alice", lax.claims(sign(key, "{\"sub\":\"alice\"}")).get("sub").asText());
+            // exp, sub and the configured audience are required, not merely checked when present.
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}")), "no exp");
+            assertNull(reader.claims(sign(key, "{\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}")), "no sub");
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"exp\":" + exp + "}")), "no aud");
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://other.example\",\"exp\":" + exp + "}")), "wrong aud");
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":1000}")), "expired");
+
+            // Without an expected issuer or audience (allow_insecure only), the signature, exp and sub still gate.
+            UserTokens.Reader lax = UserTokens.verified(jwksUrl, null, null, new JdkTransport(), true);
+            assertEquals("alice", lax.claims(sign(key, "{\"sub\":\"alice\",\"exp\":" + exp + "}")).get("sub").asText());
+            UserTokens.Reader blank = UserTokens.verified(jwksUrl, "", "", new JdkTransport(), true);
+            assertEquals("alice", blank.claims(sign(key, "{\"sub\":\"alice\",\"exp\":" + exp + "}")).get("sub").asText());
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void aRejectedUserTokenIsLoggedByReasonNeverByContent() throws Exception {
+        EllipticCurveJsonWebKey key = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        key.setKeyId("k1");
+        String jwks = new JsonWebKeySet(key).toJson(JsonWebKey.OutputControlLevel.PUBLIC_ONLY);
+        FakeTransport t = new FakeTransport().route("https://as.example/jwks", jwks);
+        UserTokens.Reader reader = UserTokens.verified("https://as.example/jwks", "https://as.example", "https://api.example", t, true);
+        long exp = System.currentTimeMillis() / 1000 + 600;
+        Map<String, String> cases = new java.util.LinkedHashMap<>();
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":1000}", "expired");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}", "no exp");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + (exp + 1200) + ",\"nbf\":" + exp + "}", "not yet valid");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://x.example\",\"exp\":" + exp + "}", "wrong audience");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"exp\":" + exp + "}", "no audience");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://x.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}", "wrong issuer");
+        cases.put("{\"sub\":\"alice\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}", "no issuer");
+        cases.put("{\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}", "no subject");
+        org.jose4j.jwt.consumer.JwtConsumer consumer = new org.jose4j.jwt.consumer.JwtConsumerBuilder()
+            .setVerificationKey(key.getPublicKey()).setRequireExpirationTime().setRequireSubject()
+            .setExpectedIssuer("https://as.example").setExpectedAudience(true, "https://api.example").build();
+        for (Map.Entry<String, String> c : cases.entrySet()) {
+            String token = sign(key, c.getKey());
+            assertNull(reader.claims(token), c.getValue());
+            org.jose4j.jwt.consumer.InvalidJwtException e = org.junit.jupiter.api.Assertions.assertThrows(
+                org.jose4j.jwt.consumer.InvalidJwtException.class, () -> consumer.processToClaims(token));
+            assertEquals(c.getValue(), UserTokens.reason(e));
+            assertFalse(UserTokens.reason(e).contains("alice"), "no claims in the log");
+        }
+        EllipticCurveJsonWebKey other = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        other.setKeyId("k1");
+        String forged = sign(other, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}");
+        org.jose4j.jwt.consumer.InvalidJwtException bad = org.junit.jupiter.api.Assertions.assertThrows(
+            org.jose4j.jwt.consumer.InvalidJwtException.class, () -> consumer.processToClaims(forged));
+        assertEquals("signature invalid", UserTokens.reason(bad));
+        org.jose4j.jwt.consumer.InvalidJwtException garbage = org.junit.jupiter.api.Assertions.assertThrows(
+            org.jose4j.jwt.consumer.InvalidJwtException.class, () -> consumer.processToClaims("not.a.token"));
+        assertTrue(UserTokens.reason(garbage).startsWith("not a verifiable token"));
+    }
+
+    @Test
+    void theJwksIsFetchedThroughTheRulesOwnBoundedTransport() throws Exception {
+        EllipticCurveJsonWebKey key = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        key.setKeyId("k1");
+        String jwks = new JsonWebKeySet(key).toJson(JsonWebKey.OutputControlLevel.PUBLIC_ONLY);
+        FakeTransport t = new FakeTransport().route("https://as.example/jwks", (Function<Transport.Request, Transport.Response>) r ->
+            new Transport.Response(200, Map.of("Content-Type", "application/json", "Cache-Control", "max-age=600"), jwks.getBytes(StandardCharsets.UTF_8)));
+        UserTokens.Reader reader = UserTokens.verified("https://as.example/jwks", null, "https://api.example", t, false);
+        long exp = System.currentTimeMillis() / 1000 + 600;
+        assertEquals("alice", reader.claims(sign(key, "{\"sub\":\"alice\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}")).get("sub").asText());
+        Transport.Request fetch = t.to("/jwks").get(0);
+        assertEquals(UserTokens.JWKS_TIMEOUT_MS, fetch.timeoutMs());
+        assertEquals(UserTokens.JWKS_MAX_BYTES, fetch.maxResponseBytes());
+        assertFalse(fetch.verifyTls(), "pdp_ssl_verify applies to the JWKS fetch too");
+        // A key set that cannot be fetched verifies nothing.
+        for (Object down : new Object[]{500, Boolean.FALSE, new Transport.Refused("too large")}) {
+            FakeTransport dt = new FakeTransport().route("https://as.example/jwks", down);
+            UserTokens.Reader r = UserTokens.verified("https://as.example/jwks", null, "https://api.example", dt, true);
+            assertNull(r.claims(sign(key, "{\"sub\":\"alice\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}")), String.valueOf(down));
+        }
+        // The response adapter jose4j reads headers and status through.
+        org.jose4j.http.SimpleResponse sr = new UserTokens.TransportGet(t, true).get("https://as.example/jwks");
+        assertEquals(200, sr.getStatusCode());
+        assertEquals("", sr.getStatusMessage());
+        assertTrue(sr.getHeaderNames().contains("Cache-Control"));
+        assertEquals(List.of("max-age=600"), sr.getHeaderValues("cache-control"));
+        assertEquals(List.of(), sr.getHeaderValues("expires"));
+        org.jose4j.http.SimpleResponse empty = new UserTokens.TransportGet(new FakeTransport().route("https://e.example",
+            (Function<Transport.Request, Transport.Response>) r -> new Transport.Response(200, null, null)), true).get("https://e.example/");
+        assertEquals("", empty.getBody());
+        assertTrue(empty.getHeaderNames().isEmpty());
     }
 
     private static String sign(EllipticCurveJsonWebKey key, String payload) throws Exception {

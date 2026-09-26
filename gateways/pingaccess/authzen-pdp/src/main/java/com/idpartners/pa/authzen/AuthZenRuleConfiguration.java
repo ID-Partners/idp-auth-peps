@@ -45,7 +45,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
 
     @UIElement(order = 40, type = ConfigurationType.SELECT, label = "Style (style)", defaultValue = "rest",
         options = {@Option(label = "rest: resource server", value = "rest"), @Option(label = "mcp: MCP edge", value = "mcp")},
-        help = @Help(title = "Request mapping", content = "rest maps REST requests to actions and resources; mcp authorises access on the JSON-RPC initialize handshake and delegates tools/call to coaz-pep.", url = ""))
+        help = @Help(title = "Request mapping", content = "rest maps REST requests to actions and resources; mcp sends every request to coaz-pep, which decides each JSON-RPC message, and needs coaz_url.", url = ""))
     @Pattern(regexp = "rest|mcp", message = "must be rest or mcp")
     public String style = "rest";
 
@@ -57,7 +57,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public boolean require_dpop = false;
 
     @UIElement(order = 70, type = ConfigurationType.CHECKBOX, label = "Require a logged-in user (require_user_login)", defaultValue = "false",
-        help = @Help(title = "RFC 9470 login challenge", content = "Deny with a login challenge unless a valid X-User-Token is present.", url = ""))
+        help = @Help(title = "RFC 9470 login challenge", content = "Deny with a login challenge unless a verified X-User-Token is present. Needs user_token_jwks_url.", url = ""))
     public boolean require_user_login = false;
 
     @UIElement(order = 80, type = ConfigurationType.TEXT, label = "Step-up scope (stepup_scope)",
@@ -68,11 +68,11 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public String stepup_action = "make_payment";
 
     @UIElement(order = 100, type = ConfigurationType.TEXT, label = "coaz-pep check API (coaz_url)",
-        help = @Help(title = "The shared engine", content = "Base URL of coaz-pep's HTTP check API. Required for require_dpop; enables per-tool-call authorisation on mcp routes.", url = ""))
+        help = @Help(title = "The shared engine", content = "Base URL of coaz-pep's HTTP check API. Required for style mcp, which sends it every request, and for require_dpop.", url = ""))
     public String coaz_url;
 
     @UIElement(order = 110, type = ConfigurationType.CONCEALED, label = "coaz-pep API key (coaz_api_key)",
-        help = @Help(title = "CHECK_API_TOKEN", content = "The shared secret coaz-pep's check API requires.", url = ""))
+        help = @Help(title = "CHECK_API_TOKEN", content = "The shared secret coaz-pep's check API requires. Required with coaz_url, and sent only over https.", url = ""))
     public String coaz_api_key;
 
     @UIElement(order = 120, type = ConfigurationType.TEXT, label = "MCP upstream (mcp_upstream_url)",
@@ -84,12 +84,12 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public String federation_entity_url;
 
     @UIElement(order = 140, type = ConfigurationType.CHECKBOX, label = "Verify TLS on outbound calls (pdp_ssl_verify)", defaultValue = "true", advanced = true,
-        help = @Help(title = "Development only when off", content = "A PEP that silently accepts any certificate has no integrity on the decision it enforces. Off is process-wide for JDK HTTP clients built afterwards.", url = ""))
+        help = @Help(title = "Development only when off", content = "Off trusts any certificate chain; the host name is still checked. A PEP that accepts any certificate has no integrity on the decision it enforces, so off needs allow_insecure.", url = ""))
     public boolean pdp_ssl_verify = true;
 
-    @UIElement(order = 150, type = ConfigurationType.CHECKBOX, label = "COAZ default mappings (coaz_defaults)", defaultValue = "false", advanced = true,
-        help = @Help(title = "Conformance", content = "Authorise tools that declare no x-authzen-mapping against the COAZ-MCP binding's default tools/call mapping, as it requires.", url = ""))
-    public boolean coaz_defaults = false;
+    @UIElement(order = 150, type = ConfigurationType.CHECKBOX, label = "COAZ default mappings (coaz_defaults)", defaultValue = "true", advanced = true,
+        help = @Help(title = "Conformance", content = "On: every MCP method is governed by the COAZ-MCP binding's default table, as it requires. Off keeps the old pass-through for methods other than tools/call.", url = ""))
+    public boolean coaz_defaults = true;
 
     @UIElement(order = 160, type = ConfigurationType.CHECKBOX, label = "Also send subject.identity (legacy_subject_identity)", defaultValue = "true", advanced = true,
         help = @Help(title = "Migration", content = "Send the non-standard subject.identity beside AuthZEN's subject.id until policies read subject.id.", url = ""))
@@ -112,7 +112,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public int pdp_metadata_ttl = 300;
 
     @UIElement(order = 200, type = ConfigurationType.LIST, label = "Permitted PDPs (pdp_allowlist)", advanced = true,
-        help = @Help(title = "What a resource may name", content = "Prefixes of PDP identifiers a resource may name; authzen_url is always permitted. Empty means any https PDP.", url = ""))
+        help = @Help(title = "What a resource may name", content = "Prefixes of PDP identifiers a resource may name; authzen_url is always permitted. Required when pdp_discovery is on.", url = ""))
     public List<String> pdp_allowlist = new ArrayList<>();
 
     @UIElement(order = 210, type = ConfigurationType.LIST, label = "Permitted resources (resource_metadata_allowlist)", advanced = true,
@@ -120,7 +120,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public List<String> resource_metadata_allowlist = new ArrayList<>();
 
     @UIElement(order = 220, type = ConfigurationType.CHECKBOX, label = "Allow http for discovered URLs (pdp_discovery_insecure)", defaultValue = "false", advanced = true,
-        help = @Help(title = "Development only", content = "authzen_url's own origin is always trusted over http.", url = ""))
+        help = @Help(title = "Development only", content = "authzen_url's own origin is always trusted over http. Needs allow_insecure.", url = ""))
     public boolean pdp_discovery_insecure = false;
 
     @UIElement(order = 230, type = ConfigurationType.CHECKBOX, label = "Forward the raw access token (forward_access_token)", defaultValue = "false",
@@ -138,13 +138,14 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     public String fail_mode = "closed";
 
     @UIElement(order = 260, type = ConfigurationType.TEXT, label = "X-User-Token JWKS (user_token_jwks_url)",
-        help = @Help(title = "Verify the user token", content = "When set, X-User-Token is verified against this JWKS and one that fails yields no claims. Unset, it is decoded only.", url = ""))
+        help = @Help(title = "Verify the user token", content = "X-User-Token is verified against this JWKS (https) and one that fails yields no claims. Unset, the token is ignored. Needs user_token_audience.", url = ""))
     public String user_token_jwks_url;
 
     @UIElement(order = 270, type = ConfigurationType.TEXT, label = "X-User-Token issuer (user_token_issuer)", advanced = true)
     public String user_token_issuer;
 
-    @UIElement(order = 280, type = ConfigurationType.TEXT, label = "X-User-Token audience (user_token_audience)", advanced = true)
+    @UIElement(order = 280, type = ConfigurationType.TEXT, label = "X-User-Token audience (user_token_audience)", advanced = true,
+        help = @Help(title = "Required with the JWKS", content = "The aud a user token must carry. Without it a token minted for any other audience would pass.", url = ""))
     public String user_token_audience;
 
     @UIElement(order = 290, type = ConfigurationType.TEXT, label = "PDP timeout, ms (pdp_timeout_ms)", defaultValue = "10000", advanced = true)
@@ -154,4 +155,8 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     @UIElement(order = 300, type = ConfigurationType.TEXT, label = "coaz-pep timeout, ms (coaz_timeout_ms)", defaultValue = "15000", advanced = true)
     @Min(value = 1, message = "must be greater than zero")
     public int coaz_timeout_ms = 15000;
+
+    @UIElement(order = 310, type = ConfigurationType.CHECKBOX, label = "Allow insecure settings (allow_insecure)", defaultValue = "false", advanced = true,
+        help = @Help(title = "Development only", content = "Lets the rule start with what it otherwise refuses: access tokens PingAccess did not validate, an unverified X-User-Token, API keys over http, TLS verification off, discovery without pdp_allowlist. Each relaxation is logged when the rule is configured.", url = ""))
+    public boolean allow_insecure = false;
 }

@@ -99,6 +99,15 @@ final class Pep {
         if (token == null && conf.require_token) {
             return deny(pep, 401, "No access token presented to the gateway.", null);
         }
+        // 1a) Whose word is the token? On a protected application PingAccess validated it
+        //     before this rule ran and hands over an identity. With none (an unprotected
+        //     application) its claims are the client's own, and an unsigned token would
+        //     become the subject and X-Auth-Principal. Refused, unless allow_insecure.
+        if (token != null && req.identityClaims == null && !conf.allow_insecure) {
+            log.warn("authzen-pdp '{}': an access token arrived that PingAccess did not validate (is the application "
+                + "unprotected?); denying", pep);
+            return deny(pep, 401, "The access token was not validated by the gateway.", null);
+        }
         ObjectNode claims = mergeClaims(token == null ? null : Jwt.claims(token.value()), req.identityClaims);
         String sub = Json.text(claims, "sub");
         String act = actSub(claims);
@@ -494,7 +503,8 @@ final class Pep {
     /**
      * The token's own payload, overlaid with what PingAccess established about it. When
      * PingAccess validated the token its view wins; when the application is unprotected
-     * there is only the payload, decoded and not verified, exactly as in Kong.
+     * there is only the payload, decoded and not verified, which decide() accepts only
+     * under allow_insecure.
      */
     static ObjectNode mergeClaims(ObjectNode fromToken, ObjectNode fromIdentity) {
         ObjectNode out = Json.object();

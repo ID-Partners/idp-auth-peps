@@ -105,9 +105,20 @@ class AuthZenRuleTest {
         }
     }
 
+    /** The demo's posture: a plain-http PDP with a key, unsigned tokens on an unprotected application. */
     static AuthZenRuleConfiguration conf() {
         AuthZenRuleConfiguration c = new AuthZenRuleConfiguration();
         c.authzen_url = "http://pdp:8080";
+        c.authzen_api_key = "k";
+        c.pep_label = "rule-pep";
+        c.allow_insecure = true;
+        return c;
+    }
+
+    /** A configuration fit to run without the escape hatch. */
+    static AuthZenRuleConfiguration secure() {
+        AuthZenRuleConfiguration c = new AuthZenRuleConfiguration();
+        c.authzen_url = "https://pdp.example";
         c.authzen_api_key = "k";
         c.pep_label = "rule-pep";
         return c;
@@ -123,30 +134,39 @@ class AuthZenRuleTest {
 
     // ---------- configuration ----------
 
+    static ValidationException refused(AuthZenRuleConfiguration c) {
+        return assertThrows(ValidationException.class, () -> AuthZenRule.validate(c));
+    }
+
     @Test
     void validatesTheConfigurationAtConfigureTime() {
-        AuthZenRuleConfiguration ok = conf();
-        AuthZenRule.validate(ok);
+        AuthZenRule.validate(conf());
+        AuthZenRule.validate(secure());
 
         AuthZenRuleConfiguration noUrl = conf();
         noUrl.authzen_url = "";
-        assertThrows(ValidationException.class, () -> AuthZenRule.validate(noUrl));
+        refused(noUrl);
         AuthZenRuleConfiguration style = conf();
         style.style = "soap";
-        assertThrows(ValidationException.class, () -> AuthZenRule.validate(style));
+        refused(style);
         AuthZenRuleConfiguration disc = conf();
         disc.pdp_discovery = "federation";
-        assertThrows(ValidationException.class, () -> AuthZenRule.validate(disc));
+        refused(disc);
         AuthZenRuleConfiguration fail = conf();
         fail.fail_mode = "maybe";
-        assertThrows(ValidationException.class, () -> AuthZenRule.validate(fail));
+        refused(fail);
         AuthZenRuleConfiguration ttl = conf();
         ttl.pdp_metadata_ttl = 0;
-        assertThrows(ValidationException.class, () -> AuthZenRule.validate(ttl));
+        refused(ttl);
+        for (int[] t : new int[][]{{0, 1}, {1, 0}}) {
+            AuthZenRuleConfiguration timeouts = conf();
+            timeouts.pdp_timeout_ms = t[0];
+            timeouts.coaz_timeout_ms = t[1];
+            assertTrue(refused(timeouts).getMessage().contains("timeout"));
+        }
         AuthZenRuleConfiguration layers = conf();
         layers.pdp_layers = List.of("resource maybe");
-        ValidationException e = assertThrows(ValidationException.class, () -> AuthZenRule.validate(layers));
-        assertTrue(e.getMessage().contains("pdp_layers"));
+        assertTrue(refused(layers).getMessage().contains("pdp_layers"));
         AuthZenRuleConfiguration nullLayers = conf();
         nullLayers.pdp_layers = null;
         AuthZenRule.validate(nullLayers);
@@ -154,10 +174,145 @@ class AuthZenRuleTest {
         // require_dpop needs somewhere to verify the proof.
         AuthZenRuleConfiguration dpop = conf();
         dpop.require_dpop = true;
-        ValidationException d = assertThrows(ValidationException.class, () -> AuthZenRule.validate(dpop));
-        assertTrue(d.getMessage().contains("coaz_url"));
+        assertTrue(refused(dpop).getMessage().contains("coaz_url"));
         dpop.coaz_url = "http://coaz-pep:9192";
         AuthZenRule.validate(dpop);
+    }
+
+    @Test
+    void aJsonNullForAnEnumIsARefusalNotANullPointerException() {
+        // PingAccess binds a JSON null onto the field, and Set.of(...).contains(null) throws.
+        AuthZenRuleConfiguration style = conf();
+        style.style = null;
+        assertTrue(refused(style).getMessage().contains("style"));
+        AuthZenRuleConfiguration disc = conf();
+        disc.pdp_discovery = null;
+        assertTrue(refused(disc).getMessage().contains("pdp_discovery"));
+        AuthZenRuleConfiguration fail = conf();
+        fail.fail_mode = null;
+        assertTrue(refused(fail).getMessage().contains("fail_mode"));
+    }
+
+    @Test
+    void everyUrlMustBeOneTheRuleCanCall() {
+        String[][] cases = {
+            {"authzen_url", "http://authzen_pdp:8080"}, {"authzen_url", "pdp:8080"}, {"authzen_url", "ftp://pdp.example"},
+            {"authzen_url", "https://pdp.example/?tenant=a"}, {"coaz_url", "coaz-pep:9192"}, {"mcp_upstream_url", "mcp"},
+            {"federation_entity_url", "http://coaz_pep:9192"}, {"resource", "https://api.example/#x"},
+            {"user_token_jwks_url", "/jwks"}, {"pdp_allowlist", "pdp.example"}, {"resource_metadata_allowlist", "https://u:p@api.example"},
+            {"pdp_allowlist", ""}, {"pdp_layers", "http://estate_pdp:8080 fail-open"},
+        };
+        for (String[] c : cases) {
+            AuthZenRuleConfiguration conf = conf();
+            switch (c[0]) {
+                case "authzen_url" -> conf.authzen_url = c[1];
+                case "coaz_url" -> conf.coaz_url = c[1];
+                case "mcp_upstream_url" -> conf.mcp_upstream_url = c[1];
+                case "federation_entity_url" -> conf.federation_entity_url = c[1];
+                case "resource" -> conf.resource = c[1];
+                case "user_token_jwks_url" -> conf.user_token_jwks_url = c[1];
+                case "pdp_allowlist" -> conf.pdp_allowlist = java.util.Arrays.asList(c[1]);
+                case "resource_metadata_allowlist" -> conf.resource_metadata_allowlist = List.of(c[1]);
+                default -> conf.pdp_layers = List.of(c[1]);
+            }
+            ValidationException e = refused(conf);
+            assertTrue(e.getMessage().startsWith(c[0]), c[0] + " " + c[1] + ": " + e.getMessage());
+        }
+        AuthZenRuleConfiguration nullEntry = conf();
+        nullEntry.pdp_allowlist = java.util.Arrays.asList((String) null);
+        assertTrue(refused(nullEntry).getMessage().contains("empty entry"));
+        // Endpoints may carry a path and a query; lists may be null.
+        AuthZenRuleConfiguration ok = conf();
+        ok.coaz_url = "https://coaz-pep.internal:9192";
+        ok.coaz_api_key = "s";
+        ok.mcp_upstream_url = "https://mcp.internal/mcp?v=1";
+        ok.pdp_allowlist = null;
+        ok.resource_metadata_allowlist = null;
+        ok.pdp_layers = List.of("https://estate.example/tenant fail-open", "static", "resource");
+        AuthZenRule.validate(ok);
+    }
+
+    @Test
+    void anMcpRouteWithoutCoazPepIsAConfigurationErrorEvenWithTheEscapeHatch() {
+        AuthZenRuleConfiguration c = conf();
+        c.style = "mcp";
+        assertTrue(refused(c).getMessage().contains("coaz_url"));
+        c.coaz_url = "http://coaz-pep:9192";
+        AuthZenRule.validate(c);
+    }
+
+    @Test
+    void anInsecureSettingIsRefusedUnlessAllowInsecureSaysOtherwise() {
+        java.util.Map<String, java.util.function.Consumer<AuthZenRuleConfiguration>> cases = new java.util.LinkedHashMap<>();
+        cases.put("require_user_login without user_token_jwks_url", c -> c.require_user_login = true);
+        cases.put("without user_token_audience", c -> c.user_token_jwks_url = "https://as.example/jwks");
+        cases.put("user_token_jwks_url is not https", c -> {
+            c.user_token_jwks_url = "http://as.example/jwks";
+            c.user_token_audience = "https://api.example";
+        });
+        cases.put("authzen_api_key would be sent over plain http", c -> c.authzen_url = "http://pdp.example");
+        cases.put("coaz_url without coaz_api_key", c -> c.coaz_url = "https://coaz-pep.example");
+        cases.put("coaz_api_key would be sent over plain http", c -> {
+            c.coaz_url = "http://coaz-pep.example";
+            c.coaz_api_key = "s";
+        });
+        cases.put("forward_access_token would send the access token over plain http", c -> {
+            c.authzen_url = "http://pdp.example";
+            c.authzen_api_key = "";
+            c.forward_access_token = true;
+        });
+        cases.put("pdp_allowlist is empty", c -> c.pdp_discovery = "resource");
+        cases.put("so a resource could name any PDP", c -> {
+            c.pdp_discovery = "authzen";
+            c.pdp_allowlist = null;
+        });
+        cases.put("pdp_discovery_insecure", c -> c.pdp_discovery_insecure = true);
+        cases.put("pdp_ssl_verify is off", c -> c.pdp_ssl_verify = false);
+        for (java.util.Map.Entry<String, java.util.function.Consumer<AuthZenRuleConfiguration>> e : cases.entrySet()) {
+            AuthZenRuleConfiguration c = secure();
+            e.getValue().accept(c);
+            ValidationException x = refused(c);
+            assertTrue(x.getMessage().contains(e.getKey()), e.getKey() + ": " + x.getMessage());
+            assertTrue(x.getMessage().contains("allow_insecure"), "the refusal names the escape hatch");
+            c.allow_insecure = true;
+            AuthZenRule.validate(c);
+        }
+        // What is fit to run needs nothing.
+        AuthZenRuleConfiguration ok = secure();
+        ok.pdp_discovery = "resource";
+        ok.pdp_allowlist = List.of("https://pdp.example");
+        ok.require_user_login = true;
+        ok.user_token_jwks_url = "https://as.example/jwks";
+        ok.user_token_audience = "https://api.example";
+        ok.coaz_url = "https://coaz-pep.example";
+        ok.coaz_api_key = "s";
+        ok.forward_access_token = true;
+        assertTrue(AuthZenRule.insecurities(ok).isEmpty(), String.valueOf(AuthZenRule.insecurities(ok)));
+        AuthZenRule.validate(ok);
+        // A key with nowhere to send it is not a key sent over http.
+        AuthZenRuleConfiguration keyOnly = secure();
+        keyOnly.coaz_api_key = "s";
+        assertTrue(AuthZenRule.insecurities(keyOnly).isEmpty());
+        assertFalse(new AuthZenRuleConfiguration().allow_insecure, "the escape hatch is off unless set");
+        assertTrue(new AuthZenRuleConfiguration().coaz_defaults, "the binding's default table is on unless turned off");
+    }
+
+    @Test
+    void configureWithTheEscapeHatchStillBuildsAWorkingRule() throws Exception {
+        AuthZenRule rule = new AuthZenRule(new FakeTransport(), DIRECT, new CapturingResponses(), () -> 0L);
+        AuthZenRuleConfiguration c = conf();
+        c.pdp_ssl_verify = false;
+        c.pdp_discovery_insecure = true;
+        rule.configure(c);
+        assertEquals(c, rule.getConfiguration());
+        // A refused configuration leaves the rule unconfigured: every request is a 500 deny.
+        AuthZenRule fresh = new AuthZenRule(new FakeTransport(), DIRECT, new CapturingResponses(), () -> 0L);
+        AuthZenRuleConfiguration insecureTls = secure();
+        insecureTls.pdp_ssl_verify = false;
+        assertThrows(ValidationException.class, () -> fresh.configure(insecureTls));
+        assertNull(fresh.getConfiguration(), "validated before it is taken");
+        Fixture f = new Fixture("GET", "/x", fields(), null, null);
+        assertEquals(Outcome.RETURN, fresh.handleRequest(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
     }
 
     @Test
@@ -185,7 +340,7 @@ class AuthZenRuleTest {
     void configureBuildsThePipelineAndDescribesEveryKnob() throws Exception {
         AuthZenRule rule = new AuthZenRule(new FakeTransport(), DIRECT, new CapturingResponses(), () -> 0L);
         AuthZenRuleConfiguration c = conf();
-        c.pdp_ssl_verify = false; // warned about, not refused
+        c.pdp_ssl_verify = false; // allowed under allow_insecure, and logged
         rule.configure(c);
         assertEquals(c, rule.getConfiguration());
         List<ConfigurationField> fields = rule.getConfigurationFields();
@@ -198,13 +353,16 @@ class AuthZenRuleTest {
             "require_user_login", "stepup_scope", "coaz_url", "coaz_api_key", "mcp_upstream_url", "federation_entity_url",
             "pdp_ssl_verify", "coaz_defaults", "legacy_subject_identity", "pdp_discovery", "resource", "pdp_metadata_ttl",
             "pdp_allowlist", "resource_metadata_allowlist", "pdp_discovery_insecure", "forward_access_token", "pdp_layers",
-            "fail_mode", "user_token_jwks_url", "user_token_issuer", "user_token_audience"}) {
+            "fail_mode", "user_token_jwks_url", "user_token_issuer", "user_token_audience", "allow_insecure"}) {
             assertTrue(names.contains(knob), knob);
         }
-        // With a JWKS, the user token is verified; the configuration is still accepted.
-        AuthZenRuleConfiguration verified = conf();
-        verified.user_token_jwks_url = "http://as.example/jwks";
+        // With a JWKS, the user token is verified; without one it is ignored, or decoded
+        // under allow_insecure. Each is a configuration the rule accepts.
+        AuthZenRuleConfiguration verified = secure();
+        verified.user_token_jwks_url = "https://as.example/jwks";
+        verified.user_token_audience = "https://api.example";
         rule.configure(verified);
+        rule.configure(secure());
         AuthZenRuleConfiguration bad = conf();
         bad.style = "nope";
         assertThrows(ValidationException.class, () -> rule.configure(bad));
