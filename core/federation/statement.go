@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
@@ -236,7 +237,13 @@ func usableForSigning(jwk map[string]any) bool {
 
 func validEntityID(s string, allowInsecure bool) bool {
 	u, err := url.Parse(s)
-	if err != nil || !u.IsAbs() || u.Host == "" || u.Fragment != "" || u.RawQuery != "" {
+	if err != nil || !u.IsAbs() || u.Host == "" || u.Fragment != "" || u.RawQuery != "" || u.User != nil {
+		return false
+	}
+	// An identifier is compared byte for byte along the chain and against naming
+	// constraints, while the server it names resolves dot segments: one that could
+	// mean somewhere else is not an identifier.
+	if metafetch.PlainPath(u) != nil {
 		return false
 	}
 	if u.Scheme == "https" {

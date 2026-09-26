@@ -36,10 +36,21 @@ type Policy struct {
 }
 
 // Check applies the policy to raw. trustedOrigin may be "".
+//
+// A path that could be resolved somewhere other than where it reads (PlainPath) and a
+// URL carrying credentials are refused before the allowlist is asked: the allowlist
+// compares what it is given, and should only ever be given a URL that means what it
+// says.
 func (p Policy) Check(raw, trustedOrigin string) error {
 	u, err := url.Parse(raw)
 	if err != nil || !u.IsAbs() || u.Host == "" {
 		return fmt.Errorf("%w: %q is not an absolute URL", ErrNotAllowed, raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%w: %q carries credentials", ErrNotAllowed, u.Redacted())
+	}
+	if err := PlainPath(u); err != nil {
+		return err
 	}
 	switch u.Scheme {
 	case "https":

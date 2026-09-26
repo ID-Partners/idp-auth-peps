@@ -65,7 +65,8 @@ func TestEntityIdentifiersRequireHTTPS(t *testing.T) {
 	if !validEntityID("http://a.example", true) {
 		t.Error("http must be allowed when the operator opted in")
 	}
-	for _, bad := range []string{"", "a.example", "ftp://a.example", "https://a.example#f", "https://a.example?q=1", "https:///nohost"} {
+	for _, bad := range []string{"", "a.example", "ftp://a.example", "https://a.example#f", "https://a.example?q=1", "https:///nohost",
+		"https://a.example/x/../y", "https://a.example/%2e%2e/y", "https://a.example/x%2Fy", "https://u:p@a.example"} {
 		if validEntityID(bad, true) {
 			t.Errorf("%q must not be a valid entity identifier", bad)
 		}

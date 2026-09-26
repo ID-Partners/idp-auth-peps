@@ -511,7 +511,12 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 	} else {
 		// Which resources may be looked up at all is the operator's call, whatever the
 		// source. Checked here, before any cache or fetch, so a refused resource costs
-		// nothing and cannot inherit another caller's cached answer.
+		// nothing and cannot inherit another caller's cached answer — and only once the
+		// identifier cannot mean somewhere other than it says: tenants/a/../b would
+		// pass a prefix match for tenants/a.
+		if err := plainIdentifier(resource); err != nil {
+			return PDPEndpoints{}, err
+		}
 		if c.opts.ResourceAllowed != nil && !c.opts.ResourceAllowed(resource) {
 			return PDPEndpoints{}, fmt.Errorf("%w: %q is outside the resource allowlist", ErrNotAllowed, resource)
 		}
@@ -672,6 +677,17 @@ func (c *Chain) Status() Status {
 		s.Sources = append(s.Sources, src.Name())
 	}
 	return s
+}
+
+// plainIdentifier refuses an identifier whose path could resolve somewhere other than
+// where it reads (see metafetch.PlainPath). One that does not parse is left to the
+// sources, which say why.
+func plainIdentifier(id string) error {
+	u, err := url.Parse(id)
+	if err != nil {
+		return nil
+	}
+	return metafetch.PlainPath(u)
 }
 
 // WellKnownURL applies the RFC 8414 / RFC 9728 / AuthZEN rule: insert
