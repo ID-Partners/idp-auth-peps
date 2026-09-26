@@ -67,8 +67,16 @@ type Options struct {
 	// TTL caps how long a resolved chain is reused; min(exp) over the chain applies
 	// as well. Default 5m.
 	TTL time.Duration
-	// NegativeTTL caches ErrInvalidChain / ErrNotFederated. Default 60s.
+	// MaxStale bounds how long past the TTL a resolved chain is still served while
+	// re-resolving it fails for want of a reachable superior. Never past the chain's own
+	// expiry, and never after a refusal: an invalid chain, a refused fetch or an entity
+	// no superior vouches for replaces the cached chain at once. Default: the TTL.
+	MaxStale time.Duration
+	// NegativeTTL caches ErrInvalidChain / ErrNotAllowed / ErrNotFederated. Default 60s.
 	NegativeTTL time.Duration
+	// FetchTimeout bounds one resolution, which runs detached from the request that
+	// asked for it so a cancelled request cannot fail it for the others. Default 30s.
+	FetchTimeout time.Duration
 	// MaxEntries bounds the resolution cache. Default 1024.
 	MaxEntries int
 	// AllowInsecure permits http Entity Identifiers and endpoints (tests, dev).
@@ -130,6 +138,9 @@ func New(o Options) (*Resolver, error) {
 	if o.NegativeTTL <= 0 {
 		o.NegativeTTL = 60 * time.Second
 	}
+	if o.FetchTimeout <= 0 {
+		o.FetchTimeout = 30 * time.Second
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -153,12 +164,22 @@ func New(o Options) (*Resolver, error) {
 		r.subject = metafetch.New(o.HTTPClient, metafetch.Policy{AllowInsecure: o.AllowInsecure, Allow: o.SubjectAllowed}, "", 0)
 	}
 	r.cache = ttlcache.New[Resolved](ttlcache.Options{
-		TTL: o.TTL, NegativeTTL: o.NegativeTTL, MaxEntries: o.MaxEntries, Now: o.Now,
+		TTL: o.TTL, MaxStale: o.MaxStale, NegativeTTL: o.NegativeTTL, MaxEntries: o.MaxEntries, Now: o.Now,
+		FetchTimeout: o.FetchTimeout, IsRefusal: isRefusal,
 	})
 	return r, nil
 }
 
-// Resolve returns the Resolved Metadata for entityID, from cache when fresh.
+// isRefusal separates the answers that replace a cached chain at once from the outages
+// it may ride out. A chain that no longer validates, a fetch the operator's policy
+// refused, and an entity no superior will vouch for any more are all the federation's
+// (or the operator's) word, not a failure to hear it.
+func isRefusal(err error) bool {
+	return errors.Is(err, ErrInvalidChain) || errors.Is(err, ErrNotAllowed) || errors.Is(err, ErrNotFederated)
+}
+
+// Resolve returns the Resolved Metadata for entityID, from cache when fresh. A cached
+// chain is never returned past its ExpiresAt, and a refusal replaces it.
 func (r *Resolver) Resolve(ctx context.Context, entityID string) (Resolved, error) {
 	return r.cache.Get(ctx, entityID, func(ctx context.Context, id string) (Resolved, time.Time, error) {
 		res, err := r.resolve(ctx, id, nil)

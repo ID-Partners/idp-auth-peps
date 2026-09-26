@@ -574,7 +574,7 @@ func TestStaleServedWhileRefreshFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mid.ecStatus = 500
-	now = now.Add(2 * time.Minute)
+	now = now.Add(90 * time.Second) // past the TTL, inside the default MaxStale (the TTL again)
 	res, err := r.Resolve(ctx(), f.leaf.id)
 	if err != nil || res.TrustAnchor != f.anchor.id {
 		t.Fatalf("stale chain should be served: %v", err)

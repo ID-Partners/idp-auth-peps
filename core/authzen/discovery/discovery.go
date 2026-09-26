@@ -138,6 +138,10 @@ type ResourceMetadata struct {
 	// ParamPolicyLayers array. Empty when the document names none. Each is asked and
 	// must permit before the resource's own PDP is; ResolveLayers does the expansion.
 	Layers []string
+	// ExpiresAt is when the document stops being true: the Trust Chain's min(exp) for
+	// federation metadata, signed_metadata's exp for an RFC 9728 document. Zero when it
+	// carries none. Nothing is served from cache past it.
+	ExpiresAt time.Time
 }
 
 // DefaultEndpoints is the spec-permitted shape for a PDP without metadata.
@@ -364,6 +368,14 @@ type Options struct {
 	// TTL / MinRefresh / MaxEntries tune both caches. Defaults 5m / 30s / 1024.
 	TTL, MinRefresh time.Duration
 	MaxEntries      int
+	// MaxStale bounds how long past the TTL cached metadata is still served while
+	// refreshing it fails. Never past the metadata's own expiry, and never after a
+	// refusal. Default: the TTL.
+	MaxStale time.Duration
+	// FetchTimeout bounds one metadata lookup, which runs detached from the request
+	// that triggered it so a cancelled request cannot fail it for the others. Default
+	// 30s. In federation mode it should not be shorter than the resolver's own.
+	FetchTimeout time.Duration
 	// AllowInsecure permits http for discovered URLs. Same-origin http as StaticPDP is
 	// always permitted.
 	AllowInsecure bool
@@ -406,11 +418,18 @@ func New(o Options) (*Chain, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.FetchTimeout <= 0 {
+		o.FetchTimeout = 30 * time.Second
+	}
 	o.StaticPDP = strings.TrimRight(o.StaticPDP, "/")
 	c := &Chain{opts: o}
 	c.resFetch = metafetch.New(o.HTTPClient, metafetch.Policy{AllowInsecure: o.AllowInsecure, Allow: o.ResourceAllowed}, "", 0)
 	c.pdpFetch = metafetch.New(o.HTTPClient, metafetch.Policy{AllowInsecure: o.AllowInsecure, Allow: o.PDPAllowed}, o.StaticPDP, 0)
-	cacheOpts := ttlcache.Options{TTL: o.TTL, MinRefresh: o.MinRefresh, MaxEntries: o.MaxEntries, Now: o.Now}
+	// A refusal — a URL the policy refused, a chain that does not validate — replaces
+	// whatever was cached at once. Only an outage is ridden out on the last good answer.
+	refused := func(err error) bool { return errors.Is(err, ErrNotAllowed) }
+	cacheOpts := ttlcache.Options{TTL: o.TTL, MaxStale: o.MaxStale, MinRefresh: o.MinRefresh, MaxEntries: o.MaxEntries,
+		FetchTimeout: o.FetchTimeout, IsRefusal: refused, Now: o.Now}
 	// A resource whose metadata cannot be fetched is served by the static PDP for a
 	// while rather than re-fetched on every request: that fetch sits in the request
 	// path, and a down resource must not turn into a slow PEP.
@@ -512,7 +531,7 @@ func (c *Chain) lookupResource(ctx context.Context, resource string) (ResourceMe
 	for _, src := range c.sources {
 		meta, err := src.Lookup(ctx, resource)
 		if err == nil && len(meta.PDPs) > 0 {
-			return meta, time.Time{}, nil
+			return meta, meta.ExpiresAt, nil
 		}
 		switch {
 		case err == nil, errors.Is(err, ErrNoMetadata):

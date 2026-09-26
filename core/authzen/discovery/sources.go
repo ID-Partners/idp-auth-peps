@@ -111,7 +111,7 @@ func (s *FederationSource) Lookup(ctx context.Context, resource string) (Resourc
 	// What travels to the PDP is the RESOLVED metadata: what survived every superior's
 	// metadata_policy, not what the resource wrote. A federation that pins a floor on
 	// the acr a resource may require has pinned it for the PDP too.
-	return ResourceMetadata{Source: "federation", Document: meta, PDPs: pdps, Layers: layers}, nil
+	return ResourceMetadata{Source: "federation", Document: meta, PDPs: pdps, Layers: layers, ExpiresAt: res.ExpiresAt}, nil
 }
 
 func pdpList(raw []any, from string) ([]string, error) {

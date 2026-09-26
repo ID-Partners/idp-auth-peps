@@ -408,7 +408,7 @@ func TestResourceMode(t *testing.T) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 		r.status = 500
-		now = now.Add(2 * time.Minute)
+		now = now.Add(90 * time.Second) // past the TTL, inside the default MaxStale
 		ep, err := c.Resolve(ctx(), r.URL)
 		if err != nil || ep.Identifier != good.URL {
 			t.Fatalf("stale list should be served: %+v %v", ep, err)

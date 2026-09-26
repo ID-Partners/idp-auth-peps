@@ -9,10 +9,24 @@ import (
 	"time"
 )
 
-type clock struct{ t time.Time }
+// clock is safe for concurrent use: fetches run on their own goroutine and may read it
+// while a test moves it.
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c *clock) now() time.Time       { return c.t }
-func (c *clock) tick(d time.Duration) { c.t = c.t.Add(d) }
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) tick(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 func newTest(t *testing.T, o Options) (*Cache[string], *clock) {
 	t.Helper()
@@ -209,7 +223,7 @@ func TestConcurrentCallersShareOneFetch(t *testing.T) {
 
 func TestDefaults(t *testing.T) {
 	c := New[int](Options{})
-	if c.opts.TTL != 5*time.Minute || c.opts.MinRefresh != 30*time.Second || c.opts.MaxEntries != 1024 || c.opts.Now == nil {
+	if c.opts.TTL != 5*time.Minute || c.opts.MaxStale != 5*time.Minute || c.opts.MinRefresh != 30*time.Second || c.opts.MaxEntries != 1024 || c.opts.Now == nil {
 		t.Fatalf("defaults: %+v", c.opts)
 	}
 }
