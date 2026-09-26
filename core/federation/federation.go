@@ -23,6 +23,7 @@ import (
 
 	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
 	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
 // WellKnown is appended to an Entity Identifier to locate its Entity Configuration.
@@ -156,6 +157,12 @@ func New(o Options) (*Resolver, error) {
 		if ta.EntityID == "" || len(ta.Keys) == 0 {
 			return nil, fmt.Errorf("federation: trust anchor %d needs an entity id and keys", i)
 		}
+		if !validEntityID(ta.EntityID, o.AllowInsecure) {
+			return nil, fmt.Errorf("federation: trust anchor %q is not a valid entity identifier", ta.EntityID)
+		}
+		if err := checkAnchorKeys(ta.Keys); err != nil {
+			return nil, fmt.Errorf("federation: trust anchor %s: %v", ta.EntityID, err)
+		}
 		if _, dup := r.anchors[ta.EntityID]; dup {
 			return nil, fmt.Errorf("federation: trust anchor %s listed twice", ta.EntityID)
 		}
@@ -172,6 +179,49 @@ func New(o Options) (*Resolver, error) {
 		FetchTimeout: o.FetchTimeout, IsRefusal: isRefusal,
 	})
 	return r, nil
+}
+
+// checkAnchorKeys refuses at startup what would otherwise fail every resolution, or
+// should never have been there: a key with no kid or a kid another key shares, one that
+// is not published for signatures or cannot be parsed as an EC or RSA public key, and
+// private key material, which has no place in a list of anchors distributed to relying
+// parties.
+func checkAnchorKeys(keys []map[string]any) error {
+	if len(keys) > jose.MaxJWKSKeys {
+		return fmt.Errorf("%d keys, the maximum is %d", len(keys), jose.MaxJWKSKeys)
+	}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		kid, _ := k["kid"].(string)
+		if kid == "" {
+			return fmt.Errorf("every key needs a kid")
+		}
+		if seen[kid] {
+			return fmt.Errorf("kid %q is listed twice", kid)
+		}
+		seen[kid] = true
+		for _, private := range []string{"d", "p", "q", "dp", "dq", "qi", "k"} {
+			if _, present := k[private]; present {
+				return fmt.Errorf("key %q carries private key material (%s): anchor keys are public", kid, private)
+			}
+		}
+		if !usableForSigning(k) {
+			return fmt.Errorf("key %q is not published for signature verification", kid)
+		}
+		var err error
+		switch kty, _ := k["kty"].(string); kty {
+		case "EC":
+			_, err = jose.ECDSAFromJWK(k)
+		case "RSA":
+			_, err = jose.RSAFromJWK(k)
+		default:
+			err = fmt.Errorf("kty %q is not a signing key this resolver verifies with", kty)
+		}
+		if err != nil {
+			return fmt.Errorf("key %q: %v", kid, err)
+		}
+	}
+	return nil
 }
 
 // isRefusal separates the answers that replace a cached chain at once from the outages

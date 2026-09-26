@@ -181,7 +181,13 @@ func (w *walker) get(raw string, client *metafetch.Client) ([]byte, error) {
 		return nil, fmt.Errorf("%w: fetch budget of %d exhausted", ErrInvalidChain, w.r.opts.MaxFetches)
 	}
 	w.budget--
-	return client.Get(w.ctx, raw, contentType)
+	body, err := client.GetTyped(w.ctx, raw, contentType)
+	if errors.Is(err, metafetch.ErrContentType) {
+		// §8.1.2: a statement is served as application/entity-statement+jwt; a response
+		// that is not is not a statement, whatever its body looks like.
+		return nil, fmt.Errorf("%w: %v", ErrInvalidChain, err)
+	}
+	return body, err
 }
 
 // entityConfiguration fetches and verifies the self-issued statement of entityID. A

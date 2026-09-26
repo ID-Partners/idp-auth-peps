@@ -37,6 +37,16 @@ type entity struct {
 	ssHook   func(sub string, hdr, claims map[string]any) // mutate a subordinate statement
 	ecStatus int                                          // non-zero: reply with this status
 	ecBody   string                                       // non-empty: reply with this raw body
+	// Content-Type of the entity configuration and of fetch responses; default
+	// application/entity-statement+jwt.
+	contentType, fetchContentType string
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 type subordinate struct {
@@ -115,6 +125,7 @@ func (e *entity) serveEC(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(e.ecStatus)
 		return
 	}
+	w.Header().Set("Content-Type", orDefault(e.contentType, contentType))
 	if e.ecBody != "" {
 		w.Write([]byte(e.ecBody))
 		return
@@ -123,7 +134,6 @@ func (e *entity) serveEC(w http.ResponseWriter, r *http.Request) {
 	if e.ecHook != nil {
 		e.ecHook(hdr, claims)
 	}
-	w.Header().Set("Content-Type", contentType)
 	w.Write([]byte(e.sign(hdr, claims, e.signWith)))
 }
 
@@ -161,7 +171,7 @@ func (e *entity) serveFetch(w http.ResponseWriter, r *http.Request) {
 	if key == nil {
 		key = e.signWith
 	}
-	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Type", orDefault(e.fetchContentType, contentType))
 	w.Write([]byte(e.sign(hdr, claims, key)))
 }
 

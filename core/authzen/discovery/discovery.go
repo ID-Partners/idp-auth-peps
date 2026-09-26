@@ -325,8 +325,12 @@ func ResourceMetadataOf(eps []PDPEndpoints) *ResourceMetadata {
 //
 //	http://estate.example fail-open, resource
 //
-// An unknown modifier or an unrecognisable name is an error: a policy that cannot be
-// read must not be silently narrowed.
+// An unknown modifier, a second modifier or an unrecognisable name is an error: a
+// policy that cannot be read must not be silently narrowed, nor decided by whichever
+// modifier came last. A PDP identifier is checked here, as ResolvePDP would read it —
+// an absolute http(s) URL with no query, fragment, credentials or dot segments — so a
+// malformed one fails the configuration instead of failing at runtime, where a
+// fail-open layer would be quietly skipped.
 func ParseLayers(raw string) ([]LayerSpec, error) {
 	var out []LayerSpec
 	for _, entry := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' }) {
@@ -335,8 +339,13 @@ func ParseLayers(raw string) ([]LayerSpec, error) {
 			continue
 		}
 		spec := LayerSpec{Name: strings.TrimRight(fields[0], "/")}
-		if spec.Name != LayerResource && spec.Name != LayerStatic && !strings.Contains(spec.Name, "://") {
-			return nil, fmt.Errorf("layer %q is neither static, resource nor a PDP identifier", spec.Name)
+		if spec.Name != LayerResource && spec.Name != LayerStatic {
+			if err := layerIdentifier(spec.Name); err != nil {
+				return nil, fmt.Errorf("layer %q is neither static, resource nor a PDP identifier: %v", spec.Name, err)
+			}
+		}
+		if len(fields) > 2 {
+			return nil, fmt.Errorf("layer %q: %v — a layer takes one failure mode", spec.Name, fields[1:])
 		}
 		for _, mod := range fields[1:] {
 			switch strings.ToLower(mod) {
@@ -353,6 +362,20 @@ func ParseLayers(raw string) ([]LayerSpec, error) {
 		out = append(out, spec)
 	}
 	return out, nil
+}
+
+// layerIdentifier is the shape a PDP identifier must have to be asked at all.
+func layerIdentifier(s string) error {
+	u, err := url.Parse(s)
+	switch {
+	case err != nil || !u.IsAbs() || u.Host == "":
+		return fmt.Errorf("not an absolute URL")
+	case u.Scheme != "https" && u.Scheme != "http":
+		return fmt.Errorf("scheme %q", u.Scheme)
+	case u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.User != nil:
+		return fmt.Errorf("carries a query, a fragment or credentials")
+	}
+	return metafetch.PlainPath(u)
 }
 
 // LayerNames renders specs for logs.

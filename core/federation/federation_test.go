@@ -19,7 +19,7 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(Options{TrustAnchors: []TrustAnchor{{EntityID: "https://a"}}}); err == nil {
 		t.Fatal("anchor without keys must fail")
 	}
-	k := []map[string]any{{"kid": "x"}}
+	k := []map[string]any{newEntity(t).jwk}
 	if _, err := New(Options{TrustAnchors: []TrustAnchor{{EntityID: "https://a", Keys: k}, {EntityID: "https://a", Keys: k}}}); err == nil {
 		t.Fatal("duplicate anchor must fail")
 	}
@@ -556,8 +556,12 @@ func TestFetchPolicy(t *testing.T) {
 	if _, err := r.Resolve(ctx(), f.leaf.id); !errors.Is(err, ErrNotAllowed) {
 		t.Fatalf("leaf refused by SubjectAllowed: %v", err)
 	}
-	// Without AllowInsecure the http fixtures are refused outright.
-	strict, err := New(Options{TrustAnchors: []TrustAnchor{f.anchor.anchor()}})
+	// Without AllowInsecure the http fixtures are refused outright: an http anchor at
+	// startup, an http subject at resolution.
+	if _, err := New(Options{TrustAnchors: []TrustAnchor{f.anchor.anchor()}}); err == nil {
+		t.Fatal("an http anchor needs AllowInsecure")
+	}
+	strict, err := New(Options{TrustAnchors: []TrustAnchor{{EntityID: "https://ta.example", Keys: []map[string]any{f.anchor.jwk}}}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -470,6 +470,7 @@ func newMiniFed(t *testing.T) *miniFed {
 		if f.breakLeafSig {
 			key = f.anchorKey
 		}
+		w.Header().Set("Content-Type", "application/entity-statement+jwt")
 		w.Write([]byte(sign(key, f.leafJWK, map[string]any{
 			"iss": f.leaf.URL, "sub": f.leaf.URL, "iat": now - 10, "exp": now + 3600,
 			"jwks": map[string]any{"keys": []any{f.leafJWK}}, "metadata": meta,
@@ -478,6 +479,7 @@ func newMiniFed(t *testing.T) *miniFed {
 	}))
 	t.Cleanup(f.leaf.Close)
 	f.anchor = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/entity-statement+jwt")
 		if r.URL.Path == "/fetch" {
 			if f.ssStatus != 0 {
 				w.WriteHeader(f.ssStatus)
