@@ -69,11 +69,11 @@ type entry[T any] struct {
 	val T
 	ok  bool
 	// fresh until soft; servable while refreshes fail until staleUntil, which is never
-	// later than hard, the value's own expiry (zero: none).
-	soft, staleUntil, hard time.Time
-	lastAttempt            time.Time
-	lastErr                error
-	negUntil               time.Time
+	// later than the value's own expiry.
+	soft, staleUntil time.Time
+	lastAttempt      time.Time
+	lastErr          error
+	negUntil         time.Time
 	// call is the fetch in flight, nil when there is none.
 	call *call[T]
 }
@@ -224,7 +224,6 @@ func (c *Cache[T]) run(ctx context.Context, e *entry[T], cl *call[T], key string
 // it, and never past exp, the value's own expiry.
 func (e *entry[T]) store(v T, exp, start time.Time, o Options) {
 	e.val, e.ok, e.lastErr, e.negUntil = v, true, nil, time.Time{}
-	e.hard = exp
 	e.soft = start.Add(o.TTL)
 	if !exp.IsZero() && exp.Before(e.soft) {
 		e.soft = exp

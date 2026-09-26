@@ -244,7 +244,10 @@ func (e *Entity) ProtectedResourceMetadata(ctx context.Context) (doc map[string]
 	// The identifier is not the controller's to change, the key set is the one that
 	// verifies the signature below, and whose word this is belongs inside it.
 	doc["resource"] = e.ID
-	doc["jwks_uri"] = e.JWKSURL()
+	delete(doc, "jwks_uri")
+	if uri := e.JWKSURL(); uri != "" {
+		doc["jwks_uri"] = uri
+	}
 	doc["metadata_source"] = source
 	signed, err := e.signMetadata(doc, now, exp)
 	if err != nil {
