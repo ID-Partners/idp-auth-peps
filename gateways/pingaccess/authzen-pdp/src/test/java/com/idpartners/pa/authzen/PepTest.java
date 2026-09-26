@@ -145,17 +145,53 @@ class PepTest {
 
     @Test
     void failsClosedWhenThePdpIsUnreachableOrUnusable() {
-        for (Object r : new Object[]{Boolean.FALSE, 500, 302}) {
+        for (Object r : new Object[]{Boolean.FALSE, 500, 503, 429}) {
             Verdict v = pep(baseConf(), pdp(r)).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
             assertEquals(503, v.status, String.valueOf(r));
-            assertTrue(body(v).get("reason").asText().contains("unreachable"));
+            assertEquals(Pep.UNREACHABLE, body(v).get("reason").asText(), String.valueOf(r));
         }
-        // A 200 that is not a decision is a deny, never a permit.
-        Verdict junk = pep(baseConf(), pdp("not json")).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
-        assertEquals(403, junk.status);
-        assertEquals("Denied by policy.", body(junk).get("reason").asText());
-        Verdict str = pep(baseConf(), pdp(obj("decision", "true"))).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
-        assertEquals(403, str.status, "a string is not a boolean decision");
+        // An answer that is there and unusable is a refusal: closed too, and said differently.
+        byte[] big = new byte[Transport.MAX_RESPONSE + 1];
+        for (Object r : new Object[]{302, 400, 401, 413, "not json", "[true]", obj("decision", "true"), obj("decision", 1), obj("context", obj()),
+            new Transport.Refused("cannot be built"), (Function<Transport.Request, Transport.Response>) q -> new Transport.Response(200, Map.of(), big)}) {
+            Verdict v = pep(baseConf(), pdp(r)).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
+            assertEquals(503, v.status, String.valueOf(r));
+            assertEquals(Pep.REFUSED, body(v).get("reason").asText(), String.valueOf(r));
+            assertFalse(v.permit);
+        }
+    }
+
+    @Test
+    void aFailOpenLayerIsSkippedOnAnOutageAndNeverOnARefusal() {
+        // A rotated key's 401, a client-padded 413, a redirect, an answer that is not a
+        // decision: none says the PDP is down, and none may switch the layer off.
+        for (Object r : new Object[]{302, 400, 401, 403, 413, "not json", obj("decision", "true"), new Transport.Refused("bad URL")}) {
+            AuthZenRuleConfiguration c = discoveryConf();
+            c.pdp_layers = List.of(DOWN + " fail-open", "resource");
+            FakeTransport t = failOpenRoutes(obj("decision", true)).route(DOWN + "/access/v1/evaluation", r);
+            Verdict v = drive(c, t);
+            assertFalse(v.permit, "a refusal (" + r + ") was skipped");
+            assertEquals(503, v.status);
+            assertEquals(0, t.count(GOOD + "/custom/eval"), "nothing after a refusal is asked");
+        }
+        for (Object r : new Object[]{500, 502, 503, 429, Boolean.FALSE}) {
+            AuthZenRuleConfiguration c = discoveryConf();
+            c.pdp_layers = List.of(DOWN + " fail-open", "resource");
+            Verdict v = drive(c, failOpenRoutes(obj("decision", true)).route(DOWN + "/access/v1/evaluation", r));
+            assertTrue(v.permit, "an outage (" + r + ") on a fail-open layer is skipped");
+            assertEquals(DOWN, v.responseHeaders.get("X-PDP-Fail-Open"), "named by identifier, never by error text");
+        }
+    }
+
+    @Test
+    void refusesToSendAnEvaluationRequestPastItsBound() {
+        FakeTransport t = pdp(obj("decision", true));
+        AuthZenRuleConfiguration c = baseConf();
+        c.forward_access_token = true;
+        String padded = jwt(obj("sub", "alice", "pad", "x".repeat(Pep.MAX_EVALUATION)));
+        Verdict v = pep(c, t).decide(req("GET", "/accounts/a/balance", Map.of("authorization", "Bearer " + padded), null));
+        assertEquals(413, v.status);
+        assertEquals(0, t.count("/access/v1/evaluation"), "never sent");
     }
 
     @Test
@@ -241,6 +277,9 @@ class PepTest {
         assertEquals(401, err.status);
         Verdict junk = (Verdict) withVerifier("not json", COAZ)[0];
         assertEquals(401, junk.status);
+        Verdict refused = (Verdict) withVerifier(new Transport.Refused("cannot be built"), COAZ)[0];
+        assertEquals(401, refused.status);
+        assertTrue(body(refused).get("reason").asText().contains("failed"));
     }
 
     @Test
@@ -433,12 +472,31 @@ class PepTest {
     }
 
     @Test
+    void theFederationRelayFailsClosedOnARefusalToo() {
+        FakeTransport t = pdp(obj("decision", true)).route(COAZ + "/.well-known/openid-federation", new Transport.Refused("too large"));
+        AuthZenRuleConfiguration c = baseConf();
+        c.federation_entity_url = COAZ;
+        Verdict v = pep(c, t).decide(req("GET", "/.well-known/openid-federation", Map.of(), null));
+        assertEquals(503, v.status);
+        assertEquals("federation_entity_unavailable", body(v).get("error").asText());
+    }
+
+    @Test
     void failsClosedWhenTheEngineIsUnreachableOrErrors() {
         Verdict down = (Verdict) mcpRoute(Boolean.FALSE, null)[0];
         assertEquals(503, down.status);
         assertTrue(body(down).get("reason").asText().contains("unreachable"));
         Verdict err = (Verdict) mcpRoute((Function<Transport.Request, Transport.Response>) r -> FakeTransport.json(500, "boom"), null)[0];
         assertEquals(503, err.status);
+        assertTrue(body(err).get("reason").asText().contains("unreachable"));
+        // A refusal is closed as well, and said differently: a wrong CHECK_API_TOKEN is
+        // not an outage.
+        for (Object r : new Object[]{401, 400, 302, obj("decision", "true"), "[]", new Transport.Refused("cannot be built")}) {
+            Verdict v = (Verdict) mcpRoute(r, null)[0];
+            assertEquals(503, v.status, String.valueOf(r));
+            assertFalse(v.permit);
+            assertTrue(body(v).get("reason").asText().contains("refused"), String.valueOf(r));
+        }
     }
 
     @Test
@@ -714,7 +772,7 @@ class PepTest {
         Verdict v = drive(c, t);
         assertTrue(v.permit);
         assertEquals(GOOD + "/custom/eval", t.last().url());
-        assertTrue(v.responseHeaders.get("X-PDP-Fail-Open").startsWith(DOWN));
+        assertEquals(DOWN, v.responseHeaders.get("X-PDP-Fail-Open"));
         assertEquals("PERMIT", v.responseHeaders.get("X-PDP-Decision"));
         // Nothing skipped, no marker.
         AuthZenRuleConfiguration clean = discoveryConf();
@@ -741,7 +799,13 @@ class PepTest {
         all.pdp_layers = List.of(DOWN);
         Verdict av = drive(all, failOpenRoutes(obj("decision", true)));
         assertTrue(av.permit);
-        assertTrue(av.responseHeaders.get("X-PDP-Reason").contains("fail-open"));
+        assertEquals("fail-open: no policy layer could be reached", av.responseHeaders.get("X-PDP-Reason"), "no error text on the wire");
+        // A layer whose discovery is down is skipped and named the same way.
+        AuthZenRuleConfiguration meta = discoveryConf();
+        meta.pdp_layers = List.of("https://meta-down.example fail-open", "resource");
+        Verdict mv = drive(meta, failOpenRoutes(obj("decision", true)).route("https://meta-down.example", 503));
+        assertTrue(mv.permit);
+        assertEquals("https://meta-down.example", mv.responseHeaders.get("X-PDP-Fail-Open"));
     }
 
     @Test

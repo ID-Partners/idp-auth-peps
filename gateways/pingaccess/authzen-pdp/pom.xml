@@ -137,16 +137,17 @@
         </configuration>
       </plugin>
       <!--
-        Coverage ratchet, the same contract as the Go, Lua and TypeScript gates. Two
-        things are deliberately excluded, and only these two, each because it needs a
-        running PingAccess or a socket rather than because it is hard:
+        Coverage ratchet, the same contract as the Go, Lua and TypeScript gates. One
+        class is excluded, because it needs a running PingAccess rather than because it
+        is hard:
 
           PaResponses    builds a com.pingidentity.pa.sdk.http.Response through the
                          SDK's ResponseBuilder, whose implementation is registered by
-                         the engine at boot. Exercised by the live-server run in demo/.
-          JdkTransport   opens real sockets; its request/response mapping is covered
-                         against a loopback server, but the trust-all TLS path can
-                         only be tried against a TLS endpoint.
+                         the engine at boot. Exercised by the live-server run in demo/
+                         (every deny the demo shows is written by it).
+
+        The trust-all TLS client behind pdp_ssl_verify=false is not excluded: the unit
+        suite runs it against a loopback TLS server with a self-signed certificate.
       -->
       <plugin>
         <groupId>org.jacoco</groupId>
@@ -169,7 +170,6 @@
             <configuration>
               <excludes>
                 <exclude>com/idpartners/pa/authzen/PaResponses.class</exclude>
-                <exclude>com/idpartners/pa/authzen/JdkTransport$Insecure.class</exclude>
               </excludes>
               <rules>
                 <rule>

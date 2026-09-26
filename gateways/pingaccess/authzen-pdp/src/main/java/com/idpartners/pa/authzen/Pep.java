@@ -46,6 +46,10 @@ final class Pep {
     private static final String JSON = "application/json";
     private static final String DEFAULT_DOCTYPE = "org.iso.18013.5.1.mDL";
     private static final String LOGIN_ACR = "urn:pingidentity:loa:password";
+    /** The largest evaluation request the rule will send: well over any real one, and under what a client could pad one to. */
+    static final int MAX_EVALUATION = 2 * 1024 * 1024;
+    static final String UNREACHABLE = "Authorization service unreachable; denying (fail-closed).";
+    static final String REFUSED = "Authorization service refused the request; denying (fail-closed).";
 
     private final AuthZenRuleConfiguration conf;
     private final Transport transport;
@@ -193,46 +197,39 @@ final class Pep {
         }
 
         // 4) ask each layer in order. Every layer must permit; the first that does not
-        //    is the answer, advice and all. A PDP error fails closed unless the layer is
-        //    fail-open, in which case it is skipped and named. A deny is never skipped.
+        //    is the answer, advice and all. An unavailable PDP fails closed unless the
+        //    layer is fail-open, in which case it is skipped and named. A deny is never
+        //    skipped, and neither is a refusal: a 4xx, a redirect or an answer that is not
+        //    a decision says nothing about the PDP being down, and a client must not be
+        //    able to switch a layer off by provoking one.
         byte[] body = Json.bytes(authzenReq);
+        if (body.length > MAX_EVALUATION) {
+            log.error("the evaluation request is {} bytes, over the {}-byte bound; refusing to send it", body.length, MAX_EVALUATION);
+            return deny(pep, 413, "The request is too large for the gateway to authorise.", null);
+        }
         List<String> skipped = new ArrayList<>(layers.skipped());
         boolean decided = false;
         boolean decision = false;
         ObjectNode dctx = Json.object();
         String reason = null;
         for (Discovery.Endpoints ep : layers.pdps()) {
-            Map<String, String> h = new LinkedHashMap<>();
-            h.put("Content-Type", JSON);
-            if (ep.apiKey != null) {
-                h.put("Authorization", "Bearer " + ep.apiKey); // bound to the PDP it was configured for
+            Answer a = ask(ep, body);
+            if (a.refused != null) {
+                log.error("PDP layer {} refused: {}; denying (a refusal never fails open)", ep.identifier, a.refused);
+                return deny(pep, 503, REFUSED, null);
             }
-            Transport.Response res = null;
-            String failure = null;
-            try {
-                res = transport.send(new Transport.Request("POST", ep.evaluation, h, body, conf.pdp_timeout_ms, conf.pdp_ssl_verify));
-                if (res.status() < 200 || res.status() >= 300) {
-                    failure = "returned " + res.status();
-                }
-            } catch (IOException e) {
-                failure = String.valueOf(e.getMessage());
-            }
-            if (failure != null) {
+            if (a.unavailable != null) {
                 if (!ep.failOpen) {
-                    log.error("PDP call failed ({}): {}", ep.identifier, failure);
-                    return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).", null);
+                    log.error("PDP layer {} unavailable: {}; denying (fail-closed)", ep.identifier, a.unavailable);
+                    return deny(pep, 503, UNREACHABLE, null);
                 }
-                log.warn("PDP layer {} failed open: {}", ep.identifier, failure);
-                skipped.add(ep.identifier + " (" + failure + ")");
+                log.warn("PDP layer {} unavailable, failing open: {}", ep.identifier, a.unavailable);
+                skipped.add(ep.identifier);
                 continue;
             }
             decided = true;
-            JsonNode data = Json.parse(res.body());
-            JsonNode d = data == null ? Json.object() : data;
-            JsonNode dec = d.get("decision");
-            decision = dec != null && dec.isBoolean() && dec.booleanValue();
-            JsonNode c = d.get("context");
-            ObjectNode lctx = c instanceof ObjectNode ? (ObjectNode) c : Json.object();
+            decision = a.decision;
+            ObjectNode lctx = a.context;
             String r = Json.text(lctx, "reason");
             String lreason = r != null ? r : decision ? "Permitted by policy." : "Denied by policy.";
             if (!decision) {
@@ -250,7 +247,7 @@ final class Pep {
         if (!decided) {
             decision = true;
             dctx = Json.object();
-            reason = "fail-open: no policy layer could be reached (" + String.join("; ", skipped) + ")";
+            reason = "fail-open: no policy layer could be reached";
         }
         String failOpen = null;
         if (!skipped.isEmpty()) {
@@ -310,6 +307,48 @@ final class Pep {
         return Verdict.permit(upstream, rh);
     }
 
+    // ---------- asking a PDP ----------
+
+    /**
+     * One layer's answer. Exactly one of three: a decision with its context, unavailable
+     * (a transport failure, a timeout, a 5xx or a 429: the only thing a fail-open layer
+     * may skip), or refused (a 3xx or another 4xx, an answer that is not a decision, a
+     * call that could not be made).
+     */
+    record Answer(boolean decision, ObjectNode context, String unavailable, String refused) {
+    }
+
+    private Answer ask(Discovery.Endpoints ep, byte[] body) {
+        Map<String, String> h = new LinkedHashMap<>();
+        h.put("Content-Type", JSON);
+        if (ep.apiKey != null) {
+            h.put("Authorization", "Bearer " + ep.apiKey); // bound to the PDP it was configured for
+        }
+        Transport.Response res;
+        try {
+            res = transport.send(new Transport.Request("POST", ep.evaluation, h, body, conf.pdp_timeout_ms, conf.pdp_ssl_verify));
+        } catch (IOException e) {
+            return new Answer(false, null, String.valueOf(e.getMessage()), null);
+        } catch (Transport.Refused e) {
+            return new Answer(false, null, null, e.getMessage());
+        }
+        if (res.unavailable()) {
+            return new Answer(false, null, "HTTP " + res.status(), null);
+        }
+        if (!res.ok()) {
+            return new Answer(false, null, null, "HTTP " + res.status());
+        }
+        // A permit is the JSON boolean true and nothing else; an answer without a boolean
+        // decision is not a deny either, it is not an answer.
+        JsonNode d = Json.parse(res.body());
+        JsonNode dec = d instanceof ObjectNode ? d.get("decision") : null;
+        if (dec == null || !dec.isBoolean()) {
+            return new Answer(false, null, null, "the answer is not a decision");
+        }
+        JsonNode c = d.get("context");
+        return new Answer(dec.booleanValue(), c instanceof ObjectNode ? (ObjectNode) c : Json.object(), null, null);
+    }
+
     // ---------- the delegated checks ----------
 
     private Verdict verifyDpop(PepRequest req, String pep) {
@@ -335,8 +374,11 @@ final class Pep {
             res = transport.send(new Transport.Request("POST", conf.coaz_url + "/v1/dpop/verify",
                 coazHeaders(), Json.bytes(body), 5000, conf.pdp_ssl_verify));
         } catch (IOException e) {
-            log.error("DPoP verification call failed: {}", e.getMessage());
+            log.error("DPoP verification unavailable: {}", e.getMessage());
             return deny(pep, 401, "DPoP verification service unreachable; denying (fail-closed).", null);
+        } catch (Transport.Refused e) {
+            log.error("DPoP verification call refused: {}", e.getMessage());
+            return deny(pep, 401, "DPoP verification failed; denying (fail-closed).", null);
         }
         if (res.status() != 200) {
             log.error("DPoP verification returned {}", res.status());
@@ -389,19 +431,24 @@ final class Pep {
             res = transport.send(new Transport.Request("POST", conf.coaz_url + "/v1/mcp/check",
                 coazHeaders(), Json.bytes(body), conf.coaz_timeout_ms, conf.pdp_ssl_verify));
         } catch (IOException e) {
-            log.error("coaz-pep engine call failed: {}", e.getMessage());
+            log.error("coaz-pep engine unavailable: {}", e.getMessage());
             return deny(pep, 503, "COAZ authorization engine unreachable; denying (fail-closed).", null);
+        } catch (Transport.Refused e) {
+            log.error("coaz-pep engine call refused: {}", e.getMessage());
+            return deny(pep, 503, "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
         if (res.status() != 200) {
-            log.error("coaz-pep engine call failed: {}", res.status());
-            return deny(pep, 503, "COAZ authorization engine unreachable; denying (fail-closed).", null);
+            log.error("coaz-pep engine returned {}", res.status());
+            return deny(pep, 503, res.unavailable() ? "COAZ authorization engine unreachable; denying (fail-closed)."
+                : "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
         JsonNode verdict = Json.parse(res.body());
-        if (!(verdict instanceof ObjectNode)) {
-            verdict = Json.object();
+        JsonNode dec = verdict instanceof ObjectNode ? verdict.get("decision") : null;
+        if (dec == null || !dec.isBoolean()) {
+            log.error("coaz-pep engine answered without a boolean decision");
+            return deny(pep, 503, "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
-        JsonNode dec = verdict.get("decision");
-        if (dec != null && dec.isBoolean() && dec.booleanValue()) {
+        if (dec.booleanValue()) {
             Map<String, String> rh = stringMap(verdict.get("response_headers"));
             String action = rh.getOrDefault("X-PDP-Action", fallbackAction);
             return Verdict.permit(stringMap(verdict.get("upstream_headers")),
@@ -425,7 +472,7 @@ final class Pep {
         Transport.Response res;
         try {
             res = transport.send(new Transport.Request("GET", conf.federation_entity_url + path, Map.of(), null, 5000, conf.pdp_ssl_verify));
-        } catch (IOException e) {
+        } catch (IOException | Transport.Refused e) {
             log.error("federation entity relay failed: {}", e.getMessage());
             return Verdict.respond(503, headers(JSON), "{\"error\":\"federation_entity_unavailable\"}".getBytes(StandardCharsets.UTF_8), null);
         }
