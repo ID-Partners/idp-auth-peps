@@ -583,6 +583,72 @@ describe('discovery: fail-open through access()', function()
   end)
 end)
 
+describe('fail-open covers unavailability only', function()
+  -- Contract section 3. A layer that cannot be reached may be skipped when its rule says
+  -- so; a layer that answered and refused, or answered something unreadable, may not.
+  -- Otherwise a 401 from a rotated key, a client-provoked 400 or an empty POST would
+  -- all quietly drop a layer.
+  local DOWN = 'https://down.example'
+  local function drive(down_answer, over, resource_doc)
+    local fn = router({
+      [RES .. '/.well-known/oauth-protected-resource'] = resource_doc
+        or { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [GOOD .. '/custom/eval'] = { decision = true },
+      [DOWN .. '/.well-known/authzen-configuration'] = 404,
+      [DOWN .. '/access/v1/evaluation'] = down_answer,
+    })
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a1/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = fn,
+    })
+    local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES,
+      access_token_verified_upstream = true, pdp_layers = { DOWN .. ' fail-open', 'resource' } }
+    for k, v in pairs(over or {}) do c[k] = v end
+    mock.proxy(plugin, c)
+    return state
+  end
+
+  it('skips a fail-open layer that is unreachable, erroring or rate-limiting', function()
+    for _, answer in ipairs({ false, 500, 502, 503, 429 }) do
+      local state = drive(answer)
+      assert.is_nil(state.exited, tostring(answer))
+      assert.matches('^' .. DOWN:gsub('%p', '%%%0'), state.response_headers['X-PDP-Fail-Open'])
+    end
+  end)
+
+  it('never skips a refusal: a 3xx or 4xx is closed whatever the layer says, and logged as a refusal', function()
+    for _, answer in ipairs({ 400, 401, 403, 404, 413, 302 }) do
+      local state = drive(answer)
+      assert.equal(503, state.exited.status, tostring(answer))
+      assert.matches('refused', table.concat(state.logs, '\n'), 1, true)
+      assert.equal('DENY', state.response_headers['X-PDP-Decision'])
+    end
+  end)
+
+  it('never skips an answer it cannot read: an unreadable 2xx, or a decision that is not a boolean', function()
+    for _, answer in ipairs({ 'not json', '[]', '{"decision":"true"}', '{"decision":1}', '{}', '{"decision":null}' }) do
+      local state = drive(function() return { status = 200, body = answer } end)
+      assert.equal(503, state.exited.status, answer)
+    end
+  end)
+
+  it('a request it cannot encode is refused, and never sent empty', function()
+    -- 1e999 is valid JSON and decodes to inf, which JSON cannot carry back out: the
+    -- evaluation cannot be encoded. It used to go out as an empty POST, the PDP answered
+    -- 400, and a fail-open layer was skipped.
+    local doc = function()
+      return { status = 200, body = '{"resource":"' .. RES .. '","authzen_policy_decision_points":["' .. GOOD .. '"],"limit":1e999}' }
+    end
+    local state = drive(false, { pdp_layers = { 'resource fail-open' } }, doc)
+    assert.equal(503, state.exited.status)
+    for _, r in ipairs(state.pdp_requests) do
+      assert.is_nil(r.url:find('/custom/eval', 1, true), 'nothing may be sent to the PDP')
+    end
+  end)
+end)
+
 describe('federation entity relay', function()
   it('serves the two well-known documents from coaz-pep, and nothing else', function()
     local fn = router({

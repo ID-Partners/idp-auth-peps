@@ -101,35 +101,38 @@ local function debug(conf, ...)
   if conf.enable_debug_logging then kong.log.debug(...) end
 end
 
--- One layer's availability failure, under its rule: fail-open skips the layer and names
--- it; fail-closed denies, with the reason a client can act on when there is one.
+-- One layer that could not be reached, under its rule: fail-open skips the layer and
+-- names it; fail-closed denies, with the reason a client can act on when there is one.
+-- A 429 answers this request only: the next is asked afresh.
 local function fail_layer(c, ep, detail, skipped, phase)
-  if detail.kind == "rate_limited" then sideband.block(ep.identifier, detail.retry_after) end
   if ep.fail_open then
-    kong.log.warn("PDP layer ", ep.identifier, " failed open (", phase, "): ", detail.msg)
+    kong.log.warn("PDP layer ", ep.identifier, " unavailable (", phase, "): ", detail.msg, "; skipped (fail-open)")
     skipped[#skipped + 1] = ep.identifier .. " (" .. detail.msg .. ")"
     return
   end
-  kong.log.err("PDP layer ", ep.identifier, " failed (", phase, "): ", detail.msg)
+  kong.log.err("PDP layer ", ep.identifier, " unavailable (", phase, "): ", detail.msg, "; denying (fail-closed)")
   c.decision, c.layer = "DENY", ep.identifier
-  if detail.kind == "rate_limited" then
+  if detail.retry_after then
     return deny(c, 429, "Authorization service is rate-limiting this gateway; denying (fail-closed).",
       { ["Retry-After"] = tostring(detail.retry_after) })
   end
-  return deny(c, 503, "Authorization service unreachable; denying (fail-closed).")
+  return deny(c, 503, "Authorization service unavailable; denying (fail-closed).")
 end
 
--- ask posts one payload to one layer, honouring a rate-limit block, and classifies the
--- answer with `classify`.
+-- One layer that answered and refused (a 3xx or 4xx, an answer it cannot read, a call it
+-- could not make): closed, whatever the layer's rule. A refusal is not an outage.
+local function refuse(c, ep, detail, phase)
+  kong.log.err("PDP layer ", ep.identifier, " refused the ", phase, " call: ", detail.msg, "; denying (fail-closed)")
+  c.decision, c.layer = "DENY", ep.identifier
+  return deny(c, 503, "Authorization service refused the request; denying (fail-closed).")
+end
+
+-- ask posts one payload to one layer and classifies the answer with `classify`.
 local function ask(conf, ep, path, payload, classify)
   local who = ep.identifier
-  local wait = sideband.blocked_for(who)
-  if wait then
-    return "failure", { kind = "rate_limited", msg = who .. " rate-limited this PEP (retry after " .. wait .. "s)", retry_after = wait }
-  end
   debug(conf, "sideband ", path, " to ", who, " (", ep.source, ")")
-  local res, err = sideband.post(who .. path, payload, conf, credential_for(conf, who))
-  return classify(res, err, who)
+  local res, err, unencodable = sideband.post(who .. path, payload, conf, credential_for(conf, who))
+  return classify(res, err, who, unencodable)
 end
 
 function SidebandPDP:access(conf)
@@ -159,8 +162,10 @@ function SidebandPDP:access(conf)
   local current, asked = original, {}
   for _, ep in ipairs(eps) do
     local verdict, detail = ask(conf, ep, sideband.REQUEST_PATH, current, sideband.classify)
-    if verdict == "failure" then
+    if verdict == "unavailable" then
       fail_layer(c, ep, detail, skipped, "request")
+    elseif verdict == "refusal" then
+      return refuse(c, ep, detail, "request")
     elseif verdict == "deny" then
       -- The policy's answer is the HTTP to send. Verbatim: what the client needs to
       -- resolve this — a WWW-Authenticate challenge, a body it can read — is the
@@ -201,8 +206,10 @@ function SidebandPDP:response(conf)
     local a = asked[i]
     if not a.ep.request_only then
       local verdict, detail = ask(conf, a.ep, sideband.RESPONSE_PATH, sideband.response_payload(current, a), sideband.classify_response)
-      if verdict == "failure" then
+      if verdict == "unavailable" then
         fail_layer(c, a.ep, detail, skipped, "response")
+      elseif verdict == "refusal" then
+        return refuse(c, a.ep, detail, "response")
       else
         current, filtered = detail, filtered + 1
       end

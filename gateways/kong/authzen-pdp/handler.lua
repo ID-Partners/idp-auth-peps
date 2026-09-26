@@ -83,7 +83,9 @@ local function extract_token(auth_header)
   return token, scheme:lower()
 end
 
+-- Every denial this plugin makes is marked as one (header_filter adds X-PDP-*).
 local function deny(pep, status, reason, headers)
+  kong.ctx.plugin.pep, kong.ctx.plugin.decision = pep, "DENY"
   local h = { ["Content-Type"] = "application/json" }
   for k, v in pairs(headers or {}) do h[k] = v end
   return kong.response.exit(status, {
@@ -207,7 +209,6 @@ local function delegate(conf, pep)
   c.pep = pep
   local headers, hstatus, hreason = request_headers()
   if not headers then
-    c.decision = "DENY"
     return deny(pep, hstatus, hreason)
   end
   local method = kong.request.get_method()
@@ -225,7 +226,6 @@ local function delegate(conf, pep)
     if mcp then
       return rpc_refusal(pep, 413, -32600, "Invalid Request: request body too large for the PEP to authorise")
     end
-    c.decision = "DENY"
     return deny(pep, 413, "The request body is too large for the gateway to authorise.")
   end
   if mcp then
@@ -406,13 +406,11 @@ local function native(conf, pep)
   end
   if misconfigured then
     kong.log.err("route misconfigured: ", misconfigured, "; denying (fail-closed)")
-    c.decision = "DENY"
     return deny(pep, 503, "Authorization is not configured correctly on this route; denying (fail-closed).")
   end
 
   local headers, hstatus, hreason = request_headers()
   if not headers then
-    c.decision = "DENY"
     return deny(pep, hstatus, hreason)
   end
 
@@ -509,11 +507,17 @@ local function native(conf, pep)
 
   -- 4) ask each layer in order. Every layer must permit; the first that does not is
   --    the answer, advice and all, and later layers are not consulted — a generic
-  --    layer is a gate in front of a specific one. A PDP error fails closed unless the
-  --    layer is fail-open, in which case it is skipped and named; if every layer was
-  --    skipped the request is permitted and marked. A deny is never skipped.
+  --    layer is a gate in front of a specific one. A layer whose PDP is unavailable (no
+  --    answer, a 5xx, a 429) fails closed unless it is fail-open, in which case it is
+  --    skipped and named; if every layer was skipped the request is permitted and
+  --    marked. A deny is never skipped, and nor is a refusal: a PDP that answered a 3xx
+  --    or 4xx, or with no boolean decision, or a request that could not be encoded.
   local body = cjson.encode(authzen_req)
-  local data, decision, reason
+  if not body then
+    kong.log.err("the evaluation request could not be encoded (a value JSON cannot carry); refused, denying (fail-closed)")
+    return deny(pep, 503, "Authorization service refused the request; denying (fail-closed).")
+  end
+  local decision, reason
   local dctx = {}
   local decided = false
   for _, ep in ipairs(eps) do
@@ -529,17 +533,26 @@ local function native(conf, pep)
       },
       ssl_verify = conf.pdp_ssl_verify ~= false,
     })
-    local failure = (not res and tostring(err)) or (res.status and (res.status < 200 or res.status >= 300) and ("returned " .. res.status)) or nil
-    if failure then
-      if not ep.fail_open then
-        kong.log.err("PDP call failed (", ep.identifier, "): ", failure)
-        return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).")
+    local kind, detail = contract.classify(res, err)
+    local data
+    if kind == "answer" then
+      data = cjson.decode(res.body)
+      if not contract.is_object(data) or type(data.decision) ~= "boolean" then
+        kind, detail = "refusal", "answered " .. tostring(res.status) .. " with no boolean decision"
       end
-      kong.log.warn("PDP layer ", ep.identifier, " failed open: ", failure)
-      skipped[#skipped + 1] = ep.identifier .. " (" .. failure .. ")"
+    end
+    if kind == "refusal" then
+      kong.log.err("PDP ", ep.identifier, " refused the evaluation (", detail, "); denying (fail-closed)")
+      return deny(pep, 503, "Authorization service refused the request; denying (fail-closed).")
+    elseif kind == "unavailable" then
+      if not ep.fail_open then
+        kong.log.err("PDP ", ep.identifier, " unavailable (", detail, "); denying (fail-closed)")
+        return deny(pep, 503, "Authorization service unavailable; denying (fail-closed).")
+      end
+      kong.log.warn("PDP layer ", ep.identifier, " unavailable (", detail, "); skipped (fail-open)")
+      skipped[#skipped + 1] = ep.identifier .. " (" .. detail .. ")"
     else
       decided = true
-      data = cjson.decode(res.body) or {}
       decision = data.decision == true
       local lctx = (contract.is_object(data.context) and data.context) or {}
       local lreason = contract.str(lctx.reason) or (decision and "Permitted by policy." or "Denied by policy.")

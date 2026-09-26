@@ -16,7 +16,6 @@ local function load_plugin(opts)
   local state = mock.install(opts)
   package.loaded['kong.plugins.sideband-pdp.handler'] = nil
   local plugin = assert(loadfile('sideband-pdp/handler.lua'))()
-  package.loaded['kong.plugins.sideband-pdp.sideband']._reset()
   return plugin, state
 end
 
@@ -250,17 +249,31 @@ describe('fail rules in the request phase', function()
     end
   end)
 
-  it('treats a 401 from the API as a failure and says what it probably is', function()
-    local fn = router({ [PAZ .. '/sideband/request'] = function() return { status = 401, body = '{"message":"no secret"}' } end })
-    local _, state = drive({}, { pdp = fn })
-    assert.equal(503, state.exited.status)
-    assert.matches('shared secret', table.concat(state.logs, '\n'))
+  it('a 401 or 403 from the API is a refusal: closed even on a fail-open layer, and says what it probably is', function()
+    for _, status in ipairs({ 401, 403 }) do
+      local fn = router({ [PAZ .. '/sideband/request'] = function() return { status = status, body = '{"message":"no secret"}' } end })
+      local _, state = drive({ fail_mode = 'open' }, { pdp = fn })
+      assert.equal(503, state.exited.status)
+      local logs = table.concat(state.logs, '\n')
+      assert.matches('shared secret', logs)
+      assert.matches('refused', logs)
+    end
   end)
 
-  it('fails closed on an unreadable answer', function()
-    local fn = router({ [PAZ .. '/sideband/request'] = 'not json' })
-    local _, state = drive({}, { pdp = fn })
-    assert.equal(503, state.exited.status)
+  it('any other 3xx or 4xx is a refusal too, never skipped', function()
+    for _, status in ipairs({ 400, 404, 302 }) do
+      local fn = router({ [PAZ .. '/sideband/request'] = status })
+      local _, state = drive({ fail_mode = 'open' }, { pdp = fn })
+      assert.equal(503, state.exited.status, tostring(status))
+    end
+  end)
+
+  it('fails closed on an unreadable answer, whatever the layer\'s rule', function()
+    for _, mode in ipairs({ 'closed', 'open' }) do
+      local fn = router({ [PAZ .. '/sideband/request'] = 'not json' })
+      local _, state = drive({ fail_mode = mode }, { pdp = fn })
+      assert.equal(503, state.exited.status, mode)
+    end
   end)
 
   it('open on the route: the layer is skipped and the permit says so', function()
@@ -274,26 +287,24 @@ describe('fail rules in the request phase', function()
     assert.matches('^' .. PAZ:gsub('%p', '%%%0'), state.response_headers['X-PDP-Fail-Open'])
   end)
 
-  it('a rate-limiting PDP is not asked again until Retry-After has passed', function()
+  it('a 429 answers the request that received it, and no other', function()
+    -- Blocking the PDP for the whole worker until Retry-After let one client's burst
+    -- deny every other client's traffic.
     local calls = 0
-    local fn = router({ [PAZ .. '/sideband/request'] = function()
+    local fn = router({ [PAZ .. '/sideband/request'] = function(url, req)
       calls = calls + 1
-      return { status = 429, headers = { ['Retry-After'] = '7' }, body = '' }
+      if calls == 1 then return { status = 429, headers = { ['Retry-After'] = '7' }, body = '' } end
+      return permit()(url, req)
     end })
     local plugin, state, c = drive({}, { pdp = fn })
     assert.equal(429, state.exited.status)
     assert.equal('7', state.exited.headers['Retry-After'])
-    assert.equal(1, calls)
-    -- Within the window: denied without a call.
-    _G.kong.ctx.plugin = {}
-    mock.run_access(plugin, c)
-    assert.equal(429, state.exited.status)
-    assert.equal(1, calls)
-    -- After it: asked again.
-    state.now = state.now + 8
+    -- The next request, within that window, is asked and decided on its own merits.
+    state.exited = nil
     _G.kong.ctx.plugin = {}
     mock.run_access(plugin, c)
     assert.equal(2, calls)
+    assert.is_nil(state.exited)
   end)
 
   it('a rate-limited fail-open layer is skipped', function()
@@ -336,17 +347,16 @@ describe('layers', function()
     assert.is_nil(state.exited.headers['X-PDP-Layers'])
   end)
 
-  it('a discovered or configured PDP never gets the static secret, and no credential is a failure under its rule', function()
+  it('a discovered or configured PDP never gets the static secret, and no credential is a refusal, whatever its rule', function()
     local fn = two_layers(function(_, req)
       if not req.headers['X-Estate'] then return { status = 401, body = '{"message":"unauthorized"}' } end
       return permit()(_, req)
     end, permit())
     local _, state = drive({ pdp_layers = { ESTATE, 'resource' } }, { pdp = fn })
     assert.equal(503, state.exited.status)
-    local plugin2, open, c2 = drive({ pdp_layers = { ESTATE .. ' fail-open', 'resource' } }, { pdp = fn })
-    assert.is_nil(open.exited)
-    mock.run_response(plugin2, c2)
-    assert.matches('401', open.exited.headers['X-PDP-Fail-Open'])
+    -- A 401 is not an outage: a fail-open layer that refuses the call is not skipped.
+    local _, open = drive({ pdp_layers = { ESTATE .. ' fail-open', 'resource' } }, { pdp = fn })
+    assert.equal(503, open.exited.status)
     local _, with = drive({ pdp_layers = { ESTATE, 'resource' }, pdp_credentials = { { pdp = ESTATE .. '/', shared_secret = 's', secret_header_name = 'X-Estate' } } }, { pdp = fn })
     assert.is_nil(with.exited)
   end)
@@ -424,11 +434,14 @@ describe('the response phase', function()
     assert.equal(1, #hits)
   end)
 
-  it('treats an unreadable response-phase answer as a failure', function()
-    local fn = router({ [PAZ .. '/sideband/request'] = permit(), [PAZ .. '/sideband/response'] = 'not json' })
-    local plugin, state, c = drive({}, { pdp = fn, upstream = upstream })
-    mock.run_response(plugin, c)
-    assert.equal(503, state.exited.status)
+  it('treats an unreadable response-phase answer as a refusal, whatever the layer\'s rule', function()
+    for _, mode in ipairs({ 'closed', 'open' }) do
+      local fn = router({ [PAZ .. '/sideband/request'] = permit(), [PAZ .. '/sideband/response'] = 'not json' })
+      local plugin, state, c = drive({ fail_mode = mode }, { pdp = fn, upstream = upstream })
+      mock.run_response(plugin, c)
+      assert.is_truthy(state.exited, mode)
+      assert.is_true(state.exited.status >= 500, mode)
+    end
   end)
 
   it('applies the layer rule to a failure here too', function()

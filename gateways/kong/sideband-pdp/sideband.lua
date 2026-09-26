@@ -12,7 +12,8 @@
 -- as the previous layer rewrote it; what comes back is applied.
 
 local http = require "resty.http"
-local cjson = require "cjson.safe"
+local contract = require "kong.plugins.authzen-pdp.contract"
+local cjson = contract.json
 
 local S = {}
 
@@ -146,31 +147,12 @@ end
 
 -- ---------- the call ----------
 
--- A PDP that answered 429 is not asked again until its Retry-After has passed. Per
--- worker, by identifier: one rate-limited PDP does not stop another being asked.
-local blocked = {}
-function S._reset() blocked = {} end
-
-function S.blocked_for(identifier)
-  local until_t = blocked[identifier]
-  if not until_t then return nil end
-  local left = until_t - ngx.now()
-  if left <= 0 then
-    blocked[identifier] = nil
-    return nil
-  end
-  return math.ceil(left)
-end
-
-function S.block(identifier, seconds)
-  blocked[identifier] = ngx.now() + (tonumber(seconds) or 1)
-end
-
 --- POST a sideband payload to url. cred is {header, secret} or nil. Returns the
---- resty.http response | nil, err.
+--- resty.http response | nil, err, and true as a third value when the payload could not
+--- be encoded at all — a refusal, never an outage a fail-open layer may skip.
 function S.post(url, payload, conf, cred)
-  local body, err = cjson.encode(payload)
-  if not body then return nil, "encoding the sideband request: " .. tostring(err) end
+  local body = cjson.encode(payload)
+  if not body then return nil, "the sideband request could not be encoded", true end
   local headers = {
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json",
@@ -188,44 +170,59 @@ function S.post(url, payload, conf, cred)
   })
 end
 
--- An availability failure, for the layer's rule, or nil when the call got an answer.
-local function failure_of(res, err, who)
-  if not res then
-    return { kind = "transient", msg = who .. ": " .. tostring(err) }
+-- The Retry-After a 429 carried, as whole seconds; 1 when it carried none we can read.
+local function retry_after(res)
+  local hdrs = type(res.headers) == "table" and res.headers or {}
+  local after = tonumber(hdrs["Retry-After"] or hdrs["retry-after"])
+  if not after or after ~= after or after < 0 or after == math.huge then return 1 end
+  return math.floor(after)
+end
+
+--- What a sideband call's outcome is, under the contract's rules: "answer" (a 2xx, still
+--- to be read), "too_large" (413, an answer about this request), "unavailable" (no
+--- answer, a 5xx or a 429 — the only thing a fail-open layer may skip) or "refusal"
+--- (any other 3xx or 4xx, or a payload that could not be encoded — closed whatever the
+--- layer's rule). The detail is for the log, never for the client.
+local function outcome(res, err, who, unencodable)
+  if unencodable then return "refusal", { msg = who .. ": " .. tostring(err) } end
+  local kind, detail = contract.classify(res, err)
+  if kind == "answer" then return "answer" end
+  local status = res and tonumber(res.status)
+  if kind == "unavailable" then
+    if status == 429 then
+      local after = retry_after(res)
+      return "unavailable", { msg = who .. " rate-limited this PEP (retry after " .. after .. "s)", retry_after = after }
+    end
+    return "unavailable", { msg = who .. " " .. detail }
   end
-  local status = tonumber(res.status) or 0
-  if status == 429 then
-    local hdrs = res.headers or {}
-    local after = tonumber(hdrs["Retry-After"] or hdrs["retry-after"]) or 1
-    return { kind = "rate_limited", msg = who .. " rate-limited this PEP (retry after " .. after .. "s)", retry_after = after }
-  end
-  if status == 413 or (status >= 200 and status < 300) then return nil end
-  local detail = type(res.body) == "string" and cjson.decode(res.body) or nil
-  local msg = who .. " returned " .. status
-  if type(detail) == "table" and detail.message then msg = msg .. ": " .. tostring(detail.message) end
+  if status == 413 then return "too_large" end
+  local msg = who .. " " .. detail
+  local body = type(res.body) == "string" and cjson.decode(res.body) or nil
+  if contract.is_object(body) and contract.str(body.message) then msg = msg .. ": " .. body.message end
   if status == 401 or status == 403 then msg = msg .. " (is a shared secret configured for it?)" end
-  return { kind = "transient", msg = msg }
+  return "refusal", { msg = msg }
 end
 
 -- 413 from the API is an answer about this request — too large for it — not an outage.
 -- Ping's plugin relays it to the client; so does this one.
 local function too_large(res)
-  return { status = 413, headers = { { ["content-type"] = "application/json" } }, body = res.body or "" }
+  return { status = 413, headers = { { ["content-type"] = "application/json" } }, body = contract.str(res.body) or "" }
 end
 
 --- What a /sideband/request answer means. Returns one of
----   "permit",  request  the request to forward, as the policy provider returned it
----   "deny",    response {status, headers (a list), body} to send the client instead
----   "failure", {kind, msg, retry_after} an availability failure, for the layer's rule
-function S.classify(res, err, who)
-  local failure = failure_of(res, err, who)
-  if failure then return "failure", failure end
-  if tonumber(res.status) == 413 then return "deny", too_large(res) end
+---   "permit",      request  the request to forward, as the policy provider returned it
+---   "deny",        response {status, headers (a list), body} to send the client instead
+---   "unavailable", {msg, retry_after} for the layer's rule
+---   "refusal",     {msg} closed, whatever the layer's rule
+function S.classify(res, err, who, unencodable)
+  local kind, detail = outcome(res, err, who, unencodable)
+  if kind == "too_large" then return "deny", too_large(res) end
+  if kind ~= "answer" then return kind, detail end
   local body = type(res.body) == "string" and cjson.decode(res.body) or nil
-  if type(body) ~= "table" then
-    return "failure", { kind = "invalid", msg = who .. " returned an unreadable body" }
+  if not contract.is_object(body) then
+    return "refusal", { msg = who .. " returned an unreadable body" }
   end
-  if type(body.response) == "table" then
+  if contract.is_object(body.response) then
     local r = body.response
     return "deny", { status = tonumber(r.response_code) or 403, headers = r.headers or {}, body = r.body }
   end
@@ -233,14 +230,14 @@ function S.classify(res, err, who)
 end
 
 --- What a /sideband/response answer means: "response", {status, headers (a list), body}
---- to send the client, or "failure", {...}.
-function S.classify_response(res, err, who)
-  local failure = failure_of(res, err, who)
-  if failure then return "failure", failure end
-  if tonumber(res.status) == 413 then return "response", too_large(res) end
+--- to send the client, or "unavailable" / "refusal", {...}.
+function S.classify_response(res, err, who, unencodable)
+  local kind, detail = outcome(res, err, who, unencodable)
+  if kind == "too_large" then return "response", too_large(res) end
+  if kind ~= "answer" then return kind, detail end
   local body = type(res.body) == "string" and cjson.decode(res.body) or nil
-  if type(body) ~= "table" or not tonumber(body.response_code) then
-    return "failure", { kind = "invalid", msg = who .. " returned an unreadable body" }
+  if not contract.is_object(body) or not tonumber(body.response_code) then
+    return "refusal", { msg = who .. " returned an unreadable body" }
   end
   return "response", { status = tonumber(body.response_code), headers = body.headers or {}, body = body.body }
 end
