@@ -917,6 +917,200 @@ class PepTest {
         assertEquals("login_required", body(v).get("error").asText());
     }
 
+    // ---------- whose login an X-User-Token is ----------
+
+    private static Verdict withUser(AuthZenRuleConfiguration c, FakeTransport t, ObjectNode accessClaims, String userToken) {
+        Map<String, String> h = new java.util.LinkedHashMap<>();
+        if (accessClaims != null) {
+            h.put("authorization", bearer(accessClaims));
+        }
+        if (userToken != null) {
+            h.put("x-user-token", userToken);
+        }
+        return pep(c, t).decide(req("POST", "/payments", h, "{\"from_account\":\"a\",\"amount\":50}"));
+    }
+
+    @Test
+    void aUserTokenCountsOnlyAsThePrincipalsOwnLogin() {
+        AuthZenRuleConfiguration login = baseConf();
+        login.require_user_login = true;
+        // Customer B's genuine login, presented beside customer A's access token, must
+        // not open A's login gate or carry B's consent into A's payment.
+        FakeTransport t = pdp(obj("decision", true));
+        Verdict other = withUser(login, t, obj("sub", "alice"), jwt(obj("sub", "bob", "scope", "payments:approve")));
+        assertEquals(401, other.status);
+        assertEquals("login_required", body(other).get("error").asText());
+        assertEquals(0, t.hits.size());
+        FakeTransport t2 = pdp(obj("decision", true));
+        withUser(baseConf(), t2, obj("sub", "alice"), jwt(obj("sub", "bob", "scope", "payments:approve")));
+        JsonNode ctx = sent(t2).get("context");
+        assertEquals("", ctx.get("user_scope").asText(), "no user_scope from someone else's login");
+        assertFalse(ctx.has("user_sub"));
+        // The access token presented again as the user token is not a login.
+        String access = jwt(obj("sub", "alice", "scope", "payments:approve"));
+        FakeTransport t3 = pdp(obj("decision", true));
+        Verdict same = pep(login, t3).decide(req("POST", "/payments", Map.of("authorization", "Bearer " + access, "x-user-token", access),
+            "{\"from_account\":\"a\",\"amount\":50}"));
+        assertEquals("login_required", body(same).get("error").asText());
+        // A delegated token (act) is an agent's, not a user's login; a token with no
+        // string subject is nobody's.
+        for (String ut : new String[]{jwt(obj("sub", "alice", "act", obj("sub", "agent-1"))), jwt(obj("scope", "x")), jwt(obj("sub", "", "scope", "x")),
+            jwt(obj("sub", 7))}) {
+            assertEquals("login_required", body(withUser(login, pdp(obj("decision", true)), obj("sub", "alice"), ut)).get("error").asText(), ut);
+        }
+        // No principal to compare against: nobody's own login either.
+        AuthZenRuleConfiguration anon = baseConf();
+        anon.require_token = false;
+        FakeTransport t4 = pdp(obj("decision", true));
+        withUser(anon, t4, null, jwt(obj("sub", "alice", "scope", "payments:approve")));
+        assertEquals("", sent(t4).get("context").get("user_scope").asText());
+        // The principal's own login counts, and says whose it is.
+        FakeTransport t5 = pdp(obj("decision", true));
+        Verdict own = withUser(login, t5, obj("sub", "alice"), jwt(obj("sub", "alice", "iss", "https://as.example", "scope", "payments:approve",
+            "acr", "urn:mfa")));
+        assertTrue(own.permit);
+        JsonNode oc = sent(t5).get("context");
+        assertEquals("payments:approve", oc.get("user_scope").asText());
+        assertEquals("alice", oc.get("user_sub").asText());
+        assertEquals("https://as.example", oc.get("user_iss").asText());
+        assertEquals("urn:mfa", oc.get("user_acr").asText());
+    }
+
+    @Test
+    void theIdentityPingAccessEstablishedIsThePrincipalAUserTokenMustMatch() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.require_user_login = true;
+        FakeTransport t = pdp(obj("decision", true));
+        // An opaque token PingAccess validated: the principal is its identity's subject.
+        PepRequest r = new PepRequest("POST", "/payments", Map.of("authorization", "Bearer opaque",
+            "x-user-token", jwt(obj("sub", "alice", "scope", "payments:approve"))), "{\"from_account\":\"a\",\"amount\":5}".getBytes(StandardCharsets.UTF_8),
+            obj("sub", "alice"));
+        assertTrue(pep(c, t).decide(r).permit);
+        assertEquals("alice", sent(t).get("context").get("user_sub").asText());
+        PepRequest mismatch = new PepRequest("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")),
+            "x-user-token", jwt(obj("sub", "alice"))), "{\"from_account\":\"a\",\"amount\":5}".getBytes(StandardCharsets.UTF_8),
+            obj("sub", "carol"));
+        assertEquals(401, pep(c, pdp(obj("decision", true))).decide(mismatch).status, "the token payload's sub is not the principal; PingAccess's is");
+    }
+
+    @Test
+    void onAPdpRouteAnApproversLoginCountsAndThePdpDecides() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.require_user_login = true;
+        c.user_token_subject = "pdp";
+        FakeTransport t = pdp(obj("decision", true));
+        // Staff approving for a customer: a different subject, verified, for the PDP to judge.
+        Verdict v = withUser(c, t, obj("sub", "alice"), jwt(obj("sub", "staff-9", "iss", "https://as.example", "scope", "payments:approve",
+            "acr", "urn:staff")));
+        assertTrue(v.permit);
+        JsonNode ctx = sent(t).get("context");
+        assertEquals("staff-9", ctx.get("user_sub").asText(), "the PDP is told whose login it is, so it can compare");
+        assertEquals("https://as.example", ctx.get("user_iss").asText());
+        assertEquals("urn:staff", ctx.get("user_acr").asText());
+        assertEquals("payments:approve", ctx.get("user_scope").asText());
+        assertEquals("alice", sent(t).get("subject").get("properties").get("on_behalf_of").asText());
+        // Even with no principal at all.
+        AuthZenRuleConfiguration anon = baseConf();
+        anon.require_token = false;
+        anon.user_token_subject = "pdp";
+        FakeTransport t2 = pdp(obj("decision", true));
+        withUser(anon, t2, null, jwt(obj("sub", "staff-9")));
+        assertEquals("staff-9", sent(t2).get("context").get("user_sub").asText());
+        assertEquals("", sent(t2).get("context").get("user_iss").asText(), "an issuer it does not name is empty, as in Go");
+        // The other rules still hold: not the access token, not delegated, a subject.
+        String access = jwt(obj("sub", "alice"));
+        Verdict echo = pep(c, pdp(obj("decision", true))).decide(req("POST", "/payments", Map.of("authorization", "Bearer " + access, "x-user-token", access),
+            "{\"from_account\":\"a\",\"amount\":5}"));
+        assertEquals("login_required", body(echo).get("error").asText());
+        for (String ut : new String[]{jwt(obj("sub", "staff-9", "act", obj("sub", "agent-1"))), jwt(obj("scope", "x"))}) {
+            assertEquals("login_required", body(withUser(c, pdp(obj("decision", true)), obj("sub", "alice"), ut)).get("error").asText(), ut);
+        }
+    }
+
+    @Test
+    void sendsThePdpTheSameUserContextAsCoazPep() {
+        // Both PEPs must send the same, or a payment authorised at the MCP edge is
+        // re-challenged at this edge and the flow loops on step-up.
+        FakeTransport t = pdp(obj("decision", true));
+        ObjectNode ad = Json.object();
+        ad.putArray("authorization_details")
+            .add(obj("type", "account_information"))
+            .add(obj("type", "payment_initiation", "amount", 250.5, "creditorAccount", "b2"));
+        ObjectNode userClaims = obj("sub", "alice", "iss", "https://as.example", "scp", List.of("payments:approve", "accounts:read"));
+        userClaims.set("authorization_details", ad.get("authorization_details"));
+        withUser(baseConf(), t, obj("sub", "alice", "aud", List.of("https://api.example", "https://other.example")), jwt(userClaims));
+        JsonNode ctx = sent(t).get("context");
+        assertEquals("payments:approve accounts:read", ctx.get("user_scope").asText());
+        assertEquals("https://api.example,https://other.example", ctx.get("token_aud").asText(), "the agent token's audience, comma-joined");
+        assertEquals("", ctx.get("user_acr").asText());
+        assertEquals(2, ctx.get("authorization_details").size());
+        assertEquals(250.5, ctx.get("consented_amount").doubleValue());
+        assertEquals("b2", ctx.get("consented_creditor").asText());
+        // No user token: the same keys, empty, and nothing about a user that is not there.
+        FakeTransport t2 = pdp(obj("decision", true));
+        withUser(baseConf(), t2, obj("sub", "alice", "aud", "https://api.example"), null);
+        JsonNode none = sent(t2).get("context");
+        assertEquals("", none.get("user_scope").asText());
+        assertEquals("https://api.example", none.get("token_aud").asText());
+        assertEquals("", none.get("user_acr").asText());
+        assertFalse(none.has("user_sub"));
+        assertFalse(none.has("user_iss"));
+        assertFalse(none.has("authorization_details"));
+        assertFalse(none.has("consented_amount"));
+        // A consent with no payment in it names no amount; odd shapes are read as Go reads them.
+        FakeTransport t3 = pdp(obj("decision", true));
+        ObjectNode odd = obj("sub", "alice", "aud", obj("x", 1), "acr", 3);
+        odd.putArray("authorization_details").add("not an object").add(obj("type", "payment_initiation", "amount", "lots"));
+        withUser(baseConf(), t3, obj("sub", "alice", "aud", 7), jwt(odd));
+        JsonNode oc = sent(t3).get("context");
+        assertEquals("", oc.get("token_aud").asText());
+        assertEquals("", oc.get("user_acr").asText());
+        assertEquals(0.0, oc.get("consented_amount").doubleValue(), "found, with no numeric amount: 0, as in Go");
+        assertEquals("", oc.get("consented_creditor").asText());
+        FakeTransport t4 = pdp(obj("decision", true));
+        ObjectNode notList = obj("sub", "alice", "authorization_details", obj("type", "payment_initiation"));
+        withUser(baseConf(), t4, obj("sub", "alice"), jwt(notList));
+        assertTrue(sent(t4).get("context").has("authorization_details"));
+        assertFalse(sent(t4).get("context").has("consented_amount"));
+        // A null consent is no consent; a payment entry with no amount at all is 0; the
+        // strings of a mixed audience array are joined and the rest dropped.
+        FakeTransport t5 = pdp(obj("decision", true));
+        ObjectNode nullAd = obj("sub", "alice");
+        nullAd.putNull("authorization_details");
+        withUser(baseConf(), t5, obj("sub", "alice"), jwt(nullAd));
+        assertFalse(sent(t5).get("context").has("authorization_details"));
+        FakeTransport t6 = pdp(obj("decision", true));
+        ObjectNode noAmount = obj("sub", "alice");
+        noAmount.putArray("authorization_details").add(obj("type", "payment_initiation", "creditorAccount", "c3"));
+        ObjectNode mixedAud = obj("sub", "alice");
+        mixedAud.putArray("aud").add("https://api.example").add(5).add("https://b.example");
+        withUser(baseConf(), t6, mixedAud, jwt(noAmount));
+        JsonNode c6 = sent(t6).get("context");
+        assertEquals(0.0, c6.get("consented_amount").doubleValue());
+        assertEquals("c3", c6.get("consented_creditor").asText());
+        assertEquals("https://api.example,https://b.example", c6.get("token_aud").asText());
+    }
+
+    @Test
+    void theUserLoginGateComesAfterTheAccessTokenAsInCoazPep() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.require_user_login = true;
+        Verdict v = pep(c, pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance", Map.of(), null));
+        assertEquals(401, v.status);
+        assertEquals("authorization_failed", body(v).get("error").asText(), "no access token is the first thing wrong");
+    }
+
+    @Test
+    void passesTheUserTokenSubjectRuleToCoazPepOnAnMcpRoute() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.coaz_url = COAZ;
+        c.user_token_subject = "pdp";
+        Object[] r = mcpRoute(obj("decision", true), c);
+        assertEquals("pdp", Json.parse(((FakeTransport) r[1]).hits.get(0).body()).get("config").get("user_token_subject").asText());
+        Object[] d = mcpRoute(obj("decision", true), null);
+        assertEquals("principal", Json.parse(((FakeTransport) d[1]).hits.get(0).body()).get("config").get("user_token_subject").asText());
+    }
+
     // ---------- what PingAccess established wins ----------
 
     @Test

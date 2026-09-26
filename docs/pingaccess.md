@@ -102,12 +102,13 @@ client the same way:
 1. **The well-known relay.** If the route is the resource's federation face
    (`federation_entity_url`), the two well-known documents are relayed from `coaz-pep`
    before any token is looked at. They are public by definition.
-2. **The user.** With `require_user_login`, no verified `X-User-Token` is a login
-   challenge.
-3. **The token.** `Authorization: Bearer` or `DPoP`. With `require_token`, none is a 401.
+2. **The token.** `Authorization: Bearer` or `DPoP`. With `require_token`, none is a 401.
    A token PingAccess did not validate - an unprotected application - is a 401 too,
    unless `allow_insecure` is set. The claims come from the token's payload overlaid
    with what PingAccess established (below). No readable subject is a 401.
+3. **The user.** With `require_user_login`, no `X-User-Token` that is the principal's own
+   verified login is a login challenge. It comes after the token because the token names
+   the principal.
 4. **DPoP**, when required, is verified by `coaz-pep`, which checks the proof's signature,
    freshness, replay and binding. Anything that cannot be verified is denied.
 5. **MCP.** On an `mcp` route every request goes to `coaz-pep`, whatever its method: the
@@ -164,6 +165,18 @@ reason without quoting the token. Without a JWKS the token is ignored - no login
 `user_scope` - and `require_user_login` without one is refused when the rule is saved.
 Under `allow_insecure` it is decoded instead, and the rule says so each time it is
 configured.
+
+A signature is not the whole question, though: it also has to be the right person's
+login. Customer B's genuine token must not carry B's consent into customer A's payment,
+so a user token counts only when its `sub` is the principal's (the subject PingAccess
+established), and never when it is the access token presented twice or an agent's
+delegated token (`act`). The staff-approval channel is the one place that rule gives
+way, and a route says so: with `user_token_subject: pdp` a verified login by someone
+else counts, and the PDP decides whether that person - a staff member, say - may
+approve for this customer. It can, because the PDP is always told whose login it is,
+`user_sub` and `user_iss`, beside the rest of what `coaz-pep` sends: `user_scope`,
+`user_acr`, `token_aud` and the `authorization_details`. The rules are `coaz-pep`'s, key
+for key, so a payment the MCP edge let through is not challenged again here.
 
 ## Finding the PDP
 
@@ -482,7 +495,7 @@ saved, unless `allow_insecure` is ticked.
 | **503** "refused the request" | the PDP (or `coaz-pep`) answered with a 3xx or 4xx, or with something that is not a decision; this never fails open | usually the key: `authzen_api_key`, or `coaz_api_key` against `CHECK_API_TOKEN`; the log has the status |
 | **500** "The authorization rule failed" | the rule threw, or PingAccess failed it; fail-closed | the stack trace is in `pingaccess.log` |
 | a step-up loops | the client retries with the same token; the step-up scope must be obtained from the AS first | the challenge names the scope; get it, then retry |
-| `X-User-Token` never counts as logged in | no JWKS, so it is ignored; or it fails verification: wrong issuer or audience, expired, no `exp` or `sub`, unknown `kid`, `alg: none` | the log says which; the demo's unsigned tokens cannot pass a JWKS |
+| `X-User-Token` never counts as logged in | no JWKS, so it is ignored; or it fails verification: wrong issuer or audience, expired, no `exp` or `sub`, unknown `kid`, `alg: none`; or it verifies but is not the principal's own login: another subject, the access token itself, a delegated (`act`) token | the log says which; a staff approver's login needs `user_token_subject: pdp` on the route; the demo's unsigned tokens cannot pass a JWKS |
 | the site sees no `X-Auth-*` headers | the request was denied before they were set, the PEP had no value for them, or a processing rule after this one stripped them | check `X-PDP-Decision`; look at the processing rules on the policy |
 | responses carry no `X-PDP-*` headers | Agent destination, where the response does not pass through PingAccess | expected; the request headers still arrive |
 

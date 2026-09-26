@@ -47,6 +47,15 @@ until it is fixed. Check each rule before you deploy the jar:
   it opens no login gate and carries no `user_scope`. `require_user_login` without a JWKS
   is refused. With one, `user_token_audience` is required, and the token must carry
   `exp`, `sub` and that audience.
+- **`X-User-Token` counts only as the principal's own login.** Its `sub` must be the
+  access token's subject (PingAccess's identity's, on a protected application), and it
+  must not be the access token itself or a delegated token (`act`). A route where
+  someone else approves - staff approving for a customer - sets
+  `user_token_subject: pdp`, and the PDP judges whose login it is from `user_sub`.
+- **The PDP gets the user context coaz-pep sends**: `user_scope`, `token_aud`,
+  `user_acr`, `user_sub` and `user_iss`, and `authorization_details` with the consented
+  amount and creditor, so a payment approved at the MCP edge is not challenged again
+  here.
 - **Missing security settings are refused**, not warned about: an API key or a forwarded
   token over plain http, `coaz_url` without `coaz_api_key`, discovery without
   `pdp_allowlist`, `pdp_discovery_insecure`, `pdp_ssl_verify` off. `allow_insecure` lets
@@ -147,6 +156,7 @@ is the whole sequence, site and application included, as a script.
 | `pdp_ssl_verify` | `true` | Certificate verification on every outbound call. Off trusts any chain but still checks the host name; needs `allow_insecure` |
 | `user_token_jwks_url` | — | Verify `X-User-Token` against this JWKS (https). Unset, the token is ignored |
 | `user_token_issuer` / `user_token_audience` | — | Expected `iss` / `aud`; the audience is required with the JWKS |
+| `user_token_subject` | `principal` | Whose login counts: `principal`, only the access token's subject; `pdp`, another person's verified login too, for the PDP to judge from `user_sub` |
 | `pdp_timeout_ms` / `coaz_timeout_ms` | `10000` / `15000` | Deadline on each call, the whole exchange included |
 | `allow_insecure` | `false` | Development only: start with what the rule otherwise refuses, logging each relaxation |
 
@@ -196,6 +206,20 @@ decoded instead, and `configure` says so. The key set is fetched through the rul
 transport - a 3 second deadline, a 256 KiB cap - kept for five minutes unless the server
 says otherwise, kept for fifteen more while a refresh fails, and refetched for an unknown
 `kid` at most every 30 seconds.
+
+A verified token still counts only as the principal's own login, by the same rules as
+`coaz-pep`: it is not the access token presented a second time, it carries no `act` (an
+agent's token is not a user having logged in), it has a `sub`, and that `sub` is the
+principal's - the subject of the identity PingAccess established, or of the token under
+`allow_insecure`. Someone else's genuine login is as much a bypass as a forged one:
+customer B's consent must not approve customer A's payment. The one exception
+is deliberate. On a route with `user_token_subject: pdp`, someone else's verified login
+counts - a staff member approving for a customer - and the PDP decides whether that
+person may approve for this principal. It can, because whenever a login counts the PDP
+is told whose it is: `user_sub` and `user_iss`, beside `user_scope`, `user_acr`,
+`token_aud` and the `authorization_details` with the consented amount and creditor,
+exactly the context `coaz-pep` sends. On an MCP route the setting is passed to
+`coaz-pep`, which reads the token itself.
 
 **How a deny is written.** PingAccess's contract for a rule is that `Outcome.RETURN`
 means "this rule rejects the request; call its error handling callback for the

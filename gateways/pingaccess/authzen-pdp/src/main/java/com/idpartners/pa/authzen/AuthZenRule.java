@@ -60,6 +60,7 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
     private static final Set<String> STYLES = Set.of("rest", "mcp");
     private static final Set<String> DISCOVERY = Set.of("off", "authzen", "resource");
     private static final Set<String> FAIL_MODES = Set.of("closed", "open");
+    private static final Set<String> USER_TOKEN_SUBJECTS = Set.of("principal", "pdp");
     private static final AtomicInteger THREADS = new AtomicInteger();
     /** Workers per rule instance. Each rule has its own pool, so one rule's stuck PDP cannot starve another's. */
     static final int THREADS_PER_RULE = Integer.getInteger("authzen.pdp.threads", 64);
@@ -137,6 +138,9 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
         }
         if (c.fail_mode == null || !FAIL_MODES.contains(c.fail_mode)) {
             throw new ValidationException("fail_mode must be closed or open");
+        }
+        if (c.user_token_subject == null || !USER_TOKEN_SUBJECTS.contains(c.user_token_subject)) {
+            throw new ValidationException("user_token_subject must be principal or pdp");
         }
         if (c.pdp_metadata_ttl <= 0) {
             throw new ValidationException("pdp_metadata_ttl must be greater than zero");

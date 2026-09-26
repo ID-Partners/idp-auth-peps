@@ -263,6 +263,7 @@ down; neither ever opens. Help: *Outages only.*
 | X-User-Token JWKS | `user_token_jwks_url` | TEXT | — | https |
 | X-User-Token issuer | `user_token_issuer` | TEXT | — | advanced |
 | X-User-Token audience | `user_token_audience` | TEXT | — | required with the JWKS |
+| Whose login counts | `user_token_subject` | SELECT: `principal`, `pdp` | `principal` | advanced |
 
 **X-User-Token JWKS** is what the user's token is verified against: its signature, and
 an `exp`, a `sub` and the audience below, all required; the issuer too when it is set;
@@ -272,6 +273,17 @@ no gate - unless *Allow insecure settings* is ticked, when it is decoded without
 verification and the log says so. Help: *Verify the user token.* **X-User-Token
 audience** is the `aud` the token must carry, and saving a JWKS without it is refused:
 without it a token minted for any other API would do. Help: *Required with the JWKS.*
+
+**Whose login counts** decides whose X-User-Token the rule accepts, once it has
+verified. `principal`, the default: only the principal's own login, a token whose `sub`
+is the subject of the access token PingAccess validated. Anyone else's genuine login is
+ignored, since customer B's consent must not approve customer A's payment. `pdp`: a
+verified login by someone else counts too, for a route where staff approve for a
+customer, and the PDP, which is told whose login it is (`user_sub` and `user_iss`),
+decides whether that person may. Either way a token that is the access token itself, an
+agent's delegated token (`act`), or one with no `sub` counts for nothing. On an `mcp`
+route the setting goes to coaz-pep, which reads the token by the same rule. Help:
+*Approvals by someone else.*
 
 ### Transport and compatibility
 
@@ -315,9 +327,9 @@ or a URL the rule cannot call. Help: *Development only.*
 | Where | Message | Cause |
 | --- | --- | --- |
 | on the field | `must not be blank` | *PDP URL* is empty |
-| on the field | `must be rest or mcp`, `must be off, authzen or resource`, `must be closed or open` | a value outside the drop-down's options, only possible through the API |
+| on the field | `must be rest or mcp`, `must be off, authzen or resource`, `must be closed or open`, `must be principal or pdp` | a value outside the drop-down's options, only possible through the API |
 | on the field | `must be greater than zero` | a TTL or timeout of 0 |
-| banner | `Invalid plugin configuration; style must be rest or mcp` and its siblings for `pdp_discovery` and `fail_mode` | a value outside the options, or a JSON `null`, sent through the API |
+| banner | `Invalid plugin configuration; style must be rest or mcp` and its siblings for `pdp_discovery`, `fail_mode` and `user_token_subject` | a value outside the options, or a JSON `null`, sent through the API |
 | banner | `Invalid plugin configuration; authzen_url http://authzen_pdp:8080 has no host name the JDK can use (an underscore in it?)` and its siblings | a URL field the rule could not call: not absolute http or https, no host, user info in it, or - for an identifier - a query or fragment |
 | banner | `Invalid plugin configuration; style mcp needs coaz_url: every request on an MCP route is decided by coaz-pep` | *Style* `mcp` with no *coaz-pep check API* |
 | banner | `Invalid plugin configuration; require_dpop needs coaz_url: this rule cannot verify a DPoP proof signature itself, so verification is delegated to coaz-pep` | *Require DPoP* ticked with no *coaz-pep check API* |
