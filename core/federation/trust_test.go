@@ -197,6 +197,16 @@ func TestNoChainIsClassifiedNotGuessed(t *testing.T) {
 			t.Fatalf("a statement that fails validation is not an absence: %v", err)
 		}
 	})
+	t.Run("two refusals: the first met is the one reported", func(t *testing.T) {
+		f := threeLevel(t)
+		a, b := newEntity(t), newEntity(t)
+		f.leaf.hints = []string{a.id, b.id}
+		r := newResolver(t, Options{FetchAllowed: func(u string) bool { return !under(u, a.id) && !under(u, b.id) }}, f.anchor)
+		_, err := r.Resolve(ctx(), f.leaf.id)
+		if !errors.Is(err, ErrNotAllowed) || !strings.Contains(err.Error(), a.id) {
+			t.Fatalf("%v", err)
+		}
+	})
 	t.Run("an exhausted fetch budget is an invalid chain, not an outage", func(t *testing.T) {
 		f := threeLevel(t)
 		_, err := newResolver(t, Options{MaxFetches: 2}, f.anchor).Resolve(ctx(), f.leaf.id)

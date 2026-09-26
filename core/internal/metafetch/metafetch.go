@@ -56,6 +56,26 @@ func (p Policy) Check(raw, trustedOrigin string) error {
 	return nil
 }
 
+// PlainPath refuses a URL path spelt so that it names one place and matches another: a
+// dot segment ("." or "..", percent-encoded or not), an encoded slash or backslash, or
+// a literal backslash. An allowlist compares strings, while the server at the other end
+// resolves these — so https://pdp.example/tenants/a/../b passes a prefix check for
+// tenant a and is served by tenant b.
+func PlainPath(u *url.URL) error {
+	p := u.EscapedPath()
+	lower := strings.ToLower(p)
+	if strings.Contains(p, `\`) || strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") {
+		return fmt.Errorf("%w: path %q carries an encoded separator", ErrNotAllowed, p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		// EscapedPath is always a valid escaping, so unescaping cannot fail.
+		if s, _ := url.PathUnescape(seg); s == "." || s == ".." {
+			return fmt.Errorf("%w: path %q has a dot segment", ErrNotAllowed, p)
+		}
+	}
+	return nil
+}
+
 func sameOrigin(u *url.URL, trusted string) bool {
 	if trusted == "" {
 		return false

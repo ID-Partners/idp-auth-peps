@@ -338,6 +338,22 @@ func stringList(v any, name string) ([]string, error) {
 	return out, nil
 }
 
+// namingList reads a naming_constraints list. An entry that is neither a domain name
+// constraint nor a URL is refused rather than guessed at: a guess could make the
+// constraint looser than whoever set it intended.
+func namingList(v any, name string) ([]string, error) {
+	list, err := stringList(v, name)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range list {
+		if !validNamingConstraint(s) {
+			return nil, fmt.Errorf("%s: %q is neither a domain name nor a URL", name, s)
+		}
+	}
+	return list, nil
+}
+
 func parseConstraints(v any) (*Constraints, error) {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -359,12 +375,12 @@ func parseConstraints(v any) (*Constraints, error) {
 		}
 		var err error
 		if p, present := obj["permitted"]; present {
-			if c.NamingPermitted, err = stringList(p, "naming_constraints.permitted"); err != nil {
+			if c.NamingPermitted, err = namingList(p, "naming_constraints.permitted"); err != nil {
 				return nil, err
 			}
 		}
 		if e, present := obj["excluded"]; present {
-			if c.NamingExcluded, err = stringList(e, "naming_constraints.excluded"); err != nil {
+			if c.NamingExcluded, err = namingList(e, "naming_constraints.excluded"); err != nil {
 				return nil, err
 			}
 		}

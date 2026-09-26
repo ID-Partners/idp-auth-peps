@@ -15,11 +15,15 @@ func TestNamingConstraintsMatchAtABoundary(t *testing.T) {
 		c + "/",         // a trailing slash
 		c + "/branch/1", // a path beneath it
 		c + ":8443",     // a port on the same host
-		c + "?x=1",      // a query
+	}
+	// An entity identifier never carries a query or fragment (§1.2), so one that does is
+	// an error rather than a match.
+	if _, err := coveredBy(c+"?x=1", c); err == nil {
+		t.Error("an identifier with a query is not an entity identifier")
 	}
 	for _, id := range covered {
-		if !coveredBy(id, c) {
-			t.Errorf("%q should be covered by %q", id, c)
+		if ok, err := coveredBy(id, c); !ok || err != nil {
+			t.Errorf("%q should be covered by %q: %v", id, c, err)
 		}
 	}
 	notCovered := []string{
@@ -31,20 +35,20 @@ func TestNamingConstraintsMatchAtABoundary(t *testing.T) {
 		"https://evil.test/" + c,
 	}
 	for _, id := range notCovered {
-		if coveredBy(id, c) {
+		if ok, _ := coveredBy(id, c); ok {
 			t.Errorf("%q must NOT be covered by %q", id, c)
 		}
 	}
-	// A host-suffix form is deliberately not implemented — see coveredBy's comment — so
-	// adding a label is never covered, in either direction.
-	if coveredBy("https://a.example.com", "https://.example.com") {
-		t.Error("host-suffix matching is not implemented and must not appear to work")
+	// The host-suffix form is §6.2.2's bare ".example.com" (see the domain-form tests);
+	// written inside a URL it is not a host at all, and covers nothing.
+	if ok, _ := coveredBy("https://a.example.com", "https://.example.com"); ok {
+		t.Error("a URL whose host starts with a dot names no host")
 	}
 	// A constraint that already names a path cannot be extended by a port.
-	if coveredBy("https://bank.example.com/x:8443", "https://bank.example.com/x") {
+	if ok, _ := coveredBy("https://bank.example.com/x:8443", "https://bank.example.com/x"); ok {
 		t.Error("a path constraint must not be extended by a port")
 	}
-	if coveredBy("anything", "") {
+	if ok, _ := coveredBy("anything", ""); ok {
 		t.Error("an empty constraint must cover nothing")
 	}
 }
