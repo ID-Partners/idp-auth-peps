@@ -30,6 +30,8 @@ function pdp(body: unknown, init: { status?: number; delayMs?: number } = {}) {
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
 const jwt = (claims: Record<string, unknown>) => `${b64({ alg: 'none' })}.${b64(claims)}.sig`;
+/** These tests mint unsigned tokens, so their verifier only decodes. A real one checks the signature. */
+const verifyForTests = async (token: string) => decodeJwtSegment(token, 1);
 
 // ---------------------------------------------------------------------------
 
@@ -73,7 +75,7 @@ describe('AuthzenClient', () => {
     const v = await client.evaluate({ subject: { type: 'user', id: 'u' }, action: { name: 'x' }, resource: { type: 'r' } });
     expect(v.allow).toBe(false);
     expect(v.kind).toBe('pdp_error');
-    expect(v.reason).toMatch(/timed out/);
+    expect(v.detail).toMatch(/timed out/);
   });
 
   it('reports the first deny in a boxcar so its advice survives', async () => {
@@ -230,7 +232,7 @@ describe('express middleware', () => {
   });
 
   it('permits and exposes the decision on req.authz', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: pathMapper([
         { method: 'GET', pattern: '/accounts/:id/balance', action: 'get_balance', resourceType: 'account', resourceId: (p) => p['id']! },
@@ -245,7 +247,7 @@ describe('express middleware', () => {
   });
 
   it('denies with the PDP challenge and never calls next', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: {
         url: 'http://pdp',
         fetch: pdp({ decision: false, context: { reason: 'Approve it', step_up_required: true, step_up_scope: 'pay' } }),
@@ -262,7 +264,7 @@ describe('express middleware', () => {
   });
 
   it('denies when no token is presented', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: () => null,
     });
@@ -274,7 +276,7 @@ describe('express middleware', () => {
   });
 
   it('denies an unmapped route rather than letting it through', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: pathMapper([{ method: 'GET', pattern: '/accounts/:id/balance', action: 'get_balance', resourceType: 'account' }]),
     });
@@ -428,8 +430,8 @@ describe('McpGuard', () => {
     expect(v.jsonRpcError?.id).toBe(7);
   });
 
-  it('lets a tool without coaz:true through', async () => {
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: false }) }, tools });
+  it('lets a tool without a mapping through when defaults are turned off', async () => {
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: false }) }, tools, applyDefaultMappings: false });
     const v = await guard.checkToolCall({ rpc: call('ping'), claims: { sub: 'u' } });
     expect(v.allow).toBe(true);
     expect(v.coazTool).toBe(false);
@@ -634,7 +636,7 @@ describe('COAZ v2 — defaults and anchoring warnings', () => {
 
   it('passes an undeclared tool through when defaults are off', async () => {
     const fetchMock = pdp({ decision: false });
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchMock }, tools: [{ name: 'weather' }] });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchMock }, tools: [{ name: 'weather' }], applyDefaultMappings: false });
     const v = await guard.checkToolCall({ rpc: call('weather'), claims: token });
     expect(v.allow).toBe(true);
     expect(v.coazTool).toBe(false);
@@ -873,7 +875,7 @@ describe('AuthzenClient — the paths that only matter when things go wrong', ()
     }) as unknown as typeof globalThis.fetch;
     const v = await new AuthzenClient({ url: 'http://pdp', fetch: fetchImpl }).evaluate(req);
     expect(v.allow).toBe(false);
-    expect(v.reason).toMatch(/ECONNREFUSED/);
+    expect(v.detail).toMatch(/ECONNREFUSED/);
   });
 
   it('rejects construction without a url, and strips a trailing slash', async () => {
@@ -986,7 +988,7 @@ describe('express middleware — remaining branches', () => {
   }
 
   it('lets an unauthenticated request through when a token is not required', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       requireToken: false,
       map: () => null,
@@ -997,7 +999,7 @@ describe('express middleware — remaining branches', () => {
   });
 
   it('denies a token with no subject claim', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: () => null,
     });
@@ -1014,7 +1016,7 @@ describe('express middleware — remaining branches', () => {
 
   it('honours a custom getToken and reports every decision', async () => {
     const decisions: string[] = [];
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       getToken: (r) => String((r.headers['x-token'] as string) ?? ''),
       onDecision: ({ verdict }) => decisions.push(verdict.kind),
@@ -1031,7 +1033,7 @@ describe('express middleware — remaining branches', () => {
   });
 
   it('does not let a broken onDecision hook open the gate', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: false, context: { reason: 'no' } }) },
       onDecision: () => { throw new Error('audit sink down'); },
       map: () => ({ subject: { type: 'user', id: 'u' }, action: { name: 'a' }, resource: { type: 'r' } }),
@@ -1044,7 +1046,7 @@ describe('express middleware — remaining branches', () => {
   });
 
   it('treats an unexpected throw as a deny, not an allow', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       getToken: () => { throw new Error('exploded'); },
       map: () => null,
@@ -1189,6 +1191,7 @@ describe('McpGuard — discovery and delegation', () => {
     const guard = new McpGuard({
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       tools: () => list as never,
+      applyDefaultMappings: false,
     });
     expect((await guard.checkToolCall({ rpc: call, claims: token })).coazTool).toBe(false);
     list = [declared];
@@ -1210,23 +1213,24 @@ describe('McpGuard — discovery and delegation', () => {
 
     const guard = new McpGuard({
       client: { url: 'http://pdp', fetch: fetchImpl },
+      upstreamUrl: 'http://mcp/mcp',
       delegate: { url: 'http://coaz-pep:9192/', apiKey: 'k' },
       fetch: fetchImpl,
     });
-    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
+    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: JSON.stringify(call) } });
     expect(v.allow).toBe(false);
     expect(v.jsonRpcError).toEqual(engineError);
   });
 
   it('permits on a delegated permit', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ decision: true }), { status: 200 })) as unknown as typeof globalThis.fetch;
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, delegate: { url: 'http://coaz-pep:9192' }, fetch: fetchImpl });
-    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, upstreamUrl: 'http://mcp/mcp', delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' }, fetch: fetchImpl });
+    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: JSON.stringify(call) } });
     expect(v.allow).toBe(true);
   });
 
   it('needs the raw request in delegate mode, and says so', async () => {
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: true }) }, delegate: { url: 'http://coaz-pep:9192' } });
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: pdp({ decision: true }) }, upstreamUrl: 'http://mcp/mcp', delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' } });
     const v = await guard.checkToolCall({ rpc: call, claims: token });
     expect(v.jsonRpcError?.error.code).toBe(CODE_MAPPING_ERROR);
     expect(v.verdict.reason).toMatch(/raw request/);
@@ -1234,9 +1238,9 @@ describe('McpGuard — discovery and delegation', () => {
 
   it('points at the shared secret when the engine answers 401', async () => {
     const fetchImpl = vi.fn(async () => new Response('', { status: 401 })) as unknown as typeof globalThis.fetch;
-    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, delegate: { url: 'http://coaz-pep:9192' }, fetch: fetchImpl });
-    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: '{}' } });
-    expect(v.verdict.reason).toMatch(/CHECK_API_TOKEN/);
+    const guard = new McpGuard({ client: { url: 'http://pdp', fetch: fetchImpl }, upstreamUrl: 'http://mcp/mcp', delegate: { url: 'http://coaz-pep:9192', apiKey: 'stale' }, fetch: fetchImpl });
+    const v = await guard.checkToolCall({ rpc: call, claims: token, raw: { headers: {}, body: JSON.stringify(call) } });
+    expect(v.verdict.detail).toMatch(/CHECK_API_TOKEN/);
   });
 
   it('accepts PepClaims as well as a bare claims map', async () => {
@@ -1531,7 +1535,7 @@ describe('coverage completeness: the remaining branches', () => {
     expect(() => evaluateExpression('double(params.bad)', p, {})).toThrow(/not a number/);
   });
 
-  it('forwards X-Auth-* headers when forwardHeaders is set', async () => {
+  it('forwards X-Auth-* on the request, not the response, when forwardHeaders is set', async () => {
     const res = {
       statusCode: 0,
       headers: {} as Record<string, string>,
@@ -1546,12 +1550,15 @@ describe('coverage completeness: the remaining branches', () => {
       map: (_r, claims) => ({ subject: { type: 'user', id: claims.sub }, action: { name: 'x' }, resource: { type: 'r' } }),
     });
     const next = vi.fn();
-    await mw({ method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'alice' })}` } }, res, next);
+    const req: PepRequest = { method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'alice' })}`, 'x-auth-principal': 'mallory' } };
+    await mw(req, res, next);
     expect(next).toHaveBeenCalledOnce();
-    expect(res.headers['X-Auth-Principal']).toBe('alice');
-    expect(res.headers['X-Auth-Agent']).toBe('agent-1');
-    expect(res.headers['X-Auth-Scope']).toBe('a b');
-    expect(res.headers['X-Auth-Acr']).toBe('urn:mfa');
+    expect(req.headers['x-auth-principal']).toBe('alice');
+    expect(req.headers['x-auth-agent']).toBe('agent-1');
+    expect(req.headers['x-auth-scope']).toBe('a b');
+    expect(req.headers['x-auth-acr']).toBe('urn:mfa');
+    // The client's response learns nothing about who the upstream was told it is.
+    expect(Object.keys(res.headers).filter((k) => k.toLowerCase().startsWith('x-auth-'))).toEqual([]);
   });
 
   it('permits directly through AuthzenClient.evaluateAll when every decision permits', async () => {
@@ -1595,14 +1602,16 @@ describe('coverage completeness: v1 builder, delegate permit, numeric CEL', () =
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ decision: true }), { status: 200 })) as unknown as typeof globalThis.fetch;
     const guard = new McpGuard({
       client: { url: 'http://pdp', fetch: fetchImpl },
+      upstreamUrl: 'http://mcp/mcp',
       delegate: { url: 'http://coaz-pep:9192', apiKey: 'k' },
       onDecision: ({ tool }) => seen.push(tool),
       fetch: fetchImpl,
     });
+    const rpc = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x' } };
     const v = await guard.checkToolCall({
-      rpc: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'x' } },
+      rpc,
       claims: token,
-      raw: { headers: { authorization: 'Bearer t' }, body: '{}' },
+      raw: { headers: { authorization: 'Bearer t' }, body: JSON.stringify(rpc) },
     });
     expect(v.allow).toBe(true);
     expect(v.verdict.reason).toMatch(/delegated/);
@@ -1679,7 +1688,7 @@ describe('coverage completeness: fallbacks and branch tails', () => {
   });
 
   it('takes the first value of an array Authorization header', () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: (_r, claims) => ({ subject: { type: 'user', id: claims.sub }, action: { name: 'x' }, resource: { type: 'r' } }),
     });
@@ -1693,7 +1702,7 @@ describe('coverage completeness: fallbacks and branch tails', () => {
   it('stringifies a non-Error rejection from fetch', async () => {
     const fetchImpl = vi.fn(async () => { throw 'a bare string, not an Error'; }) as unknown as typeof globalThis.fetch;
     const v = await new AuthzenClient({ url: 'http://pdp', fetch: fetchImpl }).evaluate({ subject: { type: 'u', id: 'x' }, action: { name: 'a' }, resource: { type: 'r' } });
-    expect(v.reason).toContain('a bare string');
+    expect(v.detail).toContain('a bare string');
   });
 });
 

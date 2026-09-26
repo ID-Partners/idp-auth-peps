@@ -26,17 +26,33 @@ export const PROTECTED_RESOURCE_WELL_KNOWN = '/.well-known/oauth-protected-resou
 export interface FederationEntityOptions {
   /** The entity identifier: the resource identifier, an https URL. */
   entityId: string;
-  /** The private key the entity signs with, as a KeyObject or a private JWK. */
+  /** The private key the entity signs with, as a KeyObject or a private JWK. EC, or RSA of at least 2048 bits. */
   key: KeyObject | JsonWebKey;
-  /** The superiors a trust controller may be reached through. */
+  /** The superiors a trust controller may be reached through: https URLs. */
   authorityHints: string[];
-  /** What the RFC 9728 document carries beyond `resource`. Default: nothing. */
+  /**
+   * What the RFC 9728 document carries beyond `resource`. Default: nothing. JWT-registered
+   * claim names (iss, sub, aud, exp, nbf, iat, jti) are dropped: the entity sets the ones
+   * `signed_metadata` needs itself.
+   */
   asserted?: Record<string, unknown>;
   /** Lifetime of each Entity Configuration minted, in seconds. Default 86400. */
   lifetimeSeconds?: number;
+  /** Lifetime of `signed_metadata`, in seconds. Default 3600; re-signed after half of it. */
+  metadataLifetimeSeconds?: number;
+  /**
+   * The escape hatch, for development only: accept http identifiers for the entity and
+   * its authority hints. Logged once, at construction.
+   */
+  allowInsecure?: boolean;
+  /** Construction-time warnings (`allowInsecure`). Defaults to `console.warn`. */
+  onWarning?: (message: string) => void;
   /** The clock, in seconds. Tests replace it. */
   now?: () => number;
 }
+
+/** The JWT claims (RFC 7519 §4.1) the entity sets, or leaves out, on its own authority. */
+const REGISTERED_CLAIMS = ['iss', 'sub', 'aud', 'exp', 'nbf', 'iat', 'jti'] as const;
 
 /** The request shape the handler reads: Express's, and any router's that looks like it. */
 export interface FederationRequest {
@@ -76,6 +92,11 @@ export function algFor(key: KeyObject): string {
   throw new Error(`unsupported key type ${String(key.asymmetricKeyType)}`);
 }
 
+function positiveSeconds(v: number, name: string): number {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) throw new Error(`${name} must be a positive number of seconds, not ${String(v)}`);
+  return v;
+}
+
 /** Mint a compact JWS. ECDSA signatures are the JOSE r||s form, not DER. */
 export function signJwt(header: Record<string, unknown>, claims: Record<string, unknown>, key: KeyObject, alg: string): string {
   const input = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
@@ -94,24 +115,47 @@ export class FederationEntity {
   private readonly alg: string;
   private readonly asserted: Record<string, unknown>;
   private readonly lifetime: number;
+  private readonly metadataLifetime: number;
   private readonly now: () => number;
   private minted?: { token: string; until: number };
+  private signedMetadata?: { doc: Record<string, unknown>; until: number };
 
   constructor(o: FederationEntityOptions) {
+    const insecure = o.allowInsecure === true;
     if (!/^https?:\/\/[^?#]+$/.test(o.entityId)) {
       throw new Error(`entityId ${JSON.stringify(o.entityId)} is not an absolute URL without query or fragment`);
+    }
+    // An OpenID Federation entity identifier is an https URL; so is every superior's.
+    if (!o.entityId.startsWith('https://') && !insecure) {
+      throw new Error(`entityId ${JSON.stringify(o.entityId)} is not https. Set allowInsecure: true only for development.`);
     }
     this.id = o.entityId.replace(/\/+$/, '');
     this.authorityHints = (o.authorityHints ?? []).map((h) => h.trim().replace(/\/+$/, '')).filter(Boolean);
     if (this.authorityHints.length === 0) throw new Error('authorityHints: who vouches for this entity?');
+    for (const hint of this.authorityHints) {
+      if (!/^https?:\/\/[^?#\s]+$/.test(hint)) throw new Error(`authorityHints: ${JSON.stringify(hint)} is not an absolute URL without query or fragment`);
+      if (!hint.startsWith('https://') && !insecure) {
+        throw new Error(`authorityHints: ${JSON.stringify(hint)} is not https. Set allowInsecure: true only for development.`);
+      }
+    }
     this.key = o.key instanceof KeyObject ? o.key : createPrivateKey({ key: o.key, format: 'jwk' });
     if (this.key.type !== 'private') throw new Error('key must be a private key');
+    const bits = this.key.asymmetricKeyDetails?.modulusLength;
+    if (this.key.asymmetricKeyType === 'rsa' && (bits === undefined || bits < 2048)) {
+      throw new Error(`an RSA key must be at least 2048 bits; this one is ${String(bits)}`);
+    }
     this.alg = algFor(this.key);
     const pub = createPublicKey(this.key).export({ format: 'jwk' }) as Record<string, unknown>;
     this.jwk = { ...pub, kid: thumbprint(pub) };
+    // What the resource asserts is metadata. The claims that make signed_metadata a JWT —
+    // who says so, about whom, for how long — are the entity's to set, not the asserted
+    // document's: an `exp` copied from it would outlive the key, an `aud` would aim it.
     this.asserted = { ...(o.asserted ?? {}) };
-    this.lifetime = o.lifetimeSeconds ?? 86400;
+    for (const k of [...REGISTERED_CLAIMS, 'signed_metadata']) delete this.asserted[k];
+    this.lifetime = positiveSeconds(o.lifetimeSeconds ?? 86400, 'lifetimeSeconds');
+    this.metadataLifetime = positiveSeconds(o.metadataLifetimeSeconds ?? 3600, 'metadataLifetimeSeconds');
     this.now = o.now ?? (() => Math.floor(Date.now() / 1000));
+    if (insecure) (o.onWarning ?? ((m: string) => console.warn(m)))('federation entity: allowInsecure is set — http identifiers are accepted');
   }
 
   /** The entity's Federation Entity Key, kid included. */
@@ -148,14 +192,22 @@ export class FederationEntity {
     return token;
   }
 
-  /** The RFC 9728 document: `resource`, what was asserted, and `signed_metadata`. */
+  /**
+   * The RFC 9728 document: `resource`, what was asserted, and `signed_metadata` — a JWT
+   * of the same members with this entity as `iss` and a lifetime of its own. Signed once
+   * and served until half that lifetime has gone, like the Entity Configuration; each
+   * caller gets a copy.
+   */
   protectedResourceMetadata(): Record<string, unknown> {
-    const doc: Record<string, unknown> = { resource: this.id, ...this.asserted };
-    delete doc['signed_metadata'];
-    doc['resource'] = this.id;
-    const claims = { ...doc, iss: this.id, iat: this.now() };
-    doc['signed_metadata'] = signJwt({ alg: this.alg, typ: 'JWT', kid: this.jwk['kid'] }, claims, this.key, this.alg);
-    return doc;
+    const now = this.now();
+    if (!this.signedMetadata || now >= this.signedMetadata.until) {
+      const doc: Record<string, unknown> = { resource: this.id, ...this.asserted };
+      doc['resource'] = this.id;
+      const claims = { ...doc, iss: this.id, iat: now, exp: now + this.metadataLifetime };
+      doc['signed_metadata'] = signJwt({ alg: this.alg, typ: 'JWT', kid: this.jwk['kid'] }, claims, this.key, this.alg);
+      this.signedMetadata = { doc, until: now + this.metadataLifetime / 2 };
+    }
+    return structuredClone(this.signedMetadata.doc);
   }
 
   /**

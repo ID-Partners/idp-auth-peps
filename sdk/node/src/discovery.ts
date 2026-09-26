@@ -5,10 +5,15 @@
  *
  *   resource identifier
  *     ├─ resource: {resource}/.well-known/oauth-protected-resource (RFC 9728) — self-asserted
- *     └─ static:   the configured PDP URL                                    — the fallback
+ *     └─ static:   the configured PDP URL — when the resource publishes nothing (404)
  *   PDP identifier
  *     ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
- *     └─ 404 / unreachable -> {pdp}/access/v1/evaluation, the spec's default paths
+ *     └─ 404 -> {pdp}/access/v1/evaluation, the spec's default paths
+ *
+ * A resource whose document cannot be read (an outage, or a document that is invalid)
+ * is not the same as one that publishes nothing: its layer is unavailable and fails by
+ * its own mode, rather than quietly becoming the static PDP. An outage serves the last
+ * good copy of either document while there is one.
  *
  * The parameter naming the PDPs, `authzen_policy_decision_points`, is minted by this
  * repo — no spec defines one — and is the same bytes in an RFC 9728 document and under
@@ -18,6 +23,8 @@
  * Two rules never relax: a URL outside an allowlist fails closed rather than falling
  * to a weaker source, and a discovered PDP never receives the static API key.
  */
+
+import { BodyTooLargeError, readCapped } from './http.js';
 
 export const PARAM_POLICY_DECISION_POINTS = 'authzen_policy_decision_points';
 
@@ -91,28 +98,53 @@ export interface LayerSpec {
 
 /**
  * Parse a layer entry: a name, optionally followed by `fail-open` or `fail-closed`
- * (`'https://estate.example fail-open'`). An unknown modifier throws: a policy that
- * cannot be read must not be silently narrowed.
+ * (`'https://estate.example fail-open'`), or `{ name, failOpen }`. Anything that cannot
+ * be read throws — an unknown modifier, a `failOpen` that is not a boolean (`'false'` is
+ * truthy), a name that is not a layer or a usable PDP identifier: a policy that cannot
+ * be read must not be silently narrowed, or silently opened.
  */
 export function parseLayer(entry: string | LayerSpec): LayerSpec {
-  if (typeof entry !== 'string') return entry;
-  const [name = '', ...mods] = entry.trim().split(/\s+/);
-  const spec: LayerSpec = { name: name.replace(/\/+$/, '') };
-  if (spec.name !== LAYER_RESOURCE && spec.name !== LAYER_STATIC && !spec.name.includes('://')) {
-    throw new DiscoveryError('invalid', `layer ${JSON.stringify(spec.name)} is neither static, resource nor a PDP identifier`);
+  if (typeof entry === 'string') {
+    const [name = '', ...mods] = entry.trim().split(/\s+/);
+    const spec: LayerSpec = { name: layerName(name) };
+    for (const mod of mods) {
+      if (mod.toLowerCase() === 'fail-open') spec.failOpen = true;
+      else if (mod.toLowerCase() === 'fail-closed') spec.failOpen = false;
+      else throw new DiscoveryError('invalid', `layer ${spec.name}: unknown modifier ${JSON.stringify(mod)} (fail-open, fail-closed)`);
+    }
+    return spec;
   }
-  for (const mod of mods) {
-    if (mod.toLowerCase() === 'fail-open') spec.failOpen = true;
-    else if (mod.toLowerCase() === 'fail-closed') spec.failOpen = false;
-    else throw new DiscoveryError('invalid', `layer ${spec.name}: unknown modifier ${JSON.stringify(mod)} (fail-open, fail-closed)`);
+  if (typeof entry !== 'object' || entry === null || typeof entry.name !== 'string') {
+    throw new DiscoveryError('invalid', `layer ${JSON.stringify(entry)} is neither a string nor { name, failOpen }`);
+  }
+  const spec: LayerSpec = { name: layerName(entry.name) };
+  if (entry.failOpen !== undefined) {
+    if (typeof entry.failOpen !== 'boolean') {
+      throw new DiscoveryError('invalid', `layer ${spec.name}: failOpen must be a boolean, not ${JSON.stringify(entry.failOpen)}`);
+    }
+    spec.failOpen = entry.failOpen;
   }
   return spec;
+}
+
+/** `static`, `resource`, or an absolute http(s) PDP identifier with no query or fragment. */
+function layerName(raw: string): string {
+  const name = raw.trim().replace(/\/+$/, '');
+  if (name === LAYER_RESOURCE || name === LAYER_STATIC) return name;
+  const u = parseAbsolute(name);
+  if (!u || (u.protocol !== 'https:' && u.protocol !== 'http:') || name.includes('?') || name.includes('#')) {
+    throw new DiscoveryError('invalid', `layer ${JSON.stringify(name)} is neither static, resource nor a PDP identifier`);
+  }
+  return name;
 }
 
 /** What resolving a layer list produced: the PDPs to ask, and the fail-open layers that were skipped. */
 export interface ResolvedLayers {
   pdps: PdpEndpoints[];
+  /** The identifiers of the skipped layers — safe to put on the wire. */
   skipped: string[];
+  /** One line per skipped layer saying why, for logs. */
+  detail: string[];
 }
 
 /**
@@ -134,6 +166,7 @@ export async function resolveLayers(
   const specs = (layers && layers.length > 0 ? layers : [LAYER_RESOURCE]).map(parseLayer);
   const out: PdpEndpoints[] = [];
   const skipped: string[] = [];
+  const detail: string[] = [];
   const seen = new Map<string, number>();
   for (const spec of specs) {
     const open = spec.failOpen ?? failOpen;
@@ -143,7 +176,8 @@ export async function resolveLayers(
     } catch (err) {
       const derr = asDiscoveryError(err);
       if (derr.kind === 'not_allowed' || !open) throw new DiscoveryError(derr.kind, `layer ${spec.name}: ${derr.message}`);
-      skipped.push(`${spec.name} (${derr.message})`);
+      skipped.push(spec.name);
+      detail.push(`${spec.name}: ${derr.message}`);
       continue;
     }
     const at = seen.get(ep.identifier);
@@ -155,7 +189,7 @@ export async function resolveLayers(
     seen.set(ep.identifier, out.length);
     out.push({ ...ep, failOpen: open });
   }
-  return { pdps: out, skipped };
+  return { pdps: out, skipped, detail };
 }
 
 /** The one resource document to forward for a layered call: whichever layer read it. */
@@ -184,11 +218,19 @@ export interface PdpDiscoveryOptions {
   /** Retry throttle while a refresh keeps failing. Default 30s. */
   minRefreshMs?: number;
   maxEntries?: number;
-  /** Allow http for discovered URLs. Same-origin http as `staticPdp` is always allowed. */
+  /**
+   * The escape hatch, for development only: allow http for discovered URLs (same-origin
+   * http as `staticPdp` is always allowed), and let resource mode start without its
+   * allowlists. Logged once, at construction.
+   */
   allowInsecure?: boolean;
-  /** Permitted discovered-PDP prefixes; `staticPdp` is always permitted. Empty: any https. */
+  /**
+   * Permitted PDP prefixes, matched at a path boundary; `staticPdp` is always permitted.
+   * Required in resource mode — without it any resource could name any https PDP — and
+   * it bounds configured layers too.
+   */
   pdpAllowlist?: string[];
-  /** Permitted `resource` prefixes for metadata fetches. Empty: any. */
+  /** Permitted `resource` prefixes for metadata fetches. Required in resource mode. */
   resourceAllowlist?: string[];
   /** Overrides the mode-derived sources. */
   sources?: MetadataSource[];
@@ -390,6 +432,9 @@ export function defaultEndpoints(pdp: string): PdpEndpoints {
 
 // ---------- the chain ----------
 
+/** The most a metadata document may be. */
+const MAX_METADATA_BYTES = 1_048_576;
+
 export class PdpDiscovery implements PdpResolver {
   readonly mode: DiscoveryMode;
   private readonly staticPdp: string;
@@ -397,6 +442,9 @@ export class PdpDiscovery implements PdpResolver {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
   private readonly warn: (message: string) => void;
+  private readonly now: () => number;
+  private readonly minRefresh: number;
+  private readonly warnedAt = new Map<string, number>();
   private readonly resourcePolicy: UrlPolicy;
   private readonly pdpPolicy: UrlPolicy;
   private readonly sources: MetadataSource[];
@@ -409,30 +457,55 @@ export class PdpDiscovery implements PdpResolver {
     this.apiKeys = opts.apiKeys ?? {};
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     if (this.mode !== 'off' && typeof this.fetchImpl !== 'function') {
-      throw new Error('PdpDiscovery needs a fetch implementation (Node 20+ or pass opts.fetch)');
+      throw new Error('PdpDiscovery needs a fetch implementation (Node 22+ or pass opts.fetch)');
     }
     this.timeoutMs = opts.timeoutMs ?? 3000;
     this.warn = opts.onWarning ?? ((m) => console.warn(m));
-    const now = opts.now ?? (() => Date.now());
+    this.now = opts.now ?? (() => Date.now());
     const ttl = opts.ttlMs ?? 300_000;
-    const minRefresh = opts.minRefreshMs ?? 30_000;
+    this.minRefresh = opts.minRefreshMs ?? 30_000;
     const max = opts.maxEntries ?? 1024;
-    this.resourcePolicy = { allowInsecure: opts.allowInsecure === true, allowlist: opts.resourceAllowlist };
+    const insecure = opts.allowInsecure === true;
+
+    // Resource mode takes a PDP's name from a document the resource publishes. Without
+    // a PDP allowlist any resource could name any https PDP, and without a resource
+    // allowlist anything that can influence the resource identifier could point the
+    // PEP at a document of its choosing. Missing either is a configuration error.
+    const missing = this.mode === 'resource' ? ([!opts.pdpAllowlist?.length && 'pdpAllowlist', !opts.resourceAllowlist?.length && 'resourceAllowlist'].filter(Boolean) as string[]) : [];
+    if (missing.length > 0 && !insecure) {
+      throw new Error(
+        `resource-mode discovery needs ${missing.join(' and ')}: without them any resource can name any PDP. ` +
+          'Set allowInsecure: true only for development.',
+      );
+    }
+    if (insecure) {
+      const relaxed = ['http is permitted for discovered URLs', ...(missing.length ? [`resource mode is running without ${missing.join(' and ')}`] : [])];
+      this.warn(`pdp discovery: allowInsecure is set — ${relaxed.join('; ')}`);
+    }
+
+    this.resourcePolicy = { allowInsecure: insecure, allowlist: opts.resourceAllowlist };
     // The static PDP is always permitted; the allowlist bounds what a resource may add.
     this.pdpPolicy = {
-      allowInsecure: opts.allowInsecure === true,
+      allowInsecure: insecure,
       trustedOrigin: this.staticPdp || undefined,
       allowlist: opts.pdpAllowlist && opts.pdpAllowlist.length > 0 ? [...opts.pdpAllowlist, this.staticPdp] : undefined,
     };
-    // A resource whose metadata cannot be fetched is served by the static PDP for a
-    // while rather than re-fetched in every request's path.
-    this.resources = new TtlCache<ResourceMetadata>(ttl, minRefresh, minRefresh, max, now);
-    this.pdps = new TtlCache<PdpEndpoints>(ttl, minRefresh, 0, max, now);
+    // A failure is remembered for the retry window rather than re-fetched in every
+    // request's path; a last good value is served through it.
+    this.resources = new TtlCache<ResourceMetadata>(ttl, this.minRefresh, this.minRefresh, max, this.now);
+    this.pdps = new TtlCache<PdpEndpoints>(ttl, this.minRefresh, this.minRefresh, max, this.now);
     this.sources =
       opts.sources ??
       (this.mode === 'resource' ? [new Rfc9728Source((url) => this.getJson(url, this.resourcePolicy))] : []);
   }
 
+  /**
+   * The PDP that decides for a resource. A resource that publishes nothing (a 404, or a
+   * document that names no PDP) is decided by the static PDP, by design. A resource whose
+   * metadata cannot be read — an outage, or a document that is invalid — has no PDP: the
+   * error is thrown, so its layer fails by its own mode instead of quietly becoming the
+   * static layer. A last good document is served through an outage.
+   */
   async resolve(resource?: string): Promise<PdpEndpoints> {
     if (this.mode === 'off') {
       if (!this.staticPdp) throw new DiscoveryError('transient', 'no PDP configured');
@@ -448,24 +521,23 @@ export class PdpDiscovery implements PdpResolver {
       // Checked on every call, not only at fetch time: the cache is shared, the policy
       // belongs to this caller.
       checkUrl(resource, this.resourcePolicy);
+      let meta: ResourceMetadata;
       try {
-        const meta = await this.resources.get(resource, (key) => this.lookupResource(key));
-        candidates = meta.pdps;
-        if (meta.document) from = meta;
+        meta = await this.resources.get(resource, (key) => this.lookupResource(key));
       } catch (err) {
         const derr = asDiscoveryError(err);
-        if (derr.kind === 'not_allowed') throw derr;
-        if (!this.staticPdp) throw new DiscoveryError('transient', `no PDP could be resolved for ${resource}: ${derr.message}`);
-        this.warn(`pdp discovery: ${resource}: ${derr.message}; using the static PDP`);
-        candidates = [this.staticPdp];
+        if (derr.kind !== 'not_allowed') this.warnOnce(`resource ${resource}`, `pdp discovery: ${resource}: ${derr.message}; its layer is unavailable`);
+        throw derr;
       }
+      candidates = meta.pdps;
+      if (meta.document) from = meta;
     }
 
     let last: DiscoveryError | undefined;
     for (const pdp of candidates) {
       checkUrl(pdp, this.pdpPolicy);
       try {
-        const ep = await this.pdps.get(pdp, (key) => this.fetchConfig(key));
+        const ep = await this.pdpEndpoints(pdp);
         for (const u of [ep.evaluation, ep.evaluations]) if (u) checkUrl(u, this.pdpPolicy);
         return this.withKey({ ...ep, source: pdp === this.staticPdp ? 'static' : 'rfc9728', ...(from ? { resource: from } : {}) });
       } catch (err) {
@@ -483,7 +555,7 @@ export class PdpDiscovery implements PdpResolver {
     pdp = pdp.replace(/\/+$/, '');
     if (this.mode === 'off') return this.withKey({ ...defaultEndpoints(pdp), source: 'layer' });
     checkUrl(pdp, this.pdpPolicy);
-    const ep = await this.pdps.get(pdp, (key) => this.fetchConfig(key));
+    const ep = await this.pdpEndpoints(pdp);
     for (const u of [ep.evaluation, ep.evaluations]) if (u) checkUrl(u, this.pdpPolicy);
     return this.withKey({ ...ep, source: 'layer' });
   }
@@ -502,8 +574,41 @@ export class PdpDiscovery implements PdpResolver {
     return key ? { ...ep, apiKey: key } : { ...ep, apiKey: undefined };
   }
 
-  /** Sources in order; no metadata anywhere resolves to the static PDP, cached. */
+  /** One warning per subject per retry window: an outage is one event, not one line per request. */
+  private warnOnce(subject: string, message: string): void {
+    const t = this.now();
+    const at = this.warnedAt.get(subject);
+    if (at !== undefined && t - at < this.minRefresh) return;
+    if (this.warnedAt.size >= 1024) this.warnedAt.clear();
+    this.warnedAt.set(subject, t);
+    this.warn(message);
+  }
+
+  /**
+   * A PDP's endpoints. A transient failure serves the last good metadata (the cache does
+   * that); with none yet, this call uses the spec's default paths and nothing is cached,
+   * so the next call after the retry window reads the metadata again rather than living
+   * with a guess for a whole TTL.
+   */
+  private async pdpEndpoints(pdp: string): Promise<PdpEndpoints> {
+    try {
+      return await this.pdps.get(pdp, (key) => this.fetchConfig(key));
+    } catch (err) {
+      const derr = asDiscoveryError(err);
+      if (derr.kind !== 'transient') throw derr;
+      this.warnOnce(`pdp ${pdp}`, `pdp discovery: ${derr.message}; using the default AuthZEN paths until ${pdp}'s metadata can be read`);
+      return defaultEndpoints(pdp);
+    }
+  }
+
+  /**
+   * Sources in order. Metadata from the first that has some wins. A source that says the
+   * resource publishes nothing falls through to the next, and nothing anywhere resolves
+   * to the static PDP, cached. An outage stops the walk; so does an invalid document once
+   * no source has answered — a quiet source must not paper over one that answered wrong.
+   */
   private async lookupResource(resource: string): Promise<ResourceMetadata> {
+    let invalid: DiscoveryError | undefined;
     for (const src of this.sources) {
       try {
         const meta = await src.lookup(resource);
@@ -511,14 +616,21 @@ export class PdpDiscovery implements PdpResolver {
       } catch (err) {
         const derr = asDiscoveryError(err);
         if (derr.kind === 'not_allowed' || derr.kind === 'transient') throw derr;
-        if (derr.kind === 'invalid') this.warn(`pdp discovery: ${src.name} for ${resource}: ${derr.message}`);
+        if (derr.kind === 'invalid') {
+          this.warn(`pdp discovery: ${src.name} for ${resource}: ${derr.message}`);
+          invalid ??= derr;
+        }
       }
     }
+    if (invalid) throw invalid;
     if (!this.staticPdp) throw new DiscoveryError('no_metadata', `no metadata names a PDP for ${resource}`);
     return { source: 'static', document: undefined as unknown as Record<string, unknown>, pdps: [this.staticPdp] };
   }
 
-  /** AuthZEN 1.0 §9: the PDP's metadata, or the default paths when it has none. */
+  /**
+   * AuthZEN 1.0 §9: the PDP's metadata. A PDP that publishes none (404) gets the default
+   * paths, cached; an outage is thrown so the cache can serve the last good copy.
+   */
   private async fetchConfig(pdp: string): Promise<PdpEndpoints> {
     const wk = wellKnownUrl(pdp, 'authzen-configuration');
     let doc: Record<string, unknown>;
@@ -526,9 +638,8 @@ export class PdpDiscovery implements PdpResolver {
       doc = (await this.getJson(wk, this.pdpPolicy)) as Record<string, unknown>;
     } catch (err) {
       const derr = asDiscoveryError(err);
-      if (derr.kind === 'not_allowed' || derr.kind === 'invalid') throw derr;
-      if (derr.kind !== 'no_metadata') this.warn(`pdp discovery: ${derr.message}; using default AuthZEN paths`);
-      return defaultEndpoints(pdp);
+      if (derr.kind === 'no_metadata') return defaultEndpoints(pdp);
+      throw derr;
     }
     const id = String(doc['policy_decision_point'] ?? '').replace(/\/+$/, '');
     if (id !== pdp.replace(/\/+$/, '')) {
@@ -544,9 +655,20 @@ export class PdpDiscovery implements PdpResolver {
     return { identifier: pdp.replace(/\/+$/, ''), evaluation, ...(evaluations ? { evaluations } : {}), ...(capabilities ? { capabilities } : {}), source: 'static' };
   }
 
-  /** Policy-checked, bounded GET. 404 -> no_metadata; redirects are not followed. */
+  /**
+   * A bounded GET of a well-known document. The identifier it was derived from has
+   * already passed the caller's allowlist, and the well-known URL shares its origin, so
+   * only the scheme is checked here — a prefix check would refuse the document of an
+   * allowlist entry that has a path, since the well-known segment goes before it.
+   *
+   *   404, 410          no_metadata  (publishes nothing)
+   *   5xx, 429, a network failure, a timeout   transient
+   *   3xx, any other 4xx, over 1 MiB, not a JSON object   invalid
+   *
+   * Redirects are not followed.
+   */
   private async getJson(url: string, policy: UrlPolicy): Promise<unknown> {
-    checkUrl(url, policy);
+    checkUrl(url, { ...policy, allowlist: undefined });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -556,17 +678,24 @@ export class PdpDiscovery implements PdpResolver {
       } catch (err) {
         throw new DiscoveryError('transient', `GET ${url}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      if (res.status === 404) throw new DiscoveryError('no_metadata', `${url} returned 404`);
-      if (!res.ok) throw new DiscoveryError('transient', `GET ${url} returned ${res.status}`);
-      const text = await res.text();
-      if (text.length > 1_048_576) throw new DiscoveryError('transient', `${url} body exceeds 1 MiB`);
+      if (res.status === 404 || res.status === 410) throw new DiscoveryError('no_metadata', `${url} returned ${res.status}`);
+      if (res.status >= 500 || res.status === 429) throw new DiscoveryError('transient', `GET ${url} returned ${res.status}`);
+      if (res.status < 200 || res.status >= 300) throw new DiscoveryError('invalid', `GET ${url} returned ${res.status}`);
+      let text: string;
       try {
-        const parsed: unknown = JSON.parse(text);
-        if (!parsed || typeof parsed !== 'object') throw new Error('not an object');
-        return parsed;
+        text = await readCapped(res, MAX_METADATA_BYTES);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) throw new DiscoveryError('invalid', `${url} body exceeds 1 MiB`);
+        throw new DiscoveryError('transient', `GET ${url}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
       } catch {
         throw new DiscoveryError('invalid', `${url} is not JSON`);
       }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new DiscoveryError('invalid', `${url} is not JSON: expected an object`);
+      return parsed;
     } finally {
       clearTimeout(timer);
     }

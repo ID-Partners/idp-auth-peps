@@ -22,9 +22,11 @@
   <p class="t">On this page</p>
   <ol>
     <li><a href="#install">Install</a></li>
+    <li><a href="#upgrading">Upgrading to 0.4.0</a></li>
     <li><a href="#client">AuthzenClient</a></li>
     <li><a href="#discovery">Discovery options</a></li>
     <li><a href="#evaluate">Per-call options</a></li>
+    <li><a href="#outcomes">What a PDP call can end in</a></li>
     <li><a href="#express">Express middleware</a></li>
     <li><a href="#mcp">McpGuard</a></li>
     <li><a href="#entity">FederationEntity</a></li>
@@ -45,43 +47,66 @@
 import { AuthzenClient, FederationEntity } from '@id-partners/authzen-pep';
 import { authzenMiddleware, pathMapper } from '@id-partners/authzen-pep/express';
 import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
-  <p>Node 20 or 22. ESM. Types ship with the package.</p>
+  <p>Node 22 or later. ESM only: there is no CommonJS build. Types ship with the package, and so does the source its maps point at.</p>
+
+  <h2 id="upgrading">Upgrading to 0.4.0</h2>
+  <p>0.4.0 closes every way the SDK had of letting a request through that no PDP judged. A configuration that would trust something nobody checked now refuses to start; <code>allowInsecure: true</code> is the escape hatch everywhere, for demos and development, and it says so once at startup.</p>
+  <div class="wide"><table>
+    <thead><tr><th>What changed</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td>Node 22 or later; ESM only.</td><td>Move off Node 20, which is end of life.</td></tr>
+      <tr><td><code>authzenMiddleware</code> throws without <code>verifyToken</code>. A verifier that throws is a 401, not a 502.</td><td>Pass a real verifier. <code>allowInsecure: true</code> decodes without verifying, for demos only.</td></tr>
+      <tr><td><code>map()</code> returning <code>undefined</code> is a mapping error (400).</td><td>Return exactly <code>null</code> to let a request through without the PDP.</td></tr>
+      <tr><td><code>forwardHeaders</code> sets <code>X-Auth-*</code> on <code>req.headers</code>, not the response. Client copies are stripped from every request let through.</td><td>Read the identity from the request in your handler; stop reading it from the response.</td></tr>
+      <tr><td><code>applyDefaultMappings</code> defaults to <code>true</code>: every MCP method is governed.</td><td>Make sure your PDP answers for <code>tools/list</code>, <code>initialize</code> and undeclared tools, or pass <code>false</code> to keep the old pass-through.</td></tr>
+      <tr><td>Delegate mode needs <code>upstreamUrl</code> and <code>delegate.apiKey</code>, and sends every MCP request to coaz-pep.</td><td>Add both. Before, coaz-pep was never told which server to read <code>tools/list</code> from, and permitted every <code>tools/call</code>.</td></tr>
+      <tr><td>Resource-mode discovery needs <code>pdpAllowlist</code> and <code>resourceAllowlist</code>.</td><td>List the PDPs a resource may name and the resources whose documents are read.</td></tr>
+      <tr><td>Only a resource that publishes nothing (404) falls back to the static PDP; an outage or an invalid document fails its layer by its own mode.</td><td>Nothing, unless you relied on a broken document quietly meaning "use the static PDP".</td></tr>
+      <tr><td>Fail-open covers an unavailable PDP only. A 3xx, a 4xx, an answer that is not a decision and a request that cannot be encoded never open.</td><td>Nothing: a refusal used to be skipped as an outage.</td></tr>
+      <tr><td>A permit is the JSON boolean <code>true</code>; a boxcar answer needs one decision per evaluation sent.</td><td>Nothing, unless your PDP answers <code>"true"</code>.</td></tr>
+      <tr><td>A PDP failure's <code>reason</code> is a fixed phrase; the specifics are in <code>verdict.detail</code>. <code>failedOpen</code> and <code>X-PDP-Fail-Open</code> carry layer identifiers only.</td><td>Log <code>detail</code> from <code>onDecision</code> if you logged <code>reason</code> for diagnosis.</td></tr>
+      <tr><td><code>pathMapper</code> matches decoded, case-insensitively, and answers <code>HEAD</code> with a <code>GET</code> rule.</td><td>Pass <code>caseSensitive: true</code> if your router is.</td></tr>
+      <tr><td>The PEP-owned context keys (<code>access_token</code>, <code>resource_metadata</code>, <code>resource_metadata_source</code>, <code>request</code>) cannot be supplied by a mapping or caller.</td><td>Pass them as per-call options.</td></tr>
+      <tr><td><code>McpVerdict</code> gains <code>response</code>, <code>upstreamHeaders</code>, <code>responseHeaders</code> and <code>message</code>; <code>wrap()</code> hands its handler <code>(rpc, verdict)</code>.</td><td>Send <code>response</code> on a deny; apply <code>upstreamHeaders</code> to what a gateway forwards.</td></tr>
+      <tr><td><code>FederationEntity</code> refuses http identifiers, RSA under 2048 bits and non-positive lifetimes; <code>signed_metadata</code> carries an <code>exp</code>.</td><td>Use https and a 2048-bit or EC key.</td></tr>
+    </tbody>
+  </table></div>
 
   <h2 id="client">AuthzenClient</h2>
   <p><code>new AuthzenClient(options)</code>. The client is the one thing every other piece is built on; the middleware and the guard accept either a client or these options.</p>
   <div class="wide"><table>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>url</code> <span class="req">required</span></td><td class="d">string</td><td>The static PDP's base URL. Without <code>discovery</code> the AuthZEN default paths are appended; with it, the PDP every mode falls back to.</td></tr>
+      <tr><td><code>url</code> <span class="req">required</span></td><td class="d">string</td><td>The static PDP's base URL, absolute http(s). Without <code>discovery</code> the AuthZEN default paths are appended; with it, the PDP every mode falls back to.</td></tr>
       <tr><td><code>apiKey</code></td><td class="d">string</td><td>Sent as <code>Authorization: Bearer</code> to <code>url</code>. A discovered PDP never receives it.</td></tr>
       <tr><td><code>discovery</code></td><td class="d">ClientDiscoveryOptions | PdpResolver</td><td>PDP discovery, below, or a resolver of your own (<code>{ resolve(resource), resolvePdp(pdp) }</code>). Absent means off: no HTTP beyond the evaluation itself.</td></tr>
-      <tr><td><code>layers</code></td><td class="d">Array&lt;string | LayerSpec&gt; · ['resource']</td><td>The ordered PDPs every call asks unless it overrides them: <code>'static'</code> (this client's <code>url</code>, regardless of discovery), <code>'resource'</code> (what discovery finds for the call's resource), or a PDP identifier, each optionally suffixed <code> fail-open</code> or <code> fail-closed</code>, or as <code>{ name, failOpen }</code>. Every layer must permit; the first that does not is the verdict.</td></tr>
-      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed' · 'closed'</td><td>What a layer does when its PDP cannot be reached, unless the layer says for itself. <code>closed</code> makes the verdict a <code>pdp_error</code>. <code>open</code> skips the layer; if every layer was skipped the verdict is a permit with <code>failedOpen</code> naming what was skipped. A refusal never opens; a deny is a decision.</td></tr>
+      <tr><td><code>layers</code></td><td class="d">Array&lt;string | LayerSpec&gt; · ['resource']</td><td>The ordered PDPs every call asks unless it overrides them: <code>'static'</code> (this client's <code>url</code>, regardless of discovery), <code>'resource'</code> (what discovery finds for the call's resource), or a PDP identifier, each optionally suffixed <code> fail-open</code> or <code> fail-closed</code>, or as <code>{ name, failOpen }</code> with a boolean <code>failOpen</code>. Every layer must permit; the first that does not is the verdict. An entry that cannot be read throws, fail-open or not.</td></tr>
+      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed' · 'closed'</td><td>What a layer does when its PDP is <a href="#outcomes">unavailable</a>, unless the layer says for itself. <code>closed</code> makes the verdict a <code>pdp_error</code>. <code>open</code> skips the layer; if every layer was skipped the verdict is a permit with <code>failedOpen</code> naming what was skipped. A refusal never opens; a deny is a decision.</td></tr>
       <tr><td><code>timeoutMs</code></td><td class="d">number · 1500</td><td>Per-request timeout. A PEP sits in the request path.</td></tr>
       <tr><td><code>headers</code></td><td class="d">Record&lt;string,string&gt;</td><td>Extra headers on every PDP call: tracing, tenant routing.</td></tr>
       <tr><td><code>fetch</code></td><td class="d">typeof fetch · global fetch</td><td>Swapped out in tests.</td></tr>
-      <tr><td><code>onTrace</code></td><td class="d">(trace: PdpTrace) =&gt; void</td><td>Called with every PDP exchange. Never throws into the request path.</td></tr>
+      <tr><td><code>onTrace</code></td><td class="d">(trace: PdpTrace) =&gt; void</td><td>Called with every PDP exchange, including its <code>outcome</code> — permit, deny, refusal or unavailable — so a refusal and an outage are logged apart. Never throws into the request path.</td></tr>
     </tbody>
   </table></div>
-  <p>Methods: <code>evaluate(request, options)</code>, <code>evaluateAll(batch, options)</code> (a boxcar, folded to one verdict, first deny wins so its advice survives), <code>evaluations</code>, <code>searchSubject</code>, <code>searchResource</code>.</p>
+  <p>Methods: <code>evaluate(request, options)</code>, <code>evaluateAll(batch, options)</code> (a boxcar, folded to one verdict, first deny wins so its advice survives; an empty batch is refused before it is sent), <code>evaluations</code>, <code>searchSubject</code>, <code>searchResource</code>. The PDP POST never follows a redirect and refuses an answer over 1 MiB.</p>
 
   <h2 id="discovery">Discovery options</h2>
   <p><code>discovery: { … }</code> on the client, or <code>new PdpDiscovery({ staticPdp, … })</code> directly. The rules are the Go PEP's: the resource's echoed <code>resource</code> must be byte-identical, the PDP's <code>policy_decision_point</code> must equal the identifier it was fetched from, a PDP without metadata gets the default paths, a batch is never sent to a PDP that advertises no <code>access_evaluations_endpoint</code>, and a URL outside an allowlist never falls through to a weaker source.</p>
   <div class="wide"><table>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>mode</code></td><td class="d">'off' | 'authzen' | 'resource' · 'off'</td><td><code>authzen</code> reads the static PDP's <code>/.well-known/authzen-configuration</code>; <code>resource</code> follows a call's <code>resource</code> to its RFC 9728 document for the PDP that decides for it, then that PDP's metadata, falling back to the static PDP. No federation mode in the SDK; <code>sources</code> is the seam for one.</td></tr>
+      <tr><td><code>mode</code></td><td class="d">'off' | 'authzen' | 'resource' · 'off'</td><td><code>authzen</code> reads the static PDP's <code>/.well-known/authzen-configuration</code>; <code>resource</code> follows a call's <code>resource</code> to its RFC 9728 document for the PDP that decides for it, then that PDP's metadata. A resource that publishes nothing (404, or a document naming no PDP) gets the static PDP; one whose document cannot be read — an outage, or an invalid document — fails its layer by its own mode. No federation mode in the SDK; <code>sources</code> is the seam for one.</td></tr>
       <tr><td><code>staticPdp</code> <span class="req">required on PdpDiscovery</span></td><td class="d">string</td><td>The configured PDP: always the fallback, always permitted. The client fills it from <code>url</code>.</td></tr>
       <tr><td><code>apiKeys</code></td><td class="d">Record&lt;identifier, bearer&gt;</td><td>Which bearer goes to which PDP. The client seeds <code>{ [url]: apiKey }</code>.</td></tr>
+      <tr><td><code>pdpAllowlist</code> <span class="req">required in resource mode</span></td><td class="d">string[]</td><td>The PDPs a resource may name, and the layers a route may, as prefixes matched at a path boundary. <code>staticPdp</code> is always permitted. An entry with a path permits its own well-known.</td></tr>
+      <tr><td><code>resourceAllowlist</code> <span class="req">required in resource mode</span></td><td class="d">string[]</td><td>The resources whose metadata is read, as prefixes.</td></tr>
+      <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>The escape hatch, for development: allows http for discovered URLs (same-origin http as <code>staticPdp</code> always is) and lets resource mode start without its allowlists. Logged once at construction.</td></tr>
       <tr><td><code>ttlMs</code></td><td class="d">number · 300000</td><td>Cache TTL for resource and PDP metadata.</td></tr>
-      <tr><td><code>minRefreshMs</code></td><td class="d">number · 30000</td><td>Retry throttle while a refresh keeps failing; the stale value is served in between.</td></tr>
+      <tr><td><code>minRefreshMs</code></td><td class="d">number · 30000</td><td>How long a failure is remembered before it is retried. The last good document is served through it; a PDP never read yet uses the default paths meanwhile, without caching them.</td></tr>
       <tr><td><code>maxEntries</code></td><td class="d">number · 1024</td><td>Cache bound.</td></tr>
-      <tr><td><code>timeoutMs</code></td><td class="d">number · 3000</td><td>Per metadata fetch.</td></tr>
-      <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>Allow http for discovered URLs. Same-origin http as <code>staticPdp</code> is always allowed.</td></tr>
-      <tr><td><code>pdpAllowlist</code></td><td class="d">string[]</td><td>Permitted discovered-PDP prefixes; <code>staticPdp</code> is always permitted. Empty: any https.</td></tr>
-      <tr><td><code>resourceAllowlist</code></td><td class="d">string[]</td><td>Permitted <code>resource</code> prefixes for metadata fetches. Empty: any.</td></tr>
+      <tr><td><code>timeoutMs</code></td><td class="d">number · 3000</td><td>Per metadata fetch. A document over 1 MiB, a redirect or a 4xx other than 404 is refused rather than taken for an outage.</td></tr>
       <tr><td><code>sources</code></td><td class="d">MetadataSource[]</td><td>Overrides the mode-derived sources. Each is <code>{ name, lookup(resource) }</code>.</td></tr>
-      <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>One line per degraded step.</td></tr>
+      <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>One line per degraded step, once per retry window.</td></tr>
       <tr><td><code>fetch</code>, <code>now</code></td><td class="d"></td><td>Swapped out in tests.</td></tr>
     </tbody>
   </table></div>
@@ -98,68 +123,109 @@ import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
       <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode for this call.</td></tr>
     </tbody>
   </table></div>
-  <p>Whatever document named the PDP is forwarded verbatim as <code>context.resource_metadata</code> with <code>context.resource_metadata_source</code>. The SDK enforces none of it.</p>
+  <p>Whatever document named the PDP is forwarded verbatim as <code>context.resource_metadata</code> with <code>context.resource_metadata_source</code>. Those two, <code>request</code> and <code>access_token</code> are the PEP's: the same keys in a mapped or supplied <code>context</code>, at the top level or in a boxcar entry, are removed, and only what the PEP forwards is sent. The SDK enforces none of it.</p>
+
+  <h2 id="outcomes">What a PDP call can end in</h2>
+  <p>Four outcomes, and a fail-open layer may skip only one of them.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Outcome</th><th>When</th><th>Fail-open layer</th></tr></thead>
+    <tbody>
+      <tr><td>permit</td><td>The decision is the JSON boolean <code>true</code>; for a boxcar, exactly one per evaluation sent, every one <code>true</code>.</td><td>—</td></tr>
+      <tr><td>deny</td><td>The decision is <code>false</code>.</td><td>Never skipped: a deny is a decision.</td></tr>
+      <tr><td>unavailable</td><td>A network error, a timeout, a 5xx, a 429; a PDP with no batch endpoint asked a boxcar; resource metadata that cannot be read.</td><td>Skipped, and named in <code>failedOpen</code> and <code>X-PDP-Fail-Open</code>.</td></tr>
+      <tr><td>refusal</td><td>A 3xx or 4xx, a 2xx that is not a decision (<code>"true"</code>, <code>1</code>, <code>{}</code>, a short boxcar), an answer over 1 MiB, a request that cannot be encoded (<code>Infinity</code>, <code>NaN</code>, a cycle), an unusable URL, an allowlist miss.</td><td>Never skipped.</td></tr>
+    </tbody>
+  </table></div>
 
   <h2 id="express">Express middleware</h2>
-  <p><code>authzenMiddleware(options)</code>. On permit the request continues and <code>req.authz</code> carries <code>{ claims, verdict, request }</code>. On deny nothing downstream runs and the response is the challenge.</p>
+  <p><code>authzenMiddleware(options)</code>. On permit the request continues and <code>req.authz</code> carries <code>{ claims, verdict, request }</code>. On deny nothing downstream runs and the response is the challenge. An error thrown downstream after a permit is the router's, not a PEP failure.</p>
   <div class="wide"><table>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>client</code> <span class="req">required</span></td><td class="d">AuthzenClient | AuthzenClientOptions</td><td>An existing client, or the options to build one.</td></tr>
-      <tr><td><code>map</code> <span class="req">required</span></td><td class="d">(req, claims) =&gt; EvaluationRequest | null</td><td>Map a request to an evaluation. Return <code>null</code> to let it through without asking the PDP, for health checks only: an unmapped route is a deny. Async, so it may look things up.</td></tr>
+      <tr><td><code>map</code> <span class="req">required</span></td><td class="d">(req, claims) =&gt; EvaluationRequest | null</td><td>Map a request to an evaluation. Return exactly <code>null</code> to let it through without asking the PDP, for health checks only. <code>undefined</code>, or anything that is not an evaluation, is a mapping error (400); so is a throw. Async, so it may look things up.</td></tr>
+      <tr><td><code>verifyToken</code> <span class="req">required</span></td><td class="d">(token, req) =&gt; Promise&lt;claims | null&gt;</td><td>Verify the token and return its claims. <code>null</code>, a throw or anything that is not a claims object is a 401. Plug in <code>jose</code>'s <code>jwtVerify</code>. The middleware will not build without it.</td></tr>
+      <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>Build without <code>verifyToken</code> and decode tokens without checking a signature. For demos; logged once at construction.</td></tr>
       <tr><td><code>pep</code></td><td class="d">string</td><td>Label for this PEP in challenges and logs.</td></tr>
       <tr><td><code>requireToken</code></td><td class="d">boolean · true</td><td>Deny when no token is present.</td></tr>
       <tr><td><code>getToken</code></td><td class="d">(req) =&gt; string</td><td>Pull the compact token out of the request. Defaults to the Authorization header.</td></tr>
-      <tr><td><code>verifyToken</code></td><td class="d">(token, req) =&gt; Promise&lt;claims | null&gt;</td><td>Verify the token and return its claims. Strongly recommended: without it the middleware only decodes, and an unverified <code>sub</code> is an attacker-chosen <code>sub</code>. Plug in <code>jose</code>'s <code>jwtVerify</code>.</td></tr>
-      <tr><td><code>forwardHeaders</code></td><td class="d">boolean · false</td><td>Forward the decided identity upstream as <code>X-Auth-Principal</code>, <code>X-Auth-Agent</code>, <code>X-Auth-Scope</code>, <code>X-Auth-Acr</code>, as the gateways do.</td></tr>
-      <tr><td><code>onDecision</code></td><td class="d">({ req, verdict, claims }) =&gt; void</td><td>Observe every decision. Must not throw.</td></tr>
+      <tr><td><code>forwardHeaders</code></td><td class="d">boolean · false</td><td>Assert the decided identity as <code>X-Auth-Principal</code>, <code>X-Auth-Agent</code>, <code>X-Auth-Scope</code>, <code>X-Auth-Acr</code> on <code>req.headers</code>, as the gateways do upstream. An empty claim leaves its header absent. Client copies are stripped from every request the middleware lets through either way.</td></tr>
+      <tr><td><code>onDecision</code></td><td class="d">({ req, verdict, claims }) =&gt; void</td><td>Observe every decision, once per request; <code>verdict.detail</code> carries what the response does not. Must not throw.</td></tr>
+      <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>Construction-time warnings.</td></tr>
       <tr><td><code>resource</code></td><td class="d">string | (req) =&gt; string</td><td>The resource identifier discovery starts from; a function of the request for a multi-tenant API. Absent means the client's static PDP.</td></tr>
       <tr><td><code>forwardAccessToken</code></td><td class="d">boolean · false</td><td>Forward the raw token as <code>context.access_token</code>.</td></tr>
-      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode on this route. A fail-open permit sets <code>X-PDP-Fail-Open</code> on the response.</td></tr>
+      <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode on this route. A fail-open permit sets <code>X-PDP-Fail-Open</code> on the response, naming the skipped layers.</td></tr>
     </tbody>
   </table></div>
-  <p><code>pathMapper(rules, { fallthrough })</code> builds a <code>map</code> from route rules: <code>{ method, pattern, action, resourceType, resourceId?, resourceProperties?, context? }</code>. An unmatched route is a deny; pass <code>fallthrough: 'allow'</code> only for paths that carry no policy.</p>
+  <p><code>pathMapper(rules, { fallthrough, caseSensitive, subjectType })</code> builds a <code>map</code> from route rules: <code>{ method, pattern, action, resourceType, resourceId?, resourceProperties?, context? }</code>. Patterns take <code>:name</code> segments and <code>*</code> for any number of segments. It matches the way Express routes: segment by segment, each percent-decoded after the split, case-insensitively unless <code>caseSensitive</code>, one trailing slash tolerated, the query ignored, and a <code>GET</code> rule answers <code>HEAD</code>. A path that cannot be decoded is a mapping error. An unmatched route is a deny; pass <code>fallthrough: 'allow'</code> only for paths that carry no policy.</p>
 
   <h2 id="mcp">McpGuard</h2>
-  <p><code>new McpGuard(options)</code>, then <code>checkToolCall({ rpc, claims, accessToken?, extraContext?, raw? })</code> or <code>guard.wrap(handler)</code>. Every MCP method is governed with <code>applyDefaultMappings</code>; unknown methods are denied so future ones fail closed.</p>
+  <p><code>new McpGuard(options)</code>, then <code>checkToolCall({ rpc?, claims?, raw?, accessToken?, extraContext? })</code> or <code>guard.wrap(handler)</code>. Every MCP method is governed; unknown methods are denied so future ones fail closed. <code>checkToolCall</code> never throws.</p>
   <div class="wide"><table>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>client</code> <span class="req">required</span></td><td class="d">AuthzenClient | AuthzenClientOptions</td><td>As above.</td></tr>
-      <tr><td><code>tools</code></td><td class="d">ToolDefinition[] | () =&gt; …</td><td>The tool definitions, when this process is the MCP server. No discovery round trip.</td></tr>
-      <tr><td><code>upstreamUrl</code></td><td class="d">string</td><td>The MCP streamable-HTTP endpoint to discover <code>tools/list</code> from, when guarding someone else's server. Ignored when <code>tools</code> is set.</td></tr>
+      <tr><td><code>tools</code></td><td class="d">ToolDefinition[] | () =&gt; …</td><td>The tool definitions, when this process is the MCP server. No discovery round trip. Ignored in delegate mode.</td></tr>
+      <tr><td><code>upstreamUrl</code></td><td class="d">string</td><td>The MCP streamable-HTTP endpoint to discover <code>tools/list</code> from, when guarding someone else's server. Required in delegate mode, where coaz-pep reads that server's list. Ignored for discovery when <code>tools</code> is set.</td></tr>
       <tr><td><code>discoveryTtlMs</code></td><td class="d">number · 60000</td><td>How long a discovered <code>tools/list</code> is reused.</td></tr>
+      <tr><td><code>discoveryTimeoutMs</code></td><td class="d">number · 10000</td><td>The deadline for one whole discovery: the session handshake, if the server wants one, and every page, following <code>nextCursor</code> up to 32. Concurrent calls share one discovery; an answer over 4 MiB is refused; a list that cannot be read to the end fails closed.</td></tr>
       <tr><td><code>discoveryHeaders</code></td><td class="d">Record&lt;string,string&gt;</td><td>Headers for the discovery call.</td></tr>
       <tr><td><code>pep</code></td><td class="d">string</td><td>Label for this PEP.</td></tr>
-      <tr><td><code>applyDefaultMappings</code></td><td class="d">boolean · false</td><td>Authorise tools and methods that declare no mapping against the binding's default mapping, as it requires. Off retains pass-through, which is not conformant but is what existing routes expect.</td></tr>
+      <tr><td><code>applyDefaultMappings</code></td><td class="d">boolean · true</td><td>Govern tools and methods that declare no mapping with the binding's default mapping, as it requires. Only an explicit <code>false</code> restores the old pass-through, which is not conformant. In delegate mode it is sent to coaz-pep as <code>coaz_defaults</code>.</td></tr>
       <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>Conditions worth surfacing but not failing on, chiefly a mapping that overrides <code>subject.id</code>.</td></tr>
-      <tr><td><code>delegate</code></td><td class="d">{ url, apiKey?, config?, timeoutMs? }</td><td>Hand the whole check to a running coaz-pep over its HTTP check API: <code>url</code> is its base, <code>apiKey</code> its <code>CHECK_API_TOKEN</code>, <code>config</code> the per-route knobs. Use it when a mapping needs CEL beyond the SDK's subset. Requires <code>raw: { headers, body }</code> on each check.</td></tr>
+      <tr><td><code>delegate</code></td><td class="d">{ url, apiKey, config?, timeoutMs? · 2000 }</td><td>Hand every MCP request to a running coaz-pep over its HTTP check API: <code>url</code> is its base, <code>apiKey</code> its <code>CHECK_API_TOKEN</code> (required), <code>config</code> the per-route knobs. The guard sets <code>style</code>, <code>mcp_upstream_url</code> and <code>coaz_defaults</code> itself; a <code>config</code> that contradicts them will not build. Requires <code>raw</code> on each check.</td></tr>
+      <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>Lets delegate mode start without <code>delegate.apiKey</code>, for development. Logged once.</td></tr>
       <tr><td><code>fetch</code></td><td class="d">typeof fetch</td><td>Swapped out in tests.</td></tr>
-      <tr><td><code>onDecision</code></td><td class="d">({ tool, verdict }) =&gt; void</td><td>Observe every decision.</td></tr>
-      <tr><td><code>resource</code></td><td class="d">string · upstreamUrl</td><td>The MCP server's identifier, which discovery starts from; passed to coaz-pep in delegate mode so both PEPs key off one identifier.</td></tr>
+      <tr><td><code>onDecision</code></td><td class="d">({ tool, verdict }) =&gt; void</td><td>Observe every decision, refusals included.</td></tr>
+      <tr><td><code>resource</code></td><td class="d">string · upstreamUrl</td><td>The MCP server's identifier: where discovery starts, what is passed to coaz-pep in delegate mode, and how the guard picks this server out of a token whose <code>aud</code> names several.</td></tr>
       <tr><td><code>forwardAccessToken</code></td><td class="d">boolean · false</td><td>Forward the raw token (passed per call as <code>accessToken</code>). In delegate mode the flag is passed to coaz-pep.</td></tr>
       <tr><td><code>failMode</code></td><td class="d">'open' | 'closed'</td><td>Overrides the client's fail mode for this guard. In delegate mode passed to coaz-pep.</td></tr>
     </tbody>
   </table></div>
-  <p>Error codes are the profile's: <code>-32001</code> the PDP denied, with <code>error.data.authz_challenge</code> carrying the remedy; <code>-32602</code> the mapping could not be evaluated; <code>-32603</code> the PDP could not be reached. Send them with HTTP 200.</p>
+  <p>A check takes the parsed message as <code>rpc</code>, the untouched request as <code>raw: { method?, path?, headers, body }</code> (body as a string or as bytes), or both, in which case they must agree. <code>claims</code> are yours to verify: the guard never decodes a token. The guard refuses, without asking the PDP, anything that is not one JSON-RPC request or response object: a batch, a non-string <code>method</code>, a <code>tools/call</code> without a string <code>params.name</code>, an object at any depth holding two member names a case-insensitive parser reads as one (Go's rule: Unicode simple case folding, so <code>Amount</code> beside <code>amount</code> in the arguments counts), and nesting deeper than 64 — exactly as coaz-pep refuses them. Given <code>raw</code> it also refuses a <code>Content-Encoding</code> other than identity (415), a byte-order mark, invalid UTF-8, trailing data, anything that is not JSON, and a member named twice at any depth. A JSON-RPC response — a client answering the server — passes through.</p>
+  <div class="wide"><table>
+    <thead><tr><th>Verdict field</th><th>When</th><th>What</th></tr></thead>
+    <tbody>
+      <tr><td><code>allow</code></td><td>always</td><td>Only <code>true</code> means go.</td></tr>
+      <tr><td><code>response</code></td><td>deny</td><td>The HTTP response to send as is: status, headers (<code>X-PDP-Decision: DENY</code>) and body. In delegate mode, what coaz-pep rendered.</td></tr>
+      <tr><td><code>jsonRpcError</code></td><td>deny</td><td>The JSON-RPC error, which is what <code>wrap()</code> returns.</td></tr>
+      <tr><td><code>upstreamHeaders</code></td><td>permit</td><td>The <code>X-Auth-*</code> identity to set on what a gateway forwards; an empty value means remove the client's copy.</td></tr>
+      <tr><td><code>responseHeaders</code></td><td>permit</td><td>Headers to add to the client's response, <code>X-PDP-Fail-Open</code> among them.</td></tr>
+      <tr><td><code>message</code></td><td>once read</td><td>The JSON-RPC message that was judged; <code>wrap()</code> hands it to the handler with the verdict.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="wide"><table>
+    <thead><tr><th>Code</th><th>HTTP</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td><code>-32001</code></td><td>200</td><td>The PDP denied, with <code>error.data.authz_challenge</code> carrying the remedy. <code>-32401</code> for a tool still declared against v1.</td></tr>
+      <tr><td><code>-32602</code></td><td>200</td><td>The mapping could not be evaluated.</td></tr>
+      <tr><td><code>-32603</code></td><td>200</td><td>The PDP, or coaz-pep, could not be reached. Generic on the wire; the detail is in the verdict.</td></tr>
+      <tr><td><code>-32600</code></td><td>400 · 415</td><td>The message is not one the PEP will read; 415 for a Content-Encoding.</td></tr>
+      <tr><td><code>-32700</code></td><td>400</td><td>The body is not JSON.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The server-scoped defaults (<code>tools/list</code>, <code>initialize</code> and friends) name this server from the token's <code>aud</code>. An array <code>aud</code> is narrowed to this server's own identifier, or to its only entry; one the guard cannot choose from, or no <code>aud</code> at all, is a <code>-32602</code>. A declared <code>subject.id</code> or <code>resource.id</code> that resolves absent is a <code>-32602</code> in both dialects.</p>
 
   <h2 id="entity">FederationEntity</h2>
   <p><code>new FederationEntity(options)</code> holds a private key and serves the two documents a federated resource publishes: a minimal entity configuration (keys, <code>authorityHints</code>, the entity type; no policy, the controller maintains that) for a trust controller to onboard, and RFC 9728 metadata with <code>signed_metadata</code>.</p>
   <div class="wide"><table>
     <thead><tr><th>Option</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>entityId</code> <span class="req">required</span></td><td class="d">string</td><td>The resource identifier, an absolute URL without query or fragment. A trailing slash is trimmed.</td></tr>
-      <tr><td><code>key</code> <span class="req">required</span></td><td class="d">KeyObject | JsonWebKey</td><td>The private key: EC P-256/384/521 (ES256/384/512) or RSA (RS256). A public key is refused.</td></tr>
-      <tr><td><code>authorityHints</code> <span class="req">required</span></td><td class="d">string[]</td><td>The superiors a trust controller may be reached through. At least one.</td></tr>
-      <tr><td><code>asserted</code></td><td class="d">Record&lt;string, unknown&gt; · {}</td><td>What the RFC 9728 document carries beyond <code>resource</code>, typically the PDP the service is configured with. The SDK has no chain resolver, so its document is self-asserted; put coaz-pep in front when the public document must be the controller's word.</td></tr>
-      <tr><td><code>lifetimeSeconds</code></td><td class="d">number · 86400</td><td>Lifetime of each entity configuration; re-minted after half of it.</td></tr>
+      <tr><td><code>entityId</code> <span class="req">required</span></td><td class="d">string</td><td>The resource identifier: an https URL without query or fragment. A trailing slash is trimmed.</td></tr>
+      <tr><td><code>key</code> <span class="req">required</span></td><td class="d">KeyObject | JsonWebKey</td><td>The private key: EC P-256/384/521 (ES256/384/512) or RSA of at least 2048 bits (RS256). A public key is refused.</td></tr>
+      <tr><td><code>authorityHints</code> <span class="req">required</span></td><td class="d">string[]</td><td>The superiors a trust controller may be reached through: https URLs, at least one.</td></tr>
+      <tr><td><code>asserted</code></td><td class="d">Record&lt;string, unknown&gt; · {}</td><td>What the RFC 9728 document carries beyond <code>resource</code>, typically the PDP the service is configured with. JWT-registered claim names (<code>iss</code>, <code>sub</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code>, <code>iat</code>, <code>jti</code>) are dropped: the entity sets the ones it needs. The SDK has no chain resolver, so the document is self-asserted; put coaz-pep in front when the public document must be the controller's word.</td></tr>
+      <tr><td><code>lifetimeSeconds</code></td><td class="d">number · 86400</td><td>Lifetime of each entity configuration; re-minted after half of it. Must be positive.</td></tr>
+      <tr><td><code>metadataLifetimeSeconds</code></td><td class="d">number · 3600</td><td>The <code>exp</code> of <code>signed_metadata</code>; the document is re-signed after half of it rather than on every GET. Must be positive.</td></tr>
+      <tr><td><code>allowInsecure</code></td><td class="d">boolean · false</td><td>Accept http identifiers, for development. Logged once.</td></tr>
+      <tr><td><code>onWarning</code></td><td class="d">(message) =&gt; void · console.warn</td><td>Construction-time warnings.</td></tr>
       <tr><td><code>now</code></td><td class="d">() =&gt; seconds</td><td>The clock, for tests.</td></tr>
     </tbody>
   </table></div>
-  <p>Methods: <code>publicJwk()</code> (with an RFC 7638 thumbprint as <code>kid</code>), <code>paths()</code> (<code>{ federation, resource }</code> for this identifier), <code>configuration()</code>, <code>protectedResourceMetadata()</code>, and <code>handler()</code>, an Express-style middleware that serves both paths and passes everything else to <code>next</code>.</p>
+  <p>Methods: <code>publicJwk()</code> (with an RFC 7638 thumbprint as <code>kid</code>), <code>paths()</code> (<code>{ federation, resource }</code> for this identifier), <code>configuration()</code>, <code>protectedResourceMetadata()</code> (a copy each call), and <code>handler()</code>, an Express-style middleware that serves both paths and passes everything else to <code>next</code>.</p>
 
   <h2 id="verdicts">Verdicts and challenges</h2>
-  <p>A verdict is <code>{ allow, kind, reason, context?, request?, failedOpen? }</code>. When the PDP's decision context says how a deny can be resolved, the SDK renders it three consistent ways, the same as the gateways:</p>
+  <p>A verdict is <code>{ allow, kind, reason, detail?, context?, request?, failedOpen? }</code>. <code>reason</code> is safe to show the caller: a PDP's own reason for a policy decision, or a fixed phrase for a failure. <code>detail</code> is what happened — which PDP, which status, which error — for logs, and never goes in a response. <code>failedOpen</code> lists the identifiers of the skipped layers. When the PDP's decision context says how a deny can be resolved, the SDK renders it three consistent ways, the same as the gateways:</p>
   <div class="wide"><table>
     <thead><tr><th>Verdict kind</th><th>HTTP</th><th><code>WWW-Authenticate</code></th><th><code>authz_challenge.type</code></th></tr></thead>
     <tbody>
@@ -171,7 +237,7 @@ import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
       <tr><td><code>pdp_error</code></td><td>502</td><td>—</td><td>—</td></tr>
     </tbody>
   </table></div>
-  <p><code>pdp_error</code> is 502 on purpose: the PDP being down is our problem, and a 403 would send the caller chasing permissions they already have.</p>
+  <p><code>pdp_error</code> is 502 on purpose: the PDP being down is our problem, and a 403 would send the caller chasing permissions they already have. Header values built from PDP data lose CR, LF and anything outside printable Latin-1, and are quoted-string escaped inside <code>WWW-Authenticate</code>, so a policy reason can neither forge a header nor make Node refuse one.</p>
 
   <h2 id="samples">Complete samples</h2>
   <h3>A REST API: verified tokens, discovery, layers, the federation face</h3>
@@ -197,7 +263,7 @@ const client = new AuthzenClient({
   layers: ['https://estate-pdp.bank.example fail-open', 'resource'],
   failMode: 'closed',
   timeoutMs: 1500,
-  onTrace: (t) => log.debug(t),
+  onTrace: (t) =&gt; log.debug(t),                <span class="c">// t.outcome: permit, deny, refusal or unavailable</span>
 });
 
 <span class="c">// The resource's federation face: this service holds the key; the controller holds the policy.</span>
@@ -212,19 +278,19 @@ app.use(entity.handler());                       <span class="c">// /.well-known
 app.use(authzenMiddleware({
   client,
   pep: 'api-edge',
-  verifyToken: async (token) => (await jwtVerify(token, jwks, { audience: 'https://api.bank.example' })).payload,
+  verifyToken: async (token) =&gt; (await jwtVerify(token, jwks, { audience: 'https://api.bank.example' })).payload,
   map: pathMapper([
-    { method: 'GET',  pattern: '/accounts/:id/balance', action: 'get_balance',  resourceType: 'account', resourceId: (p) => p.id },
+    { method: 'GET',  pattern: '/accounts/:id/balance', action: 'get_balance',  resourceType: 'account', resourceId: (p) =&gt; p.id },
     { method: 'POST', pattern: '/payments',             action: 'make_payment', resourceType: 'payment',
-      resourceProperties: (_p, req) => ({ amount: (req.body as { amount?: number })?.amount }) },
+      resourceProperties: (_p, req) =&gt; ({ amount: (req.body as { amount?: number })?.amount }) },
   ]),
   resource: 'https://api.bank.example',
   forwardAccessToken: true,                      <span class="c">// the PDP connection is TLS and authenticated</span>
-  forwardHeaders: true,
-  onDecision: ({ verdict }) => audit.log(verdict),
+  forwardHeaders: true,                          <span class="c">// X-Auth-* on req.headers</span>
+  onDecision: ({ verdict }) =&gt; audit.log(verdict.kind, verdict.reason, verdict.detail),
 }));
 
-app.get('/accounts/:id/balance', (req, res) => res.json({ balance: 12.5, decidedBy: req.authz?.verdict.reason }));
+app.get('/accounts/:id/balance', (req, res) =&gt; res.json({ balance: 12.5, principal: req.get('x-auth-principal') }));
 app.listen(8070);</code></pre>
 
   <h3>An MCP server guarding its own tools</h3>
@@ -233,30 +299,39 @@ app.listen(8070);</code></pre>
 const guard = new McpGuard({
   client: { url: process.env.AUTHZEN_URL!, apiKey: process.env.AUTHZEN_API_KEY },
   tools,                                         <span class="c">// this process IS the MCP server</span>
-  pep: 'mcp-edge',
-  applyDefaultMappings: true,                    <span class="c">// every method governed, unknown ones denied</span>
+  pep: 'mcp-edge',                               <span class="c">// every method governed by default; unknown ones denied</span>
   resource: 'https://mcp.bank.example',
   forwardAccessToken: true,
-  onDecision: ({ tool, verdict }) => audit.log(tool, verdict),
+  onDecision: ({ tool, verdict }) =&gt; audit.log(tool, verdict),
 });
 
-const handle = guard.wrap(async (rpc) => runTool(rpc));
-const result = await handle(rpc, claims);        <span class="c">// the JSON-RPC error on deny, sent with HTTP 200</span></code></pre>
+app.post('/mcp', express.raw({ type: 'application/json', inflate: false }), async (req, res) =&gt; {
+  const claims = await verify(req.get('authorization'));   <span class="c">// yours: the guard never decodes a token</span>
+  const v = await guard.checkToolCall({ raw: { headers: req.headers, body: req.body }, claims });
+  if (!v.allow) return res.status(v.response!.status).set(v.response!.headers).send(v.response!.body);
+  res.json(await runTool(v.message!));
+});</code></pre>
 
   <h3>An MCP gateway delegating to coaz-pep</h3>
   <pre><code>const guard = new McpGuard({
   client: { url: process.env.AUTHZEN_URL! },
+  upstreamUrl: 'https://mcp.bank.example/mcp',   <span class="c">// required: coaz-pep reads this server's tools/list</span>
   delegate: {
     url: 'http://coaz-pep:9192',
-    apiKey: process.env.CHECK_API_TOKEN,         <span class="c">// coaz-pep's CHECK_API_TOKEN</span>
-    config: { style: 'mcp', require_token: 'true', require_user_login: 'true', coaz_defaults: 'true' },
+    apiKey: process.env.CHECK_API_TOKEN,         <span class="c">// required: coaz-pep's CHECK_API_TOKEN</span>
+    config: { require_token: 'true', require_user_login: 'true' },
   },
   resource: 'https://mcp.bank.example',
   forwardAccessToken: true,
   failMode: 'closed',
 });
-await guard.checkToolCall({ rpc, claims, raw: { headers, body: rawBody } });</code></pre>
-  <p>The engine renders the JSON-RPC error and the SDK relays it verbatim; two renderings of one decision would drift.</p>
+
+<span class="c">// Every MCP request goes to coaz-pep, whatever its method.</span>
+const v = await guard.checkToolCall({ raw: { method: req.method, path: '/mcp', headers: req.headers, body: rawBody } });
+if (!v.allow) return res.status(v.response!.status).set(v.response!.headers).send(v.response!.body);
+forwardUpstream(req, v.upstreamHeaders);         <span class="c">// X-Auth-* as coaz-pep asserted them; '' removes</span>
+res.set(v.responseHeaders ?? {});                <span class="c">// X-PDP-Fail-Open survives</span></code></pre>
+  <p>The engine renders the deny and the SDK relays it verbatim, a 401 challenge included; two renderings of one decision would drift.</p>
 
   <h3>What the PDP receives</h3>
   <pre><code>{
@@ -273,7 +348,7 @@ await guard.checkToolCall({ rpc, claims, raw: { headers, body: rawBody } });</co
     "access_token": "eyJ…"
   }
 }</code></pre>
-  <p>The SDK is tested with vitest (<code>sdk/node/test/</code>) and holds coverage floors of 97% lines, 90% branches, 100% functions.</p>
+  <p>The SDK is tested with vitest (<code>sdk/node/test/</code>, 460 tests on Node 22 and 24) and holds coverage floors of 99% statements and lines, 95% branches and 100% functions.</p>
 </main>
 </div>
 

@@ -14,14 +14,16 @@ export default defineConfig({
       // and counting them as 0% would make the whole-project number meaningless.
       exclude: ['src/index.ts', 'src/types.ts', 'dist/**', '**/*.config.ts'],
       thresholds: {
-        // Functions and per-file lines are held at 100 where reached; the residual
-        // statement/branch gap is defensive code unreachable on validated input
-        // (an object-claim that is not an object, AST fall-through the compiler rules
-        // out). Floors sit at the current numbers and ratchet up as that shrinks.
-        statements: 97,
-        branches: 90,
+        // Measured with vitest 4, whose v8 provider remaps by AST and so counts an early
+        // `return` or a one-line `throw` as a statement of its own. At 0.4.0: 99.77
+        // statements, 96.22 branches, 100 functions, 99.86 lines. The residual gap is
+        // defensive code unreachable on validated input (a re-check of what the
+        // declaration check already refused). Floors sit a little under the numbers so a
+        // Node minor version does not trip them.
+        statements: 99,
+        branches: 95,
         functions: 100,
-        lines: 97,
+        lines: 99,
       },
     },
   },
