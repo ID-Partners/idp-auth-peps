@@ -184,7 +184,7 @@ local function relaxations(conf)
   end
   if conf.pdp_discovery_insecure == true then out[#out + 1] = "discovered URLs may be plain http" end
   if conf.verify_service_certificate == false then out[#out + 1] = "TLS verification is off" end
-  if conf.pdp_discovery == "federation" and tostring(conf.federation_resolve_url or ""):lower():match("^http://") then
+  if conf.pdp_discovery == "federation-resolver" and tostring(conf.federation_resolve_url or ""):lower():match("^http://") then
     out[#out + 1] = "the federation resolver is plain http"
   end
   return out

@@ -3,12 +3,12 @@
 -- (which requires it under this module name, so there is one copy of these rules in Lua).
 --
 --   resource identifier (conf.resource, or mcp_upstream_url on an mcp route)
---     ├─ federation: what a federation resolve endpoint resolves for it       — the federation's word
+--     ├─ federation-resolver: what a federation resolve endpoint resolves for it — the resolver's word
 --     ├─ resource:   {resource}/.well-known/oauth-protected-resource (RFC 9728) — self-asserted
 --     └─ static:     conf.authzen_url                                          — the fallback
 --   PDP identifier
 --     ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
---     └─ 404 / unreachable -> {pdp}/access/v1/evaluation, the spec's default paths
+--     └─ 404 -> {pdp}/access/v1/evaluation, the spec's default paths
 --        (or no probe at all, for a caller whose protocol has no PDP metadata to read)
 --
 -- Two parameters are minted by this repo, in a shape valid both in an RFC 9728 document
@@ -17,14 +17,15 @@
 -- (candidates for ONE decision, first preferred), and `authzen_policy_layers`, the PDPs
 -- to ask in FRONT of it, every one of which must permit.
 --
--- Federation mode does not walk a Trust Chain here. There is no JOSE verifier available
--- to a Kong plugin, so a chain cannot be validated in it; instead the plugin asks a
--- federation resolve endpoint (OpenID Federation 1.0 §8.3) — typically the trust
--- anchor's — and takes the resolver's answer on transport: TLS to a URL the operator
--- configured, the resolve response's signature NOT verified. That is the trust the plugin
--- already places in its static PDP, and a weaker claim than the Go PEP's, which verifies
--- the chain to an anchor key it holds. A route that needs the stronger claim belongs
--- behind coaz-pep.
+-- There is no federation mode here in the Go PEP's sense: it walks the Trust Chain and
+-- verifies every signature to an anchor key it holds, and a Kong plugin has no JOSE
+-- verifier to do that with. The federation-resolver mode asks a federation resolve
+-- endpoint (OpenID Federation 1.0 §8.3) — typically the trust anchor's — and takes the
+-- resolver's answer on transport: TLS to a URL the operator configured, the resolve
+-- response's signature NOT verified. That is the trust the plugin already places in its
+-- static PDP, and a weaker claim, so it is named apart: the mode, and the source a PDP
+-- is told the metadata came from, say federation-resolver and never federation. A route
+-- that needs the stronger claim belongs behind coaz-pep.
 --
 -- Two rules are never relaxed: a URL outside an allowlist fails closed rather than
 -- falling to a weaker source, and a discovered PDP never receives the static API key.
@@ -41,6 +42,8 @@ D.PARAM_LAYERS = "authzen_policy_layers"
 -- "layer" for one the operator configured and the metadata sources for the resource's own.
 D.SOURCE_PUBLISHED = "published"
 D.RESOLVE_RESPONSE_TYP = "resolve-response+jwt"
+-- The resolve-endpoint mode, and the source of metadata it found.
+D.RESOLVER = "federation-resolver"
 D.MAX_BODY = 1048576
 D.MIN_REFRESH = 30
 
@@ -285,7 +288,7 @@ local RESOLVE_ERRORS = {
 local function federation_lookup(resource, opts)
   local f = opts.federation
   if not f.resolve_url or f.resolve_url == "" or not f.anchor or f.anchor == "" then
-    return fail(NOT_ALLOWED, "federation mode needs federation_resolve_url and federation_trust_anchor")
+    return fail(NOT_ALLOWED, "federation-resolver mode needs federation_resolve_url and federation_trust_anchor")
   end
   local url = f.resolve_url .. (f.resolve_url:find("?", 1, true) and "&" or "?")
     .. "sub=" .. ngx.escape_uri(resource) .. "&anchor=" .. ngx.escape_uri(f.anchor)
@@ -321,7 +324,7 @@ local function federation_lookup(resource, opts)
   -- What travels to the PDP is the RESOLVED metadata: what survived every superior's
   -- policy, not what the resource wrote. It is good until the answer's exp and no
   -- longer, however long the cache TTL.
-  return { pdps = pdps, layers = layers, document = meta, source = "federation",
+  return { pdps = pdps, layers = layers, document = meta, source = D.RESOLVER,
     expires_at = type(claims.exp) == "number" and claims.exp or nil }
 end
 
@@ -591,10 +594,10 @@ function D.resolve(conf, resource, opts)
     if not rok then return fail(NOT_ALLOWED, rwhy) end
     -- One store per source: a route trusting the federation and one trusting the
     -- resource's own word must not share an answer.
-    local store = mode == "federation" and caches.federation or caches.resources
+    local store = mode == D.RESOLVER and caches.federation or caches.resources
     local meta, err = cache_get(store, resource, o.ttl, D.MIN_REFRESH, function()
       local found, perr
-      if mode == "federation" then found, perr = federation_lookup(resource, o)
+      if mode == D.RESOLVER then found, perr = federation_lookup(resource, o)
       else found, perr = rfc9728_lookup(resource, o) end
       if found then return found end
       if perr.kind == NOT_ALLOWED or perr.kind == TRANSIENT then return nil, perr end

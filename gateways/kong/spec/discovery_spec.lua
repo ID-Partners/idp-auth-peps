@@ -940,7 +940,7 @@ describe('discovery: federation via a resolve endpoint', function()
   local RESOLVE = ANCHOR .. '/resolve'
   local function fconf(over)
     return conf((function()
-      local o = { pdp_discovery = 'federation', federation_resolve_url = RESOLVE, federation_trust_anchor = ANCHOR }
+      local o = { pdp_discovery = 'federation-resolver', federation_resolve_url = RESOLVE, federation_trust_anchor = ANCHOR }
       for k, v in pairs(over or {}) do o[k] = v end
       return o
     end)())
@@ -967,7 +967,7 @@ describe('discovery: federation via a resolve endpoint', function()
     local D = load({ pdp = fn })
     local ep, err = D.resolve(fconf(), RES)
     assert.is_nil(err)
-    assert.equal(GOOD, ep.identifier); assert.equal('federation', ep.source); assert.equal('federation', ep.resource.source)
+    assert.equal(GOOD, ep.identifier); assert.equal('federation-resolver', ep.source); assert.equal('federation-resolver', ep.resource.source)
     assert.is_nil(ep.api_key)
     assert.same({ 'accounts:read' }, ep.resource.document.scopes_supported)
     assert.equal(0, count(hits, 'oauth-protected-resource'))

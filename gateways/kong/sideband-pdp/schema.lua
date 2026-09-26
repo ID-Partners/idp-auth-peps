@@ -31,12 +31,12 @@ local function validate(config)
   if not url_ok(config.service_url) then
     return nil, "service_url must be an http or https URL with a host"
   end
-  local switch = config.pdp_discovery == "federation"
+  local switch = config.pdp_discovery == "federation-resolver"
   if switch and not set(config.federation_resolve_url) then
-    return nil, "pdp_discovery=federation needs federation_resolve_url: the resolve endpoint whose word is taken for the resource"
+    return nil, "pdp_discovery=federation-resolver needs federation_resolve_url: the resolve endpoint whose word is taken for the resource"
   end
   if switch and not set(config.federation_trust_anchor) then
-    return nil, "pdp_discovery=federation needs federation_trust_anchor: the anchor the resolver resolves under"
+    return nil, "pdp_discovery=federation-resolver needs federation_trust_anchor: the anchor the resolver resolves under"
   end
   if config.allow_insecure == true then return true end
 
@@ -53,7 +53,7 @@ local function validate(config)
   -- The resolver's answer is taken on transport, so the transport has to be worth
   -- something.
   if switch and not reference(config.federation_resolve_url) and scheme_of(config.federation_resolve_url) ~= "https" then
-    return nil, "pdp_discovery=federation needs an https federation_resolve_url: its answer is trusted on TLS alone"
+    return nil, "pdp_discovery=federation-resolver needs an https federation_resolve_url: its answer is trusted on TLS alone"
   end
   return true
 end
@@ -104,10 +104,12 @@ return {
           -- PDP discovery (see ../README.md). "off" is service_url. "resource" reads the
           -- route's resource's RFC 9728 document for the PDPs that decide for it and the
           -- layers it publishes in front of them, falling back to service_url.
-          -- "federation" asks a federation resolve endpoint for the resource's Resolved
-          -- Metadata instead, and never the resource's own document.
+          -- "federation-resolver" asks a federation resolve endpoint for the resource's
+          -- Resolved Metadata instead, and never the resource's own document. Its answer
+          -- is taken on TLS, unverified — named apart from coaz-pep's "federation",
+          -- which verifies the Trust Chain.
           { pdp_discovery = { type = "string", default = "off",
-                              one_of = { "off", "resource", "federation" } } },
+                              one_of = { "off", "resource", "federation-resolver" } } },
           -- The protected resource's identifier (RFC 8707), the key discovery starts
           -- from. A route without one uses service_url.
           { resource = { type = "string" } },
@@ -125,9 +127,10 @@ return {
           -- discovery or a plain-http resolver, or with TLS verification off. For
           -- development and demos only; logged when the configuration loads.
           { allow_insecure = { type = "boolean", default = false } },
-          -- The switch to the federation: its resolve endpoint (OpenID Federation 1.0
-          -- §8.3, usually the trust anchor's) and the trust anchor to resolve under. The
-          -- resolver's answer is taken on transport — see the README for what that means.
+          -- The switch to the federation's resolver: its resolve endpoint (OpenID
+          -- Federation 1.0 §8.3, usually the trust anchor's; https unless allow_insecure)
+          -- and the trust anchor to resolve under. The resolver's answer is taken on
+          -- transport — see the README for what that means.
           { federation_resolve_url = { type = "string" } },
           { federation_trust_anchor = { type = "string" } },
           -- The ordered PDPs to ask, every one of which must permit: "static"

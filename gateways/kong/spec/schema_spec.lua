@@ -163,7 +163,7 @@ describe('allow_insecure is logged when the configuration loads', function()
 
   it('names each relaxation on a sideband-pdp route', function()
     local logs = configure('sideband-pdp/handler.lua', { {
-      pep_label = 'demo', allow_insecure = true, pdp_discovery = 'federation', verify_service_certificate = false,
+      pep_label = 'demo', allow_insecure = true, pdp_discovery = 'federation-resolver', verify_service_certificate = false,
       federation_resolve_url = 'http://anchor/resolve',
     } })
     assert.matches('pdp_allowlist', logs)
@@ -221,7 +221,7 @@ describe('the sideband-pdp schema', function()
   end)
 
   it('refuses the resolver switch without its settings, or over plain http', function()
-    local switch = { pdp_discovery = 'federation', pdp_allowlist = { 'https://pdp.example' },
+    local switch = { pdp_discovery = 'federation-resolver', pdp_allowlist = { 'https://pdp.example' },
       federation_resolve_url = 'https://anchor.example/resolve', federation_trust_anchor = 'https://anchor.example' }
     assert.is_true(check(switch))
     for _, missing in ipairs({ 'federation_resolve_url', 'federation_trust_anchor' }) do
@@ -238,6 +238,12 @@ describe('the sideband-pdp schema', function()
     assert.is_nil(ok); assert.matches('https', err)
     o.allow_insecure = true
     assert.is_true(check(o))
+  end)
+
+  it('names the switch federation-resolver, so it never passes for a verified chain', function()
+    -- coaz-pep's "federation" walks and verifies the Trust Chain; this switch takes a
+    -- resolver's answer on transport. The old name is refused, not quietly kept.
+    assert.same({ 'off', 'resource', 'federation-resolver' }, field(config, 'pdp_discovery').one_of)
   end)
 
   it('marks every shared secret encrypted and referenceable', function()

@@ -726,7 +726,7 @@ describe('discovery through the plugin', function()
       [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { 'https://rogue.example' } },
       [ANCHOR .. '/resolve'] = resolved,
     }))
-    local plugin, state, c = drive({ pdp_discovery = 'federation', resource = RES, federation_resolve_url = ANCHOR .. '/resolve', federation_trust_anchor = ANCHOR }, { pdp = fn })
+    local plugin, state, c = drive({ pdp_discovery = 'federation-resolver', resource = RES, federation_resolve_url = ANCHOR .. '/resolve', federation_trust_anchor = ANCHOR }, { pdp = fn })
     assert.is_nil(state.exited)
     assert.equal(1, #urls(hits, ANCHOR .. '/resolve'))
     assert.matches('sub=https%%3A%%2F%%2Fapi%.bank%.example', urls(hits, '/resolve')[1])
@@ -734,11 +734,11 @@ describe('discovery through the plugin', function()
     assert.equal(0, #urls(hits, 'oauth-protected-resource'))
     assert.same({ ESTATE .. '/sideband/request', BANKPDP .. '/sideband/request' }, urls(hits, '/sideband/request'))
     mock.run_response(plugin, c)
-    assert.equal('federation', state.exited.headers['X-PDP-Source'])
+    assert.equal('federation-resolver', state.exited.headers['X-PDP-Source'])
   end)
 
   it('the switch: a subject the resolver does not know falls to service_url; an invalid chain fails closed even when open', function()
-    local base = { pdp_discovery = 'federation', resource = RES, federation_resolve_url = ANCHOR .. '/resolve', federation_trust_anchor = ANCHOR }
+    local base = { pdp_discovery = 'federation-resolver', resource = RES, federation_resolve_url = ANCHOR .. '/resolve', federation_trust_anchor = ANCHOR }
     local fn, hits = router(bank_routes({ [ANCHOR .. '/resolve'] = function() return { status = 404, body = json({ error = 'not_found' }) } end, [PAZ .. '/sideband/request'] = permit() }))
     local _, state = drive(base, { pdp = fn })
     assert.is_nil(state.exited)
