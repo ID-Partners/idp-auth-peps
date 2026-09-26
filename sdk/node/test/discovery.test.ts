@@ -656,7 +656,7 @@ describe('discovery: through the client, middleware and guard', () => {
     expect(await lax.evaluate(req, { resource: RES, layers: ['resource'] })).not.toHaveProperty('failedOpen');
   });
 
-  it('a batch fails open past a layer that is down, only when told, and never past one that cannot take a batch', async () => {
+  it('a batch fails open past a layer that is down or cannot take one, only when told', async () => {
     const NOBATCH = 'https://nobatch.example';
     const DOWN = 'https://down.example';
     const { fetch, hits } = router({
@@ -670,9 +670,9 @@ describe('discovery: through the client, middleware and guard', () => {
     const batch = { evaluations: [req] };
     expect(await client.evaluateAll(batch, { layers: [NOBATCH, 'static'] })).toMatchObject({ allow: false, kind: 'pdp_error', detail: expect.stringContaining('access_evaluations_endpoint') });
     expect(hits.filter((h) => h.method === 'POST')).toHaveLength(0);
-    // A PDP that cannot take a batch is not an outage: fail-open does not cover it.
-    expect(await client.evaluateAll(batch, { layers: [`${NOBATCH} fail-open`, 'static'] })).toMatchObject({ allow: false, kind: 'pdp_error' });
-    expect(hits.filter((h) => h.method === 'POST')).toHaveLength(0);
+    // A PDP that cannot take a batch is unavailable to it: a fail-open layer is skipped, and marked.
+    expect(await client.evaluateAll(batch, { layers: [`${NOBATCH} fail-open`, 'static'] })).toMatchObject({ allow: true, failedOpen: [NOBATCH] });
+    expect(hits.filter((h) => h.method === 'POST')).toHaveLength(1);
     expect(await client.evaluateAll(batch, { layers: [DOWN, 'static'], failMode: 'open' })).toMatchObject({ allow: true, failedOpen: [DOWN] });
     expect(await client.evaluateAll(batch, { layers: [DOWN], failMode: 'open' })).toMatchObject({ allow: true, reason: expect.stringMatching(/^fail-open:/) });
     expect(await client.evaluateAll(batch, { layers: [DOWN], failMode: 'closed' })).toMatchObject({ allow: false, kind: 'pdp_error' });

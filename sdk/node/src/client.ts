@@ -195,24 +195,31 @@ export class AuthzenClient {
   /**
    * POST to the evaluations (boxcar) endpoint. Folds to a single Verdict: every decision
    * must permit, there must be exactly one per request sent, and the FIRST deny is the
-   * one reported, so its advice survives the fold. A PDP that advertises no evaluations
-   * endpoint is a pdp_error — a batch is never sent to a guessed path.
+   * one reported, so its advice survives the fold. A batch is never sent to a guessed
+   * path: a PDP that advertises no evaluations endpoint is unavailable to it — skipped on
+   * a fail-open layer, a pdp_error otherwise.
    */
   async evaluateAll(request: EvaluationsRequest, options: EvaluateOptions = {}): Promise<Verdict> {
     try {
       const sent = Array.isArray(request?.evaluations) ? request.evaluations.length : 0;
       if (sent === 0) throw new PdpError('an evaluations request must carry at least one evaluation');
       const layers = await this.resolveAll(options);
-      // A layer that advertises no batch endpoint cannot take this call. That is not an
-      // outage, so it is refused even on a fail-open layer — skipping it would leave
-      // every batch unjudged by that layer for as long as the configuration stands.
-      // Checked before anything is sent, so a batch is never half-done.
+      // A layer that advertises no batch endpoint cannot be asked this call at all: it is
+      // unavailable to it, so a fail-open layer is skipped (and marked) and a fail-closed
+      // one fails the call. Checked before anything is sent, so a batch is never half-done.
+      const askable: PdpEndpoints[] = [];
       for (const ep of layers.pdps) {
-        if (!ep.evaluations) throw new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`);
+        if (ep.evaluations) {
+          askable.push(ep);
+          continue;
+        }
+        const err = new PdpError(`PDP ${ep.identifier} advertises no access_evaluations_endpoint`, undefined, 'unavailable');
+        if (!skippable(ep, err)) throw err;
+        skip(layers, ep.identifier, err);
       }
       request = withForwardedContext(request, resourceMetadataOf(layers.pdps), options);
       let verdict: Verdict | undefined;
-      for (const ep of layers.pdps) {
+      for (const ep of askable) {
         let list: EvaluationResponse[];
         try {
           list = readEvaluations(await this.exchange(ep.evaluations!, request, ep.apiKey, true), sent, ep.identifier);
