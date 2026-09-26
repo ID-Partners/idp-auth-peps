@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
@@ -121,11 +122,16 @@ func setupLogging(format string) {
 func (s *server) audit(surface string, conf pepConfig, method, path string, headers map[string]string, resp *authv3.CheckResponse, started time.Time) {
 	outcome, status := "permit", 200
 	var hdrs map[string]string
+	reason := ""
 	if denied := resp.GetDeniedResponse(); denied != nil {
 		outcome, status = "deny", int(denied.GetStatus().GetCode())
 		hdrs = flattenHeaders(denied.GetHeaders())
+		reason = denialReason(denied.GetBody())
 	} else {
 		hdrs = flattenHeaders(resp.GetOkResponse().GetResponseHeadersToAdd())
+	}
+	if r := hdrs["X-PDP-Reason"]; r != "" {
+		reason = r
 	}
 	failOpen := hdrs["X-PDP-Fail-Open"]
 	s.metrics.decision(outcome, conf.style, failOpen != "")
@@ -133,9 +139,29 @@ func (s *server) audit(surface string, conf pepConfig, method, path string, head
 		"pep", conf.pepLabel, "surface", surface, "style", conf.style,
 		"method", method, "path", path, "request_id", headers["x-request-id"],
 		"outcome", outcome, "status", status,
-		"action", hdrs["X-PDP-Action"], "reason", hdrs["X-PDP-Reason"],
+		"action", hdrs["X-PDP-Action"], "reason", reason,
 		"fail_open", failOpen, "insecure", s.insecure,
 		"duration_ms", float64(time.Since(started).Microseconds())/1000)
+}
+
+// denialReason is the client-facing reason in a denial body: the gateway deny shape's
+// "reason", or a JSON-RPC error's message.
+func denialReason(body string) string {
+	var d struct {
+		Reason string `json:"reason"`
+		Error  any    `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &d) != nil {
+		return ""
+	}
+	if d.Reason != "" {
+		return d.Reason
+	}
+	if e, ok := d.Error.(map[string]any); ok {
+		m, _ := e["message"].(string)
+		return m
+	}
+	return ""
 }
 
 // metrics is a minimal Prometheus exposition, kept dependency-free: counters and one

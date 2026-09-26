@@ -238,3 +238,16 @@ func TestSmallHelpers(t *testing.T) {
 		t.Error("an unparseable base matches nothing")
 	}
 }
+
+func TestDenialReason(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"error":"authorization_failed","reason":"Authorization service unavailable"}`:       "Authorization service unavailable",
+		`{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request: batch"}}`: "Invalid Request: batch",
+		`not json`: "",
+		`{}`:       "",
+	} {
+		if got := denialReason(body); got != want {
+			t.Errorf("denialReason(%s) = %q, want %q", body, got, want)
+		}
+	}
+}
