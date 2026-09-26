@@ -1,0 +1,39 @@
+# Keeps every dependency moving: Go modules, the Node SDK's dev tooling, the PingAccess
+# build, the pinned GitHub Actions and the base images pinned by digest. Minor and patch
+# updates are grouped per ecosystem, so a week's bumps arrive as one PR each.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /core
+    schedule: { interval: weekly }
+    groups:
+      go:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /sdk/node
+    schedule: { interval: weekly }
+    groups:
+      node-dev:
+        update-types: [minor, patch]
+
+  - package-ecosystem: maven
+    directory: /gateways/pingaccess/authzen-pdp
+    schedule: { interval: weekly }
+    ignore:
+      # Taken from the PingAccess image, not a repository: the image tag decides it.
+      - dependency-name: com.pingidentity.pingaccess:pingaccess-sdk
+    groups:
+      maven:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directories: [/core, /demo/railway, /demo/pingaccess, /gateways/envoy/agentgateway]
+    schedule: { interval: weekly }
