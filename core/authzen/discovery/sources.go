@@ -168,6 +168,9 @@ func layerList(doc map[string]any, from string) ([]string, error) {
 }
 
 func identifiers(raw []any, from string) ([]string, error) {
+	if len(raw) > maxListedPDPs {
+		return nil, fmt.Errorf("%w: %s lists more than %d PDPs", ErrInvalid, from, maxListedPDPs)
+	}
 	out := make([]string, 0, len(raw))
 	for _, v := range raw {
 		s, _ := v.(string)

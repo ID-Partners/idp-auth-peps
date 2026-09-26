@@ -189,17 +189,19 @@ func TestPDPConfigFallbacksAndRejections(t *testing.T) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
-	t.Run("500 uses defaults", func(t *testing.T) {
+	// Only a 404 means "no metadata, use the defaults". A PDP whose metadata cannot be
+	// had, with nothing cached, is unavailable: its layer fails by its mode.
+	t.Run("500 with nothing cached is unavailable, not the defaults", func(t *testing.T) {
 		pdp := newPDP(t, fullConfig)
 		pdp.status = 500
 		c := mustNew(t, Options{Mode: ModeAuthZEN, StaticPDP: pdp.URL})
-		if ep, err := c.Resolve(ctx(), ""); err != nil || ep.Evaluation != pdp.URL+"/access/v1/evaluation" {
+		if ep, err := c.Resolve(ctx(), ""); err == nil || errors.Is(err, ErrNotAllowed) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
-	t.Run("unreachable uses defaults", func(t *testing.T) {
+	t.Run("unreachable with nothing cached is unavailable, not the defaults", func(t *testing.T) {
 		c := mustNew(t, Options{Mode: ModeAuthZEN, StaticPDP: "http://127.0.0.1:1"})
-		if ep, err := c.Resolve(ctx(), ""); err != nil || ep.Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
+		if ep, err := c.Resolve(ctx(), ""); err == nil || errors.Is(err, ErrNotAllowed) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
@@ -324,41 +326,35 @@ func TestResourceMode(t *testing.T) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
-	t.Run("resource echo mismatch is invalid, falls to static", func(t *testing.T) {
-		r := newResource(t, func(self string) any {
+	// An invalid document or an outage is the resource's layer unavailable, never the
+	// static PDP's to answer: only a 404 (or a document naming no PDP) is.
+	unavailable := func(t *testing.T, resource string) {
+		t.Helper()
+		ep, err := mustNew(t, opts).Resolve(ctx(), resource)
+		if err == nil || errors.Is(err, ErrNotAllowed) || !strings.Contains(err.Error(), "unavailable") {
+			t.Fatalf("%+v %v", ep, err)
+		}
+	}
+	t.Run("resource echo mismatch is invalid: unavailable", func(t *testing.T) {
+		unavailable(t, newResource(t, func(self string) any {
 			return map[string]any{"resource": "https://impostor.example", ParamPolicyDecisionPoints: []string{good.URL}}
-		})
-		ep, err := mustNew(t, opts).Resolve(ctx(), r.URL)
-		if err != nil || ep.Identifier != static.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
+		}).URL)
 	})
-	t.Run("bad entries are invalid", func(t *testing.T) {
-		r := newResource(t, func(self string) any {
+	t.Run("bad entries are invalid: unavailable", func(t *testing.T) {
+		unavailable(t, newResource(t, func(self string) any {
 			return map[string]any{"resource": self, ParamPolicyDecisionPoints: []any{"not a url", 1}}
-		})
-		ep, err := mustNew(t, opts).Resolve(ctx(), r.URL)
-		if err != nil || ep.Identifier != static.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
+		}).URL)
 	})
-	t.Run("not JSON is invalid", func(t *testing.T) {
-		r := newResource(t, func(string) any { return "<html>" })
-		if ep, err := mustNew(t, opts).Resolve(ctx(), r.URL); err != nil || ep.Identifier != static.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
+	t.Run("not JSON is invalid: unavailable", func(t *testing.T) {
+		unavailable(t, newResource(t, func(string) any { return "<html>" }).URL)
 	})
-	t.Run("transport error falls to static", func(t *testing.T) {
+	t.Run("a transport error is unavailable", func(t *testing.T) {
 		r := newResource(t, fullConfig)
 		r.status = 500
-		if ep, err := mustNew(t, opts).Resolve(ctx(), r.URL); err != nil || ep.Identifier != static.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
+		unavailable(t, r.URL)
 	})
-	t.Run("resource with a query is invalid", func(t *testing.T) {
-		if ep, err := mustNew(t, opts).Resolve(ctx(), "http://r.example/?x"); err != nil || ep.Identifier != static.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
+	t.Run("resource with a query is invalid: unavailable", func(t *testing.T) {
+		unavailable(t, "http://r.example/?x")
 	})
 	t.Run("first candidate bad, second good", func(t *testing.T) {
 		bad := newPDP(t, func(self string) any { return map[string]any{"policy_decision_point": "https://x"} })
@@ -610,11 +606,11 @@ func TestFederationMode(t *testing.T) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
-	t.Run("transient federation error falls to static", func(t *testing.T) {
+	t.Run("a transient federation error is unavailable, never static", func(t *testing.T) {
 		f := newMiniFed(t)
 		f.leafStatus = 500
 		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
-		if ep, err := c.Resolve(ctx(), f.leaf.URL); err != nil || ep.Identifier != static.URL {
+		if ep, err := c.Resolve(ctx(), f.leaf.URL); err == nil || errors.Is(err, ErrNotAllowed) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
@@ -669,9 +665,10 @@ func TestResolveLayers(t *testing.T) {
 	if len(dup.PDPs) != 1 || dup.PDPs[0].Resource == nil {
 		t.Fatalf("duplicate should collapse and keep the document: %+v", dup)
 	}
-	// An unreachable explicit layer falls back to the AuthZEN default paths, like any
-	// PDP without metadata; an invalid identifier is an error that names the layer.
-	if r, err := ResolveLayers(ctx(), c, res.URL, specs("http://127.0.0.1:1"), false); err != nil || r.PDPs[0].Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
+	// An unreachable explicit layer is unavailable — its metadata cannot be had, and the
+	// default paths are only for a PDP that publishes none; an invalid identifier is an
+	// error that names the layer.
+	if r, err := ResolveLayers(ctx(), c, res.URL, specs("http://127.0.0.1:1"), false); err == nil || errors.Is(err, ErrNotAllowed) {
 		t.Fatalf("%+v %v", r, err)
 	}
 	if _, err := ResolveLayers(ctx(), c, res.URL, specs("http://p.example/?x=1"), false); err == nil || !strings.Contains(err.Error(), "layer") {
@@ -682,9 +679,10 @@ func TestResolveLayers(t *testing.T) {
 	if _, err := strict.ResolvePDP(ctx(), estate.URL); !errors.Is(err, ErrNotAllowed) {
 		t.Fatalf("%v", err)
 	}
-	off := Static(static.URL, "k")
+	off := mustNew(t, Options{Mode: ModeOff, StaticPDP: static.URL, APIKeys: map[string]string{static.URL: "k"}})
+	before := atomic.LoadInt32(&estate.hits)
 	ep, err := off.ResolvePDP(ctx(), estate.URL+"/")
-	if err != nil || ep.Evaluation != estate.URL+"/access/v1/evaluation" || ep.Source != "layer" {
+	if err != nil || ep.Evaluation != estate.URL+"/access/v1/evaluation" || ep.Source != "layer" || atomic.LoadInt32(&estate.hits) != before {
 		t.Fatalf("%+v %v", ep, err)
 	}
 	got, err := ParseLayers(" static, resource\nhttps://p.example/ ")
@@ -779,48 +777,41 @@ func TestSourcesOverride(t *testing.T) {
 }
 
 type fakeSource struct {
-	pdps []string
-	err  error
+	pdps  []string
+	err   error
+	calls int32
 }
 
 func (fakeSource) Name() string { return "fake" }
 func (f *fakeSource) Lookup(context.Context, string) (ResourceMetadata, error) {
+	atomic.AddInt32(&f.calls, 1)
 	return ResourceMetadata{PDPs: f.pdps}, f.err
 }
 
 func TestSourceErrorHandling(t *testing.T) {
 	pdp := newPDP(t, fullConfig)
-	t.Run("transient error logged, static used, not cached as the answer", func(t *testing.T) {
-		var logged []string
-		src := &fakeSource{err: fmt.Errorf("boom")}
-		o := quiet(Options{Mode: ModeResource, StaticPDP: pdp.URL, MinRefresh: time.Second, Sources: []MetadataSource{src}})
-		o.Logf = func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }
-		c, _ := New(o)
-		if ep, err := c.Resolve(ctx(), "http://r.example"); err != nil || ep.Identifier != pdp.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
-		if len(logged) != 1 || !strings.Contains(logged[0], "boom") {
-			t.Fatalf("logged %v", logged)
-		}
-		if s := c.Status(); s.Resources["http://r.example"].Cached {
-			t.Fatal("a transient failure must not be cached as the resource's answer")
-		}
-	})
-	t.Run("invalid metadata logged, static cached as the answer", func(t *testing.T) {
-		var logged []string
-		o := quiet(Options{Mode: ModeResource, StaticPDP: pdp.URL, Sources: []MetadataSource{&fakeSource{err: fmt.Errorf("%w: bad", ErrInvalid)}}})
-		o.Logf = func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }
-		c, _ := New(o)
-		if ep, err := c.Resolve(ctx(), "http://r.example"); err != nil || ep.Identifier != pdp.URL {
-			t.Fatalf("%+v %v", ep, err)
-		}
-		if len(logged) != 1 || !strings.Contains(logged[0], "bad") {
-			t.Fatalf("logged %v", logged)
-		}
-		if s := c.Status(); !s.Resources["http://r.example"].Cached {
-			t.Fatal("invalid metadata resolves to static and that is cached")
-		}
-	})
+	for name, srcErr := range map[string]error{"transient": fmt.Errorf("boom"), "invalid": fmt.Errorf("%w: bad", ErrInvalid)} {
+		t.Run(name+" error: logged, the resource unavailable, remembered briefly, never cached as the answer", func(t *testing.T) {
+			var logged []string
+			src := &fakeSource{err: srcErr}
+			o := quiet(Options{Mode: ModeResource, StaticPDP: pdp.URL, MinRefresh: time.Second, Sources: []MetadataSource{src}})
+			o.Logf = func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }
+			c, _ := New(o)
+			if ep, err := c.Resolve(ctx(), "http://r.example"); err == nil || !strings.Contains(err.Error(), srcErr.Error()) {
+				t.Fatalf("%+v %v", ep, err)
+			}
+			if len(logged) != 1 || !strings.Contains(logged[0], srcErr.Error()) {
+				t.Fatalf("logged %v", logged)
+			}
+			if s := c.Status(); s.Resources["http://r.example"].Cached {
+				t.Fatal("a failure must not be cached as the resource's answer")
+			}
+			c.Resolve(ctx(), "http://r.example")
+			if atomic.LoadInt32(&src.calls) != 1 {
+				t.Fatalf("a failure is remembered for a while, not repeated per request: %d lookups", src.calls)
+			}
+		})
+	}
 	t.Run("static candidate that resolves to nothing", func(t *testing.T) {
 		bad := newPDP(t, func(self string) any { return map[string]any{"policy_decision_point": "https://x"} })
 		c := mustNew(t, Options{Mode: ModeResource, StaticPDP: bad.URL, Sources: []MetadataSource{&fakeSource{err: fmt.Errorf("boom")}}})
@@ -955,19 +946,24 @@ func TestPublishedLayersFailureModes(t *testing.T) {
 		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{"http://p.example/?x=1"}}
 	})
 	c := mustNew(t, Options{Mode: ModeResource, StaticPDP: static.URL})
-	// ...except that an identifier with a query is rejected when the document is read,
-	// so the whole document is invalid and the operator's PDP is the fallback — the
-	// same path a malformed PDP list takes.
-	if r, err := ResolveLayers(ctx(), c, res2.URL, nil, false); err != nil || len(r.PDPs) != 1 || r.PDPs[0].Identifier != static.URL {
-		t.Fatalf("invalid document falls to static: %+v %v", r, err)
+	// ...where an identifier with a query is rejected when the document is read, so the
+	// whole document is unreadable, and that is the resource's layer unavailable — the
+	// same path a malformed PDP list takes. Never the static PDP standing in for it.
+	if r, err := ResolveLayers(ctx(), c, res2.URL, nil, false); err == nil || errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("an unreadable document fails the resource layer: %+v %v", r, err)
 	}
-	// A well-formed identifier nobody answers at is a PDP without metadata: AuthZEN's
-	// default paths, no failure at resolution. Resolution only fails when the fetch is
-	// refused or the identifier is unusable, and the refusal case is above.
+	if r, err := ResolveLayers(ctx(), c, res2.URL, []LayerSpec{{Name: LayerResource, FailOpen: &open}}, false); err != nil || len(r.PDPs) != 0 || !reflect.DeepEqual(r.Skipped, []string{LayerResource}) {
+		t.Fatalf("fail-open: skipped and named: %+v %v", r, err)
+	}
+	// A well-formed identifier nobody answers at is a PDP whose metadata cannot be had:
+	// the published layer is unavailable, closed by default, skipped when open.
 	res3 := newResource(t, func(self string) any {
 		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: []string{"http://127.0.0.1:1"}}
 	})
-	if r, err := ResolveLayers(ctx(), c, res3.URL, nil, false); err != nil || len(r.PDPs) != 2 || r.PDPs[0].Evaluation != "http://127.0.0.1:1/access/v1/evaluation" {
+	if r, err := ResolveLayers(ctx(), c, res3.URL, nil, false); err == nil || errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if r, err := ResolveLayers(ctx(), c, res3.URL, []LayerSpec{{Name: LayerResource, FailOpen: &open}}, false); err != nil || !reflect.DeepEqual(r.Skipped, []string{"http://127.0.0.1:1"}) || !reflect.DeepEqual(idsOf(r.PDPs), []string{good.URL}) {
 		t.Fatalf("%+v %v", r, err)
 	}
 
@@ -975,8 +971,8 @@ func TestPublishedLayersFailureModes(t *testing.T) {
 	res4 := newResource(t, func(self string) any {
 		return map[string]any{"resource": self, ParamPolicyDecisionPoints: []string{good.URL}, ParamPolicyLayers: "estate"}
 	})
-	if r, err := ResolveLayers(ctx(), c, res4.URL, nil, false); err != nil || len(r.PDPs) != 1 || r.PDPs[0].Identifier != static.URL {
-		t.Fatalf("non-array falls to static: %+v %v", r, err)
+	if r, err := ResolveLayers(ctx(), c, res4.URL, nil, false); err == nil || errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("non-array fails the resource layer: %+v %v", r, err)
 	}
 }
 

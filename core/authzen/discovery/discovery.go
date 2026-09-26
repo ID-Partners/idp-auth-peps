@@ -55,6 +55,12 @@ const (
 	wellKnownResource  = "oauth-protected-resource"
 	wellKnownPDP       = "authzen-configuration"
 	entityTypeResource = "oauth_resource"
+	// maxListedPDPs bounds either list a document may carry. Each candidate may cost a
+	// metadata fetch, and each layer a decision call on every request; nobody needs
+	// more than a handful of either.
+	maxListedPDPs = 8
+	// pdpNegativeTTL is how long a PDP's failed metadata fetch is remembered.
+	pdpNegativeTTL = 5 * time.Second
 )
 
 var (
@@ -181,8 +187,18 @@ type LayerSpec struct {
 // Resolved is the outcome of resolving a layer list: the PDPs to ask, in order, and
 // the fail-open layers that could not be resolved and were skipped.
 type Resolved struct {
-	PDPs    []PDPEndpoints
+	PDPs []PDPEndpoints
+	// Skipped names each skipped layer — its layer name, or the identifier of a
+	// published layer — and nothing else: it is what X-PDP-Fail-Open may carry.
 	Skipped []string
+	// SkippedReasons says why, one per Skipped entry, for the log only: it can carry
+	// internal URLs and upstream errors.
+	SkippedReasons []string
+}
+
+func (r *Resolved) skip(name string, err error) {
+	r.Skipped = append(r.Skipped, name)
+	r.SkippedReasons = append(r.SkippedReasons, fmt.Sprintf("%s: %v", name, err))
 }
 
 // ResolveLayers resolves each layer in order and returns the PDPs to ask, in that order,
@@ -208,6 +224,11 @@ type Resolved struct {
 // case it is skipped and named in Skipped. A refusal — ErrNotAllowed, which also wraps
 // an invalid federation chain — is never skipped: fail-open is about availability, and a
 // refusal is not an outage.
+//
+// One exception to "the configured entry's word wins": the slot that carries the
+// resource's own PDP keeps the stricter of the two modes. Otherwise a document could
+// name a configured fail-open layer as its own PDP and make the resource's own decision
+// skippable.
 func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []LayerSpec, failOpen bool) (Resolved, error) {
 	if len(layers) == 0 {
 		layers = []LayerSpec{{Name: LayerResource}}
@@ -215,27 +236,30 @@ func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []La
 	var res Resolved
 	seen := map[string]int{}
 	explicit := map[string]bool{} // identifier -> its entry set a failure mode of its own
-	add := func(ep PDPEndpoints, open, own bool) {
+	owned := map[string]bool{}    // identifier -> it is the resource's own PDP
+	add := func(ep PDPEndpoints, open, own, resourcesOwn bool) {
 		ep.FailOpen = open
 		if i, dup := seen[ep.Identifier]; dup {
 			// The same PDP twice is one call. Keep the resource metadata if this
 			// occurrence carried it and the earlier one did not. On the failure mode,
 			// an entry's own setting beats an inherited default; between two of a kind
-			// the stricter wins.
+			// the stricter wins; and the resource's own PDP is always the stricter.
 			if res.PDPs[i].Resource == nil && ep.Resource != nil {
 				res.PDPs[i].Resource = ep.Resource
 			}
 			switch {
-			case own && !explicit[ep.Identifier]:
-				res.PDPs[i].FailOpen = open
-			case own == explicit[ep.Identifier]:
+			case resourcesOwn || owned[ep.Identifier], own == explicit[ep.Identifier]:
 				res.PDPs[i].FailOpen = res.PDPs[i].FailOpen && open
+			case own:
+				res.PDPs[i].FailOpen = open
 			}
 			explicit[ep.Identifier] = explicit[ep.Identifier] || own
+			owned[ep.Identifier] = owned[ep.Identifier] || resourcesOwn
 			return
 		}
 		seen[ep.Identifier] = len(res.PDPs)
 		explicit[ep.Identifier] = own
+		owned[ep.Identifier] = resourcesOwn
 		res.PDPs = append(res.PDPs, ep)
 	}
 	for _, layer := range layers {
@@ -257,7 +281,7 @@ func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []La
 			if errors.Is(err, ErrNotAllowed) || !open {
 				return Resolved{}, fmt.Errorf("layer %q: %w", layer.Name, err)
 			}
-			res.Skipped = append(res.Skipped, fmt.Sprintf("%s (%v)", layer.Name, err))
+			res.skip(layer.Name, err)
 			continue
 		}
 		if layer.Name == LayerResource && ep.Resource != nil {
@@ -268,14 +292,14 @@ func ResolveLayers(ctx context.Context, r Resolver, resource string, layers []La
 					if errors.Is(err, ErrNotAllowed) || !open {
 						return Resolved{}, fmt.Errorf("layer %q: %s published layer %q: %w", layer.Name, resource, pdp, err)
 					}
-					res.Skipped = append(res.Skipped, fmt.Sprintf("%s (published by %s: %v)", pdp, resource, err))
+					res.skip(pdp, fmt.Errorf("published by %s: %w", resource, err))
 					continue
 				}
 				gate.Source = SourcePublished
-				add(gate, open, false)
+				add(gate, open, false, false)
 			}
 		}
-		add(ep, open, own)
+		add(ep, open, own, layer.Name == LayerResource)
 	}
 	return res, nil
 }
@@ -430,7 +454,7 @@ func New(o Options) (*Chain, error) {
 	refused := func(err error) bool { return errors.Is(err, ErrNotAllowed) }
 	cacheOpts := ttlcache.Options{TTL: o.TTL, MaxStale: o.MaxStale, MinRefresh: o.MinRefresh, MaxEntries: o.MaxEntries,
 		FetchTimeout: o.FetchTimeout, IsRefusal: refused, Now: o.Now}
-	// A resource whose metadata cannot be fetched is served by the static PDP for a
+	// A resource whose metadata cannot be fetched is remembered as unavailable for a
 	// while rather than re-fetched on every request: that fetch sits in the request
 	// path, and a down resource must not turn into a slow PEP.
 	resOpts := cacheOpts
@@ -439,7 +463,12 @@ func New(o Options) (*Chain, error) {
 		resOpts.NegativeTTL = 30 * time.Second
 	}
 	c.resources = ttlcache.New[ResourceMetadata](resOpts)
-	c.pdps = ttlcache.New[PDPEndpoints](cacheOpts)
+	// A PDP's metadata failure is remembered too, briefly: long enough that a PDP
+	// whose metadata endpoint is down is not asked on every request, short enough that
+	// it is back as soon as it is.
+	pdpOpts := cacheOpts
+	pdpOpts.NegativeTTL = pdpNegativeTTL
+	c.pdps = ttlcache.New[PDPEndpoints](pdpOpts)
 
 	switch {
 	case o.Sources != nil:
@@ -491,19 +520,18 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 			if errors.Is(err, ErrNotAllowed) {
 				return PDPEndpoints{}, err
 			}
-			// Transient, and nothing stale to serve: the operator's own PDP is the
-			// fallback. Not a downgrade — it is the PDP they configured.
-			if c.opts.StaticPDP == "" {
-				return PDPEndpoints{}, fmt.Errorf("%w for %s: %v", ErrNoPDP, resource, err)
-			}
-			c.opts.Logf("pdp discovery: %s: %v; using the static PDP", resource, err)
-			candidates = []string{c.opts.StaticPDP}
-		} else {
-			candidates = meta.PDPs
-			if meta.Document != nil {
-				m := meta
-				from = &m
-			}
+			// An outage, or a document that could not be read, and nothing stale to
+			// serve. That is the resource's layer being unavailable — it fails by its
+			// mode — not a resource that publishes nothing: only for that does the
+			// static PDP answer. Standing in for the resource here would also collapse
+			// a [static, resource] policy into one layer without a word.
+			c.opts.Logf("pdp discovery: %s: resource metadata unavailable: %v", resource, err)
+			return PDPEndpoints{}, fmt.Errorf("%w for %s: resource metadata unavailable: %v", ErrNoPDP, resource, err)
+		}
+		candidates = meta.PDPs
+		if meta.Document != nil {
+			m := meta
+			from = &m
 		}
 	}
 
@@ -525,8 +553,10 @@ func (c *Chain) Resolve(ctx context.Context, resource string) (PDPEndpoints, err
 }
 
 // lookupResource walks the sources in order; the first that names a PDP wins. No
-// metadata anywhere resolves to the static PDP, and that answer is cached like any
-// other. A transient failure is returned as an error so the cache can serve stale.
+// metadata anywhere — a 404, or a document that names no PDP — resolves to the static
+// PDP, and that answer is cached like any other. Anything else is an error: an outage
+// or an unreadable document, so the cache can serve stale and, with nothing stale, the
+// resource layer is unavailable rather than quietly the static PDP's.
 func (c *Chain) lookupResource(ctx context.Context, resource string) (ResourceMetadata, time.Time, error) {
 	for _, src := range c.sources {
 		meta, err := src.Lookup(ctx, resource)
@@ -537,8 +567,6 @@ func (c *Chain) lookupResource(ctx context.Context, resource string) (ResourceMe
 		case err == nil, errors.Is(err, ErrNoMetadata):
 		case errors.Is(err, ErrNotAllowed):
 			return ResourceMetadata{}, time.Time{}, err
-		case errors.Is(err, ErrInvalid):
-			c.opts.Logf("pdp discovery: %s for %s: %v", src.Name(), resource, err)
 		default:
 			return ResourceMetadata{}, time.Time{}, fmt.Errorf("%s: %w", src.Name(), err)
 		}
@@ -550,7 +578,10 @@ func (c *Chain) lookupResource(ctx context.Context, resource string) (ResourceMe
 }
 
 // fetchConfig reads {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9), falling
-// back to the default paths when the PDP publishes none.
+// back to the default paths when the PDP publishes none (404). Any other failure is an
+// error, never the default paths: the cache then serves what the PDP last advertised,
+// and with nothing cached the PDP is unavailable. Defaults on a blip would replace a
+// relocated PDP's endpoint with one it no longer serves, for a whole TTL.
 func (c *Chain) fetchConfig(ctx context.Context, pdp string) (PDPEndpoints, time.Time, error) {
 	if err := c.pdpFetch.Check(pdp); err != nil {
 		return PDPEndpoints{}, time.Time{}, err
@@ -561,13 +592,10 @@ func (c *Chain) fetchConfig(ctx context.Context, pdp string) (PDPEndpoints, time
 	}
 	body, err := c.pdpFetch.Get(ctx, wk, "application/json")
 	if err != nil {
-		if errors.Is(err, ErrNotAllowed) {
-			return PDPEndpoints{}, time.Time{}, err
+		if errors.Is(err, metafetch.ErrNotFound) {
+			return DefaultEndpoints(pdp), time.Time{}, nil
 		}
-		if !errors.Is(err, metafetch.ErrNotFound) {
-			c.opts.Logf("pdp discovery: %s: %v; using default AuthZEN paths", wk, err)
-		}
-		return DefaultEndpoints(pdp), time.Time{}, nil
+		return PDPEndpoints{}, time.Time{}, err // ErrNotAllowed, or the metadata is unavailable
 	}
 	var doc struct {
 		PDP          string   `json:"policy_decision_point"`
@@ -598,12 +626,16 @@ func (c *Chain) fetchConfig(ctx context.Context, pdp string) (PDPEndpoints, time
 }
 
 // ResolvePDP reads the metadata of an explicitly named PDP. Off mode reads nothing, as
-// everywhere else. The PDP allowlist applies: a layer URL that arrived in per-route
-// config is caller-supplied over the check API, exactly like mcp_upstream_url, and gets
-// the same treatment; ones from the service's own configuration are allowlisted by it.
+// everywhere else. The PDP allowlist and the https rule apply in every mode: a layer
+// URL that arrived in per-route config is caller-supplied over the check API, exactly
+// like mcp_upstream_url, and gets the same treatment; ones from the service's own
+// configuration are allowlisted by it.
 func (c *Chain) ResolvePDP(ctx context.Context, pdp string) (PDPEndpoints, error) {
 	pdp = strings.TrimRight(pdp, "/")
 	if c.opts.Mode == ModeOff {
+		if err := c.pdpFetch.Check(pdp); err != nil {
+			return PDPEndpoints{}, err
+		}
 		ep := DefaultEndpoints(pdp)
 		ep.APIKey, ep.Source = c.opts.APIKeys[pdp], "layer"
 		return ep, nil
