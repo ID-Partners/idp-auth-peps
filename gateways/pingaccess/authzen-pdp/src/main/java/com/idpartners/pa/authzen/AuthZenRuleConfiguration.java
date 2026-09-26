@@ -30,7 +30,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
 
     @UIElement(order = 10, type = ConfigurationType.TEXT, label = "PDP URL (authzen_url)", required = true,
         help = @Help(title = "The static PDP",
-            content = "Base URL of the AuthZEN PDP. Always the fallback and always permitted, whatever discovery finds.", url = ""))
+            content = "Base URL of the AuthZEN PDP. Decides when discovery is off or a resource publishes nothing, and is always permitted.", url = ""))
     @NotBlank
     public String authzen_url;
 

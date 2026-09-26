@@ -233,11 +233,11 @@ class DiscoveryTest {
 
     @Test
     void aPdpMetadataBlipServesTheLastGoodEntryNotTheDefaults() throws Exception {
-        FakeTransport t = resourceRoutes();
-        Clock clock = new Clock();
-        Discovery d = discovery(t, clock);
-        assertEquals(GOOD + "/custom/eval", d.resolve(conf(), RES).evaluation);
         for (Object blip : new Object[]{500, Boolean.FALSE, 302, "<html>"}) {
+            FakeTransport t = resourceRoutes();
+            Clock clock = new Clock();
+            Discovery d = discovery(t, clock);
+            assertEquals(GOOD + "/custom/eval", d.resolve(conf(), RES).evaluation);
             t.route(GOOD + "/.well-known/authzen-configuration", blip);
             clock.now += 301;
             assertEquals(GOOD + "/custom/eval", d.resolve(conf(), RES).evaluation, String.valueOf(blip));
@@ -382,7 +382,7 @@ class DiscoveryTest {
             d.waitMs = 5000;
             Thread.currentThread().interrupt();
             Discovery.Failure interrupted = assertThrows(Discovery.Failure.class, () -> d.resolve(noStatic, RES));
-            assertEquals(Discovery.Kind.TRANSIENT, interrupted.kind, "wrapped by resolve as no PDP");
+            assertEquals(Discovery.Kind.REFUSED, interrupted.kind, "not an outage, so never skipped");
             assertTrue(Thread.interrupted(), "the interrupt is kept");
         } finally {
             Thread.interrupted();
@@ -466,20 +466,77 @@ class DiscoveryTest {
 
     @Test
     void aResourceMetadataFetchThatFailsNeverReplacesTheLastGoodList() throws Exception {
-        for (Object blip : new Object[]{500, 403, 302, Boolean.FALSE}) {
+        Map<Object, Discovery.Kind> blips = Map.<Object, Discovery.Kind>of(
+            500, Discovery.Kind.TRANSIENT, Boolean.FALSE, Discovery.Kind.TRANSIENT,
+            403, Discovery.Kind.REFUSED, 302, Discovery.Kind.REFUSED, "<html>", Discovery.Kind.INVALID);
+        for (Map.Entry<Object, Discovery.Kind> blip : blips.entrySet()) {
+            String name = String.valueOf(blip.getKey());
             FakeTransport t = resourceRoutes();
             Clock clock = new Clock();
             Discovery d = discovery(t, clock);
             assertEquals(GOOD, d.resolve(conf(), RES).identifier);
-            t.route(RES + "/.well-known/oauth-protected-resource", blip);
+            t.route(RES + "/.well-known/oauth-protected-resource", blip.getKey());
             clock.now += 301;
-            assertEquals(GOOD, d.resolve(conf(), RES).identifier, String.valueOf(blip));
-            // Cold, it is the static PDP for this request, and not cached as the answer.
-            FakeTransport cold = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", blip);
+            assertEquals(GOOD, d.resolve(conf(), RES).identifier, name);
+            // Cold, with nothing stale to serve, the resource's layer is unavailable. It is
+            // never the static PDP's, and the failure is not cached as the answer.
+            FakeTransport cold = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", blip.getKey());
             Discovery dc = discovery(cold);
-            assertEquals(STATIC, dc.resolve(conf(), RES).identifier, String.valueOf(blip));
-            assertFalse(dc.resourceEntry(RES).ok, String.valueOf(blip));
+            Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> dc.resolve(conf(), RES), name);
+            assertEquals(blip.getValue(), f.kind, name);
+            assertTrue(f.getMessage().contains("unavailable and none is cached"), f.getMessage());
+            assertFalse(dc.resourceEntry(RES).ok, name);
+            assertEquals(0, cold.count(STATIC), name + ": the static PDP does not stand in");
         }
+    }
+
+    @Test
+    void theLastGoodListIsServedForOneMoreTtlAndNoLonger() throws Exception {
+        FakeTransport t = resourceRoutes();
+        Clock clock = new Clock();
+        Discovery d = discovery(t, clock);
+        long start = clock.now;
+        assertEquals(GOOD, d.resolve(conf(), RES).identifier);
+        t.route(RES + "/.well-known/oauth-protected-resource", 503);
+        clock.now = start + 301;
+        assertEquals(GOOD, d.resolve(conf(), RES).identifier, "stale, past the TTL");
+        clock.now = start + 599;
+        assertEquals(GOOD, d.resolve(conf(), RES).identifier, "stale, just inside one more TTL");
+        clock.now = start + 600;
+        Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> d.resolve(conf(), RES));
+        assertEquals(Discovery.Kind.TRANSIENT, f.kind);
+        assertFalse(d.resourceEntry(RES).ok, "the stale list is gone, not parked");
+        // Its layer is unavailable: fail-closed it fails the request; fail-open it is
+        // skipped and named. Either way [static, resource] never becomes [static].
+        Discovery.Failure layered = assertThrows(Discovery.Failure.class,
+            () -> d.resolveLayers(conf(), RES, List.of("static", "resource"), false));
+        assertTrue(layered.getMessage().contains("layer resource"), layered.getMessage());
+        Discovery.Layers open = d.resolveLayers(conf(), RES, List.of("static", "resource fail-open"), false);
+        assertEquals(1, open.pdps().size());
+        assertEquals(STATIC, open.pdps().get(0).identifier);
+        assertEquals(List.of("resource"), open.skipped());
+        // Recovery, once the retry window has passed.
+        t.route(RES + "/.well-known/oauth-protected-resource", resourceDoc(GOOD));
+        clock.now += Discovery.MIN_REFRESH + 1;
+        assertEquals(GOOD, d.resolve(conf(), RES).identifier);
+    }
+
+    @Test
+    void aRefusalOnRefreshEndsTheStaleEntryAtOnce() throws Exception {
+        AuthZenRuleConfiguration c = conf();
+        c.pdp_allowlist = List.of(GOOD);
+        FakeTransport t = resourceRoutes();
+        Clock clock = new Clock();
+        Discovery d = discovery(t, clock);
+        assertEquals(GOOD + "/custom/eval", d.resolve(c, RES).evaluation);
+        // The PDP now advertises an endpoint the allowlist refuses: an answer, not an
+        // outage, so the entry it replaces is not served on.
+        t.route(GOOD + "/.well-known/authzen-configuration", pdpConfig(GOOD, "https://elsewhere.example/eval", null));
+        clock.now += 301;
+        assertEquals(Discovery.Kind.NOT_ALLOWED, assertThrows(Discovery.Failure.class, () -> d.resolve(c, RES)).kind);
+        // Nothing is left to ride out an outage on.
+        t.route(GOOD + "/.well-known/authzen-configuration", 503);
+        assertEquals(Discovery.Kind.TRANSIENT, assertThrows(Discovery.Failure.class, () -> d.resolve(c, RES)).kind);
     }
 
     // ---------- resource mode ----------
@@ -515,50 +572,67 @@ class DiscoveryTest {
     }
 
     @Test
-    void fallsToTheStaticPdpWhenTheResourceHasNoUsableMetadata() throws Exception {
-        ObjectNode badEntries = obj("resource", RES);
-        badEntries.putArray(Discovery.PARAM).add("not a url").add(1);
-        ObjectNode withQuery = obj("resource", RES);
-        withQuery.putArray(Discovery.PARAM).add(GOOD + "/?x");
+    void fallsToTheStaticPdpWhenTheResourcePublishesNothing() throws Exception {
         ObjectNode empty = obj("resource", RES);
         empty.putArray(Discovery.PARAM);
         Map<String, Object> cases = Map.of(
             "404", 404,
             "no parameter", obj("resource", RES),
-            "echo mismatch", resourceDoc(GOOD).put("resource", "https://impostor.example"),
-            "bad entries", badEntries,
-            "entry with query", withQuery,
             "empty list", empty,
-            "not JSON", "<html>",
             "parameter not a list", obj("resource", RES, Discovery.PARAM, GOOD));
         for (Map.Entry<String, Object> c : cases.entrySet()) {
             FakeTransport t = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", c.getValue());
-            Discovery.Endpoints ep = discovery(t).resolve(conf(), RES);
+            Discovery d = discovery(t);
+            Discovery.Endpoints ep = d.resolve(conf(), RES);
             assertEquals(STATIC, ep.identifier, c.getKey());
             assertEquals("static-key", ep.apiKey, c.getKey());
             assertNull(ep.resource, c.getKey() + ": falling to static forwards no document");
+            assertTrue(d.resourceEntry(RES).ok, c.getKey() + ": an answer, cached like any other");
         }
-        // An identifier that cannot have metadata at all.
-        assertEquals(STATIC, discovery(resourceRoutes()).resolve(conf(), "https://r.example/?x").identifier);
     }
 
     @Test
-    void fallsToTheStaticPdpOnATransientFailureWithoutCachingItAsTheAnswer() throws Exception {
+    void aResourceDocumentThatDoesNotValidateIsNotTheStaticPdps() {
+        ObjectNode badEntries = obj("resource", RES);
+        badEntries.putArray(Discovery.PARAM).add("not a url").add(1);
+        ObjectNode withQuery = obj("resource", RES);
+        withQuery.putArray(Discovery.PARAM).add(GOOD + "/?x");
+        Map<String, Object> cases = Map.of(
+            "echo mismatch", resourceDoc(GOOD).put("resource", "https://impostor.example"),
+            "bad entries", badEntries,
+            "entry with query", withQuery,
+            "not JSON", "<html>");
+        for (Map.Entry<String, Object> c : cases.entrySet()) {
+            FakeTransport t = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", c.getValue());
+            Discovery d = discovery(t);
+            Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> d.resolve(conf(), RES), c.getKey());
+            assertEquals(Discovery.Kind.INVALID, f.kind, c.getKey());
+            assertFalse(d.resourceEntry(RES).ok, c.getKey() + ": not cached as the answer");
+            assertEquals(0, t.count(STATIC), c.getKey());
+        }
+        // An identifier that cannot have metadata at all.
+        Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> discovery(resourceRoutes()).resolve(conf(), "https://r.example/?x"));
+        assertEquals(Discovery.Kind.INVALID, f.kind);
+    }
+
+    @Test
+    void aResourceOutageFailsItsLayerAndIsNotRetriedOnEveryRequest() throws Exception {
         FakeTransport t = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", 500);
         Clock clock = new Clock();
         Discovery d = discovery(t, clock);
-        assertEquals(STATIC, d.resolve(conf(), RES).identifier);
+        assertEquals(Discovery.Kind.TRANSIENT, assertThrows(Discovery.Failure.class, () -> d.resolve(conf(), RES)).kind);
         Discovery.Entry e = d.resourceEntry(RES);
         assertFalse(e.ok);
         assertTrue(e.negUntil > 0);
         // Within the negative window the resource is not re-fetched.
         int before = t.hits.size();
-        d.resolve(conf(), RES);
+        assertThrows(Discovery.Failure.class, () -> d.resolve(conf(), RES));
         assertEquals(before, t.hits.size());
         // Past it, it is.
         clock.now += 31;
-        d.resolve(conf(), RES);
+        assertThrows(Discovery.Failure.class, () -> d.resolve(conf(), RES));
         assertTrue(t.hits.size() > before);
+        assertEquals(0, t.count(STATIC));
     }
 
     @Test

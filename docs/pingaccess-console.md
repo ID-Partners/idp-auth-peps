@@ -96,10 +96,10 @@ label.
 | PEP label | `pep_label` | TEXT | `pingaccess-pep` | |
 
 **PDP URL** is the static PDP: the base URL AuthZEN's evaluation endpoints hang off when
-discovery is off, and the fallback whenever discovery finds nothing. It is always
+discovery is off, and the PDP for a resource that publishes nothing. It is always
 permitted, whatever the allowlists say, and its own origin is trusted over plain http.
-Help: *The static PDP. Base URL of the AuthZEN PDP. Always the fallback and always
-permitted, whatever discovery finds.*
+Help: *The static PDP. Base URL of the AuthZEN PDP. Decides when discovery is off or a
+resource publishes nothing, and is always permitted.*
 
 **PDP API key** is sent as a bearer token to the static PDP and to nothing else. A PDP
 found by discovery never receives it, because a key is bound to the PDP it was issued

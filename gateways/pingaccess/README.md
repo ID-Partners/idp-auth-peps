@@ -65,6 +65,10 @@ until it is fixed. Check each rule before you deploy the jar:
   host name, so the JDK has no host to connect to.
 - **A fail-open layer opens on an outage only.** A 4xx, a redirect or an answer that is
   not a decision is a refusal, and closed.
+- **A resource whose metadata cannot be read is not the static PDP's.** Only a resource
+  that publishes nothing (a 404, or a document naming no PDP) falls back to
+  `authzen_url`. An outage, a refusal or a document that does not validate serves the
+  last good copy for up to one more TTL, then fails the resource layer by its mode.
 - **A payment or a new account needs a readable body.** A `POST /payments` with no
   `from_account` or no numeric amount is a 400 before any PDP is asked.
 
@@ -131,7 +135,7 @@ is the whole sequence, site and application included, as a script.
 
 | Knob | Default | Meaning |
 | --- | --- | --- |
-| `authzen_url` | required | The static PDP: always the fallback, always permitted |
+| `authzen_url` | required | The static PDP: decides for a resource that publishes nothing, and is always permitted |
 | `authzen_api_key` | — | Bearer key for `authzen_url`, sent over https only. A discovered PDP never receives it |
 | `pep_label` | `pingaccess-pep` | Names this PEP in challenges and the `X-PDP-PEP` header |
 | `style` | `rest` | `rest` (resource server) or `mcp` (MCP edge: every request goes to `coaz-pep`; needs `coaz_url`) |
@@ -281,7 +285,7 @@ would guarantee drift.
 | --- | --- | --- |
 | `off` | nothing — static PDP, default paths, no fetch | — |
 | `authzen` | `authzen_url`'s `/.well-known/authzen-configuration` | default paths, when the PDP publishes none (a 404) |
-| `resource` | the route's resource's RFC 9728 document (`authzen_policy_decision_points`), then that PDP's metadata | `authzen_url` |
+| `resource` | the route's resource's RFC 9728 document (`authzen_policy_decision_points`), then that PDP's metadata | `authzen_url`, when the resource publishes nothing (a 404, or no PDP named) |
 
 Whatever document named the PDP is forwarded verbatim as `context.resource_metadata`
 (with `context.resource_metadata_source`), the endpoint hit as `context.request`, and

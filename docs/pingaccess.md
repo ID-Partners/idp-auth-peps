@@ -180,8 +180,9 @@ for key, so a payment the MCP edge let through is not challenged again here.
 
 ## Finding the PDP
 
-The rule is never told which PDP decides; it can be, and the static `authzen_url` is
-always the fallback, but the point of the repository is that it need not be. Three
+The rule is never told which PDP decides; it can be, and the static `authzen_url`
+decides for a resource that publishes nothing, but the point of the repository is that
+it need not be. Three
 modes:
 
 | `pdp_discovery` | What the rule reads | Then |
@@ -220,9 +221,14 @@ skipped those, anyone who could provoke one could switch a layer off, so a refus
 
 Four rules never relax: a URL outside an allowlist fails closed rather than falling to a
 weaker source; a discovered PDP never receives `authzen_api_key`; a refusal never
-fails open; and metadata is cached per identifier with stale-while-failing, so a
-metadata outage is not an authorization outage. A PDP's metadata falls back to
-AuthZEN's default paths only when the PDP publishes none, never because a fetch failed.
+fails open; and an outage is ridden out, not routed around. Metadata is cached per
+identifier and served stale while a refresh fails, for up to one more TTL, so a blip is
+not an authorization outage - but past that the layer is unavailable and fails by its
+mode. It never quietly becomes the static PDP's, which would let anyone who can take a
+resource's metadata down choose its judge. The static PDP decides only for a resource
+that publishes nothing (a 404, or a document naming no PDP), and a PDP's metadata falls
+back to AuthZEN's default paths only when the PDP publishes none, never because a fetch
+failed.
 With discovery on, `pdp_allowlist` is required: an empty one would let a resource name
 any PDP at all.
 

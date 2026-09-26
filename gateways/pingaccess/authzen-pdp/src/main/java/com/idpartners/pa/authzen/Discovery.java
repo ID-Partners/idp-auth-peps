@@ -31,11 +31,15 @@ import java.util.regex.Pattern;
  * <pre>
  *   resource identifier (conf.resource, or mcp_upstream_url on an mcp route)
  *     +- resource: {resource}/.well-known/oauth-protected-resource (RFC 9728), self-asserted
- *     +- static:   conf.authzen_url, the fallback
+ *     +- static:   conf.authzen_url, when the resource publishes nothing (404, or no PDP named)
  *   PDP identifier
  *     +- {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 s9)
- *     +- 404 / unreachable -> {pdp}/access/v1/evaluation, the spec's default paths
+ *     +- 404 -> {pdp}/access/v1/evaluation, the spec's default paths
  * </pre>
+ *
+ * <p>Metadata that cannot be fetched, or does not validate, is not "publishes nothing":
+ * the last good copy is served for up to one more TTL, and after that the layer is
+ * unavailable and fails by its mode. It never quietly becomes the static PDP's.
  *
  * <p>The parameter naming the PDPs, {@code authzen_policy_decision_points}, is minted by
  * this repository (no spec defines one) and shared with the Go PEP byte for byte.
@@ -133,16 +137,18 @@ final class Discovery {
 
     /**
      * A cache entry, keyed by identifier: the documents are public, so no credential in
-     * the key. Serves stale while a refresh fails or is under way, throttles retries,
-     * negatively caches a failure so a down resource does not put a fetch in every
-     * request's path, and lets one request fetch while the others use the stale value
-     * or, when there is none yet, wait for that one fetch.
+     * the key. Serves stale while a refresh fails or is under way, for up to one more TTL,
+     * throttles retries, negatively caches a failure so a down resource does not put a
+     * fetch in every request's path, and lets one request fetch while the others use the
+     * stale value or, when there is none yet, wait for that one fetch. A refusal ends the
+     * stale value at once.
      */
     static final class Entry {
         boolean ok;
         Object val;
         Failure err;
         long expires;
+        long staleUntil;
         long negUntil;
         long lastAttempt;
         CompletableFuture<Object> inflight;
@@ -308,6 +314,12 @@ final class Discovery {
         CompletableFuture<Object> theirs = null;
         synchronized (e) {
             long t = clock.getAsLong();
+            if (e.ok && t >= e.staleUntil) {
+                // A whole extra TTL of failed refreshes: the last good value is not served
+                // past that, and the failure becomes the caller's.
+                e.ok = false;
+                e.val = null;
+            }
             if (e.ok && t < e.expires) {
                 return (T) e.val;
             }
@@ -355,16 +367,20 @@ final class Discovery {
                 e.val = val;
                 e.ok = true;
                 e.expires = t + ttl;
+                e.staleUntil = e.expires + ttl;
                 e.err = null;
                 e.negUntil = 0;
                 mine.complete(val);
                 return val;
             }
             e.err = err;
-            if (e.ok) {
+            if (e.ok && err.kind != Kind.NOT_ALLOWED) {
                 mine.complete(e.val);
-                return (T) e.val; // stale beats failing every request
+                return (T) e.val; // stale beats failing every request, until staleUntil
             }
+            // A refusal is an answer, not an outage: what was trusted is trusted no longer.
+            e.ok = false;
+            e.val = null;
             // A policy refusal cost no fetch and belongs to one route's allowlist;
             // another route sharing this cache must not inherit it.
             if (negativeTtl > 0 && err.kind != Kind.NOT_ALLOWED) {
@@ -659,16 +675,11 @@ final class Discovery {
                     try {
                         return rfc9728Lookup(key, o);
                     } catch (Failure perr) {
-                        // Only "publishes nothing" (a 404) and a document that says the
-                        // wrong thing are an answer; a fetch that failed must not replace
-                        // the last good list with the static PDP.
-                        if (perr.kind == Kind.NOT_ALLOWED || perr.kind == Kind.TRANSIENT || perr.kind == Kind.REFUSED) {
-                            throw perr;
-                        }
-                        if (perr.kind == Kind.INVALID) {
-                            log.warn("pdp discovery: {}", perr.getMessage());
-                        }
-                        if (o.staticPdp.isEmpty()) {
+                        // Only "publishes nothing" is an answer the static PDP takes: a 404,
+                        // or a document that names no PDP. An outage, a refusal or a
+                        // document that does not validate stays a failure, so the cache
+                        // serves the last good list or the layer fails by its mode.
+                        if (perr.kind != Kind.NO_METADATA || o.staticPdp.isEmpty()) {
                             throw perr;
                         }
                         return new Meta(List.of(o.staticPdp), null, null);
@@ -678,11 +689,13 @@ final class Discovery {
                 if (err.kind == Kind.NOT_ALLOWED) {
                     throw err;
                 }
-                if (o.staticPdp.isEmpty()) {
+                if (err.kind == Kind.NO_METADATA) {
                     throw new Failure(Kind.TRANSIENT, "no PDP could be resolved for " + resource + ": " + err.getMessage());
                 }
-                log.warn("pdp discovery: {}; using the static PDP", err.getMessage());
-                meta = new Meta(List.of(o.staticPdp), null, null);
+                // Nothing stale to serve. Standing the static PDP in here would let whoever
+                // can take a resource's metadata down choose its judge, and would collapse
+                // a [static, resource] policy into one layer without a word.
+                throw new Failure(err.kind, "the metadata for " + resource + " is unavailable and none is cached: " + err.getMessage());
             }
             candidates = meta.pdps;
             if (meta.document != null) {

@@ -58,6 +58,7 @@
     <li><b>Missing security settings are refused</b>, not warned about: an API key or forwarded token over http, <code>coaz_url</code> without its key, discovery without <code>pdp_allowlist</code>, <code>pdp_discovery_insecure</code>, <code>pdp_ssl_verify</code> off. <code>allow_insecure</code> lets a development rule start with them, and logs each one.</li>
     <li><b>Every URL must be one the rule can call</b>: absolute http or https with a host. <code>http://authzen_pdp:8080</code> is refused - an underscore is not legal in a host name.</li>
     <li><b>A fail-open layer opens on an outage only.</b> A 4xx, a redirect or an answer that is not a decision is a refusal, and closed.</li>
+    <li><b>A resource whose metadata cannot be read is not the static PDP's.</b> Only a resource that publishes nothing (a 404, or a document naming no PDP) falls back to <code>authzen_url</code>; an outage, a refusal or a document that does not validate serves the last good copy for up to one more TTL, then fails the resource layer by its mode.</li>
     <li><b>A payment needs a readable body</b> with a <code>from_account</code> and a numeric amount, or it is a 400 before any PDP is asked.</li>
   </ul>
 
@@ -86,7 +87,7 @@ mvn -Dpa.server.root=/opt/pingaccess -Dpa.sdk.version=9.1.0.1 verify</code></pre
   <div class="wide"><table>
     <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>authzen_url</code> <span class="req">required</span></td><td class="d">text</td><td>The static PDP: always the fallback, always permitted.</td></tr>
+      <tr><td><code>authzen_url</code> <span class="req">required</span></td><td class="d">text</td><td>The static PDP: decides for a resource that publishes nothing, and is always permitted.</td></tr>
       <tr><td><code>authzen_api_key</code></td><td class="d">concealed</td><td>Bearer key for <code>authzen_url</code>, sent over https only. A discovered PDP never receives it. Stored encrypted; the API returns <code>{"encryptedValue": "OBF:JWE:…"}</code>.</td></tr>
       <tr><td><code>pdp_timeout_ms</code> <span class="req">advanced</span></td><td class="d">text · 10000</td><td>Deadline on each PDP call, the whole exchange included.</td></tr>
       <tr><td><code>pdp_ssl_verify</code> <span class="req">advanced</span></td><td class="d">checkbox · true</td><td>Certificate verification on every outbound call. Off trusts any chain but still checks the host name, and needs <code>allow_insecure</code>: dev only.</td></tr>
@@ -126,7 +127,7 @@ mvn -Dpa.server.root=/opt/pingaccess -Dpa.sdk.version=9.1.0.1 verify</code></pre
     <thead><tr><th>Field</th><th>Widget · default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>pdp_discovery</code></td><td class="d">select · off</td><td><code>off</code>, <code>authzen</code> or <code>resource</code>. No federation mode; the same reason as Kong, and the same remedy: behind coaz-pep.</td></tr>
-      <tr><td><code>pdp_metadata_ttl</code> <span class="req">advanced</span></td><td class="d">text · 300</td><td>Cache TTL, seconds, for resource and PDP metadata.</td></tr>
+      <tr><td><code>pdp_metadata_ttl</code> <span class="req">advanced</span></td><td class="d">text · 300</td><td>Cache TTL, seconds, for resource and PDP metadata. A fetch that fails, or a document that does not validate, serves the last good copy for up to one more TTL; after that, or with none, the layer is unavailable and its failure mode decides.</td></tr>
       <tr><td><code>pdp_allowlist</code></td><td class="d">list</td><td>Permitted discovered-PDP prefixes; required when <code>pdp_discovery</code> is on. <code>authzen_url</code> is always permitted.</td></tr>
       <tr><td><code>resource_metadata_allowlist</code></td><td class="d">list · any</td><td>Permitted <code>resource</code> prefixes for metadata fetches.</td></tr>
       <tr><td><code>pdp_discovery_insecure</code> <span class="req">advanced</span></td><td class="d">checkbox · false</td><td>Allow http for discovered URLs; needs <code>allow_insecure</code> (dev only).</td></tr>
