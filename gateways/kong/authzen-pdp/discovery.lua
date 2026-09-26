@@ -3,12 +3,12 @@
 -- (which requires it under this module name, so there is one copy of these rules in Lua).
 --
 --   resource identifier (conf.resource, or mcp_upstream_url on an mcp route)
---     ├─ federation: what a federation resolve endpoint resolves for it       — the federation's word
+--     ├─ federation-resolver: what a federation resolve endpoint resolves for it — the resolver's word
 --     ├─ resource:   {resource}/.well-known/oauth-protected-resource (RFC 9728) — self-asserted
 --     └─ static:     conf.authzen_url                                          — the fallback
 --   PDP identifier
 --     ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
---     └─ 404 / unreachable -> {pdp}/access/v1/evaluation, the spec's default paths
+--     └─ 404 -> {pdp}/access/v1/evaluation, the spec's default paths
 --        (or no probe at all, for a caller whose protocol has no PDP metadata to read)
 --
 -- Two parameters are minted by this repo, in a shape valid both in an RFC 9728 document
@@ -17,20 +17,22 @@
 -- (candidates for ONE decision, first preferred), and `authzen_policy_layers`, the PDPs
 -- to ask in FRONT of it, every one of which must permit.
 --
--- Federation mode does not walk a Trust Chain here. There is no JOSE verifier available
--- to a Kong plugin, so a chain cannot be validated in it; instead the plugin asks a
--- federation resolve endpoint (OpenID Federation 1.0 §8.3) — typically the trust
--- anchor's — and takes the resolver's answer on transport: TLS to a URL the operator
--- configured, the resolve response's signature NOT verified. That is the trust the plugin
--- already places in its static PDP, and a weaker claim than the Go PEP's, which verifies
--- the chain to an anchor key it holds. A route that needs the stronger claim belongs
--- behind coaz-pep.
+-- There is no federation mode here in the Go PEP's sense: it walks the Trust Chain and
+-- verifies every signature to an anchor key it holds, and a Kong plugin has no JOSE
+-- verifier to do that with. The federation-resolver mode asks a federation resolve
+-- endpoint (OpenID Federation 1.0 §8.3) — typically the trust anchor's — and takes the
+-- resolver's answer on transport: TLS to a URL the operator configured, the resolve
+-- response's signature NOT verified. That is the trust the plugin already places in its
+-- static PDP, and a weaker claim, so it is named apart: the mode, and the source a PDP
+-- is told the metadata came from, say federation-resolver and never federation. A route
+-- that needs the stronger claim belongs behind coaz-pep.
 --
 -- Two rules are never relaxed: a URL outside an allowlist fails closed rather than
 -- falling to a weaker source, and a discovered PDP never receives the static API key.
 
 local http = require "resty.http"
-local cjson = require "cjson.safe"
+local contract = require "kong.plugins.authzen-pdp.contract"
+local cjson = contract.json
 
 local D = {}
 
@@ -40,6 +42,8 @@ D.PARAM_LAYERS = "authzen_policy_layers"
 -- "layer" for one the operator configured and the metadata sources for the resource's own.
 D.SOURCE_PUBLISHED = "published"
 D.RESOLVE_RESPONSE_TYP = "resolve-response+jwt"
+-- The resolve-endpoint mode, and the source of metadata it found.
+D.RESOLVER = "federation-resolver"
 D.MAX_BODY = 1048576
 D.MIN_REFRESH = 30
 
@@ -143,8 +147,11 @@ end
 
 -- ---------- cache ----------
 -- Per worker, keyed by identifier: the documents are public, so no credential in the
--- key. Serves stale while a refresh fails, throttles retries, and negatively caches a
--- transient failure so a down resource does not put a fetch in every request's path.
+-- key. Serves the last good value while a refresh fails — an outage is not a reason to
+-- trust something else — throttles retries, and negatively caches a transient failure
+-- so a down resource does not put a fetch in every request's path. Two things end the
+-- stale value instead: a refusal (the resolver now says the chain is invalid, say), and
+-- the value's own expiry (a resolve response's exp), past which it is never served.
 
 local caches = { resources = {}, federation = {}, pdps = {} }
 
@@ -157,6 +164,9 @@ local function cache_get(store, key, ttl, negative_ttl, fetch)
   local e = store[key]
   if not e then e = {}; store[key] = e end
   local t = now()
+  if e.ok and e.hard_expiry and t >= e.hard_expiry then
+    e.ok, e.val, e.hard_expiry = false, nil, nil
+  end
   if e.ok and t < e.expires then return e.val end
   if not e.ok and e.err and e.neg_until and t < e.neg_until then return nil, e.err end
   if e.ok and e.err and (t - (e.last_attempt or 0)) < D.MIN_REFRESH then return e.val end
@@ -164,15 +174,18 @@ local function cache_get(store, key, ttl, negative_ttl, fetch)
   local val, err = fetch(key)
   if not val then
     e.err = err
-    if e.ok then return e.val end -- stale beats failing every request
-    -- A policy refusal cost no fetch and belongs to one route's allowlist; another
-    -- route sharing this worker must not inherit it.
-    if negative_ttl and negative_ttl > 0 and not (type(err) == "table" and err.kind == NOT_ALLOWED) then
-      e.neg_until = t + negative_ttl
+    local refused = type(err) == "table" and err.kind == NOT_ALLOWED
+    if refused then
+      -- A refusal is an answer, not an outage: what was trusted is trusted no longer.
+      e.ok, e.val, e.neg_until = false, nil, nil
+      return nil, err
     end
+    if e.ok then return e.val end -- the last good value beats failing every request
+    if negative_ttl and negative_ttl > 0 then e.neg_until = t + negative_ttl end
     return nil, err
   end
   e.val, e.ok, e.expires, e.err, e.neg_until = val, true, t + ttl, nil, nil
+  e.hard_expiry = type(val) == "table" and tonumber(val.expires_at) or nil
   return val
 end
 
@@ -202,12 +215,12 @@ local function pdp_list(raw, from)
   return out
 end
 
--- layer_list reads authzen_policy_layers out of a document: absent is no layers;
--- anything that is not an array of PDP identifiers makes the document invalid — a policy
--- the PEP cannot read is not one it may quietly narrow.
+-- layer_list reads authzen_policy_layers out of a document: absent (or null) is no
+-- layers; anything else that is not an array of PDP identifiers makes the document
+-- invalid — a policy the PEP cannot read is not one it may quietly narrow.
 local function layer_list(doc, from)
   local raw = doc[D.PARAM_LAYERS]
-  if raw == nil then return {} end
+  if raw == nil or raw == contract.null then return {} end
   if type(raw) ~= "table" then return fail(INVALID, from .. " " .. D.PARAM_LAYERS .. " is not an array") end
   return identifiers(raw, from)
 end
@@ -220,7 +233,12 @@ end
 local function rfc9728_lookup(resource, opts)
   local wk, err = D.well_known_url(resource, "oauth-protected-resource")
   if not wk then return fail(INVALID, err) end
-  local doc, ferr = get_json(wk, opts.resource_policy)
+  -- The allowlist bounds the resource identifier, checked before this is called. The
+  -- well-known URL is that identifier's own, on its origin, with the segment inserted
+  -- after the host, so it would never sit under a path-bearing entry: fetch it under the
+  -- rest of the policy (https unless insecure), not the allowlist again.
+  local p = opts.resource_policy
+  local doc, ferr = get_json(wk, { insecure = p.insecure, ssl_verify = p.ssl_verify, timeout_ms = p.timeout_ms })
   if not doc then return nil, ferr end
   -- §3.3: the echoed identifier MUST be identical, or whoever answers at that path has
   -- just named a PDP for someone else's resource.
@@ -275,7 +293,7 @@ local RESOLVE_ERRORS = {
 local function federation_lookup(resource, opts)
   local f = opts.federation
   if not f.resolve_url or f.resolve_url == "" or not f.anchor or f.anchor == "" then
-    return fail(NOT_ALLOWED, "federation mode needs federation_resolve_url and federation_trust_anchor")
+    return fail(NOT_ALLOWED, "federation-resolver mode needs federation_resolve_url and federation_trust_anchor")
   end
   local url = f.resolve_url .. (f.resolve_url:find("?", 1, true) and "&" or "?")
     .. "sub=" .. ngx.escape_uri(resource) .. "&anchor=" .. ngx.escape_uri(f.anchor)
@@ -309,37 +327,49 @@ local function federation_lookup(resource, opts)
   local layers, lerr = layer_list(meta, from)
   if not layers then return nil, lerr end
   -- What travels to the PDP is the RESOLVED metadata: what survived every superior's
-  -- policy, not what the resource wrote.
-  return { pdps = pdps, layers = layers, document = meta, source = "federation" }
+  -- policy, not what the resource wrote. It is good until the answer's exp and no
+  -- longer, however long the cache TTL.
+  return { pdps = pdps, layers = layers, document = meta, source = D.RESOLVER,
+    expires_at = type(claims.exp) == "number" and claims.exp or nil }
 end
 
---- AuthZEN 1.0 §9: the PDP's own metadata, or the default paths when it has none.
+--- AuthZEN 1.0 §9: the PDP's own metadata, or the default paths when it has none (a
+--- 404). A PDP whose metadata cannot be fetched is not one without metadata: the caller's
+--- cache serves the last good answer, and with none the layer is unavailable — the
+--- defaults would send the evaluation somewhere the PDP may no longer answer.
 local function fetch_config(pdp, opts)
   local ok, why = D.check_url(pdp, opts.pdp_policy)
   if not ok then return fail(NOT_ALLOWED, why) end
   local wk, err = D.well_known_url(pdp, "authzen-configuration")
   if not wk then return fail(INVALID, err) end
-  local doc, ferr = get_json(wk, opts.pdp_policy)
+  -- The identifier has passed the allowlist; its own metadata, on its origin with the
+  -- segment inserted after the host, is fetched under the rest of the policy. What the
+  -- metadata advertises is checked against the allowlist below.
+  local p = opts.pdp_policy
+  local doc, ferr = get_json(wk, { insecure = p.insecure, trusted_origin = p.trusted_origin, ssl_verify = p.ssl_verify, timeout_ms = p.timeout_ms })
   if not doc then
-    if ferr.kind == NOT_ALLOWED or ferr.kind == INVALID then return nil, ferr end
-    if ferr.kind ~= NO_METADATA then kong.log.warn("pdp discovery: ", ferr.msg, "; using default AuthZEN paths") end
-    return D.default_endpoints(pdp)
+    if ferr.kind == NO_METADATA then return D.default_endpoints(pdp) end
+    return nil, ferr
   end
-  if trim_slash(tostring(doc.policy_decision_point or "")) ~= trim_slash(pdp) then
-    return fail(INVALID, wk .. " says policy_decision_point is " .. tostring(doc.policy_decision_point) .. ", expected " .. pdp)
+  local declared = contract.str(doc.policy_decision_point)
+  if trim_slash(declared or "") ~= trim_slash(pdp) then
+    return fail(INVALID, wk .. " says policy_decision_point is " .. tostring(declared) .. ", expected " .. pdp)
   end
-  if type(doc.access_evaluation_endpoint) ~= "string" or doc.access_evaluation_endpoint == "" then
+  local evaluation = contract.str(doc.access_evaluation_endpoint)
+  if not evaluation or evaluation == "" then
     return fail(INVALID, wk .. " has no access_evaluation_endpoint")
   end
-  for _, u in ipairs({ doc.access_evaluation_endpoint, doc.access_evaluations_endpoint }) do
+  -- A null is absent: the PDP has no batch endpoint.
+  local evaluations = contract.str(doc.access_evaluations_endpoint)
+  for _, u in ipairs({ evaluation, evaluations }) do
     local eok, ewhy = D.check_url(u, opts.pdp_policy)
     if not eok then return fail(NOT_ALLOWED, ewhy) end
   end
   return {
     identifier = trim_slash(pdp),
-    evaluation = doc.access_evaluation_endpoint,
-    evaluations = doc.access_evaluations_endpoint,
-    capabilities = doc.capabilities,
+    evaluation = evaluation,
+    evaluations = evaluations,
+    capabilities = contract.is_array(doc.capabilities) and doc.capabilities or nil,
   }
 end
 
@@ -403,7 +433,7 @@ local function endpoints_of(pdp, o)
   local pok, pwhy = D.check_url(pdp, o.pdp_policy)
   if not pok then return fail(NOT_ALLOWED, pwhy) end
   if not o.probe then return D.default_endpoints(pdp) end
-  local ep, err = cache_get(caches.pdps, pdp, o.ttl, nil, function(key) return fetch_config(key, o) end)
+  local ep, err = cache_get(caches.pdps, pdp, o.ttl, D.MIN_REFRESH, function(key) return fetch_config(key, o) end)
   if not ep then return nil, err end
   for _, u in ipairs({ ep.evaluation, ep.evaluations }) do
     local eok, ewhy = D.check_url(u, o.pdp_policy)
@@ -511,7 +541,10 @@ function D.resolve_layers(conf, resource, layers, default_open, opts)
       if err.kind == NOT_ALLOWED or not open then
         return nil, { kind = err.kind, msg = "layer " .. spec.name .. ": " .. err.msg }
       end
-      skipped[#skipped + 1] = spec.name .. " (" .. err.msg .. ")"
+      -- The skipped list is what a client is shown (X-PDP-Fail-Open): identifiers only.
+      -- Why a layer was skipped is for the log.
+      kong.log.warn("pdp discovery: layer ", spec.name, " could not be resolved (", err.msg, "); skipped (fail-open)")
+      skipped[#skipped + 1] = spec.name
     else
       if spec.name == "resource" and ep.resource and ep.resource.layers then
         -- What the document put in front of its PDP, in the document's order.
@@ -521,7 +554,8 @@ function D.resolve_layers(conf, resource, layers, default_open, opts)
             if gerr.kind == NOT_ALLOWED or not open then
               return nil, { kind = gerr.kind, msg = "layer resource: " .. resource .. " published layer " .. pdp .. ": " .. gerr.msg }
             end
-            skipped[#skipped + 1] = pdp .. " (published by " .. resource .. ": " .. gerr.msg .. ")"
+            kong.log.warn("pdp discovery: layer ", pdp, " published by ", resource, " could not be resolved (", gerr.msg, "); skipped (fail-open)")
+            skipped[#skipped + 1] = pdp
           else
             gate.source = D.SOURCE_PUBLISHED
             add(gate, {}, open, false)
@@ -569,10 +603,10 @@ function D.resolve(conf, resource, opts)
     if not rok then return fail(NOT_ALLOWED, rwhy) end
     -- One store per source: a route trusting the federation and one trusting the
     -- resource's own word must not share an answer.
-    local store = mode == "federation" and caches.federation or caches.resources
+    local store = mode == D.RESOLVER and caches.federation or caches.resources
     local meta, err = cache_get(store, resource, o.ttl, D.MIN_REFRESH, function()
       local found, perr
-      if mode == "federation" then found, perr = federation_lookup(resource, o)
+      if mode == D.RESOLVER then found, perr = federation_lookup(resource, o)
       else found, perr = rfc9728_lookup(resource, o) end
       if found then return found end
       if perr.kind == NOT_ALLOWED or perr.kind == TRANSIENT then return nil, perr end
@@ -582,9 +616,12 @@ function D.resolve(conf, resource, opts)
     end)
     if not meta then
       if err.kind == NOT_ALLOWED then return nil, err end
-      if o.static == "" then return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg) end
-      kong.log.warn("pdp discovery: ", err.msg, "; using the static PDP")
-      meta = { pdps = { o.static } }
+      -- Unavailable with nothing cached: the layer fails under its own rule. Falling to
+      -- the static PDP would quietly drop whatever the resource puts in front of its own.
+      if err.kind == TRANSIENT then
+        return fail(TRANSIENT, "the metadata for " .. resource .. " is unavailable and none is cached: " .. err.msg)
+      end
+      return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg)
     end
     candidates = meta.pdps
     if meta.document then from = { source = meta.source, document = meta.document, layers = meta.layers } end

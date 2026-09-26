@@ -155,13 +155,48 @@ describe('discovery: off and authzen modes', function()
     assert.equal('transient', err.kind)
   end)
 
-  it('falls back to the default paths on 404, 500 and connection failure', function()
-    for _, r in ipairs({ 404, 500, false }) do
-      local fn = router({ [STATIC] = r })
-      local D = load({ pdp = fn })
-      local ep = D.resolve(conf({ pdp_discovery = 'authzen' }), '')
-      assert.equal(STATIC .. '/access/v1/evaluation', ep.evaluation, tostring(r))
+  it('uses the default paths for a PDP with no metadata (404), and never for one it cannot reach', function()
+    local D = load({ pdp = router({ [STATIC] = 404 }) })
+    assert.equal(STATIC .. '/access/v1/evaluation', D.resolve(conf({ pdp_discovery = 'authzen' }), '').evaluation)
+    -- An outage is not "no metadata": the PDP may have moved its endpoints, and the
+    -- defaults would send the evaluation somewhere it no longer answers, for a whole TTL.
+    for _, r in ipairs({ 500, false }) do
+      local D2 = load({ pdp = router({ [STATIC] = r }) })
+      local ep, err = D2.resolve(conf({ pdp_discovery = 'authzen' }), '')
+      assert.is_nil(ep, tostring(r))
+      assert.equal('transient', err.kind)
     end
+  end)
+
+  it('serves the last good PDP metadata through an outage, never the defaults', function()
+    local r = { [STATIC .. '/.well-known/authzen-configuration'] = pdp_config(STATIC, STATIC .. '/custom/eval') }
+    local D, state = load({ pdp = router(r) })
+    assert.equal(STATIC .. '/custom/eval', D.resolve(conf({ pdp_discovery = 'authzen' }), '').evaluation)
+    r[STATIC .. '/.well-known/authzen-configuration'] = 503
+    state.now = state.now + 301
+    for _ = 1, 2 do
+      assert.equal(STATIC .. '/custom/eval', D.resolve(conf({ pdp_discovery = 'authzen' }), '').evaluation)
+    end
+    -- And a PDP with nothing cached is not re-fetched on every request while it is down.
+    local down = { [STATIC .. '/.well-known/authzen-configuration'] = false }
+    local D2, state2 = load({ pdp = router(down) })
+    assert.is_nil((D2.resolve(conf({ pdp_discovery = 'authzen' }), '')))
+    local before = #state2.pdp_requests
+    assert.is_nil((D2.resolve(conf({ pdp_discovery = 'authzen' }), '')))
+    assert.equal(before, #state2.pdp_requests)
+  end)
+
+  it('reads a JSON null in PDP metadata as absent', function()
+    local fn = router({ [STATIC .. '/.well-known/authzen-configuration'] = function()
+      return { status = 200, body = '{"policy_decision_point":"' .. STATIC .. '","access_evaluation_endpoint":"' .. STATIC
+        .. '/e","access_evaluations_endpoint":null,"capabilities":null}' }
+    end })
+    local D = load({ pdp = fn })
+    local ep, err = D.resolve(conf({ pdp_discovery = 'authzen', pdp_allowlist = { 'https://elsewhere.example' } }), '')
+    assert.is_nil(err)
+    assert.equal(STATIC .. '/e', ep.evaluation)
+    assert.is_nil(ep.evaluations)
+    assert.is_nil(ep.capabilities)
   end)
 
   it('rejects a document about another PDP, or without an evaluation endpoint, or not JSON', function()
@@ -199,13 +234,14 @@ describe('discovery: off and authzen modes', function()
     assert.equal('http://other:8080/evals', ok.evaluations)
   end)
 
-  it('treats a redirect or an oversized body as a transport failure', function()
+  it('treats a redirect or an oversized body as a transport failure, not as no metadata', function()
     local big = string.rep('x', 1048577)
     for _, r in ipairs({ 302, function() return { status = 200, body = big } end, function() return { status = 200 } end }) do
       local fn = router({ [STATIC] = r })
       local D = load({ pdp = fn })
-      local ep = D.resolve(conf({ pdp_discovery = 'authzen' }), '')
-      assert.equal(STATIC .. '/access/v1/evaluation', ep.evaluation)
+      local ep, err = D.resolve(conf({ pdp_discovery = 'authzen' }), '')
+      assert.is_nil(ep)
+      assert.equal('transient', err.kind)
     end
   end)
 end)
@@ -272,10 +308,14 @@ describe('discovery: resource mode', function()
     assert.equal(STATIC, D.resolve(conf(), 'https://r.example/?x').identifier)
   end)
 
-  it('falls to the static PDP on a transient failure without caching it as the answer', function()
+  it('fails the layer on a transient failure with nothing cached, rather than fall to the static PDP', function()
+    -- Falling to static would quietly drop whatever the resource publishes in front of
+    -- its own PDP, and with "static,resource" collapse two layers into one.
     local down = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = 500 }))
     local D, state = load({ pdp = down })
-    assert.equal(STATIC, D.resolve(conf(), RES).identifier)
+    local ep, err = D.resolve(conf(), RES)
+    assert.is_nil(ep)
+    assert.equal('transient', err.kind)
     local e = D._cache().resources[RES]
     assert.is_falsy(e.ok)
     assert.is_truthy(e.neg_until)
@@ -287,6 +327,23 @@ describe('discovery: resource mode', function()
     state.now = state.now + 31
     D.resolve(conf(), RES)
     assert.is_true(#state.pdp_requests > before)
+    -- Through the layers: the resource layer's own rule decides.
+    local D2 = load({ pdp = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = 500 })) })
+    local closed, cerr = D2.resolve_layers(conf(), RES, { 'static', 'resource' })
+    assert.is_nil(closed); assert.equal('transient', cerr.kind)
+    local open = D2.resolve_layers(conf(), RES, { 'static', 'resource fail-open' })
+    assert.equal(1, #open.pdps); assert.equal(STATIC, open.pdps[1].identifier)
+    assert.equal(1, #open.skipped)
+  end)
+
+  it('reads a JSON null for authzen_policy_layers as no layers', function()
+    local fn = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = function()
+      return { status = 200, body = '{"resource":"' .. RES .. '","authzen_policy_decision_points":["' .. GOOD .. '"],"authzen_policy_layers":null}' }
+    end }))
+    local D = load({ pdp = fn })
+    local r = D.resolve_layers(conf(), RES, nil)
+    assert.equal(1, #r.pdps)
+    assert.equal(GOOD, r.pdps[1].identifier, 'a null is absent, not an unreadable document')
   end)
 
   it('serves the stale list while the resource is down after the TTL', function()
@@ -306,6 +363,39 @@ describe('discovery: resource mode', function()
     state.now = state.now + 31
     assert.equal(GOOD, D.resolve(conf(), RES).identifier)
     assert.is_nil(D._cache().resources[RES].err)
+  end)
+
+  it('fetches the metadata of a resource a path-bearing allowlist entry permits', function()
+    -- The well-known URL inserts its segment after the host, so it never sits under a
+    -- path-bearing entry; the resource identifier is what the allowlist bounds, and its
+    -- own metadata is fetched on the same origin. Found in the live run.
+    local R = RES .. '/bank'
+    local fn = router({ [RES .. '/.well-known/oauth-protected-resource/bank'] = { resource = R, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD) })
+    local D = load({ pdp = fn })
+    local ep, err = D.resolve(conf({ resource_metadata_allowlist = { R } }), R)
+    assert.is_nil(err)
+    assert.equal(GOOD, ep.identifier)
+    -- And an identifier outside the entry is still refused.
+    local none, nerr = D.resolve(conf({ resource_metadata_allowlist = { R } }), RES .. '/other')
+    assert.is_nil(none); assert.equal('not_allowed', nerr.kind)
+  end)
+
+  it('fetches the metadata of a PDP a path-bearing allowlist entry permits, and still bounds what it advertises', function()
+    local TENANT = GOOD .. '/tenants/bank'
+    local r = {
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { TENANT } },
+      [GOOD .. '/.well-known/authzen-configuration/tenants/bank'] = pdp_config(TENANT, TENANT .. '/access/v1/evaluation'),
+    }
+    local D = load({ pdp = router(r) })
+    local ep, err = D.resolve(conf({ pdp_allowlist = { TENANT } }), RES)
+    assert.is_nil(err)
+    assert.equal(TENANT .. '/access/v1/evaluation', ep.evaluation)
+    -- An endpoint the PDP advertises outside the entry is still refused.
+    r[GOOD .. '/.well-known/authzen-configuration/tenants/bank'] = pdp_config(TENANT, GOOD .. '/elsewhere/eval')
+    local D2 = load({ pdp = router(r) })
+    local none, nerr = D2.resolve(conf({ pdp_allowlist = { TENANT } }), RES)
+    assert.is_nil(none); assert.equal('not_allowed', nerr.kind)
   end)
 
   it('fails closed on a disallowed resource without fetching it', function()
@@ -490,7 +580,8 @@ describe('discovery: layers', function()
         headers = { authorization = 'Bearer ' .. mock.jwt(claims) }, pdp = fn,
       })
       mock.run_access(plugin, { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest', require_token = true,
-        pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES, pdp_layers = { ESTATE, 'resource' } })
+        pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES, pdp_layers = { ESTATE, 'resource' },
+        access_token_verified_upstream = true })
       return state
     end
     local state = drive({ sub = 'alice', client_id = 'good-client' })
@@ -512,7 +603,8 @@ describe('discovery: fail-open through access()', function()
       headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = pdp_fn,
     })
     local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
-      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES }
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES,
+      access_token_verified_upstream = true }
     for k, v in pairs(over or {}) do c[k] = v end
     mock.run_access(plugin, c)
     plugin:header_filter(c)
@@ -542,6 +634,16 @@ describe('discovery: fail-open through access()', function()
     -- Nothing skipped, no marker.
     local clean = drive({ pdp_layers = { 'resource' } }, fn())
     assert.is_nil(clean.exited); assert.is_nil(clean.response_headers['X-PDP-Fail-Open'])
+  end)
+
+  it('names the skipped layers and nothing else: no URL of a failure, no error text', function()
+    local state = drive({ pdp_layers = { DOWN .. ' fail-open', 'resource' } }, fn())
+    assert.equal(DOWN, state.response_headers['X-PDP-Fail-Open'])
+    local all = drive({ fail_mode = 'open', pdp_layers = { DOWN } }, fn())
+    assert.equal('fail-open: no policy layer could be reached', all.response_headers['X-PDP-Reason'])
+    assert.equal(DOWN, all.response_headers['X-PDP-Fail-Open'])
+    -- The detail is in the log.
+    assert.matches('503', table.concat(all.logs, '\n'))
   end)
 
   it('fail_mode on the route is the default; the layer\'s own word wins; everything skipped is a marked permit', function()
@@ -581,6 +683,72 @@ describe('discovery: fail-open through access()', function()
   end)
 end)
 
+describe('fail-open covers unavailability only', function()
+  -- Contract section 3. A layer that cannot be reached may be skipped when its rule says
+  -- so; a layer that answered and refused, or answered something unreadable, may not.
+  -- Otherwise a 401 from a rotated key, a client-provoked 400 or an empty POST would
+  -- all quietly drop a layer.
+  local DOWN = 'https://down.example'
+  local function drive(down_answer, over, resource_doc)
+    local fn = router({
+      [RES .. '/.well-known/oauth-protected-resource'] = resource_doc
+        or { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [GOOD .. '/custom/eval'] = { decision = true },
+      [DOWN .. '/.well-known/authzen-configuration'] = 404,
+      [DOWN .. '/access/v1/evaluation'] = down_answer,
+    })
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a1/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = fn,
+    })
+    local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES,
+      access_token_verified_upstream = true, pdp_layers = { DOWN .. ' fail-open', 'resource' } }
+    for k, v in pairs(over or {}) do c[k] = v end
+    mock.proxy(plugin, c)
+    return state
+  end
+
+  it('skips a fail-open layer that is unreachable, erroring or rate-limiting', function()
+    for _, answer in ipairs({ false, 500, 502, 503, 429 }) do
+      local state = drive(answer)
+      assert.is_nil(state.exited, tostring(answer))
+      assert.matches('^' .. DOWN:gsub('%p', '%%%0'), state.response_headers['X-PDP-Fail-Open'])
+    end
+  end)
+
+  it('never skips a refusal: a 3xx or 4xx is closed whatever the layer says, and logged as a refusal', function()
+    for _, answer in ipairs({ 400, 401, 403, 404, 413, 302 }) do
+      local state = drive(answer)
+      assert.equal(503, state.exited.status, tostring(answer))
+      assert.matches('refused', table.concat(state.logs, '\n'), 1, true)
+      assert.equal('DENY', state.response_headers['X-PDP-Decision'])
+    end
+  end)
+
+  it('never skips an answer it cannot read: an unreadable 2xx, or a decision that is not a boolean', function()
+    for _, answer in ipairs({ 'not json', '[]', '{"decision":"true"}', '{"decision":1}', '{}', '{"decision":null}' }) do
+      local state = drive(function() return { status = 200, body = answer } end)
+      assert.equal(503, state.exited.status, answer)
+    end
+  end)
+
+  it('a request it cannot encode is refused, and never sent empty', function()
+    -- 1e999 is valid JSON and decodes to inf, which JSON cannot carry back out: the
+    -- evaluation cannot be encoded. It used to go out as an empty POST, the PDP answered
+    -- 400, and a fail-open layer was skipped.
+    local doc = function()
+      return { status = 200, body = '{"resource":"' .. RES .. '","authzen_policy_decision_points":["' .. GOOD .. '"],"limit":1e999}' }
+    end
+    local state = drive(false, { pdp_layers = { 'resource fail-open' } }, doc)
+    assert.equal(503, state.exited.status)
+    for _, r in ipairs(state.pdp_requests) do
+      assert.is_nil(r.url:find('/custom/eval', 1, true), 'nothing may be sent to the PDP')
+    end
+  end)
+end)
+
 describe('federation entity relay', function()
   it('serves the two well-known documents from coaz-pep, and nothing else', function()
     local fn = router({
@@ -595,7 +763,7 @@ describe('federation entity relay', function()
     local drive = function(path, over)
       local plugin, state = load_plugin({ method = 'GET', path = path, headers = {}, pdp = fn })
       local c = { authzen_url = STATIC, pep_label = 'test-pep', style = 'rest', require_token = true, pdp_ssl_verify = true,
-        federation_entity_url = 'http://coaz-pep:9192' }
+        federation_entity_url = 'http://coaz-pep:9192', access_token_verified_upstream = true }
       for k, v in pairs(over or {}) do c[k] = v end
       mock.run_access(plugin, c)
       return state
@@ -623,7 +791,7 @@ describe('discovery: through access()', function()
       pdp = pdp_fn,
     })
     local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
-      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment' }
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', access_token_verified_upstream = true }
     for k, v in pairs(over or {}) do c[k] = v end
     mock.run_access(plugin, c)
     return state
@@ -691,18 +859,14 @@ describe('discovery: through access()', function()
     assert.equal(0, #hits)
   end)
 
-  it('an MCP route is keyed by its upstream', function()
+  it('an MCP route runs no discovery of its own: coaz-pep keys it by its upstream', function()
     local mcp = 'https://mcp.example/mcp'
-    local fn = router({
-      [mcp .. '/.well-known/oauth-protected-resource'] = 404,
-      ['https://mcp.example/.well-known/oauth-protected-resource/mcp'] = { resource = mcp, authzen_policy_decision_points = { GOOD } },
-      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
-      [GOOD .. '/custom/eval'] = { decision = true },
-    })
-    local state = drive({ pdp_discovery = 'resource', style = 'mcp', mcp_upstream_url = mcp }, fn,
+    local fn, hits = router({ ['http://coaz-pep:9192/v1/mcp/check'] = { decision = true, upstream_headers = {} } })
+    local state = drive({ pdp_discovery = 'resource', style = 'mcp', coaz_url = 'http://coaz-pep:9192', mcp_upstream_url = mcp }, fn,
       '{"jsonrpc":"2.0","id":1,"method":"initialize"}', 'POST', '/mcp')
     assert.is_nil(state.exited)
-    assert.equal(GOOD .. '/custom/eval', state.pdp_requests[#state.pdp_requests].url)
+    assert.equal(1, #hits)
+    assert.equal(mcp, mock.json_decode(state.pdp_requests[1].body).config.mcp_upstream_url)
   end)
 
   it('passes an explicit resource to the COAZ engine', function()
@@ -761,13 +925,15 @@ describe('discovery: published layers', function()
     assert.is_nil(r); assert.equal('not_allowed', err.kind); assert.matches('published layer', err.msg)
   end)
 
-  it('an unresolvable published layer fails the route, or is skipped under fail-open and named by its publisher', function()
-    local D = load({ pdp = router(routes({ [ESTATE .. '/.well-known/authzen-configuration'] = { policy_decision_point = 'https://someone.else', access_evaluation_endpoint = 'https://someone.else/e' } })) })
+  it('an unresolvable published layer fails the route, or is skipped under fail-open and logged with its publisher', function()
+    local D, state = load({ pdp = router(routes({ [ESTATE .. '/.well-known/authzen-configuration'] = { policy_decision_point = 'https://someone.else', access_evaluation_endpoint = 'https://someone.else/e' } })) })
     local r, err = D.resolve_layers(conf(), RES, nil)
     assert.is_nil(r); assert.matches('published layer', err.msg)
     r = D.resolve_layers(conf(), RES, { 'resource fail-open' })
     assert.equal(1, #r.pdps); assert.equal(GOOD, r.pdps[1].identifier)
-    assert.equal(1, #r.skipped); assert.matches('published by', r.skipped[1])
+    -- The skipped list is what a client is shown: the layer's identifier, nothing else.
+    assert.same({ ESTATE }, r.skipped)
+    assert.matches('published by%s+' .. RES:gsub('%p', '%%%0'), table.concat(state.logs, '\n'))
   end)
 
   it('a document whose layers cannot be read is invalid, and the static PDP decides', function()
@@ -807,7 +973,7 @@ describe('discovery: federation via a resolve endpoint', function()
   local RESOLVE = ANCHOR .. '/resolve'
   local function fconf(over)
     return conf((function()
-      local o = { pdp_discovery = 'federation', federation_resolve_url = RESOLVE, federation_trust_anchor = ANCHOR }
+      local o = { pdp_discovery = 'federation-resolver', federation_resolve_url = RESOLVE, federation_trust_anchor = ANCHOR }
       for k, v in pairs(over or {}) do o[k] = v end
       return o
     end)())
@@ -834,7 +1000,7 @@ describe('discovery: federation via a resolve endpoint', function()
     local D = load({ pdp = fn })
     local ep, err = D.resolve(fconf(), RES)
     assert.is_nil(err)
-    assert.equal(GOOD, ep.identifier); assert.equal('federation', ep.source); assert.equal('federation', ep.resource.source)
+    assert.equal(GOOD, ep.identifier); assert.equal('federation-resolver', ep.source); assert.equal('federation-resolver', ep.resource.source)
     assert.is_nil(ep.api_key)
     assert.same({ 'accounts:read' }, ep.resource.document.scopes_supported)
     assert.equal(0, count(hits, 'oauth-protected-resource'))
@@ -877,13 +1043,50 @@ describe('discovery: federation via a resolve endpoint', function()
     assert.equal('not_allowed', kind_of(401, 'nope'))
     assert.equal('transient', kind_of(503, json({ error = 'temporarily_unavailable' })))
     assert.equal('transient', kind_of(500, ''))
-    -- through resolve(): not_found and transient end at the static PDP; a refusal ends the request
+    -- through resolve(): not_found ends at the static PDP; a refusal ends the request (and
+    -- a transient failure with nothing cached fails the layer: see the cache tests below)
     local D = load({ pdp = router(routes({ [RESOLVE] = function() return { status = 404, body = json({ error = 'not_found' }) } end })) })
     local ep = D.resolve(fconf(), RES)
     assert.equal(STATIC, ep.identifier); assert.equal('static-key', ep.api_key)
     local D3 = load({ pdp = router(routes({ [RESOLVE] = function() return { status = 400, body = json({ error = 'invalid_trust_chain' }) } end })) })
     local none, err = D3.resolve(fconf(), RES)
     assert.is_nil(none); assert.equal('not_allowed', err.kind)
+  end)
+
+  it('never serves a resolved answer past its exp, even inside the cache TTL', function()
+    local r = routes({ [RESOLVE] = resolved({ exp = 1700000060 }) })
+    local D, state = load({ pdp = router(r) })
+    assert.equal(GOOD, D.resolve(fconf(), RES).identifier)
+    -- Past exp but inside pdp_metadata_ttl: the answer has expired, so it is fetched again.
+    state.now = state.now + 120
+    r[RESOLVE] = resolved({ exp = 1700000300 })
+    local before = #state.pdp_requests
+    assert.equal(GOOD, D.resolve(fconf(), RES).identifier)
+    assert.is_true(#state.pdp_requests > before)
+    -- And an expired answer is not what the cache falls back to when the resolver is down.
+    state.now = state.now + 400
+    r[RESOLVE] = 503
+    local ep, err = D.resolve(fconf(), RES)
+    assert.is_nil(ep)
+    assert.equal('transient', err.kind)
+  end)
+
+  it('a refusal on refresh ends the cached trust: revocation reaches a running PEP', function()
+    local r = routes()
+    local D, state = load({ pdp = router(r) })
+    assert.equal(GOOD, D.resolve(fconf(), RES).identifier)
+    r[RESOLVE] = function() return { status = 400, body = json({ error = 'invalid_trust_chain' }) } end
+    state.now = state.now + 301
+    local ep, err = D.resolve(fconf(), RES)
+    assert.is_nil(ep)
+    assert.equal('not_allowed', err.kind)
+    -- A resolver outage, by contrast, is served from the last good answer.
+    local r2 = routes({ [RESOLVE] = resolved({ exp = 1700090000 }) })
+    local D2, state2 = load({ pdp = router(r2) })
+    assert.equal(GOOD, D2.resolve(fconf(), RES).identifier)
+    r2[RESOLVE] = 503
+    state2.now = state2.now + 301
+    assert.equal(GOOD, D2.resolve(fconf(), RES).identifier)
   end)
 
   it('needs its two settings, and an https resolver unless told otherwise', function()

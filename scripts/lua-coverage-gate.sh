@@ -6,7 +6,7 @@
 # floor when coverage rises; never lower it to make CI pass.
 set -euo pipefail
 
-FLOOR=97
+FLOOR=99
 
 cd "$(dirname "$0")/../gateways/kong"
 

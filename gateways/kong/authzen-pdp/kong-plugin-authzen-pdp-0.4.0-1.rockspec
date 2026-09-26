@@ -1,9 +1,9 @@
 package = "kong-plugin-authzen-pdp"
-version = "0.3.0-1"
+version = "0.4.0-1"
 
 source = {
   url = "git+https://github.com/ID-Partners/idp-auth-peps.git",
-  tag = "v0.3.0",
+  tag = "v0.4.0",
 }
 
 description = {
@@ -11,13 +11,16 @@ description = {
   detailed = [[
     A Kong Policy Enforcement Point that authorizes delegated AI-agent traffic
     against an AuthZEN Policy Decision Point (e.g. Ping Authorize via the
-    authzen-adapter): token/actor-claim extraction (RFC 8693 delegation),
-    DPoP sender-constraint checks (RFC 9449), RFC 9470 step-up challenges,
-    REST and MCP request mapping, and — for MCP tools declaring coaz:true —
-    per-tool-call authorization per the OpenID AuthZEN MCP profile, delegated
-    to the shared coaz-pep engine (discovery, CEL mapping, JSON-RPC errors).
+    authzen-adapter). With coaz_url set, the whole decision is delegated to the
+    coaz-pep engine, which verifies the access token, X-User-Token and DPoP
+    proof (RFC 9449), maps the request, and authorizes every MCP request -
+    tools/call per the OpenID AuthZEN MCP profile - with JSON-RPC parsed
+    strictly first. Without it, REST routes are decided natively on claims an
+    auth plugin verified: RFC 8693 delegation, RFC 9470 step-up challenges,
     PDP discovery via RFC 9728 protected resource metadata and the AuthZEN
-    .well-known/authzen-configuration document.
+    .well-known/authzen-configuration document, with ordered policy layers.
+    Also provides the discovery and contract modules sideband-pdp requires.
+    Kong Gateway 3.4 or later; 3.9 or later recommended.
   ]],
   homepage = "https://github.com/ID-Partners/idp-auth-peps",
   license = "Apache-2.0",
@@ -33,5 +36,6 @@ build = {
     ["kong.plugins.authzen-pdp.handler"] = "gateways/kong/authzen-pdp/handler.lua",
     ["kong.plugins.authzen-pdp.schema"] = "gateways/kong/authzen-pdp/schema.lua",
     ["kong.plugins.authzen-pdp.discovery"] = "gateways/kong/authzen-pdp/discovery.lua",
+    ["kong.plugins.authzen-pdp.contract"] = "gateways/kong/authzen-pdp/contract.lua",
   },
 }
