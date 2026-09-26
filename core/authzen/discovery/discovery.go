@@ -6,10 +6,10 @@
 //	resource identifier (route config)
 //	  ├─ federation: resolved oauth_resource metadata from a Trust Chain   (authoritative)
 //	  ├─ rfc9728:    {resource}/.well-known/oauth-protected-resource       (self-asserted)
-//	  └─ static:     AUTHZEN_URL                                           (fallback)
+//	  └─ static:     AUTHZEN_URL                  (when the resource publishes nothing)
 //	PDP identifier
 //	  ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
-//	  └─ 404 / unreachable -> {pdp}/access/v1/evaluation (spec-permitted defaults)
+//	  └─ 404 -> {pdp}/access/v1/evaluation (spec-permitted defaults)
 //
 // The protected-resource parameters that name the PDP, and the PDPs to ask in front of
 // it, are not standardised anywhere — not in RFC 9728, AuthZEN 1.0, the MCP profile,
@@ -17,8 +17,17 @@
 // ParamPolicyLayers, in a shape valid both in an RFC 9728 document and under
 // metadata.oauth_resource in an Entity Statement.
 //
-// One error is never swallowed: ErrNotAllowed. Everything else degrades — stale cache,
-// next source, static PDP — and only when nothing is left does Resolve fail, closed.
+// Three kinds of answer, kept apart:
+//
+//   - Nothing published — a 404, a document naming no PDP, an entity outside the
+//     federation — is the static PDP's to answer, by design.
+//   - A refusal — ErrNotAllowed: a URL outside an allowlist, a chain that does not
+//     validate, a federation-vouched document the PEP cannot use — is never skipped and
+//     never routed around, and it replaces anything cached.
+//   - Anything else — an outage, an unreadable document — serves the last good answer
+//     for a bounded time (never past the answer's own expiry) and then is the layer
+//     unavailable: it fails by its mode, closed unless the layer said otherwise. It is
+//     never quietly the static PDP's.
 package discovery
 
 import (
