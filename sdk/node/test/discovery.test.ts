@@ -505,9 +505,9 @@ describe('discovery: through the client, middleware and guard', () => {
     const token = jwt({ sub: 'u1' });
     const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
     const r1: PepRequest = { method: 'GET', path: '/accounts/1', headers: { authorization: `Bearer ${token}` } };
-    await authzenMiddleware({ client, map: () => req })(r1, res, vi.fn());
+    await authzenMiddleware({ client, verifyToken: verifyForTests, map: () => req })(r1, res, vi.fn());
     expect((seen[0] as { context: Record<string, unknown> }).context).toEqual({ request: { method: 'GET', path: '/accounts/1' } });
-    await authzenMiddleware({ client, map: () => req, forwardAccessToken: true })(r1, res, vi.fn());
+    await authzenMiddleware({ client, verifyToken: verifyForTests, map: () => req, forwardAccessToken: true })(r1, res, vi.fn());
     expect((seen[1] as { context: Record<string, unknown> }).context['access_token']).toBe(token);
   });
 
@@ -685,10 +685,10 @@ describe('discovery: through the client, middleware and guard', () => {
     const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
     const next = vi.fn();
     const r: PepRequest = { method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'u1' })}` } };
-    await authzenMiddleware({ client, map: () => req, resource: RES })(r, res, next);
+    await authzenMiddleware({ client, verifyToken: verifyForTests, map: () => req, resource: RES })(r, res, next);
     expect(next).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(502);
-    await authzenMiddleware({ client, map: () => req, resource: RES, failMode: 'open' })(r, res, next);
+    await authzenMiddleware({ client, verifyToken: verifyForTests, map: () => req, resource: RES, failMode: 'open' })(r, res, next);
     expect(next).toHaveBeenCalledTimes(1);
     expect(res.set).toHaveBeenCalledWith('X-PDP-Fail-Open', expect.stringContaining(DOWN));
 
@@ -740,7 +740,7 @@ describe('discovery: through the client, middleware and guard', () => {
     const { fetch, hits } = router(routes());
     const client = new AuthzenClient({ url: STATIC, fetch, discovery: { mode: 'resource', ...open, ...quiet } });
     const run = async (resource: AuthzenMiddlewareResource) => {
-      const mw = authzenMiddleware({ client, map: () => req, resource });
+      const mw = authzenMiddleware({ client, verifyToken: verifyForTests, map: () => req, resource });
       const res = { status: vi.fn().mockReturnThis(), set: vi.fn(), json: vi.fn() };
       const next = vi.fn();
       const r: PepRequest = { method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'u1' })}` } };
@@ -784,3 +784,5 @@ describe('discovery: through the client, middleware and guard', () => {
 type AuthzenMiddlewareResource = string | ((req: PepRequest) => string | undefined) | undefined;
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
 const jwt = (claims: Record<string, unknown>) => `${b64({ alg: 'none' })}.${b64(claims)}.sig`;
+/** These tests mint unsigned tokens, so their verifier only decodes. A real one checks the signature. */
+const verifyForTests = async (token: string) => JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString()) as Record<string, unknown>;

@@ -30,6 +30,8 @@ function pdp(body: unknown, init: { status?: number; delayMs?: number } = {}) {
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
 const jwt = (claims: Record<string, unknown>) => `${b64({ alg: 'none' })}.${b64(claims)}.sig`;
+/** These tests mint unsigned tokens, so their verifier only decodes. A real one checks the signature. */
+const verifyForTests = async (token: string) => decodeJwtSegment(token, 1);
 
 // ---------------------------------------------------------------------------
 
@@ -230,7 +232,7 @@ describe('express middleware', () => {
   });
 
   it('permits and exposes the decision on req.authz', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: pathMapper([
         { method: 'GET', pattern: '/accounts/:id/balance', action: 'get_balance', resourceType: 'account', resourceId: (p) => p['id']! },
@@ -245,7 +247,7 @@ describe('express middleware', () => {
   });
 
   it('denies with the PDP challenge and never calls next', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: {
         url: 'http://pdp',
         fetch: pdp({ decision: false, context: { reason: 'Approve it', step_up_required: true, step_up_scope: 'pay' } }),
@@ -262,7 +264,7 @@ describe('express middleware', () => {
   });
 
   it('denies when no token is presented', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: () => null,
     });
@@ -274,7 +276,7 @@ describe('express middleware', () => {
   });
 
   it('denies an unmapped route rather than letting it through', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: pathMapper([{ method: 'GET', pattern: '/accounts/:id/balance', action: 'get_balance', resourceType: 'account' }]),
     });
@@ -986,7 +988,7 @@ describe('express middleware — remaining branches', () => {
   }
 
   it('lets an unauthenticated request through when a token is not required', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       requireToken: false,
       map: () => null,
@@ -997,7 +999,7 @@ describe('express middleware — remaining branches', () => {
   });
 
   it('denies a token with no subject claim', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: () => null,
     });
@@ -1014,7 +1016,7 @@ describe('express middleware — remaining branches', () => {
 
   it('honours a custom getToken and reports every decision', async () => {
     const decisions: string[] = [];
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       getToken: (r) => String((r.headers['x-token'] as string) ?? ''),
       onDecision: ({ verdict }) => decisions.push(verdict.kind),
@@ -1031,7 +1033,7 @@ describe('express middleware — remaining branches', () => {
   });
 
   it('does not let a broken onDecision hook open the gate', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: false, context: { reason: 'no' } }) },
       onDecision: () => { throw new Error('audit sink down'); },
       map: () => ({ subject: { type: 'user', id: 'u' }, action: { name: 'a' }, resource: { type: 'r' } }),
@@ -1044,7 +1046,7 @@ describe('express middleware — remaining branches', () => {
   });
 
   it('treats an unexpected throw as a deny, not an allow', async () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       getToken: () => { throw new Error('exploded'); },
       map: () => null,
@@ -1533,7 +1535,7 @@ describe('coverage completeness: the remaining branches', () => {
     expect(() => evaluateExpression('double(params.bad)', p, {})).toThrow(/not a number/);
   });
 
-  it('forwards X-Auth-* headers when forwardHeaders is set', async () => {
+  it('forwards X-Auth-* on the request, not the response, when forwardHeaders is set', async () => {
     const res = {
       statusCode: 0,
       headers: {} as Record<string, string>,
@@ -1548,12 +1550,15 @@ describe('coverage completeness: the remaining branches', () => {
       map: (_r, claims) => ({ subject: { type: 'user', id: claims.sub }, action: { name: 'x' }, resource: { type: 'r' } }),
     });
     const next = vi.fn();
-    await mw({ method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'alice' })}` } }, res, next);
+    const req: PepRequest = { method: 'GET', path: '/x', headers: { authorization: `Bearer ${jwt({ sub: 'alice' })}`, 'x-auth-principal': 'mallory' } };
+    await mw(req, res, next);
     expect(next).toHaveBeenCalledOnce();
-    expect(res.headers['X-Auth-Principal']).toBe('alice');
-    expect(res.headers['X-Auth-Agent']).toBe('agent-1');
-    expect(res.headers['X-Auth-Scope']).toBe('a b');
-    expect(res.headers['X-Auth-Acr']).toBe('urn:mfa');
+    expect(req.headers['x-auth-principal']).toBe('alice');
+    expect(req.headers['x-auth-agent']).toBe('agent-1');
+    expect(req.headers['x-auth-scope']).toBe('a b');
+    expect(req.headers['x-auth-acr']).toBe('urn:mfa');
+    // The client's response learns nothing about who the upstream was told it is.
+    expect(Object.keys(res.headers).filter((k) => k.toLowerCase().startsWith('x-auth-'))).toEqual([]);
   });
 
   it('permits directly through AuthzenClient.evaluateAll when every decision permits', async () => {
@@ -1683,7 +1688,7 @@ describe('coverage completeness: fallbacks and branch tails', () => {
   });
 
   it('takes the first value of an array Authorization header', () => {
-    const mw = authzenMiddleware({
+    const mw = authzenMiddleware({ verifyToken: verifyForTests,
       client: { url: 'http://pdp', fetch: pdp({ decision: true }) },
       map: (_r, claims) => ({ subject: { type: 'user', id: claims.sub }, action: { name: 'x' }, resource: { type: 'r' } }),
     });

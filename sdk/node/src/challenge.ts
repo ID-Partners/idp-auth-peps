@@ -10,6 +10,7 @@
  * point is that a client gets an identical challenge whichever PEP denied it.
  */
 
+import { sanitizeHeaderValue } from './http.js';
 import type { AuthzChallenge, DecisionContext, EvaluationResponse, Verdict } from './types.js';
 
 /** Fold one AuthZEN decision + its advice into a Verdict. */
@@ -158,8 +159,9 @@ export function toHttpChallenge(verdict: Verdict, pep?: string): HttpChallenge {
 
 /**
  * RFC 6750 §3 challenge. Reasons come from policy and can carry anything, so every
- * value is quoted-string escaped — a header-injecting reason would otherwise let
- * policy text forge response headers.
+ * value is sanitised and quoted-string escaped — a header-injecting reason would
+ * otherwise let policy text forge response headers, and a character outside Latin-1
+ * would make Node refuse the header and turn the challenge into an error.
  */
 function wwwAuthenticate(error: string, params: Record<string, string | undefined>): string {
   const parts = [`error="${escapeQuoted(error)}"`];
@@ -171,8 +173,9 @@ function wwwAuthenticate(error: string, params: Record<string, string | undefine
 }
 
 function escapeQuoted(v: string): string {
-  // Strip CR/LF outright (header injection), then escape " and \ per the grammar.
-  return v.replace(/[\r\n]+/g, ' ').replace(/([\\"])/g, '\\$1');
+  // CR/LF become spaces and anything outside printable Latin-1 goes, then " and \ are
+  // escaped per the quoted-string grammar.
+  return sanitizeHeaderValue(v).replace(/([\\"])/g, '\\$1');
 }
 
 function ctxVal(verdict: Verdict, key: keyof DecisionContext): unknown {
