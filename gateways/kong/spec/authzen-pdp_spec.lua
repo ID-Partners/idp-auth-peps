@@ -306,6 +306,42 @@ describe('step-up and PDP advice', function()
   end)
 end)
 
+describe('a JSON null from the PDP reads as absent', function()
+  -- cjson decodes null to cjson.null, which is truthy: read straight, a null reason
+  -- became a header value Kong refuses (a 500 from header_filter), and a null
+  -- step_up_required became a challenge.
+  local function answer(body, method, path, request_body)
+    local plugin, state = load_plugin({
+      method = method or 'GET', path = path or '/accounts/a/balance', body = request_body,
+      headers = { authorization = token({ sub = 'alice' }) },
+      pdp = function() return { status = 200, body = body } end,
+    })
+    mock.proxy(plugin, base_conf())
+    return state
+  end
+
+  it('a null reason is the default reason, and header_filter does not raise', function()
+    local state = answer('{"decision":true,"context":{"reason":null,"step_up_required":null,"identity_proofing_required":null}}')
+    assert.is_nil(state.exited)
+    assert.equal('Permitted by policy.', state.response_headers['X-PDP-Reason'])
+    local denied = answer('{"decision":false,"context":{"reason":null}}')
+    assert.equal(403, denied.exited.status)
+    assert.equal('Denied by policy.', denied.response_headers['X-PDP-Reason'])
+  end)
+
+  it('a null context is no context', function()
+    local state = answer('{"decision":true,"context":null}')
+    assert.is_nil(state.exited)
+  end)
+
+  it('a challenge whose parameters are null still renders', function()
+    local state = answer('{"decision":false,"context":{"step_up_required":true,"step_up_scope":null}}',
+      'POST', '/payments', '{"from_account":"a","amount":9000}')
+    assert.equal(401, state.exited.status)
+    assert.equal('Bearer error="insufficient_scope", scope=""', state.exited.headers['WWW-Authenticate'])
+  end)
+end)
+
 describe('challenge parity with the other PEPs', function()
   -- The repo's central claim is that a client gets the same challenge whichever PEP
   -- denies it. These pin the wire shape so a change to one PEP cannot silently drift.

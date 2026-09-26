@@ -30,7 +30,8 @@
 -- falling to a weaker source, and a discovered PDP never receives the static API key.
 
 local http = require "resty.http"
-local cjson = require "cjson.safe"
+local contract = require "kong.plugins.authzen-pdp.contract"
+local cjson = contract.json
 
 local D = {}
 
@@ -143,8 +144,11 @@ end
 
 -- ---------- cache ----------
 -- Per worker, keyed by identifier: the documents are public, so no credential in the
--- key. Serves stale while a refresh fails, throttles retries, and negatively caches a
--- transient failure so a down resource does not put a fetch in every request's path.
+-- key. Serves the last good value while a refresh fails — an outage is not a reason to
+-- trust something else — throttles retries, and negatively caches a transient failure
+-- so a down resource does not put a fetch in every request's path. Two things end the
+-- stale value instead: a refusal (the resolver now says the chain is invalid, say), and
+-- the value's own expiry (a resolve response's exp), past which it is never served.
 
 local caches = { resources = {}, federation = {}, pdps = {} }
 
@@ -157,6 +161,9 @@ local function cache_get(store, key, ttl, negative_ttl, fetch)
   local e = store[key]
   if not e then e = {}; store[key] = e end
   local t = now()
+  if e.ok and e.hard_expiry and t >= e.hard_expiry then
+    e.ok, e.val, e.hard_expiry = false, nil, nil
+  end
   if e.ok and t < e.expires then return e.val end
   if not e.ok and e.err and e.neg_until and t < e.neg_until then return nil, e.err end
   if e.ok and e.err and (t - (e.last_attempt or 0)) < D.MIN_REFRESH then return e.val end
@@ -164,15 +171,18 @@ local function cache_get(store, key, ttl, negative_ttl, fetch)
   local val, err = fetch(key)
   if not val then
     e.err = err
-    if e.ok then return e.val end -- stale beats failing every request
-    -- A policy refusal cost no fetch and belongs to one route's allowlist; another
-    -- route sharing this worker must not inherit it.
-    if negative_ttl and negative_ttl > 0 and not (type(err) == "table" and err.kind == NOT_ALLOWED) then
-      e.neg_until = t + negative_ttl
+    local refused = type(err) == "table" and err.kind == NOT_ALLOWED
+    if refused then
+      -- A refusal is an answer, not an outage: what was trusted is trusted no longer.
+      e.ok, e.val, e.neg_until = false, nil, nil
+      return nil, err
     end
+    if e.ok then return e.val end -- the last good value beats failing every request
+    if negative_ttl and negative_ttl > 0 then e.neg_until = t + negative_ttl end
     return nil, err
   end
   e.val, e.ok, e.expires, e.err, e.neg_until = val, true, t + ttl, nil, nil
+  e.hard_expiry = type(val) == "table" and tonumber(val.expires_at) or nil
   return val
 end
 
@@ -202,12 +212,12 @@ local function pdp_list(raw, from)
   return out
 end
 
--- layer_list reads authzen_policy_layers out of a document: absent is no layers;
--- anything that is not an array of PDP identifiers makes the document invalid — a policy
--- the PEP cannot read is not one it may quietly narrow.
+-- layer_list reads authzen_policy_layers out of a document: absent (or null) is no
+-- layers; anything else that is not an array of PDP identifiers makes the document
+-- invalid — a policy the PEP cannot read is not one it may quietly narrow.
 local function layer_list(doc, from)
   local raw = doc[D.PARAM_LAYERS]
-  if raw == nil then return {} end
+  if raw == nil or raw == contract.null then return {} end
   if type(raw) ~= "table" then return fail(INVALID, from .. " " .. D.PARAM_LAYERS .. " is not an array") end
   return identifiers(raw, from)
 end
@@ -309,11 +319,16 @@ local function federation_lookup(resource, opts)
   local layers, lerr = layer_list(meta, from)
   if not layers then return nil, lerr end
   -- What travels to the PDP is the RESOLVED metadata: what survived every superior's
-  -- policy, not what the resource wrote.
-  return { pdps = pdps, layers = layers, document = meta, source = "federation" }
+  -- policy, not what the resource wrote. It is good until the answer's exp and no
+  -- longer, however long the cache TTL.
+  return { pdps = pdps, layers = layers, document = meta, source = "federation",
+    expires_at = type(claims.exp) == "number" and claims.exp or nil }
 end
 
---- AuthZEN 1.0 §9: the PDP's own metadata, or the default paths when it has none.
+--- AuthZEN 1.0 §9: the PDP's own metadata, or the default paths when it has none (a
+--- 404). A PDP whose metadata cannot be fetched is not one without metadata: the caller's
+--- cache serves the last good answer, and with none the layer is unavailable — the
+--- defaults would send the evaluation somewhere the PDP may no longer answer.
 local function fetch_config(pdp, opts)
   local ok, why = D.check_url(pdp, opts.pdp_policy)
   if not ok then return fail(NOT_ALLOWED, why) end
@@ -321,25 +336,28 @@ local function fetch_config(pdp, opts)
   if not wk then return fail(INVALID, err) end
   local doc, ferr = get_json(wk, opts.pdp_policy)
   if not doc then
-    if ferr.kind == NOT_ALLOWED or ferr.kind == INVALID then return nil, ferr end
-    if ferr.kind ~= NO_METADATA then kong.log.warn("pdp discovery: ", ferr.msg, "; using default AuthZEN paths") end
-    return D.default_endpoints(pdp)
+    if ferr.kind == NO_METADATA then return D.default_endpoints(pdp) end
+    return nil, ferr
   end
-  if trim_slash(tostring(doc.policy_decision_point or "")) ~= trim_slash(pdp) then
-    return fail(INVALID, wk .. " says policy_decision_point is " .. tostring(doc.policy_decision_point) .. ", expected " .. pdp)
+  local declared = contract.str(doc.policy_decision_point)
+  if trim_slash(declared or "") ~= trim_slash(pdp) then
+    return fail(INVALID, wk .. " says policy_decision_point is " .. tostring(declared) .. ", expected " .. pdp)
   end
-  if type(doc.access_evaluation_endpoint) ~= "string" or doc.access_evaluation_endpoint == "" then
+  local evaluation = contract.str(doc.access_evaluation_endpoint)
+  if not evaluation or evaluation == "" then
     return fail(INVALID, wk .. " has no access_evaluation_endpoint")
   end
-  for _, u in ipairs({ doc.access_evaluation_endpoint, doc.access_evaluations_endpoint }) do
+  -- A null is absent: the PDP has no batch endpoint.
+  local evaluations = contract.str(doc.access_evaluations_endpoint)
+  for _, u in ipairs({ evaluation, evaluations }) do
     local eok, ewhy = D.check_url(u, opts.pdp_policy)
     if not eok then return fail(NOT_ALLOWED, ewhy) end
   end
   return {
     identifier = trim_slash(pdp),
-    evaluation = doc.access_evaluation_endpoint,
-    evaluations = doc.access_evaluations_endpoint,
-    capabilities = doc.capabilities,
+    evaluation = evaluation,
+    evaluations = evaluations,
+    capabilities = contract.is_array(doc.capabilities) and doc.capabilities or nil,
   }
 end
 
@@ -403,7 +421,7 @@ local function endpoints_of(pdp, o)
   local pok, pwhy = D.check_url(pdp, o.pdp_policy)
   if not pok then return fail(NOT_ALLOWED, pwhy) end
   if not o.probe then return D.default_endpoints(pdp) end
-  local ep, err = cache_get(caches.pdps, pdp, o.ttl, nil, function(key) return fetch_config(key, o) end)
+  local ep, err = cache_get(caches.pdps, pdp, o.ttl, D.MIN_REFRESH, function(key) return fetch_config(key, o) end)
   if not ep then return nil, err end
   for _, u in ipairs({ ep.evaluation, ep.evaluations }) do
     local eok, ewhy = D.check_url(u, o.pdp_policy)
@@ -582,9 +600,12 @@ function D.resolve(conf, resource, opts)
     end)
     if not meta then
       if err.kind == NOT_ALLOWED then return nil, err end
-      if o.static == "" then return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg) end
-      kong.log.warn("pdp discovery: ", err.msg, "; using the static PDP")
-      meta = { pdps = { o.static } }
+      -- Unavailable with nothing cached: the layer fails under its own rule. Falling to
+      -- the static PDP would quietly drop whatever the resource puts in front of its own.
+      if err.kind == TRANSIENT then
+        return fail(TRANSIENT, "the metadata for " .. resource .. " is unavailable and none is cached: " .. err.msg)
+      end
+      return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg)
     end
     candidates = meta.pdps
     if meta.document then from = { source = meta.source, document = meta.document, layers = meta.layers } end

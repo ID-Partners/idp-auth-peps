@@ -155,13 +155,48 @@ describe('discovery: off and authzen modes', function()
     assert.equal('transient', err.kind)
   end)
 
-  it('falls back to the default paths on 404, 500 and connection failure', function()
-    for _, r in ipairs({ 404, 500, false }) do
-      local fn = router({ [STATIC] = r })
-      local D = load({ pdp = fn })
-      local ep = D.resolve(conf({ pdp_discovery = 'authzen' }), '')
-      assert.equal(STATIC .. '/access/v1/evaluation', ep.evaluation, tostring(r))
+  it('uses the default paths for a PDP with no metadata (404), and never for one it cannot reach', function()
+    local D = load({ pdp = router({ [STATIC] = 404 }) })
+    assert.equal(STATIC .. '/access/v1/evaluation', D.resolve(conf({ pdp_discovery = 'authzen' }), '').evaluation)
+    -- An outage is not "no metadata": the PDP may have moved its endpoints, and the
+    -- defaults would send the evaluation somewhere it no longer answers, for a whole TTL.
+    for _, r in ipairs({ 500, false }) do
+      local D2 = load({ pdp = router({ [STATIC] = r }) })
+      local ep, err = D2.resolve(conf({ pdp_discovery = 'authzen' }), '')
+      assert.is_nil(ep, tostring(r))
+      assert.equal('transient', err.kind)
     end
+  end)
+
+  it('serves the last good PDP metadata through an outage, never the defaults', function()
+    local r = { [STATIC .. '/.well-known/authzen-configuration'] = pdp_config(STATIC, STATIC .. '/custom/eval') }
+    local D, state = load({ pdp = router(r) })
+    assert.equal(STATIC .. '/custom/eval', D.resolve(conf({ pdp_discovery = 'authzen' }), '').evaluation)
+    r[STATIC .. '/.well-known/authzen-configuration'] = 503
+    state.now = state.now + 301
+    for _ = 1, 2 do
+      assert.equal(STATIC .. '/custom/eval', D.resolve(conf({ pdp_discovery = 'authzen' }), '').evaluation)
+    end
+    -- And a PDP with nothing cached is not re-fetched on every request while it is down.
+    local down = { [STATIC .. '/.well-known/authzen-configuration'] = false }
+    local D2, state2 = load({ pdp = router(down) })
+    assert.is_nil((D2.resolve(conf({ pdp_discovery = 'authzen' }), '')))
+    local before = #state2.pdp_requests
+    assert.is_nil((D2.resolve(conf({ pdp_discovery = 'authzen' }), '')))
+    assert.equal(before, #state2.pdp_requests)
+  end)
+
+  it('reads a JSON null in PDP metadata as absent', function()
+    local fn = router({ [STATIC .. '/.well-known/authzen-configuration'] = function()
+      return { status = 200, body = '{"policy_decision_point":"' .. STATIC .. '","access_evaluation_endpoint":"' .. STATIC
+        .. '/e","access_evaluations_endpoint":null,"capabilities":null}' }
+    end })
+    local D = load({ pdp = fn })
+    local ep, err = D.resolve(conf({ pdp_discovery = 'authzen', pdp_allowlist = { 'https://elsewhere.example' } }), '')
+    assert.is_nil(err)
+    assert.equal(STATIC .. '/e', ep.evaluation)
+    assert.is_nil(ep.evaluations)
+    assert.is_nil(ep.capabilities)
   end)
 
   it('rejects a document about another PDP, or without an evaluation endpoint, or not JSON', function()
@@ -199,13 +234,14 @@ describe('discovery: off and authzen modes', function()
     assert.equal('http://other:8080/evals', ok.evaluations)
   end)
 
-  it('treats a redirect or an oversized body as a transport failure', function()
+  it('treats a redirect or an oversized body as a transport failure, not as no metadata', function()
     local big = string.rep('x', 1048577)
     for _, r in ipairs({ 302, function() return { status = 200, body = big } end, function() return { status = 200 } end }) do
       local fn = router({ [STATIC] = r })
       local D = load({ pdp = fn })
-      local ep = D.resolve(conf({ pdp_discovery = 'authzen' }), '')
-      assert.equal(STATIC .. '/access/v1/evaluation', ep.evaluation)
+      local ep, err = D.resolve(conf({ pdp_discovery = 'authzen' }), '')
+      assert.is_nil(ep)
+      assert.equal('transient', err.kind)
     end
   end)
 end)
@@ -272,10 +308,14 @@ describe('discovery: resource mode', function()
     assert.equal(STATIC, D.resolve(conf(), 'https://r.example/?x').identifier)
   end)
 
-  it('falls to the static PDP on a transient failure without caching it as the answer', function()
+  it('fails the layer on a transient failure with nothing cached, rather than fall to the static PDP', function()
+    -- Falling to static would quietly drop whatever the resource publishes in front of
+    -- its own PDP, and with "static,resource" collapse two layers into one.
     local down = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = 500 }))
     local D, state = load({ pdp = down })
-    assert.equal(STATIC, D.resolve(conf(), RES).identifier)
+    local ep, err = D.resolve(conf(), RES)
+    assert.is_nil(ep)
+    assert.equal('transient', err.kind)
     local e = D._cache().resources[RES]
     assert.is_falsy(e.ok)
     assert.is_truthy(e.neg_until)
@@ -287,6 +327,23 @@ describe('discovery: resource mode', function()
     state.now = state.now + 31
     D.resolve(conf(), RES)
     assert.is_true(#state.pdp_requests > before)
+    -- Through the layers: the resource layer's own rule decides.
+    local D2 = load({ pdp = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = 500 })) })
+    local closed, cerr = D2.resolve_layers(conf(), RES, { 'static', 'resource' })
+    assert.is_nil(closed); assert.equal('transient', cerr.kind)
+    local open = D2.resolve_layers(conf(), RES, { 'static', 'resource fail-open' })
+    assert.equal(1, #open.pdps); assert.equal(STATIC, open.pdps[1].identifier)
+    assert.equal(1, #open.skipped)
+  end)
+
+  it('reads a JSON null for authzen_policy_layers as no layers', function()
+    local fn = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = function()
+      return { status = 200, body = '{"resource":"' .. RES .. '","authzen_policy_decision_points":["' .. GOOD .. '"],"authzen_policy_layers":null}' }
+    end }))
+    local D = load({ pdp = fn })
+    local r = D.resolve_layers(conf(), RES, nil)
+    assert.equal(1, #r.pdps)
+    assert.equal(GOOD, r.pdps[1].identifier, 'a null is absent, not an unreadable document')
   end)
 
   it('serves the stale list while the resource is down after the TTL', function()
@@ -941,13 +998,50 @@ describe('discovery: federation via a resolve endpoint', function()
     assert.equal('not_allowed', kind_of(401, 'nope'))
     assert.equal('transient', kind_of(503, json({ error = 'temporarily_unavailable' })))
     assert.equal('transient', kind_of(500, ''))
-    -- through resolve(): not_found and transient end at the static PDP; a refusal ends the request
+    -- through resolve(): not_found ends at the static PDP; a refusal ends the request (and
+    -- a transient failure with nothing cached fails the layer: see the cache tests below)
     local D = load({ pdp = router(routes({ [RESOLVE] = function() return { status = 404, body = json({ error = 'not_found' }) } end })) })
     local ep = D.resolve(fconf(), RES)
     assert.equal(STATIC, ep.identifier); assert.equal('static-key', ep.api_key)
     local D3 = load({ pdp = router(routes({ [RESOLVE] = function() return { status = 400, body = json({ error = 'invalid_trust_chain' }) } end })) })
     local none, err = D3.resolve(fconf(), RES)
     assert.is_nil(none); assert.equal('not_allowed', err.kind)
+  end)
+
+  it('never serves a resolved answer past its exp, even inside the cache TTL', function()
+    local r = routes({ [RESOLVE] = resolved({ exp = 1700000060 }) })
+    local D, state = load({ pdp = router(r) })
+    assert.equal(GOOD, D.resolve(fconf(), RES).identifier)
+    -- Past exp but inside pdp_metadata_ttl: the answer has expired, so it is fetched again.
+    state.now = state.now + 120
+    r[RESOLVE] = resolved({ exp = 1700000300 })
+    local before = #state.pdp_requests
+    assert.equal(GOOD, D.resolve(fconf(), RES).identifier)
+    assert.is_true(#state.pdp_requests > before)
+    -- And an expired answer is not what the cache falls back to when the resolver is down.
+    state.now = state.now + 400
+    r[RESOLVE] = 503
+    local ep, err = D.resolve(fconf(), RES)
+    assert.is_nil(ep)
+    assert.equal('transient', err.kind)
+  end)
+
+  it('a refusal on refresh ends the cached trust: revocation reaches a running PEP', function()
+    local r = routes()
+    local D, state = load({ pdp = router(r) })
+    assert.equal(GOOD, D.resolve(fconf(), RES).identifier)
+    r[RESOLVE] = function() return { status = 400, body = json({ error = 'invalid_trust_chain' }) } end
+    state.now = state.now + 301
+    local ep, err = D.resolve(fconf(), RES)
+    assert.is_nil(ep)
+    assert.equal('not_allowed', err.kind)
+    -- A resolver outage, by contrast, is served from the last good answer.
+    local r2 = routes({ [RESOLVE] = resolved({ exp = 1700090000 }) })
+    local D2, state2 = load({ pdp = router(r2) })
+    assert.equal(GOOD, D2.resolve(fconf(), RES).identifier)
+    r2[RESOLVE] = 503
+    state2.now = state2.now + 301
+    assert.equal(GOOD, D2.resolve(fconf(), RES).identifier)
   end)
 
   it('needs its two settings, and an https resolver unless told otherwise', function()
