@@ -258,21 +258,18 @@ func numClaim(claims map[string]any, name string) (int64, bool) {
 }
 
 func parseJWKS(v any) ([]map[string]any, error) {
-	set, ok := v.(map[string]any)
-	if !ok {
+	if _, ok := v.(map[string]any); !ok {
 		return nil, fmt.Errorf("jwks missing or not an object")
 	}
-	raw, ok := set["keys"].([]any)
-	if !ok || len(raw) == 0 {
-		return nil, fmt.Errorf("jwks has no keys")
+	// Bounded like any other key set: a statement is at most 1 MiB, and that is room
+	// for a great many keys nobody needs.
+	list, err := jose.JWKSKeys(v)
+	if err != nil {
+		return nil, fmt.Errorf("jwks: %v", err)
 	}
 	seen := map[string]bool{}
-	keys := make([]map[string]any, 0, len(raw))
-	for _, k := range raw {
-		jwk, ok := k.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("jwks contains a non-object key")
-		}
+	keys := make([]map[string]any, 0, len(list))
+	for _, jwk := range list {
 		kid, _ := jwk["kid"].(string)
 		if kid == "" {
 			return nil, fmt.Errorf("every federation key needs a kid")

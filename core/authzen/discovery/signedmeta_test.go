@@ -116,6 +116,11 @@ func TestUnverifiableSignedMetadataIsNeverDowngraded(t *testing.T) {
 		},
 		"jwks_uri unreachable":    func(s *signedResource) { s.jwksCode = http.StatusInternalServerError },
 		"jwks_uri serves no keys": func(s *signedResource) { s.jwksKeys = nil },
+		"jwks_uri serves more keys than a set may carry": func(s *signedResource) {
+			for len(s.jwksKeys) <= jose.MaxJWKSKeys {
+				s.jwksKeys = append(s.jwksKeys, s.jwksKeys[0])
+			}
+		},
 	}
 	for name, bend := range cases {
 		t.Run(name, func(t *testing.T) {

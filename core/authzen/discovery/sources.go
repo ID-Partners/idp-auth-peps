@@ -214,15 +214,13 @@ func (s *RFC9728Source) applySignedMetadata(ctx context.Context, doc map[string]
 		}
 		return fmt.Errorf("%w: fetching %s to verify signed_metadata: %v", ErrInvalid, jwksURI, err)
 	}
-	var set struct {
-		Keys []map[string]any `json:"keys"`
-	}
-	if err := json.Unmarshal(body, &set); err != nil || len(set.Keys) == 0 {
-		return fmt.Errorf("%w: %s served no usable JWK set", ErrInvalid, jwksURI)
+	keys, err := jose.ParseJWKSet(body)
+	if err != nil {
+		return fmt.Errorf("%w: %s served no usable JWK set: %v", ErrInvalid, jwksURI, err)
 	}
 	kid, _ := hdr["kid"].(string)
 	verified := false
-	for _, k := range set.Keys {
+	for _, k := range keys {
 		// With a kid, only that key may verify; without one, any key in the set may.
 		if kid != "" {
 			if id, _ := k["kid"].(string); id != kid {

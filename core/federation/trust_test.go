@@ -3,10 +3,13 @@ package federation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
 // P1: a cached chain used to be served forever once refreshes started failing, with
@@ -222,5 +225,42 @@ func TestAnOffboardedEntityRepublishesItsOwnWord(t *testing.T) {
 	now = now.Add(61 * time.Second)
 	if resp, body := get(t, srv.URL+resPath); resp.Header.Get("X-Resource-Metadata-Source") != "self" {
 		t.Fatalf("offboarding must revert at the next refresh: %s", body)
+	}
+}
+
+// The JOSE rules reach the chain: a statement whose header carries crit, one signed
+// under an ES alg that is not its key's curve, and one whose jwks is oversized each
+// invalidate the chain.
+func TestStatementsAreHeldToTheJOSERules(t *testing.T) {
+	cases := map[string]func(f fed){
+		"header crit": func(f fed) {
+			f.leaf.ecHook = func(h, c map[string]any) { h["crit"] = []any{"exp"}; h["exp"] = 1 }
+		},
+		"ES384 over a P-256 key": func(f fed) {
+			f.leaf.ecHook = func(h, c map[string]any) { h["alg"] = "ES384" }
+		},
+		"a key set past the cap": func(f fed) {
+			f.leaf.ecHook = func(h, c map[string]any) {
+				keys := []any{f.leaf.jwk}
+				for i := 0; len(keys) <= jose.MaxJWKSKeys; i++ {
+					k := map[string]any{}
+					for n, v := range f.leaf.jwk {
+						k[n] = v
+					}
+					k["kid"] = fmt.Sprintf("spare-%d", i)
+					keys = append(keys, k)
+				}
+				c["jwks"] = map[string]any{"keys": keys}
+			}
+		},
+	}
+	for name, bend := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := threeLevel(t)
+			bend(f)
+			if _, err := newResolver(t, Options{}, f.anchor).Resolve(ctx(), f.leaf.id); !errors.Is(err, ErrInvalidChain) {
+				t.Fatalf("want ErrInvalidChain, got %v", err)
+			}
+		})
 	}
 }
