@@ -312,46 +312,91 @@ end
 
 -- ---------- native: REST, decided here ----------
 
+-- The path the route delegates to its service, which is what the mapping describes:
+-- normalised (kong.request.get_path is RFC 3986-normalised on Kong 3.x, the path its
+-- router matched and the upstream receives), with the route's matched prefix removed
+-- when the route strips it, as Kong does. A regex route path is not stripped.
+local function routed_path()
+  local path = kong.request.get_path()
+  local route = kong.router.get_route()
+  if not contract.is_object(route) or route.strip_path == false then return path end
+  local prefix
+  for _, p in ipairs(contract.is_array(route.paths) and route.paths or {}) do
+    if type(p) == "string" and p:sub(1, 1) == "/" and path:sub(1, #p) == p and (not prefix or #p > #prefix) then
+      prefix = p
+    end
+  end
+  if not prefix then return path end
+  local rest = path:sub(#prefix + 1)
+  if rest:sub(1, 1) ~= "/" then rest = "/" .. rest end
+  return rest
+end
+
+local function present(v) return v ~= nil and v ~= cjson.null end
+local function finite(v) return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge end
+
+-- The body of a request whose mapping needs it, as one JSON object; or nil, a status and
+-- a reason. A body that cannot be read in full, or parsed, is never mapped as empty.
+local function json_body(conf)
+  local raw, err = contract.read_body(conf.max_request_body_size)
+  if not raw then
+    kong.log.err("the request body could not be read in full (", err, "); refusing it")
+    return nil, 413, "The request body is too large for the gateway to authorise."
+  end
+  local body = cjson.decode(raw)
+  if not contract.is_object(body) then
+    return nil, 400, "The request body is not a JSON object the gateway can read."
+  end
+  return body
+end
+
 -- Map the HTTP request to an AuthZEN (action, resource, context, resource properties).
--- Resource Server semantics: fine-grained, e.g. the payment amount.
+-- Resource Server semantics: fine-grained, e.g. the payment amount. Every pattern is
+-- anchored to the whole routed path. Returns the mapping, or nil, a status and a reason
+-- when the request cannot be mapped faithfully.
 local function map_request(conf)
   local method = kong.request.get_method()
-  local path = kong.request.get_path()
+  local path = routed_path()
   local m = { ctx = { channel = "ai-agent" }, rprops = {} }
 
-  -- Patterns are prefix-tolerant: Kong strips the route prefix (/bank) but the
-  -- plugin sees the original request path, so we match without anchoring at ^.
-  local cust = path:match("/customers/([^/]+)/accounts")
-  local acct = path:match("/accounts/([^/]+)/balance")
+  local cust = path:match("^/customers/([^/]+)/accounts/?$")
+  local acct = path:match("^/accounts/([^/]+)/balance/?$")
   if cust then
     m.action, m.rtype, m.rid = "list_accounts", "customer", cust
   elseif acct then
     m.action, m.rtype, m.rid = "get_balance", "account", acct
-  elseif path:match("/accounts") and method == "POST" then
-    m.action, m.rtype = "open_account", "account"
-    local body = cjson.decode(contract.read_body(conf.max_request_body_size) or "")
-    if contract.is_object(body) then
-      m.rid = "new:" .. tostring(contract.str(body.account_type) or "savings")
-      m.rprops.account_type = contract.str(body.account_type)
-    else
-      m.rid = "new:savings"
+  elseif method == "POST" and path:match("^/accounts/?$") then
+    local body, status, reason = json_body(conf)
+    if not body then return nil, status, reason end
+    local account_type = body.account_type
+    if present(account_type) and not set(account_type) then
+      return nil, 400, "account_type must be a non-empty string."
     end
-  elseif path:match("/payments") and method == "POST" then
-    m.action, m.rtype = "make_payment", "account"
-    local body = cjson.decode(contract.read_body(conf.max_request_body_size) or "")
-    if contract.is_object(body) then
-      m.rid = tostring(contract.str(body.from_account) or "")
-      m.rprops.from_account = body.from_account
-      m.rprops.to_account = body.to_account
-      m.ctx.amount = tonumber(body.amount)
-      m.ctx.currency = contract.str(body.currency) or "AUD"
-      m.ctx.description = body.description
-      if body.internal_transfer ~= nil then
-        m.ctx.internal_transfer = body.internal_transfer
-      end
+    account_type = present(account_type) and account_type or nil
+    m.action, m.rtype, m.rid = "open_account", "account", "new:" .. (account_type or "savings")
+    m.rprops.account_type = account_type
+  elseif method == "POST" and path:match("^/payments/?$") then
+    -- What the PDP is asked about must be what the upstream will do: an amount it cannot
+    -- read is not an amount of nothing.
+    local body, status, reason = json_body(conf)
+    if not body then return nil, status, reason end
+    if not set(body.from_account) then return nil, 400, "from_account must be a non-empty string." end
+    if not finite(body.amount) then return nil, 400, "amount must be a number." end
+    for _, f in ipairs({ "to_account", "currency", "description" }) do
+      if present(body[f]) and type(body[f]) ~= "string" then return nil, 400, f .. " must be a string." end
     end
+    if present(body.internal_transfer) and type(body.internal_transfer) ~= "boolean" then
+      return nil, 400, "internal_transfer must be true or false."
+    end
+    m.action, m.rtype, m.rid = "make_payment", "account", body.from_account
+    m.rprops.from_account = body.from_account
+    m.rprops.to_account = contract.str(body.to_account)
+    m.ctx.amount = body.amount
+    m.ctx.currency = set(body.currency) and body.currency or "AUD"
+    m.ctx.description = contract.str(body.description)
+    if type(body.internal_transfer) == "boolean" then m.ctx.internal_transfer = body.internal_transfer end
   else
-    m.action, m.rtype, m.rid = "http:" .. method:lower(), "endpoint", path
+    m.action, m.rtype, m.rid = "http:" .. method:lower(), "endpoint", kong.request.get_path()
   end
   return m
 end
@@ -444,7 +489,8 @@ local function native(conf, pep)
   end
 
   -- 2) build the AuthZEN evaluation request
-  local m = map_request(conf)
+  local m, mstatus, mreason = map_request(conf)
+  if not m then return deny(pep, mstatus, mreason) end
   local ctx = m.ctx
 
   -- AuthZEN 1.0 names the subject identifier `id`. This plugin historically sent

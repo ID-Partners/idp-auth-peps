@@ -148,6 +148,89 @@ describe('request mapping', function()
     local m = plugin._TEST.map_request(base_conf())
     assert.equal('ai-agent', m.ctx.channel)
   end)
+
+  local function mapped(opts)
+    local plugin = load_plugin(opts)
+    return plugin._TEST.map_request(base_conf())
+  end
+
+  it('matches the path the route delegates to its service: its prefix stripped as Kong strips it', function()
+    local route = { paths = { '/bank' }, strip_path = true }
+    local m = mapped({ method = 'GET', path = '/bank/accounts/acc-9/balance', route = route })
+    assert.equal('get_balance', m.action); assert.equal('acc-9', m.rid)
+    -- A route that does not strip forwards the whole path, and that is what is matched.
+    m = mapped({ method = 'GET', path = '/bank/accounts/acc-9/balance', route = { paths = { '/bank' }, strip_path = false } })
+    assert.equal('http:get', m.action)
+    -- The longest matching prefix is the one Kong matched; a regex path is not stripped.
+    m = mapped({ method = 'GET', path = '/bank/v2/accounts/a/balance', route = { paths = { '/bank', '/bank/v2' } } })
+    assert.equal('get_balance', m.action)
+    m = mapped({ method = 'GET', path = '/bank/accounts/a/balance', route = { paths = { '~/bank' } } })
+    assert.equal('http:get', m.action)
+  end)
+
+  it('anchors every pattern: a mapped path inside another is not that operation', function()
+    for _, c in ipairs({
+      { 'GET', '/admin/accounts/a1/balance' },     -- used to map to get_balance(a1)
+      { 'GET', '/customers/c1/accounts/a1/balance' }, -- used to map to list_accounts(c1)
+      { 'POST', '/accounts/a1/close' },            -- used to map to open_account
+      { 'POST', '/refunds/payments' },             -- used to map to make_payment
+    }) do
+      local m = mapped({ method = c[1], path = c[2], body = '{"from_account":"a","amount":1}' })
+      assert.equal('http:' .. c[1]:lower(), m.action, c[2])
+      assert.equal(c[2], m.rid)
+    end
+    assert.equal('get_balance', mapped({ method = 'GET', path = '/accounts/a1/balance/' }).action)
+  end)
+
+  it('matches the normalised path, never the one the client wrote', function()
+    -- Kong's router and upstream both work from the normalised path; the raw one could
+    -- name an account's balance while /admin/users is what runs.
+    local m = mapped({ method = 'GET', raw_path = '/accounts/a1/balance/../../../admin/users', path = '/admin/users' })
+    assert.equal('http:get', m.action)
+    assert.equal('/admin/users', m.rid)
+  end)
+end)
+
+describe('a payment or account the plugin cannot read is refused, never sent without its amount', function()
+  local function post(path, body, over, extra)
+    local opts = { method = 'POST', path = path, body = body, headers = { authorization = token({ sub = 'alice' }) }, pdp = { decision = true } }
+    for k, v in pairs(extra or {}) do opts[k] = v end
+    local plugin, state = load_plugin(opts)
+    mock.run_access(plugin, base_conf(over))
+    return state
+  end
+
+  it('a body it cannot read in full is a 413', function()
+    local state = post('/payments', '{"from_account":"a","amount":5,"pad":"' .. string.rep('x', 9000) .. '"}', nil, { kong_version_num = 3007001 })
+    assert.equal(413, state.exited.status)
+    assert.equal(0, #state.pdp_requests)
+  end)
+
+  it('a body that is not one JSON object, or a payment without a readable account and amount, is a 400', function()
+    for _, body in ipairs({ '', 'not json', '[{"amount":5}]', '"x"', '{"amount":5}', '{"from_account":7,"amount":5}',
+      '{"from_account":"a"}', '{"from_account":"a","amount":"50"}', '{"from_account":"a","amount":1e999}',
+      '{"from_account":"a","amount":5,"to_account":7}', '{"from_account":"a","amount":5,"internal_transfer":"yes"}',
+      '{"from_account":"a","amount":5,"currency":["AUD"]}' }) do
+      local state = post('/payments', body)
+      assert.equal(400, state.exited.status, body)
+      assert.equal(0, #state.pdp_requests, body)
+    end
+    for _, body in ipairs({ 'not json', '{"account_type":7}', '{"account_type":""}' }) do
+      local state = post('/accounts', body)
+      assert.equal(400, state.exited.status, body)
+    end
+  end)
+
+  it('a readable payment reaches the PDP with its amount and account; a null optional field is absent', function()
+    local state = post('/payments', '{"from_account":"a1","to_account":"b2","amount":50,"currency":null,"description":"rent"}')
+    assert.is_nil(state.exited)
+    local sent = mock.json_decode(state.pdp_requests[1].body)
+    assert.equal(50, sent.context.amount)
+    assert.equal('AUD', sent.context.currency)
+    assert.equal('rent', sent.context.description)
+    assert.equal('a1', sent.resource.id)
+    assert.equal('b2', sent.resource.properties.to_account)
+  end)
 end)
 
 describe('access(): the decision path', function()
