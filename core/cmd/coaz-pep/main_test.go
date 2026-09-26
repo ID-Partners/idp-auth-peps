@@ -49,6 +49,7 @@ func TestBuildServer(t *testing.T) {
 			"ACCESS_TOKEN_JWKS_URL":  "https://as/jwks",
 			"ACCESS_TOKEN_ISSUER":    "https://as",
 			"ACCESS_TOKEN_AUDIENCE":  "https://api",
+			"USER_TOKEN_AUDIENCE":    "banking-app",
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -68,11 +69,25 @@ func TestBuildServer(t *testing.T) {
 		}
 	})
 
+	t.Run("a user token with no audience to check is ignored, not decoded", func(t *testing.T) {
+		srv, _, _, err := buildServer(env(map[string]string{
+			"AUTHZEN_URL":           "http://pdp:8080",
+			"ACCESS_TOKEN_JWKS_URL": "https://as/jwks",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if srv.userValidator != nil || srv.decodeUserTokens {
+			t.Fatal("without USER_TOKEN_AUDIENCE an agent's own token would pass as the user's login")
+		}
+	})
+
 	t.Run("user validator can be configured independently", func(t *testing.T) {
 		srv, _, _, err := buildServer(env(map[string]string{
 			"AUTHZEN_URL":         "http://pdp:8080",
 			"USER_TOKEN_JWKS_URL": "https://as/user-jwks",
 			"USER_TOKEN_ISSUER":   "https://as",
+			"USER_TOKEN_AUDIENCE": "banking-app",
 		}))
 		if err != nil {
 			t.Fatal(err)

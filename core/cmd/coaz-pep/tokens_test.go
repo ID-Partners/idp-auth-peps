@@ -216,28 +216,71 @@ func TestUserClaimsDropsAForgedTokenWhenConfigured(t *testing.T) {
 	defer srv.Close()
 
 	s := &server{userValidator: newTestValidator(t, srv.URL)}
+	principal := validClaims()["sub"].(string)
 
 	forged := mintJWT(t, attacker, "k1", validClaims())
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": forged}); got != nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": forged}, principal, "access"); got != nil {
 		t.Fatalf("a forged X-User-Token yielded claims: %v", got)
 	}
 
 	genuine := mintJWT(t, real, "k1", validClaims())
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": genuine}); got == nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": genuine}, principal, "access"); got == nil {
 		t.Fatal("a genuine X-User-Token should yield claims")
 	}
 }
 
-func TestUserClaimsFallsBackToDecodingWhenUnconfigured(t *testing.T) {
-	// The pre-existing behaviour, retained so nothing breaks; main() warns about it.
-	s := &server{}
+// A genuine token is still only the user's login if it is THIS principal's: customer B's
+// consent must not authorise customer A's payment, and an agent's own delegated token,
+// or the access token presented twice, is not a user having logged in.
+func TestUserClaimsBelongToThePrincipal(t *testing.T) {
+	key := newKey(t)
+	srv := jwksServer(t, key, "k1")
+	defer srv.Close()
+	s := &server{userValidator: newTestValidator(t, srv.URL)}
+	principal := validClaims()["sub"].(string)
+	user := func(over map[string]any) string {
+		c := validClaims()
+		for k, v := range over {
+			c[k] = v
+		}
+		return mintJWT(t, key, "k1", c)
+	}
+
+	someoneElse := user(map[string]any{"sub": "bob@example.com"})
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": someoneElse}, principal, "access"); got != nil {
+		t.Fatalf("another customer's login must not count for this principal: %v", got)
+	}
+	delegated := user(map[string]any{"act": map[string]any{"sub": "agent-1"}})
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": delegated}, principal, "access"); got != nil {
+		t.Fatalf("a delegated token is not a user's login: %v", got)
+	}
+	own := user(nil)
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, principal, own); got != nil {
+		t.Fatalf("the access token presented as the user token must not count: %v", got)
+	}
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, "", "access"); got != nil {
+		t.Fatalf("with no principal there is nobody for the login to belong to: %v", got)
+	}
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, principal, "access"); got == nil {
+		t.Fatal("the principal's own verified login counts")
+	}
+}
+
+func TestUserClaimsDecodingIsOptIn(t *testing.T) {
 	key := newKey(t)
 	tok := mintJWT(t, key, "", validClaims())
-	got := s.userClaims(context.Background(), map[string]string{"x-user-token": tok})
-	if got == nil || got["sub"] != "alice@example.com" {
-		t.Fatalf("unconfigured should decode, got %v", got)
+	principal := validClaims()["sub"].(string)
+
+	// No verifier and decoding not allowed: an unverifiable token counts for nothing.
+	if got := (&server{}).userClaims(context.Background(), map[string]string{"x-user-token": tok}, principal, "access"); got != nil {
+		t.Fatalf("an unverifiable token must not count, got %v", got)
 	}
-	if s.userClaims(context.Background(), map[string]string{}) != nil {
+	s := &server{decodeUserTokens: true}
+	got := s.userClaims(context.Background(), map[string]string{"x-user-token": tok}, principal, "access")
+	if got == nil || got["sub"] != principal {
+		t.Fatalf("decoding allowed should decode, got %v", got)
+	}
+	if s.userClaims(context.Background(), map[string]string{}, principal, "access") != nil {
 		t.Fatal("no header should yield no claims")
 	}
 }

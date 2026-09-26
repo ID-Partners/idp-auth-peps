@@ -45,6 +45,7 @@ type dpopVerifyResponse struct {
 
 func (s *server) handleDpopVerify(w http.ResponseWriter, r *http.Request) {
 	var req dpopVerifyRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxCheckRequestBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid dpop verify request"}`, http.StatusBadRequest)
 		return
@@ -59,10 +60,20 @@ func (s *server) handleDpopVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token, scheme := extractToken(lower["authorization"])
-	// Claims are only read for cnf.jkt. The token's own signature is validated by the
-	// access-token validator when one is configured; this endpoint answers the narrower
-	// question of whether the PROOF is good for this token.
+	// The proof is only as good as the cnf.jkt it is compared with, so the token is
+	// validated first when a validator is configured: a caller who could mint a token
+	// naming their own key would otherwise get any proof they sign accepted.
 	claims := jwtClaims(token)
+	if s.accessValidator != nil {
+		verified, err := s.accessValidator.Validate(r.Context(), token)
+		if err != nil {
+			log.Printf("[%s] DPoP verify: access token rejected: %v", pep, err)
+			writeDpopVerify(w, dpopVerifyResponse{Valid: false, Status: int(typev3.StatusCode_Unauthorized),
+				Reason: "Access token failed validation."})
+			return
+		}
+		claims = verified
+	}
 
 	out := dpopVerifyResponse{Valid: true}
 	if resp := checkDpop(pep, scheme, req.Method, req.Path, token, lower, claims); resp != nil {
@@ -76,6 +87,10 @@ func (s *server) handleDpopVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	writeDpopVerify(w, out)
+}
+
+func writeDpopVerify(w http.ResponseWriter, out dpopVerifyResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(out); err != nil {
 		log.Printf("dpop verify response encode failed: %v", err)

@@ -35,12 +35,15 @@ func newPDPStub(t *testing.T, response map[string]any, status int) *pdpStub {
 	return stub
 }
 
+// newServer is a PEP with no token validators, as PEP_ALLOW_INSECURE allows: tokens are
+// decoded, which is what the unsigned test tokens need.
 func newServer(t *testing.T, pdpURL string) *server {
 	t.Helper()
 	return &server{
-		authzenURL:    pdpURL,
-		authzenAPIKey: "test-key",
-		httpc:         &http.Client{Timeout: 5 * time.Second},
+		authzenURL:       pdpURL,
+		authzenAPIKey:    "test-key",
+		httpc:            &http.Client{Timeout: 5 * time.Second},
+		decodeUserTokens: true,
 	}
 }
 
@@ -99,15 +102,31 @@ func TestConfigFromReadsEveryKnob(t *testing.T) {
 	if d.pepLabel != "coaz-pep" || d.style != "rest" {
 		t.Fatalf("defaults wrong: %+v", d)
 	}
-	if d.requireToken || d.requireDpop || d.coazDefaults {
-		t.Fatalf("booleans should default false: %+v", d)
+	if d.requireToken || d.requireDpop || d.requireUserLogin || d.forwardAccessToken {
+		t.Fatalf("controls default off: %+v", d)
 	}
-	if d.stepupAction != "make_payment" {
-		t.Fatalf("stepup_action default wrong: %q", d.stepupAction)
+	if !d.coazDefaults || !d.legacySubjectIdentity {
+		t.Fatalf("default mappings and the legacy subject field default on: %+v", d)
 	}
-	// Anything other than "true" is false — a typo must not enable a control.
-	if configFrom(map[string]string{"require_dpop": "yes"}).requireDpop {
-		t.Fatal(`only "true" should enable require_dpop`)
+	if configFrom(map[string]string{"coaz_defaults": "False"}).coazDefaults {
+		t.Fatal(`only an explicit "false" turns default mappings off`)
+	}
+	if d.stepupAction != "make_payment" || d.confErr != nil {
+		t.Fatalf("defaults wrong: %+v", d)
+	}
+	// A knob that is neither true nor false fails the route closed — "yes" must neither
+	// enable a control nor quietly leave it off.
+	for k, v := range map[string]string{
+		"require_dpop": "yes", "require_token": "1", "coaz_defaults": "off",
+		"style": "graphql", "fail_mode": "maybe", "pdp_layers": "static fail-sometimes",
+	} {
+		if configFrom(map[string]string{k: v}).confErr == nil {
+			t.Errorf("%s=%q should be a configuration error", k, v)
+		}
+	}
+	// Style is read case-insensitively: "MCP" must not fall to the REST mapping.
+	if configFrom(map[string]string{"style": "MCP"}).style != "mcp" {
+		t.Fatal(`"MCP" is the mcp style`)
 	}
 }
 
@@ -207,25 +226,6 @@ func TestExtractToken(t *testing.T) {
 	}
 }
 
-func TestIsToolsCallAndToolCallName(t *testing.T) {
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"make_payment"}}`
-	if !isToolsCall(body) {
-		t.Fatal("should recognise a tools/call")
-	}
-	if got := toolCallName(body); got != "make_payment" {
-		t.Fatalf("tool name: %q", got)
-	}
-	for _, other := range []string{
-		`{"jsonrpc":"2.0","method":"tools/list"}`,
-		`not json`,
-		``,
-	} {
-		if isToolsCall(other) {
-			t.Errorf("%q is not a tools/call", other)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // mapRequest — the port of the Kong plugin's map_request. Both gateways must send
 // the PDP identical evaluation requests, so the shapes are pinned here.
@@ -262,23 +262,11 @@ func TestMapRequestREST(t *testing.T) {
 }
 
 func TestMapRequestMCP(t *testing.T) {
-	// The MCP edge authorizes ACCESS to the service on the initialize handshake; other
-	// JSON-RPC passes on a valid token, with per-tool policy enforced at the next PEP.
+	// Only a route that opted out of default mappings maps an MCP request here, and only
+	// its initialize handshake: the pre-binding coarse check, access_mcp.
 	init := mapRequest("mcp", "POST", "/mcp", `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
-	if init.action != "access_mcp" {
-		t.Fatalf("initialize should map to access_mcp, got %q", init.action)
-	}
-	if init.rtype != "mcp-service" {
-		t.Fatalf("resource type = %q", init.rtype)
-	}
-
-	other := mapRequest("mcp", "POST", "/mcp", `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
-	if other.action != allowAction {
-		t.Fatalf("non-initialize JSON-RPC should use the allow sentinel, got %q", other.action)
-	}
-	// A body that is not JSON at all must not be treated as a handshake.
-	if got := mapRequest("mcp", "GET", "/mcp", "").action; got != allowAction {
-		t.Fatalf("empty body should not be access_mcp, got %q", got)
+	if init.action != "access_mcp" || init.rtype != "mcp-service" {
+		t.Fatalf("initialize should map to access_mcp on mcp-service, got %q on %q", init.action, init.rtype)
 	}
 }
 
@@ -646,21 +634,23 @@ func TestCheckRequiresALoggedInUserWhenConfigured(t *testing.T) {
 	}
 }
 
-func TestCheckAllowsMCPTrafficThatIsNotAHandshake(t *testing.T) {
+func TestCheckDecidesMCPTrafficThatIsNotAToolCall(t *testing.T) {
 	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
 	s := newServer(t, pdp.URL)
-	conf := configFrom(map[string]string{"style": "mcp", "require_token": "true"})
-	headers := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice"})}
+	s.coaz = coaz.NewEngine(coaz.Options{PDP: coaz.PDPConfig{URL: pdp.URL}})
+	headers := map[string]string{"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "alice", "aud": "https://mcp"})}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
 
-	// The allow sentinel short-circuits: authenticated non-handshake JSON-RPC proceeds
-	// without a PDP round trip, because per-tool policy lives at the next PEP.
-	resp := s.check(context.Background(), conf, "POST", "/mcp", headers,
-		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
-	if resp == nil {
-		t.Fatal("expected a response")
+	// Default mappings are on unless the route says otherwise: tools/list is the PDP's.
+	resp := s.check(context.Background(), configFrom(map[string]string{"style": "mcp", "require_token": "true"}), "POST", "/mcp", headers, body)
+	if resp.GetOkResponse() == nil || len(pdp.requests) != 1 {
+		t.Fatalf("tools/list must be decided by the PDP, got %d calls", len(pdp.requests))
 	}
-	if len(pdp.requests) != 0 {
-		t.Fatalf("the allow sentinel should skip the PDP, got %d calls", len(pdp.requests))
+
+	// The explicit opt-out keeps the old pass-through.
+	resp = s.check(context.Background(), configFrom(map[string]string{"style": "mcp", "require_token": "true", "coaz_defaults": "false"}), "POST", "/mcp", headers, body)
+	if resp.GetOkResponse() == nil || len(pdp.requests) != 1 {
+		t.Fatalf("with defaults off tools/list passes without the PDP, got %d calls", len(pdp.requests))
 	}
 }
 

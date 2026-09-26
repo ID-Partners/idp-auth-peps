@@ -7,27 +7,28 @@ package main
 // For every proxied request it:
 //
 //   1. extracts the delegated access token (DPoP or Bearer) and reads its
-//      claims (sub = principal, act.sub = acting agent, scope, cnf.jkt);
+//      claims (sub = principal, act.sub = acting agent, scope, cnf.jkt), and the
+//      logged-in user's X-User-Token, which counts only when it verifies and belongs
+//      to the same principal;
 //   2. if DPoP is required, checks the sender-constraint binding (RFC 9449);
 //   3. authorizes the request:
-//        - MCP routes: `initialize` is evaluated as access_mcp; `tools/call`
-//          on a COAZ-declared tool is evaluated per the tool's x-coaz-mapping
-//          (discovery, CEL, evaluation/evaluations API, JSON-RPC errors);
-//          other MCP traffic passes on a valid token;
+//        - MCP routes: every JSON-RPC message is parsed strictly and decided by the
+//          COAZ engine — a tool's declared x-authzen-mapping, otherwise the binding's
+//          default mapping for its method; ping, notifications and a client's
+//          responses pass; a body the PEP cannot read unambiguously is refused;
 //        - REST routes: the request maps to a business action/resource and is
 //          evaluated at the PDP;
 //   4. PERMIT -> forward with X-Auth-* identity headers and X-PDP-* decision
 //      headers; DENY -> the exact challenge or JSON-RPC error passes through.
 //
-// NOTE (demo honesty): the PEP reads JWT claims and enforces the DPoP key
-// binding but does not itself verify the access-token JWS signature — pair it
-// with the gateway's JWT/JWKS validation in hardened deployments. The
-// authorization decision itself is always made by the AuthZEN PDP.
+// Token signatures are verified when a JWKS is configured, which main() requires unless
+// PEP_ALLOW_INSECURE is set. The authorization decision itself is always the PDP's.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -59,8 +60,9 @@ type pepConfig struct {
 	// mcpUpstreamURL enables COAZ on an MCP route: the MCP server whose
 	// tools/list declares the x-coaz-mapping objects.
 	mcpUpstreamURL string
-	// coazDefaults applies the binding's default mappings to tools that declare none.
-	// Off leaves the non-conformant pass-through that deployed routes expect.
+	// coazDefaults applies the binding's default mappings: every MCP method is decided,
+	// a tool that declares no mapping included. On unless the route says "false", which
+	// keeps the pre-binding pass-through as an explicit opt-out.
 	coazDefaults bool
 	// legacySubjectIdentity additionally sends the non-standard `subject.identity`
 	// alongside the correct `subject.id`. On by default so upgrading the PEP alone
@@ -77,11 +79,12 @@ type pepConfig struct {
 	// and authenticated, and that is the operator's call.
 	forwardAccessToken bool
 	// layers is the ordered list of PDPs to ask (see discovery.ResolveLayers). Empty
-	// means the service default, which is the resource's PDP alone. layersErr is a
-	// policy that could not be read: such a route fails closed rather than run a
-	// narrower policy than it was given.
-	layers    []discovery.LayerSpec
-	layersErr error
+	// means the service default, which is the resource's PDP alone.
+	layers []discovery.LayerSpec
+	// confErr is route configuration that could not be read — an unknown style, a knob
+	// that is neither true nor false, a bad layer list. Such a route fails closed rather
+	// than run a narrower policy than it was given.
+	confErr error
 	// failOpen is the route's failure mode, when it sets one: nil inherits the
 	// service's PDP_FAIL_MODE.
 	failOpen *bool
@@ -99,30 +102,51 @@ func (c pepConfig) resourceID() string {
 }
 
 func configFrom(ext map[string]string) pepConfig {
+	var errs []string
 	get := func(k, def string) string {
 		if v, ok := ext[k]; ok && v != "" {
 			return v
 		}
 		return def
 	}
-	isTrue := func(k string) bool { return strings.EqualFold(ext[k], "true") }
+	// A knob that is neither true nor false is an error, not false: "yes" or "1" on
+	// require_token must not quietly mean the token is optional.
+	flag := func(k string, def bool) bool {
+		switch strings.ToLower(ext[k]) {
+		case "":
+			return def
+		case "true":
+			return true
+		case "false":
+			return false
+		}
+		errs = append(errs, fmt.Sprintf("%s %q is neither true nor false", k, ext[k]))
+		return def
+	}
 	c := pepConfig{
 		pepLabel:         get("pep_label", "coaz-pep"),
-		style:            get("style", "rest"),
-		requireToken:     isTrue("require_token"),
-		requireDpop:      isTrue("require_dpop"),
-		requireUserLogin: isTrue("require_user_login"),
+		style:            strings.ToLower(get("style", "rest")),
+		requireToken:     flag("require_token", false),
+		requireDpop:      flag("require_dpop", false),
+		requireUserLogin: flag("require_user_login", false),
 		stepupScope:      ext["stepup_scope"],
 		stepupAction:     get("stepup_action", "make_payment"),
 		mcpUpstreamURL:   ext["mcp_upstream_url"],
-		coazDefaults:     isTrue("coaz_defaults"),
+		coazDefaults:     flag("coaz_defaults", true),
 		// Defaults ON: absent config must not silently drop a field a deployed policy
 		// may still be reading. Only an explicit "false" removes it.
-		legacySubjectIdentity: !strings.EqualFold(ext["legacy_subject_identity"], "false"),
+		legacySubjectIdentity: flag("legacy_subject_identity", true),
 		resource:              strings.TrimRight(ext["resource"], "/"),
-		forwardAccessToken:    isTrue("forward_access_token"),
+		forwardAccessToken:    flag("forward_access_token", false),
 	}
-	c.layers, c.layersErr = discovery.ParseLayers(ext["pdp_layers"])
+	if c.style != "rest" && c.style != "mcp" {
+		// An unknown style would otherwise fall to the REST mapping and skip COAZ.
+		errs = append(errs, fmt.Sprintf("style %q is neither rest nor mcp", ext["style"]))
+	}
+	var err error
+	if c.layers, err = discovery.ParseLayers(ext["pdp_layers"]); err != nil {
+		errs = append(errs, err.Error())
+	}
 	switch strings.ToLower(ext["fail_mode"]) {
 	case "open":
 		t := true
@@ -132,7 +156,10 @@ func configFrom(ext map[string]string) pepConfig {
 		c.failOpen = &f
 	case "":
 	default:
-		c.layersErr = fmt.Errorf("fail_mode %q is neither open nor closed", ext["fail_mode"])
+		errs = append(errs, fmt.Sprintf("fail_mode %q is neither open nor closed", ext["fail_mode"]))
+	}
+	if len(errs) > 0 {
+		c.confErr = errors.New(strings.Join(errs, "; "))
 	}
 	return c
 }
@@ -158,25 +185,48 @@ type server struct {
 	// main() warns. Non-nil means fail closed.
 	accessValidator *Validator
 	userValidator   *Validator
+	// decodeUserTokens lets an unverifiable X-User-Token count, decoded. Without it a
+	// user token that cannot be verified counts for nothing.
+	decodeUserTokens bool
 }
 
-// userClaims returns the verified claims of the X-User-Token, or nil.
+// userClaims returns the claims of the X-User-Token, or nil when it does not count.
 //
 // These claims drive user_scope, user_acr, authorization_details and the consented
 // amount cap — the step-up and consent gates. A forged token here is a bypass of both,
-// so when a validator is configured a token that does not verify yields NO claims
-// rather than decoded ones.
-func (s *server) userClaims(ctx context.Context, headers map[string]string) map[string]any {
+// and so is a genuine one belonging to someone else: customer B's consent must not
+// authorise customer A's payment. So the token counts only when it verifies (or, with
+// no verifier, when decoding was allowed) AND it is the principal's own login: its sub is
+// the access token's sub, it is not the access token itself, and it is not a delegated
+// token (no act claim) — an agent's own token is not a user having logged in.
+func (s *server) userClaims(ctx context.Context, headers map[string]string, principal, accessToken string) map[string]any {
 	raw := headers["x-user-token"]
 	if raw == "" {
 		return nil
 	}
-	if s.userValidator == nil {
-		return jwtClaims(raw)
+	var claims map[string]any
+	switch {
+	case s.userValidator != nil:
+		c, err := s.userValidator.Validate(ctx, raw)
+		if err != nil {
+			log.Printf("X-User-Token rejected: %v", err)
+			return nil
+		}
+		claims = c
+	case s.decodeUserTokens:
+		claims = jwtClaims(raw)
+	default:
+		return nil
 	}
-	claims, err := s.userValidator.Validate(ctx, raw)
-	if err != nil {
-		log.Printf("X-User-Token rejected: %v", err)
+	switch {
+	case raw == accessToken:
+		log.Printf("X-User-Token ignored: it is the access token")
+		return nil
+	case claims["act"] != nil:
+		log.Printf("X-User-Token ignored: it is a delegated token (act), not a user's login")
+		return nil
+	case principal == "" || claimString(claims, "sub") != principal:
+		log.Printf("X-User-Token ignored: its subject is not the access token's")
 		return nil
 	}
 	return claims
@@ -195,9 +245,15 @@ func headerOpts(h map[string]string) []*corev3.HeaderValueOption {
 	return out
 }
 
-// sanitizeHeader keeps policy reasons from breaking the header framing.
+// sanitizeHeader keeps values the PDP or a client chose from breaking the header
+// framing: every control character becomes a space.
 func sanitizeHeader(v string) string {
-	return strings.NewReplacer("\r", " ", "\n", " ").Replace(v)
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, v)
 }
 
 func deniedRaw(httpStatus typev3.StatusCode, rpcCode codes.Code, body []byte, headers map[string]string) *authv3.CheckResponse {
@@ -231,16 +287,26 @@ func denySimple(pep string, httpStatus typev3.StatusCode, rpcCode codes.Code, re
 	}, extraHeaders)
 }
 
+// identity is who a permit vouches for, carried upstream as the X-Auth-* headers.
+type identity struct {
+	sub, act, scope, acr string
+}
+
 // permit lets the request through, tagging the upstream request with the
 // delegation identity and the response with the PDP decision.
-func permit(pep, action, reason, sub, act, scope string) *authv3.CheckResponse {
-	return permitWith(pep, action, reason, sub, act, scope, nil)
+func permit(pep, action, reason string, id identity) *authv3.CheckResponse {
+	return permitWith(pep, action, reason, id, nil)
 }
 
 // permitWith is permit with the fail-open marker: X-PDP-Fail-Open names the layers that
 // were skipped, so a permit that rests on fewer opinions than the policy asked for is
 // visible on the wire and countable downstream.
-func permitWith(pep, action, reason, sub, act, scope string, failedOpen []string) *authv3.CheckResponse {
+//
+// The X-Auth-* headers are the PEP's word on who is calling, so a client's own copies
+// never reach the upstream: a value is set with OVERWRITE (which discards every copy the
+// client sent), and a header this PEP has no value for is removed rather than set empty
+// — Envoy drops an empty-valued mutation, which would leave the client's copy in place.
+func permitWith(pep, action, reason string, id identity, failedOpen []string) *authv3.CheckResponse {
 	responseHeaders := map[string]string{
 		"X-PDP-PEP":      pep,
 		"X-PDP-Decision": "PERMIT",
@@ -248,17 +314,25 @@ func permitWith(pep, action, reason, sub, act, scope string, failedOpen []string
 		"X-PDP-Reason":   reason,
 	}
 	if len(failedOpen) > 0 {
-		responseHeaders["X-PDP-Fail-Open"] = sanitizeHeader(strings.Join(failedOpen, ", "))
+		responseHeaders["X-PDP-Fail-Open"] = strings.Join(coaz.LayerNames(failedOpen), ", ")
+	}
+	set := map[string]string{}
+	var remove []string
+	for _, h := range []struct{ name, value string }{
+		{"X-Auth-Principal", id.sub}, {"X-Auth-Agent", id.act}, {"X-Auth-Scope", id.scope}, {"X-Auth-Acr", id.acr},
+	} {
+		if v := sanitizeHeader(h.value); v != "" {
+			set[h.name] = v
+		} else {
+			remove = append(remove, h.name)
+		}
 	}
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{Code: int32(codes.OK)},
 		HttpResponse: &authv3.CheckResponse_OkResponse{
 			OkResponse: &authv3.OkHttpResponse{
-				Headers: headerOpts(map[string]string{
-					"X-Auth-Principal": sub,
-					"X-Auth-Agent":     act,
-					"X-Auth-Scope":     scope,
-				}),
+				Headers:              headerOpts(set),
+				HeadersToRemove:      remove,
 				ResponseHeadersToAdd: headerOpts(responseHeaders),
 			},
 		},
@@ -280,41 +354,36 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
 	}
-	return s.check(ctx, conf, httpReq.GetMethod(), path, headers, httpReq.GetBody()), nil
+	// With pack_as_bytes the body arrives in raw_body and body is empty; reading only one
+	// of them would authorise an empty body while the upstream receives the real one.
+	body := httpReq.GetBody()
+	if raw := httpReq.GetRawBody(); len(raw) > 0 {
+		body = string(raw)
+	}
+	return s.check(ctx, conf, httpReq.GetMethod(), path, headers, body), nil
 }
 
 // check is the transport-independent pipeline, shared by the ext_authz gRPC
 // server and the HTTP check API (used by the Kong plugin).
 func (s *server) check(ctx context.Context, conf pepConfig, method, path string, headers map[string]string, body string) *authv3.CheckResponse {
 	pep := conf.pepLabel
-
-	// 0) Step-up: require a logged-in END USER (RFC 9470 step-up challenge).
-	if conf.requireUserLogin {
-		uclaims := s.userClaims(ctx, headers)
-		if claimString(uclaims, "sub") == "" {
-			log.Printf("[%s] 401 login_required %s %s", pep, method, path)
-			return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
-				"error":      "login_required",
-				"pep":        pep,
-				"reason":     "The gateway requires an authenticated user (no valid X-User-Token).",
-				"acr_values": "urn:pingidentity:loa:password",
-			}, map[string]string{
-				"WWW-Authenticate": `Bearer error="insufficient_user_authentication", ` +
-					`error_description="Login required", acr_values="urn:pingidentity:loa:password"`,
-			})
-		}
+	if conf.confErr != nil {
+		log.Printf("[%s] route policy unreadable: %v", pep, conf.confErr)
+		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
+			"Authorization policy for this route could not be read; denying (fail-closed).", nil)
 	}
 
 	// 1) token + claims
 	token, scheme := extractToken(headers["authorization"])
 	if token == "" && conf.requireToken {
+		log.Printf("[%s] 401 no access token %s %q", pep, method, path)
 		return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated,
 			"No access token presented to the gateway.", nil)
 	}
 
 	// The binding: "The access token ... MUST be validated by the PEP before its claims
 	// are used." When a validator is configured this fails closed; when it is not, the
-	// token is decoded as before and main() has warned at startup.
+	// token is decoded, which main() allows only with PEP_ALLOW_INSECURE.
 	var claims map[string]any
 	if s.accessValidator != nil && token != "" {
 		verified, err := s.accessValidator.Validate(ctx, token)
@@ -330,135 +399,191 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		claims = jwtClaims(token)
 	}
 	sub := claimString(claims, "sub")
-	act := actorSub(claims)
-	scope := scopeString(claims)
+	id := identity{sub: sub, act: actorSub(claims), scope: scopeString(claims), acr: strClaim(claims, "acr")}
 	clientID := claimString(claims, "client_id")
 	if clientID == "" {
 		clientID = claimString(claims, "azp")
 	}
 
 	if conf.requireToken && sub == "" {
+		log.Printf("[%s] 401 access token has no subject %s %q", pep, method, path)
 		return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated,
 			"Access token missing or unreadable (no subject claim).", nil)
 	}
 
-	// 2) DPoP sender-constraint binding (RFC 9449)
+	// 2) Step-up: require a logged-in END USER (RFC 9470 step-up challenge) — the
+	//    principal's own verified login, see userClaims.
+	uclaims := s.userClaims(ctx, headers, sub, token)
+	if conf.requireUserLogin && claimString(uclaims, "sub") == "" {
+		log.Printf("[%s] 401 login_required %s %q", pep, method, path)
+		return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
+			"error":      "login_required",
+			"pep":        pep,
+			"reason":     "The gateway requires an authenticated user (no valid X-User-Token).",
+			"acr_values": "urn:pingidentity:loa:password",
+		}, map[string]string{
+			"WWW-Authenticate": `Bearer error="insufficient_user_authentication", ` +
+				`error_description="Login required", acr_values="urn:pingidentity:loa:password"`,
+		})
+	}
+
+	// 3) DPoP sender-constraint binding (RFC 9449)
 	if conf.requireDpop {
 		if resp := checkDpop(pep, scheme, method, path, token, headers, claims); resp != nil {
 			return resp
 		}
 	}
 
-	// 2b) COAZ (AuthZEN MCP profile): tools/call on an MCP route with a
-	//     declared upstream is evaluated per the tool's x-coaz-mapping.
-	if conf.style == "mcp" && conf.mcpUpstreamURL != "" && isToolsCall(body) {
-		// The upstream may be caller-supplied over the HTTP check API, so it is
-		// checked before anything fetches it.
-		if !upstreamAllowed(s.upstreamAllowlist, conf.mcpUpstreamURL) {
-			log.Printf("[%s] refusing mcp_upstream_url outside the allowlist: %s", pep, conf.mcpUpstreamURL)
-			return denySimple(pep, typev3.StatusCode_Forbidden, codes.PermissionDenied,
-				"Configured MCP upstream is not permitted by this PEP.", nil)
-		}
-		// Carry the logged-in USER's token claims (from X-User-Token) into the COAZ AuthZEN
-		// context — the x-coaz-mapping is derived from the AGENT's token + tool params and
-		// can't see them. The PDP checks these against the request:
-		//   user_scope            — the coarse consented scope (RFC 9068); without it the
-		//                           step-up rule's "user hasn't approved" test always trips → loop.
-		//   authorization_details — the fine-grained RAR (RFC 9396) the customer consented to, carried
-		//                           in their rich JWT (userJwtATM emits it). Lets the policy verify
-		//                           THIS payment is within a consented RAR entry, not just the scope.
-		uclaims := s.userClaims(ctx, headers)
-		extraContext := map[string]any{
-			"user_scope": scopeString(uclaims),
-			// The agent token's audience (RFC 8707 / FAPI 2.0): the token is minted for THIS
-			// resource only. Forwarded so the policy can see + enforce audience-restriction.
-			"token_aud": audString(claims),
-			// How the user token was authenticated (acr). The autonomous demo's staff channel
-			// (the approver, the agent owner, approving out-of-band) is recognised by the policy via a
-			// staff-approval acr — PF can't attach the RFC 9396 RAR to an ROPC/CIBA-minted
-			// token, so acr + the elevated scope is that channel's step-up evidence.
-			"user_acr": strClaim(uclaims, "acr"),
-		}
-		if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
-			extraContext["authorization_details"] = ad
-			// Pre-extract the consented payment cap + destination from the RAR so the
-			// policy can do a fine-grained match (amount <= consented, account matches)
-			// with plain comparisons instead of parsing JSON itself.
-			if amt, cred, found := consentedPayment(ad); found {
-				extraContext["consented_amount"] = amt
-				extraContext["consented_creditor"] = cred
-			}
-		}
-		if conf.layersErr != nil {
-			log.Printf("[%s] route policy unreadable: %v", pep, conf.layersErr)
-			return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
-				"Authorization policy for this route could not be read; denying (fail-closed).", nil)
-		}
-		callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path,
-			Layers: s.layersFor(conf), FailOpen: s.failOpenFor(conf)}
-		if conf.forwardAccessToken {
-			callOpts.AccessToken = token
-		}
-		v := s.coaz.CheckToolCall(ctx, conf.mcpUpstreamURL, headers["authorization"],
-			[]byte(body), claimsForCEL(claims), extraContext, callOpts)
-		if v.CoazTool {
-			toolName := toolCallName(body)
-			if v.JSONRPCError != nil {
-				log.Printf("[%s] COAZ DENY tools/call %s: %s", pep, toolName, v.Reason)
-				// Profile: protocol errors are JSON-RPC error responses
-				// (HTTP 200, application/json), not HTTP-level denials.
-				return deniedRaw(typev3.StatusCode_OK, codes.PermissionDenied, v.JSONRPCError,
-					map[string]string{
-						"Content-Type":   "application/json",
-						"X-PDP-PEP":      pep,
-						"X-PDP-Decision": "DENY",
-						"X-PDP-Action":   "tools/call:" + toolName,
-						"X-PDP-Reason":   sanitizeHeader(v.Reason),
-					})
-			}
-			if len(v.FailedOpen) > 0 {
-				log.Printf("[%s] COAZ PERMIT tools/call %s FAILED OPEN past %v", pep, toolName, v.FailedOpen)
-			}
-			log.Printf("[%s] COAZ PERMIT tools/call %s (principal=%s agent=%s)", pep, toolName, sub, act)
-			return permitWith(pep, "tools/call:"+toolName, v.Reason, sub, act, scope, v.FailedOpen)
-		}
-		// non-COAZ tool: fall through to the legacy MCP-edge behaviour
+	// 4) MCP: every message is decided by the COAZ engine.
+	if conf.style == "mcp" {
+		return s.checkMCP(ctx, conf, method, path, headers, body, token, claims, uclaims, id)
 	}
 
-	// 3) map the HTTP request to an AuthZEN action/resource/context
-	m := mapRequest(conf.style, method, path, body)
+	// 5) REST: map the HTTP request to an AuthZEN action/resource/context.
+	return s.decide(ctx, conf, mapRequest(conf.style, method, path, body), method, path, token, claims, uclaims, id, clientID)
+}
 
-	// MCP handshake / non-tool traffic: allow on a valid token, skip the PDP.
-	if m.action == allowAction {
-		return permit(pep, "mcp-handshake",
-			"MCP handshake allowed (authenticated); policy applies to tool calls.",
-			sub, act, scope)
+// userContext is what the PEP asserts about the logged-in user and the token's audience,
+// carried into every PDP request so the policy can check consent against the call.
+//
+//	user_scope            the coarse consented scope (RFC 9068); without it a step-up
+//	                      rule's "user hasn't approved" test always trips, and loops.
+//	authorization_details the fine-grained RAR (RFC 9396) the customer consented to,
+//	                      with the consented payment cap and destination pre-extracted
+//	                      so the policy can compare with plain comparisons.
+//	token_aud             the agent token's audience (RFC 8707 / FAPI 2.0).
+//	user_acr              how the user authenticated; the staff-approval channel is
+//	                      recognised by its acr.
+//
+// Both PEPs must send the same, or a payment authorised at the MCP edge is re-challenged
+// at the API edge and the flow loops on step-up.
+func userContext(uclaims, claims map[string]any) map[string]any {
+	ctx := map[string]any{
+		"user_scope": scopeString(uclaims),
+		"token_aud":  audString(claims),
+		"user_acr":   strClaim(uclaims, "acr"),
 	}
-
-	// 3b) Carry the USER's consented context (from X-User-Token) into the PDP:
-	//     the coarse scope AND the fine-grained RFC 9396 RAR (authorization_details),
-	//     pre-extracting the consented amount + destination. This MUST match what the
-	//     COAZ/MCP path (PEP #1) sends, or a payment authorized at the MCP edge gets
-	//     re-challenged here at the Bank-API edge (PEP #2) because the RAR context is
-	//     missing → the payment fails downstream and the whole flow loops on step-up.
-	uclaims := s.userClaims(ctx, headers)
-	m.ctx["user_scope"] = scopeString(uclaims)
-	// The agent token's audience (RFC 8707 / FAPI 2.0) — this token was minted for THIS
-	// resource. Forwarded so the policy can see + enforce that a token is audience-restricted.
-	m.ctx["token_aud"] = audString(claims)
-	// Staff-approval channel marker (see PEP #1) — must match what PEP #1 sends or a payment
-	// authorized at the MCP edge gets re-challenged here.
-	m.ctx["user_acr"] = strClaim(uclaims, "acr")
 	if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
-		m.ctx["authorization_details"] = ad
+		ctx["authorization_details"] = ad
 		if amt, cred, found := consentedPayment(ad); found {
-			m.ctx["consented_amount"] = amt
-			m.ctx["consented_creditor"] = cred
+			ctx["consented_amount"] = amt
+			ctx["consented_creditor"] = cred
 		}
+	}
+	return ctx
+}
+
+// checkMCP decides one request on an MCP route.
+//
+// GET (the server's SSE stream) and DELETE (ending a session) carry no JSON-RPC message
+// and pass on the token checks already made. A POST body must parse strictly as ONE
+// JSON-RPC message — see coaz.ParseRequest — and then the engine decides it, whatever
+// its method. Anything the PEP could read one way and the upstream another is refused:
+// a batch, a body Envoy truncated, an encoded body, duplicate or case-variant members.
+func (s *server) checkMCP(ctx context.Context, conf pepConfig, method, path string, headers map[string]string, body, token string, claims, uclaims map[string]any, id identity) *authv3.CheckResponse {
+	pep := conf.pepLabel
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "DELETE":
+		return permit(pep, "mcp:"+strings.ToLower(method), "MCP transport request; policy applies to JSON-RPC messages.", id)
+	case "POST":
+	default:
+		return rpcRefusal(pep, typev3.StatusCode_MethodNotAllowed, "Invalid Request: method not supported on an MCP endpoint")
+	}
+	if strings.EqualFold(headers["x-envoy-auth-partial-body"], "true") {
+		log.Printf("[%s] 413 partial body on an MCP route", pep)
+		return rpcRefusal(pep, typev3.StatusCode_PayloadTooLarge, "Invalid Request: request body too large for the PEP to authorise")
+	}
+	if enc := strings.TrimSpace(headers["content-encoding"]); enc != "" && !strings.EqualFold(enc, "identity") {
+		log.Printf("[%s] 415 Content-Encoding %q on an MCP route", pep, enc)
+		return rpcRefusal(pep, typev3.StatusCode_UnsupportedMediaType, "Invalid Request: Content-Encoding not supported by the PEP")
+	}
+	rpc, err := coaz.ParseRequest([]byte(body))
+	if err != nil {
+		log.Printf("[%s] refused an MCP body: %v", pep, err)
+		return coazDeny(pep, coaz.Refused(err), "mcp")
+	}
+	action := rpc.Method
+	if rpc.ToolName != "" {
+		action = "tools/call:" + rpc.ToolName
+	} else if rpc.Kind == coaz.KindResponse {
+		action = "jsonrpc-response"
+	}
+
+	// The upstream may be caller-supplied over the HTTP check API, so it is checked
+	// before anything fetches it.
+	if conf.mcpUpstreamURL != "" && !upstreamAllowed(s.upstreamAllowlist, conf.mcpUpstreamURL) {
+		log.Printf("[%s] refusing mcp_upstream_url outside the allowlist: %q", pep, conf.mcpUpstreamURL)
+		return denySimple(pep, typev3.StatusCode_Forbidden, codes.PermissionDenied,
+			"Configured MCP upstream is not permitted by this PEP.", nil)
+	}
+	callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path,
+		Layers: s.layersFor(conf), FailOpen: s.failOpenFor(conf)}
+	if conf.forwardAccessToken {
+		callOpts.AccessToken = token
+	}
+	v := s.coaz.CheckMCP(ctx, conf.mcpUpstreamURL, headers["authorization"], rpc,
+		claimsForCEL(claims), userContext(uclaims, claims), callOpts)
+	switch {
+	case !v.Decision:
+		log.Printf("[%s] COAZ DENY %q: %s", pep, action, v.Reason)
+		return coazDeny(pep, v, action)
+	case v.PassThrough && !conf.coazDefaults && rpc.Method == "initialize":
+		// A route that opted out of the default mappings keeps the pre-binding coarse
+		// check: the handshake is evaluated as access_mcp.
+		return s.decide(ctx, conf, mapRequest("mcp", method, path, body), method, path, token, claims, uclaims, id, clientIDOf(claims))
+	case v.PassThrough:
+		return permit(pep, "mcp:"+action, v.ClientReason, id)
+	}
+	if len(v.FailedOpen) > 0 {
+		log.Printf("[%s] COAZ PERMIT %q FAILED OPEN past %v", pep, action, v.FailedOpen)
+	}
+	log.Printf("[%s] COAZ PERMIT %q (principal=%q agent=%q)", pep, action, id.sub, id.act)
+	return permitWith(pep, action, v.ClientReason, id, v.FailedOpen)
+}
+
+// coazDeny relays an engine deny: the JSON-RPC error, with the status the engine chose —
+// 200 for a policy denial, as the binding requires, or 400 for a body it would not read.
+func coazDeny(pep string, v coaz.Verdict, action string) *authv3.CheckResponse {
+	status := typev3.StatusCode_OK
+	if v.HTTPStatus != 0 {
+		status = typev3.StatusCode(v.HTTPStatus)
+	}
+	return deniedRaw(status, codes.PermissionDenied, v.JSONRPCError, map[string]string{
+		"Content-Type":   "application/json",
+		"X-PDP-PEP":      pep,
+		"X-PDP-Decision": "DENY",
+		"X-PDP-Action":   action,
+		"X-PDP-Reason":   v.ClientReason,
+	})
+}
+
+// rpcRefusal is a JSON-RPC Invalid Request carried at an HTTP status other than 400.
+func rpcRefusal(pep string, status typev3.StatusCode, message string) *authv3.CheckResponse {
+	v := coaz.Refused(&coaz.ParseError{Code: coaz.CodeInvalidRequest, Message: message})
+	v.HTTPStatus = int(status)
+	return coazDeny(pep, v, "mcp")
+}
+
+func clientIDOf(claims map[string]any) string {
+	if id := claimString(claims, "client_id"); id != "" {
+		return id
+	}
+	return claimString(claims, "azp")
+}
+
+// decide evaluates one mapped request at the PDP layers and enforces the answer.
+func (s *server) decide(ctx context.Context, conf pepConfig, m mapped, method, path, token string, claims, uclaims map[string]any, id identity, clientID string) *authv3.CheckResponse {
+	pep := conf.pepLabel
+	if m.refusal != "" {
+		log.Printf("[%s] 400 %s %q: %s", pep, method, path, m.refusal)
+		return denySimple(pep, typev3.StatusCode_BadRequest, codes.InvalidArgument, m.refusal, nil)
+	}
+	for k, v := range userContext(uclaims, claims) {
+		m.ctx[k] = v
 	}
 
 	// 4) evaluate at the PDP and enforce (fail closed on PDP error)
-	agent := act
+	agent := id.act
 	if agent == "" {
 		agent = clientID
 	}
@@ -472,33 +597,28 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"type": "agent",
 		"id":   agent,
 		"properties": map[string]any{
-			"on_behalf_of": sub,
+			"on_behalf_of": id.sub,
 			"agent_type":   "ai_assistant",
-			"scope":        scope,
+			"scope":        id.scope,
 			"client_id":    clientID,
 		},
 	}
 	if conf.legacySubjectIdentity {
 		subject["identity"] = agent
 	}
-	// 3c) Which PDP, and what it gets to reason with beyond the mapped request: the
-	//     resource's declared posture as published (scopes, acr, sender-constraint
-	//     requirements — whatever it said), tagged with whether the federation vouched
-	//     for it; the endpoint actually hit; and, when the route allows, the raw token.
-	//     This PEP enforces none of it. Comparing a token's scope or acr to what a
-	//     resource requires is a policy decision, and policy is offloaded to the PDP,
-	//     where it can weigh them alongside risk, consent and history — things a gateway
-	//     never sees. Resolved once, so one decision cannot straddle a PDP that moved.
-	if conf.layersErr != nil {
-		log.Printf("[%s] route policy unreadable: %v", pep, conf.layersErr)
-		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
-			"Authorization policy for this route could not be read; denying (fail-closed).", nil)
-	}
+	// Which PDP, and what it gets to reason with beyond the mapped request: the
+	// resource's declared posture as published (scopes, acr, sender-constraint
+	// requirements — whatever it said), tagged with whether the federation vouched for
+	// it; the endpoint actually hit; and, when the route allows, the raw token. This PEP
+	// enforces none of it. Comparing a token's scope or acr to what a resource requires
+	// is a policy decision, and policy is offloaded to the PDP, where it can weigh them
+	// alongside risk, consent and history — things a gateway never sees. Resolved once,
+	// so one decision cannot straddle a PDP that moved.
 	layers, err := discovery.ResolveLayers(ctx, s.resolverOrStatic(), conf.resourceID(), s.layersFor(conf), s.failOpenFor(conf))
 	if err != nil {
 		log.Printf("[%s] PDP call failed: PDP discovery: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
-			"Authorization service unreachable; denying (fail-closed).", nil)
+			"Authorization service unavailable; denying (fail-closed).", nil)
 	}
 	eps := layers.PDPs
 	if meta := discovery.ResourceMetadataOf(eps); meta != nil {
@@ -521,10 +641,10 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
-			"Authorization service unreachable; denying (fail-closed).", nil)
+			"Authorization service unavailable; denying (fail-closed).", nil)
 	}
 	if len(out.FailedOpen) > 0 {
-		log.Printf("[%s] %s %s FAILED OPEN past %v", pep, m.action, m.rid, out.FailedOpen)
+		log.Printf("[%s] %s %q FAILED OPEN past %v", pep, m.action, m.rid, out.FailedOpen)
 	}
 	decision, reason, stepUp, stepUpScope := out.Decision, out.Reason, out.StepUp, out.StepUpScope
 
@@ -536,14 +656,14 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		if doctype == "" {
 			doctype = "org.iso.18013.5.1.mDL"
 		}
-		log.Printf("[%s] 401 identity proofing required (%s) %s %s", pep, doctype, m.action, m.rid)
+		log.Printf("[%s] 401 identity proofing required (%q) %s %q", pep, doctype, m.action, m.rid)
 		return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
 			"error":   "identity_verification_required",
 			"doctype": doctype,
 			"pep":     pep,
 			"reason":  reason,
 		}, map[string]string{
-			"WWW-Authenticate": `Bearer error="identity_verification_required", doctype="` + doctype + `"`,
+			"WWW-Authenticate": `Bearer error="identity_verification_required", doctype=` + quoteParam(doctype),
 		})
 	}
 
@@ -555,51 +675,51 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		if scope == "" {
 			scope = conf.stepupScope
 		}
-		log.Printf("[%s] 401 step-up required (%s) %s %s", pep, scope, m.action, m.rid)
+		log.Printf("[%s] 401 step-up required (%q) %s %q", pep, scope, m.action, m.rid)
 		return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
 			"error":  "insufficient_scope",
 			"scope":  scope,
 			"pep":    pep,
 			"reason": reason,
 		}, map[string]string{
-			"WWW-Authenticate": `Bearer error="insufficient_scope", scope="` + scope + `"`,
+			"WWW-Authenticate": `Bearer error="insufficient_scope", scope=` + quoteParam(scope),
 		})
 	}
 
 	if !decision {
-		log.Printf("[%s] DENY %s %s: %s", pep, m.action, m.rid, reason)
+		log.Printf("[%s] DENY %s %q: %q", pep, m.action, m.rid, reason)
 		return denySimple(pep, typev3.StatusCode_Forbidden, codes.PermissionDenied, reason,
 			map[string]string{
 				"X-PDP-PEP":      pep,
 				"X-PDP-Decision": "DENY",
 				"X-PDP-Action":   m.action,
-				"X-PDP-Reason":   sanitizeHeader(reason),
+				"X-PDP-Reason":   reason,
 			})
 	}
 
-	log.Printf("[%s] PERMIT %s %s (principal=%s agent=%s)", pep, m.action, m.rid, sub, agent)
-	return permitWith(pep, m.action, reason, sub, act, scope, out.FailedOpen)
+	log.Printf("[%s] PERMIT %s %q (principal=%q agent=%q)", pep, m.action, m.rid, id.sub, agent)
+	return permitWith(pep, m.action, reason, id, out.FailedOpen)
 }
 
-// isToolsCall cheaply detects a tools/call JSON-RPC body.
-func isToolsCall(body string) bool {
-	if body == "" {
-		return false
+// quoteParam renders an auth-param value as an RFC 9110 quoted-string: backslash and
+// double quote are escaped, and control characters dropped, so a value the PDP chose
+// cannot close the parameter and append one of its own (resource_metadata, say, which
+// an MCP client would follow).
+func quoteParam(v string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range v {
+		switch {
+		case r == '"' || r == '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f:
+		default:
+			b.WriteRune(r)
+		}
 	}
-	var probe struct {
-		Method string `json:"method"`
-	}
-	return json.Unmarshal([]byte(body), &probe) == nil && probe.Method == "tools/call"
-}
-
-func toolCallName(body string) string {
-	var probe struct {
-		Params struct {
-			Name string `json:"name"`
-		} `json:"params"`
-	}
-	_ = json.Unmarshal([]byte(body), &probe)
-	return probe.Params.Name
+	b.WriteByte('"')
+	return b.String()
 }
 
 // extractToken parses Authorization: "DPoP <t>" or "Bearer <t>".
@@ -812,19 +932,21 @@ func mergePermit(acc, layer pepOutcome) pepOutcome {
 }
 
 // evaluateLayers asks each PDP in order; every layer must permit, the first that does
-// not is the answer. A PDP error fails closed unless the layer is fail-open, in which
-// case it is skipped and named; if every layer was skipped the request is permitted and
-// marked. A deny is never skipped. See the engine's twin.
+// not is the answer. A PDP failure fails closed; only an UNAVAILABLE PDP
+// (coaz.ErrPDPUnavailable) on a fail-open layer is skipped and named — a refusal never
+// is. If every layer was skipped the request is permitted and marked. A deny is never
+// skipped. See the engine's twin.
 func (s *server) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoints, authzenReq map[string]any, skipped []string) (pepOutcome, error) {
 	var out pepOutcome
 	decided := false
 	for _, ep := range eps {
 		o, err := s.evaluateAt(ctx, ep, authzenReq)
 		if err != nil {
-			if !ep.FailOpen {
+			if !ep.FailOpen || !errors.Is(err, coaz.ErrPDPUnavailable) {
 				return out, fmt.Errorf("%s: %w", ep.Identifier, err)
 			}
-			skipped = append(skipped, fmt.Sprintf("%s (%v)", ep.Identifier, err))
+			log.Printf("fail-open layer %s skipped: %v", ep.Identifier, err)
+			skipped = append(skipped, ep.Identifier)
 			continue
 		}
 		decided = true
@@ -833,10 +955,10 @@ func (s *server) evaluateLayers(ctx context.Context, eps []discovery.PDPEndpoint
 		}
 		out = mergePermit(out, o)
 	}
-	out.FailedOpen = skipped
+	out.FailedOpen = coaz.LayerNames(skipped)
 	if !decided {
 		out.Decision = true
-		out.Reason = "fail-open: no policy layer could be reached (" + strings.Join(skipped, "; ") + ")"
+		out.Reason = "fail-open: no policy layer could be reached (" + strings.Join(out.FailedOpen, ", ") + ")"
 	}
 	return out, nil
 }
@@ -853,10 +975,13 @@ func (s *server) evaluate(ctx context.Context, resource string, authzenReq map[s
 
 func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, authzenReq map[string]any) (pepOutcome, error) {
 	var out pepOutcome
-	payload, _ := json.Marshal(authzenReq)
+	payload, err := json.Marshal(authzenReq)
+	if err != nil {
+		return out, fmt.Errorf("PDP request could not be encoded: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.Evaluation, bytes.NewReader(payload))
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("PDP request could not be built: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if ep.APIKey != "" {
@@ -864,17 +989,18 @@ func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, auth
 	}
 	resp, err := s.httpc.Do(req)
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("%w: %v", coaz.ErrPDPUnavailable, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("%w: reading the answer: %v", coaz.ErrPDPUnavailable, err)
 	}
 	// AuthZEN answers 200 with a decision, permit or deny. Anything else is not a decision:
-	// a PDP that is down and says so in JSON must not be read as a deny.
+	// a PDP that is down and says so in JSON must not be read as a deny, and a PDP that
+	// refuses the request (a 4xx) must not be read as down.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return out, fmt.Errorf("PDP returned %d", resp.StatusCode)
+		return out, coaz.PDPStatusError(resp.StatusCode)
 	}
 	var data struct {
 		Decision bool `json:"decision"`

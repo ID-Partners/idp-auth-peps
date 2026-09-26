@@ -19,7 +19,8 @@ package main
 //	  "response": {                       // present when decision=false (or headers on permit)
 //	    "status": 200, "headers": {...}, "body": "<verbatim body to return>"
 //	  },
-//	  "upstream_headers": {...},          // headers to inject on permit (X-Auth-*)
+//	  "upstream_headers": {...},          // X-Auth-* to set on the upstream request on
+//	                                      // permit; an empty value means remove it
 //	  "response_headers": {...}           // headers to add to the response (X-PDP-*)
 //	}
 
@@ -53,8 +54,13 @@ type deniedResponse struct {
 	Body    string            `json:"body"`
 }
 
+// maxCheckRequestBytes bounds a check request: the relayed body plus the envelope. The
+// ext_authz path is bounded by the gateway's max_request_bytes; this one by us.
+const maxCheckRequestBytes = 1<<20 + 64<<10
+
 func (s *server) handleHTTPCheck(w http.ResponseWriter, r *http.Request) {
 	var req checkRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxCheckRequestBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid check request"}`, http.StatusBadRequest)
 		return
@@ -71,6 +77,9 @@ func (s *server) handleHTTPCheck(w http.ResponseWriter, r *http.Request) {
 	case *authv3.CheckResponse_OkResponse:
 		out.Decision = true
 		out.UpstreamHeaders = flattenHeaders(hr.OkResponse.GetHeaders())
+		for _, k := range hr.OkResponse.GetHeadersToRemove() {
+			out.UpstreamHeaders[k] = "" // the caller removes the client's copy
+		}
 		out.ResponseHeaders = flattenHeaders(hr.OkResponse.GetResponseHeadersToAdd())
 	case *authv3.CheckResponse_DeniedResponse:
 		out.Decision = false

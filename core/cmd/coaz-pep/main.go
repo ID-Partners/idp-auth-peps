@@ -166,18 +166,28 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		Issuer:   getenv("ACCESS_TOKEN_ISSUER"),
 		Audience: getenv("ACCESS_TOKEN_AUDIENCE"),
 	})
-	srv.userValidator = NewValidator(ValidatorConfig{
-		JWKSURL:  env("USER_TOKEN_JWKS_URL", getenv("ACCESS_TOKEN_JWKS_URL")),
-		Issuer:   env("USER_TOKEN_ISSUER", getenv("ACCESS_TOKEN_ISSUER")),
-		Audience: getenv("USER_TOKEN_AUDIENCE"),
-	})
+	// X-User-Token needs an audience as well as a key: the agent's own access token comes
+	// from the same issuer and verifies against the same JWKS, and without an audience it
+	// would pass as the user having logged in.
+	userJWKS, userAud := env("USER_TOKEN_JWKS_URL", getenv("ACCESS_TOKEN_JWKS_URL")), getenv("USER_TOKEN_AUDIENCE")
+	switch {
+	case userJWKS != "" && userAud != "":
+		srv.userValidator = NewValidator(ValidatorConfig{
+			JWKSURL:  userJWKS,
+			Issuer:   env("USER_TOKEN_ISSUER", getenv("ACCESS_TOKEN_ISSUER")),
+			Audience: userAud,
+		})
+	case userJWKS != "":
+		log.Printf("WARNING: USER_TOKEN_AUDIENCE is unset — X-User-Token is IGNORED, so require_user_login " +
+			"routes deny. Set it to the audience the user's own login token carries.")
+	default:
+		srv.decodeUserTokens = true
+		log.Printf("WARNING: no JWKS configured for X-User-Token — it is DECODED, NOT VERIFIED. " +
+			"Its claims drive the step-up and consent gates, so a forged one bypasses them.")
+	}
 	if srv.accessValidator == nil {
 		log.Printf("WARNING: ACCESS_TOKEN_JWKS_URL is unset — access tokens are DECODED, " +
 			"NOT VERIFIED. The COAZ-MCP binding requires validation before claims are used.")
-	}
-	if srv.userValidator == nil {
-		log.Printf("WARNING: no JWKS configured for X-User-Token — it is DECODED, NOT VERIFIED. " +
-			"Its claims drive the step-up and consent gates, so a forged one bypasses them.")
 	}
 
 	mux := http.NewServeMux()
