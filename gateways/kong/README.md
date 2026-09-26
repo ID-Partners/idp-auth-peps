@@ -74,9 +74,15 @@ or COAZ at all.
 The knobs sent: `style`, `require_token`, `require_dpop`, `require_user_login`,
 `stepup_scope`, `stepup_action`, `mcp_upstream_url`, `resource`, `pdp_layers`, `fail_mode`
 (always sent, so a route that says nothing is closed whatever `coaz-pep`'s own default),
-`forward_access_token`, `legacy_subject_identity`, `coaz_defaults` and `pep_label`. The
-route's own discovery fields (`pdp_discovery`, the allowlists, `authzen_url`) play no part:
-`coaz-pep` discovers under its own settings.
+`forward_access_token`, `legacy_subject_identity`, `coaz_defaults`, `user_token_subject`
+and `pep_label`. The route's own discovery fields (`pdp_discovery`, the allowlists,
+`authzen_url`) play no part: `coaz-pep` discovers under its own settings.
+
+`user_token_subject` says whose `X-User-Token` counts. `principal`, the default, counts
+only the access token's own subject's login — customer B's consent never authorises
+customer A's payment. `pdp` also counts someone else's verified login, for a route where a
+staff member approves for a customer; the PDP receives `user_sub` and decides whether that
+person may. It needs `coaz_url`, since only `coaz-pep` reads the user's token.
 
 `coaz_api_key` is required with `coaz_url`: the check API relays a caller-supplied
 `Authorization` header, so it authenticates its callers (`CHECK_API_TOKEN`). `coaz-pep`

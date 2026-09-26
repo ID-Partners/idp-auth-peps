@@ -25,6 +25,9 @@ local function validate(config)
   if config.require_user_login == true and not delegated then
     return nil, "require_user_login needs coaz_url: this plugin cannot verify X-User-Token's signature, so the route is decided by coaz-pep"
   end
+  if config.user_token_subject == "pdp" and not delegated then
+    return nil, "user_token_subject=pdp needs coaz_url: X-User-Token is only read, and judged, by coaz-pep"
+  end
   -- What follows is a missing or weakened security setting. allow_insecure is the one
   -- explicit way past each, logged when the configuration loads.
   if config.allow_insecure == true then return true end
@@ -113,6 +116,11 @@ return {
           -- policy still reading the old field. Set false once policies read
           -- subject.id; the field is removed in a later release.
           { legacy_subject_identity = { type = "boolean", default = true } },
+          -- Whose X-User-Token counts, forwarded to coaz-pep: "principal" (the default)
+          -- counts only the access token's own subject's login; "pdp" also counts someone
+          -- else's — a staff member approving for a customer — and the PDP, which gets
+          -- user_sub, decides whether they may. Needs coaz_url.
+          { user_token_subject = { type = "string", default = "principal", one_of = { "principal", "pdp" } } },
           -- Without coaz_url, the route is decided here on the access token's claims,
           -- which this plugin does not verify. Set true when an openid-connect or jwt
           -- plugin on the route validates Authorization first (it runs before this one);

@@ -59,6 +59,12 @@ describe('the authzen-pdp schema', function()
     assert.is_true(field(config, 'coaz_defaults').default)
   end)
 
+  it('counts only the principal\'s own login unless a route says otherwise', function()
+    local f = field(config, 'user_token_subject')
+    assert.equal('principal', f.default)
+    assert.same({ 'principal', 'pdp' }, f.one_of)
+  end)
+
   it('refuses an MCP route, DPoP or a user login without coaz-pep to decide it', function()
     local base = { authzen_url = 'https://pdp', authzen_api_key = 'k', access_token_verified_upstream = true }
     local function with(over) local o = {}; for k, v in pairs(base) do o[k] = v end; for k, v in pairs(over) do o[k] = v end; return o end
@@ -66,6 +72,7 @@ describe('the authzen-pdp schema', function()
       { { style = 'mcp' }, 'style=mcp needs coaz_url' },
       { { require_dpop = true }, 'require_dpop needs coaz_url' },
       { { require_user_login = true }, 'require_user_login needs coaz_url' },
+      { { user_token_subject = 'pdp' }, 'user_token_subject=pdp needs coaz_url' },
     }) do
       local ok, err = check(with(case[1]))
       assert.is_nil(ok)

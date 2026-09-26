@@ -160,6 +160,7 @@ kong:
       <tr><td><code>allow_insecure</code></td><td class="d">boolean · false</td><td>The one way past the refusals below that are about missing security: unverified claims, no <code>coaz_api_key</code>, no <code>pdp_allowlist</code>, plain-http discovery, TLS verification off. For development and demos. Kong logs what it relaxes, per route, when the configuration loads.</td></tr>
       <tr><td><code>protocols</code></td><td class="d">http, https, grpc, grpcs</td><td>Kong's own field: which protocols the plugin runs on.</td></tr>
       <tr><td><code>legacy_subject_identity</code></td><td class="d">boolean · true</td><td>Also send the non-standard <code>subject.identity</code> beside AuthZEN's <code>subject.id</code>, so upgrading the gateway alone cannot break a policy still reading the old field. Set false once policies read <code>subject.id</code>.</td></tr>
+      <tr><td><code>user_token_subject</code></td><td class="d">principal | pdp · principal</td><td>Whose <code>X-User-Token</code> counts, applied by coaz-pep. <code>principal</code> counts only the access token's own subject's login. <code>pdp</code> also counts someone else's verified login — a staff member approving for a customer — and the PDP, which receives <code>user_sub</code>, decides whether they may. Needs <code>coaz_url</code>.</td></tr>
     </tbody>
   </table></div>
 

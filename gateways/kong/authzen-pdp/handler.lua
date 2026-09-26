@@ -197,6 +197,7 @@ local function check_config(conf, pep)
     -- Default mappings are on: only an explicit false opts out.
     coaz_defaults = conf.coaz_defaults == false and "false" or "true",
     legacy_subject_identity = conf.legacy_subject_identity == false and "false" or "true",
+    user_token_subject = conf.user_token_subject == "pdp" and "pdp" or "principal",
     -- coaz-pep runs its own PDP discovery (federation included); an explicit resource is
     -- passed so both PEPs key off the same identifier.
     resource = set(conf.resource) and (conf.resource:gsub("/+$", "")) or nil,

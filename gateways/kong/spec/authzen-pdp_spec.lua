@@ -651,6 +651,11 @@ describe('an MCP route: every request goes to coaz-pep', function()
     -- Only an explicit false opts out of the default mappings.
     local _, calls2 = mcp('POST', TOOLS_CALL, { coaz_defaults = false })
     assert.equal('false', checks(calls2)[1].config.coaz_defaults)
+    -- Whose X-User-Token counts is coaz-pep's to apply: the principal's own, unless the
+    -- route lets the PDP judge an approver's.
+    assert.equal('principal', sent.config.user_token_subject)
+    local _, calls3 = mcp('POST', TOOLS_CALL, { user_token_subject = 'pdp' })
+    assert.equal('pdp', checks(calls3)[1].config.user_token_subject)
   end)
 
   it('applies the engine\'s upstream headers on a permit, an empty value clearing one', function()
