@@ -38,9 +38,9 @@ KONG_LUA_PACKAGE_PATH=/opt/?.lua;;
 ```
 
 Mount `authzen-pdp/` at `/opt/kong/plugins/authzen-pdp/` (the module path Kong looks for
-is `kong.plugins.authzen-pdp.handler`). Or install the rock,
-`kong-plugin-authzen-pdp-0.4.0-1.rockspec`, built from the `v0.4.0` tag; it also carries
-the `discovery` and `contract` modules `sideband-pdp` requires.
+is `kong.plugins.authzen-pdp.handler`). Or install the rock from the `v0.4.0` release,
+`luarocks install kong-plugin-authzen-pdp-0.4.0-1.all.rock` - the plugin alone, nothing
+fetched. It also carries the `discovery` and `contract` modules `sideband-pdp` requires.
 
 ## How a route is decided
 

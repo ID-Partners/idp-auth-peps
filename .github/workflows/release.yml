@@ -109,23 +109,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Pack both rocks from the tag
-        # Source rocks built from the tag: the rockspecs' module paths are repo-relative.
-        # authzen-pdp first, because sideband-pdp depends on it — install them in that
-        # order too. Packing clones the rockspec's source tag, so the packed copy names
-        # the tag being released: the same tag for a release, the candidate's for a
-        # candidate, since the release tag does not exist yet.
+      - name: Build both rocks from the tag
+        # Pure-Lua .all.rock files, the way Kong packages a plugin: built with luarocks
+        # make from the checkout (the rockspecs' module paths are repo-relative) and
+        # packed from what that installed, so a rock holds the plugin and nothing else of
+        # the repository, and installs without fetching anything. authzen-pdp first,
+        # because sideband-pdp depends on it: install them in that order too. The
+        # rockspecs attached, and the ones inside the rocks, name the tag being released
+        # - the candidate's own for a candidate, since the release tag does not exist yet.
         run: |
           sudo apt-get update && sudo apt-get install -y lua5.4 luarocks lua-sec
           base="${{ needs.versions.outputs.base }}"
           mkdir -p dist
           for p in authzen-pdp sideband-pdp; do
-            spec="gateways/kong/$p/kong-plugin-$p-$base-1.rockspec"
-            cp "$spec" dist/
-            sed -i "s/^  tag = \"v[^\"]*\",$/  tag = \"$GITHUB_REF_NAME\",/" "dist/$(basename "$spec")"
-            grep -q "^  tag = \"$GITHUB_REF_NAME\",$" "dist/$(basename "$spec")"
-            luarocks --lua-version=5.4 lint "dist/$(basename "$spec")"
-            (cd dist && luarocks --lua-version=5.4 pack "$(basename "$spec")")
+            spec="dist/kong-plugin-$p-$base-1.rockspec"
+            sed "s/^  tag = \"v[^\"]*\",$/  tag = \"$GITHUB_REF_NAME\",/" "gateways/kong/$p/${spec#dist/}" > "$spec"
+            grep -q "^  tag = \"$GITHUB_REF_NAME\",$" "$spec"
+            luarocks --lua-version=5.4 lint "$spec"
+            luarocks --lua-version=5.4 --tree "$PWD/rocktree" make --deps-mode=one "$spec"
+            (cd dist && luarocks --lua-version=5.4 --tree "$PWD/../rocktree" pack "kong-plugin-$p" "$base-1")
           done
           ls -l dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -193,10 +195,16 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The release carries the rocks and the jar, by name: a run also holds artifacts
+      # that are not the product, such as the Docker build record.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: kong
           path: assets
-          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pingaccess
+          path: assets
       - name: Notes from CHANGELOG.md, assets attached
         env:
           GH_TOKEN: ${{ github.token }}

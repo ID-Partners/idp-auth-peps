@@ -47,7 +47,7 @@
   <p class="lede"><code>authzen-pdp</code> is a Kong plugin that authorises every request against an AuthZEN PDP. With <code>coaz_url</code> set, <a href="coaz-pep.html">coaz-pep</a> decides the whole request — it verifies the access token, <code>X-User-Token</code> and the DPoP proof, maps the request, finds the PDPs and asks them — and the plugin enforces the answer; every MCP route works this way, after the plugin has parsed its JSON-RPC strictly. Without it, a REST route is decided in Lua, on claims an auth plugin in front has verified: request mapping, RFC 9470 step-up challenges, and RFC 9728 and AuthZEN metadata discovery. Every knob is plugin configuration on a route or service, and Kong Manager shows it. Version 0.4.0; Kong Gateway 3.4 or later, 3.9 or later recommended.</p>
 
   <h2 id="install">Install</h2>
-  <p>DB-less: mount the plugin directory and tell Kong about it. The module path Kong looks for is <code>kong.plugins.authzen-pdp.handler</code>. Or install the rock, <code>kong-plugin-authzen-pdp-0.4.0-1</code>, built from the <code>v0.4.0</code> tag.</p>
+  <p>DB-less: mount the plugin directory and tell Kong about it. The module path Kong looks for is <code>kong.plugins.authzen-pdp.handler</code>. Or install the rock the <code>v0.4.0</code> release carries: <code>luarocks install kong-plugin-authzen-pdp-0.4.0-1.all.rock</code>.</p>
   <pre><code><span class="c"># kong.conf, or environment</span>
 KONG_PLUGINS=bundled,authzen-pdp
 KONG_LUA_PACKAGE_PATH=/opt/?.lua;;</code></pre>

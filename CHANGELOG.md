@@ -159,6 +159,8 @@ These change behaviour on purpose. Each is a secure default with an explicit way
 
 - Images: distroless, non-root, pinned by digest, signed with cosign, with an SBOM and
   build provenance, for amd64 and arm64.
+- Kong rocks as `.all.rock` files: the plugin alone, installed with `luarocks install`
+  and nothing fetched.
 - CI: read-only permissions, SHA-pinned actions, the race detector, govulncheck,
   `npm audit`, both Kong plugins parsed, Java 17 and 21, an image boot check and the
   demo walkthrough end to end. Dependabot for every ecosystem.
