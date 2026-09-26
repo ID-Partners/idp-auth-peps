@@ -95,7 +95,7 @@ kong:
   <div class="wide"><table>
     <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>authzen_url</code> <span class="req">required · ref</span></td><td class="d">string</td><td>The static PDP's base URL. With discovery off the AuthZEN default paths are appended; with it, the fallback every mode ends at, and the one PDP that receives the key. Its origin is always permitted, even over http. Plays no part when <code>coaz_url</code> is set.</td></tr>
+      <tr><td><code>authzen_url</code> <span class="req">required · ref</span></td><td class="d">string</td><td>The static PDP's base URL. With discovery off the AuthZEN default paths are appended; with it, the PDP for a resource that publishes nothing, and the one PDP that receives the key. Its origin is always permitted, even over http. Plays no part when <code>coaz_url</code> is set.</td></tr>
       <tr><td><code>authzen_api_key</code> <span class="req">required · ref · enc</span></td><td class="d">string</td><td>Sent as <code>Authorization: Bearer</code> to <code>authzen_url</code> only. A discovered PDP never receives it.</td></tr>
       <tr><td><code>pdp_ssl_verify</code></td><td class="d">boolean · true</td><td>TLS verification on PDP and coaz-pep calls. A PEP that accepts any certificate has no integrity on the decision it enforces. Off needs <code>allow_insecure</code>; trust a private certificate with <code>lua_ssl_trusted_certificate</code> instead.</td></tr>
     </tbody>
@@ -137,7 +137,7 @@ kong:
     <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>pdp_discovery</code></td><td class="d">off | authzen | resource · off</td><td><code>off</code>: the static PDP, default paths, no fetch. <code>authzen</code>: read <code>authzen_url</code>'s <code>/.well-known/authzen-configuration</code>. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code>, then that PDP's metadata, falling back to <code>authzen_url</code> when the resource publishes nothing. No <code>federation</code> mode: a trust chain cannot be validated without a JOSE verifier; a route that must take the federation's word belongs behind coaz-pep.</td></tr>
-      <tr><td><code>pdp_metadata_ttl</code></td><td class="d">number · 300</td><td>Cache TTL, seconds, for resource and PDP metadata. A fetch that fails serves the last good document; with none, the layer is unavailable and its rule decides, and the failure is retried after 30 seconds. A 404 means no metadata: the static PDP, or the default paths.</td></tr>
+      <tr><td><code>pdp_metadata_ttl</code></td><td class="d">number · 300</td><td>Cache TTL, seconds, for resource and PDP metadata. A fetch that fails, or a document that does not validate, serves the last good document for up to one more TTL; after that, or with none, the layer is unavailable and its rule decides, and the failure is retried after 30 seconds. A 404 means no metadata: the static PDP, or the default paths.</td></tr>
       <tr><td><code>pdp_allowlist</code></td><td class="d">array of string</td><td>Prefixes a discovered PDP, and every endpoint its metadata advertises, must match; <code>authzen_url</code> is always permitted. <b>Required with discovery on</b>. An entry may carry a path (a tenant's PDP); the PDP's own well-known document is still fetched on its origin.</td></tr>
       <tr><td><code>resource_metadata_allowlist</code></td><td class="d">array of string</td><td>Prefixes a route's <code>resource</code> must match before its metadata is fetched. Empty means any. An entry may carry a path.</td></tr>
       <tr><td><code>pdp_discovery_insecure</code></td><td class="d">boolean · false</td><td>Allow http for discovered URLs. Dev only, and needs <code>allow_insecure</code>; <code>authzen_url</code>'s own origin is always trusted over http.</td></tr>
@@ -196,7 +196,7 @@ services:
           claims_to_verify: ["exp"]
       - name: authzen-pdp
         config:
-          authzen_url:     "{vault://env/authzen-url}"        <span class="c"># always the fallback, always permitted</span>
+          authzen_url:     "{vault://env/authzen-url}"        <span class="c"># the static PDP, always permitted</span>
           authzen_api_key: "{vault://env/authzen-api-key}"
           pep_label: "PEP#2 (Bank API edge)"
           style: rest
@@ -312,7 +312,7 @@ services:
     <li>With <code>coaz_url</code> set, coaz-pep decides the whole request, REST routes included, and the route's own discovery settings no longer apply there.</li>
     <li>Without <code>coaz_url</code>, set <code>access_token_verified_upstream</code> (with an <code>openid-connect</code> or <code>jwt</code> plugin in front) or <code>allow_insecure</code>. <code>X-User-Token</code> is no longer read there, so <code>context.user_scope</code> is no longer sent.</li>
     <li><code>coaz_url</code> needs <code>coaz_api_key</code>; discovery needs <code>pdp_allowlist</code>; the weakening flags need <code>allow_insecure</code>.</li>
-    <li>A 3xx or 4xx from a PDP is a refusal, closed even on a fail-open layer; a metadata outage serves the last good document, then fails the layer under its rule.</li>
+    <li>A 3xx or 4xx from a PDP is a refusal, closed even on a fail-open layer; a metadata outage serves the last good document for up to one more TTL, then fails the layer under its rule.</li>
     <li>REST patterns are anchored to the routed path, and an unreadable payment or account body is refused.</li>
     <li><code>X-PDP-Fail-Open</code> names identifiers only.</li>
     <li>The rock is <code>kong-plugin-authzen-pdp-0.4.0-1</code>, from the <code>v0.4.0</code> tag.</li>

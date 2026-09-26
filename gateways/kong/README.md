@@ -253,7 +253,7 @@ so it is never mistaken for a verified chain; see
 
 ```yaml
 config:
-  authzen_url: "{vault://env/authzen-url}"        # always the fallback, always permitted
+  authzen_url: "{vault://env/authzen-url}"        # the static PDP, always permitted
   pdp_discovery: resource
   resource: https://api.bank.example              # RFC 8707 identifier
   pdp_allowlist: ["https://pdp.bank.example"]     # required with discovery on
@@ -267,8 +267,9 @@ prefix — and the identifier's own well-known document is still fetched on its 
 the endpoints a PDP's metadata advertises must fall inside the allowlist too.
 
 Metadata is cached per identifier. A fetch that fails — no answer, a 5xx, a redirect, a
-body that is missing or too large — serves the last good document; with none cached, the
-layer is unavailable and its failure rule decides, and the failure is not retried for 30
+body that is missing or too large — or a document that does not validate serves the last
+good document for up to one more TTL; after that, or with none cached, the layer is
+unavailable and its failure rule decides, and the failure is not retried for 30
 seconds. A 404 is different: the resource publishes nothing, or the PDP has no metadata,
 and the static PDP or the default paths are what the design says. An outage used to be
 read as a 404, which cached the default endpoints for a whole TTL, or fell to the static
@@ -411,8 +412,9 @@ verifier or CEL evaluator in Lua.
 - **`coaz_url` needs `coaz_api_key`**; **discovery needs `pdp_allowlist`**;
   `pdp_discovery_insecure` and `pdp_ssl_verify: false` need `allow_insecure`.
 - **A 3xx or 4xx from a PDP is a refusal**, closed even on a fail-open layer.
-- **A PDP-metadata or resource-metadata outage** serves the last good document, then fails
-  the layer under its rule — never the defaults or the static PDP.
+- **A PDP-metadata or resource-metadata outage** serves the last good document for up to
+  one more TTL, then fails the layer under its rule — never the defaults or the static
+  PDP. So does a resource document that does not validate.
 - **REST patterns are anchored**, and a payment or account body that cannot be read is
   refused.
 - **`X-PDP-Fail-Open` names identifiers only**; the error detail is in the log.

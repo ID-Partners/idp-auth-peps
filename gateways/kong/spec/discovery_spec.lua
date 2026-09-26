@@ -285,15 +285,12 @@ describe('discovery: resource mode', function()
     assert.equal(0, count(hits, RES))
   end)
 
-  it('falls to the static PDP when the resource has no usable metadata', function()
+  it('falls to the static PDP when the resource publishes nothing', function()
     local cases = {
       ['404'] = 404,
       ['no parameter'] = { resource = RES },
-      ['echo mismatch'] = { resource = 'https://impostor.example', authzen_policy_decision_points = { GOOD } },
-      ['bad entries'] = { resource = RES, authzen_policy_decision_points = { 'not a url', 1 } },
-      ['entry with query'] = { resource = RES, authzen_policy_decision_points = { GOOD .. '/?x' } },
       ['empty list'] = { resource = RES, authzen_policy_decision_points = {} },
-      ['not JSON'] = '<html>',
+      ['parameter not a list'] = { resource = RES, authzen_policy_decision_points = GOOD },
     }
     for name, doc in pairs(cases) do
       local fn = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = doc }))
@@ -302,10 +299,58 @@ describe('discovery: resource mode', function()
       assert.equal(STATIC, ep.identifier, name)
       assert.equal('static-key', ep.api_key, name)
       assert.is_nil(ep.resource, name .. ': falling to static forwards no document')
+      assert.is_true(D._cache().resources[RES].ok, name .. ': an answer, cached like any other')
+    end
+  end)
+
+  it('fails the layer on a document that does not validate, rather than fall to the static PDP', function()
+    local cases = {
+      ['echo mismatch'] = { resource = 'https://impostor.example', authzen_policy_decision_points = { GOOD } },
+      ['bad entries'] = { resource = RES, authzen_policy_decision_points = { 'not a url', 1 } },
+      ['entry with query'] = { resource = RES, authzen_policy_decision_points = { GOOD .. '/?x' } },
+      ['not JSON'] = '<html>',
+    }
+    for name, doc in pairs(cases) do
+      local fn, hits = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = doc }))
+      local D = load({ pdp = fn })
+      local ep, err = D.resolve(conf(), RES)
+      assert.is_nil(ep, name)
+      assert.equal('transient', err.kind, name)
+      assert.matches('unavailable and none is cached', err.msg, 1, true)
+      assert.is_falsy(D._cache().resources[RES].ok, name .. ': not cached as the answer')
+      assert.equal(0, count(hits, STATIC), name)
     end
     -- An identifier that cannot have metadata at all.
     local D = load({ pdp = router(routes()) })
-    assert.equal(STATIC, D.resolve(conf(), 'https://r.example/?x').identifier)
+    local ep, err = D.resolve(conf(), 'https://r.example/?x')
+    assert.is_nil(ep); assert.equal('transient', err.kind)
+  end)
+
+  it('serves the last good list for one more TTL, and no longer', function()
+    local r = routes()
+    local D, state = load({ pdp = router(r) })
+    local start = state.now
+    assert.equal(GOOD, D.resolve(conf(), RES).identifier)
+    r[RES .. '/.well-known/oauth-protected-resource'] = 503
+    state.now = start + 301
+    assert.equal(GOOD, D.resolve(conf(), RES).identifier, 'stale, past the TTL')
+    state.now = start + 599
+    assert.equal(GOOD, D.resolve(conf(), RES).identifier, 'stale, just inside one more TTL')
+    state.now = start + 600
+    local ep, err = D.resolve(conf(), RES)
+    assert.is_nil(ep)
+    assert.equal('transient', err.kind)
+    assert.is_falsy(D._cache().resources[RES].ok, 'the stale list is gone, not parked')
+    -- Its layer is unavailable: [static, resource] never quietly becomes [static].
+    local closed, cerr = D.resolve_layers(conf(), RES, { 'static', 'resource' })
+    assert.is_nil(closed); assert.matches('layer resource', cerr.msg, 1, true)
+    local open = D.resolve_layers(conf(), RES, { 'static', 'resource fail-open' })
+    assert.equal(1, #open.pdps); assert.equal(STATIC, open.pdps[1].identifier)
+    assert.same({ 'resource' }, open.skipped)
+    -- Recovery, once the retry window has passed.
+    r[RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } }
+    state.now = state.now + D.MIN_REFRESH + 1
+    assert.equal(GOOD, D.resolve(conf(), RES).identifier)
   end)
 
   it('fails the layer on a transient failure with nothing cached, rather than fall to the static PDP', function()
@@ -936,10 +981,12 @@ describe('discovery: published layers', function()
     assert.matches('published by%s+' .. RES:gsub('%p', '%%%0'), table.concat(state.logs, '\n'))
   end)
 
-  it('a document whose layers cannot be read is invalid, and the static PDP decides', function()
+  it('a document whose layers cannot be read is invalid, and its layer unavailable, never the static PDP\'s', function()
     local D = load({ pdp = router(routes({ [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD }, authzen_policy_layers = 'estate' } })) })
-    local r = D.resolve_layers(conf(), RES, nil)
-    assert.equal(1, #r.pdps); assert.equal(STATIC, r.pdps[1].identifier)
+    local r, err = D.resolve_layers(conf(), RES, nil)
+    assert.is_nil(r); assert.equal('transient', err.kind)
+    local open = D.resolve_layers(conf(), RES, { 'resource fail-open' })
+    assert.equal(0, #open.pdps); assert.same({ 'resource' }, open.skipped)
   end)
 end)
 

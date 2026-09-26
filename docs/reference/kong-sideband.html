@@ -78,7 +78,7 @@ kong:
   <div class="wide"><table>
     <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>service_url</code> <span class="req">required · ref</span></td><td class="d">string</td><td>PingAuthorize's base URL, without <code>/sideband…</code> in the path: <code>/sideband/request</code> and <code>/sideband/response</code> are appended. The static PDP. With discovery on, the fallback every mode ends at, and the one PDP that is called with <code>shared_secret</code>. Its origin is always permitted, even over http. Must be an http or https URL with a host, or a vault reference.</td></tr>
+      <tr><td><code>service_url</code> <span class="req">required · ref</span></td><td class="d">string</td><td>PingAuthorize's base URL, without <code>/sideband…</code> in the path: <code>/sideband/request</code> and <code>/sideband/response</code> are appended. The static PDP. With discovery on, the PDP for a resource that publishes nothing, and the one PDP that is called with <code>shared_secret</code>. Its origin is always permitted, even over http. Must be an http or https URL with a host, or a vault reference.</td></tr>
       <tr><td><code>shared_secret</code> <span class="req">required · ref · enc</span></td><td class="d">string</td><td>The Sideband API shared secret PingAuthorize expects from this PEP. Sent to <code>service_url</code> only; a discovered PDP is called with what <code>pdp_credentials</code> names for it, or with nothing.</td></tr>
       <tr><td><code>secret_header_name</code> <span class="req">required</span></td><td class="d">string</td><td>The header the secret travels in, as configured on the PingAuthorize Sideband API shared secret (commonly <code>CLIENT-TOKEN</code>). Also the default header for <code>pdp_credentials</code> entries.</td></tr>
       <tr><td><code>connection_timeout_ms</code></td><td class="d">integer · 10000</td><td>Timeout on each sideband call.</td></tr>
@@ -106,7 +106,7 @@ kong:
     <thead><tr><th>Field</th><th>Type · default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>pdp_discovery</code></td><td class="d">off | resource | federation-resolver · off</td><td><code>off</code>: <code>service_url</code>, no fetch. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code> (the PDP that decides for it; the first this route may call wins) and <code>authzen_policy_layers</code> (the PDPs to ask in front of it), falling back to <code>service_url</code> when the resource publishes nothing. <code>federation-resolver</code>: read the same two parameters from the resource's <em>resolved</em> <code>oauth_resource</code> metadata, from a federation resolve endpoint, and never from the resource's own document. No PDP metadata is probed in any mode: a sideband endpoint has none, and an identifier is the base its endpoints hang off.</td></tr>
-      <tr><td><code>pdp_metadata_ttl</code></td><td class="d">number · 300</td><td>Cache TTL, seconds, for resource and resolved metadata. A fetch that fails serves the last good answer; with none, the layer is unavailable and its rule decides. Must be greater than zero.</td></tr>
+      <tr><td><code>pdp_metadata_ttl</code></td><td class="d">number · 300</td><td>Cache TTL, seconds, for resource and resolved metadata. A fetch that fails, or an answer that does not validate, serves the last good answer for up to one more TTL, and never past a resolved answer's own <code>exp</code>; after that, or with none, the layer is unavailable and its rule decides. Must be greater than zero.</td></tr>
       <tr><td><code>pdp_allowlist</code></td><td class="d">array of string</td><td>Prefixes a discovered or configured PDP must match; <code>service_url</code> is always permitted. A published layer passes this too. <b>Required with discovery on</b>.</td></tr>
       <tr><td><code>resource_metadata_allowlist</code></td><td class="d">array of string</td><td>Prefixes a route's <code>resource</code> must match before its metadata is looked up, in either mode. Empty means any. An entry may carry a path.</td></tr>
       <tr><td><code>pdp_discovery_insecure</code></td><td class="d">boolean · false</td><td>Allow http for discovered URLs and the resolve endpoint. Dev only, and needs <code>allow_insecure</code>; <code>service_url</code>'s own origin is always trusted over http.</td></tr>
@@ -184,7 +184,7 @@ services:
     plugins:
       - name: sideband-pdp
         config:
-          service_url:        "{vault://env/paz-url}"          <span class="c"># the fallback; the one PDP called with shared_secret</span>
+          service_url:        "{vault://env/paz-url}"          <span class="c"># the static PDP; the one PDP called with shared_secret</span>
           shared_secret:      "{vault://env/paz-secret}"
           secret_header_name: CLIENT-TOKEN
           pep_label: "PEP#2 (Bank API edge)"

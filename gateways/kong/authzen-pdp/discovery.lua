@@ -5,7 +5,7 @@
 --   resource identifier (conf.resource, or mcp_upstream_url on an mcp route)
 --     ├─ federation-resolver: what a federation resolve endpoint resolves for it — the resolver's word
 --     ├─ resource:   {resource}/.well-known/oauth-protected-resource (RFC 9728) — self-asserted
---     └─ static:     conf.authzen_url                                          — the fallback
+--     └─ static:     conf.authzen_url                  — when the resource publishes nothing
 --   PDP identifier
 --     ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9)
 --     └─ 404 -> {pdp}/access/v1/evaluation, the spec's default paths
@@ -29,6 +29,10 @@
 --
 -- Two rules are never relaxed: a URL outside an allowlist fails closed rather than
 -- falling to a weaker source, and a discovered PDP never receives the static API key.
+-- And the static PDP is where a resource that publishes nothing lands (a 404, a document
+-- naming no PDP, a subject the resolver does not know), not where an outage or a document
+-- that does not validate lands: those serve the last good answer for up to one more TTL,
+-- and then the layer is unavailable and fails by its mode.
 
 local http = require "resty.http"
 local contract = require "kong.plugins.authzen-pdp.contract"
@@ -149,9 +153,10 @@ end
 -- Per worker, keyed by identifier: the documents are public, so no credential in the
 -- key. Serves the last good value while a refresh fails — an outage is not a reason to
 -- trust something else — throttles retries, and negatively caches a transient failure
--- so a down resource does not put a fetch in every request's path. Two things end the
--- stale value instead: a refusal (the resolver now says the chain is invalid, say), and
--- the value's own expiry (a resolve response's exp), past which it is never served.
+-- so a down resource does not put a fetch in every request's path. Three things end the
+-- stale value: a refusal (the resolver now says the chain is invalid, say), the value's
+-- own expiry (a resolve response's exp), and one whole TTL past its own of failed
+-- refreshes. Past any of them it is never served, and the layer is unavailable.
 
 local caches = { resources = {}, federation = {}, pdps = {} }
 
@@ -164,8 +169,8 @@ local function cache_get(store, key, ttl, negative_ttl, fetch)
   local e = store[key]
   if not e then e = {}; store[key] = e end
   local t = now()
-  if e.ok and e.hard_expiry and t >= e.hard_expiry then
-    e.ok, e.val, e.hard_expiry = false, nil, nil
+  if e.ok and ((e.hard_expiry and t >= e.hard_expiry) or (e.stale_until and t >= e.stale_until)) then
+    e.ok, e.val, e.hard_expiry, e.stale_until = false, nil, nil, nil
   end
   if e.ok and t < e.expires then return e.val end
   if not e.ok and e.err and e.neg_until and t < e.neg_until then return nil, e.err end
@@ -185,6 +190,7 @@ local function cache_get(store, key, ttl, negative_ttl, fetch)
     return nil, err
   end
   e.val, e.ok, e.expires, e.err, e.neg_until = val, true, t + ttl, nil, nil
+  e.stale_until = t + 2 * ttl
   e.hard_expiry = type(val) == "table" and tonumber(val.expires_at) or nil
   return val
 end
@@ -609,19 +615,21 @@ function D.resolve(conf, resource, opts)
       if mode == D.RESOLVER then found, perr = federation_lookup(resource, o)
       else found, perr = rfc9728_lookup(resource, o) end
       if found then return found end
-      if perr.kind == NOT_ALLOWED or perr.kind == TRANSIENT then return nil, perr end
-      if perr.kind == INVALID then kong.log.warn("pdp discovery: ", perr.msg) end
-      if o.static == "" then return nil, perr end
+      -- Only "publishes nothing" is an answer the static PDP takes. An outage or a
+      -- document that does not validate stays a failure, so the last good answer is
+      -- served or, with none, the layer fails under its own rule.
+      if perr.kind ~= NO_METADATA or o.static == "" then return nil, perr end
       return { pdps = { o.static } }
     end)
     if not meta then
       if err.kind == NOT_ALLOWED then return nil, err end
-      -- Unavailable with nothing cached: the layer fails under its own rule. Falling to
-      -- the static PDP would quietly drop whatever the resource puts in front of its own.
-      if err.kind == TRANSIENT then
-        return fail(TRANSIENT, "the metadata for " .. resource .. " is unavailable and none is cached: " .. err.msg)
+      if err.kind == NO_METADATA then
+        return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg)
       end
-      return fail(TRANSIENT, "no PDP could be resolved for " .. resource .. ": " .. err.msg)
+      -- Nothing cached to serve. Standing the static PDP in here would let whoever can
+      -- take a resource's metadata down choose its judge, and quietly drop whatever the
+      -- resource puts in front of its own.
+      return fail(TRANSIENT, "the metadata for " .. resource .. " is unavailable and none is cached: " .. err.msg)
     end
     candidates = meta.pdps
     if meta.document then from = { source = meta.source, document = meta.document, layers = meta.layers } end

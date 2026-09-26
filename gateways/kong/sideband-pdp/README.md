@@ -18,8 +18,8 @@ The sideband half is Ping's [`kong-plugin-ping-auth`](https://github.com/pingide
 by way of the ID Partners fork, and its seven configuration fields keep their names and
 defaults, so a `ping-auth` route ports over by changing the plugin name. What changed:
 
-- **Discovery.** `service_url` was the only PDP; it is now the static one, the fallback,
-  and the one the configured secret is bound to. The PDPs actually asked come from the
+- **Discovery.** `service_url` was the only PDP; it is now the static one, for a
+  resource that publishes nothing, and the one the configured secret is bound to. The PDPs actually asked come from the
   resource's metadata or the federation's resolver, in layers.
 - **One request, several PDPs.** The request and response walks are generalised to an
   ordered list, each layer seeing the request as the previous one rewrote it, each with
@@ -70,7 +70,7 @@ plugins:
   - name: sideband-pdp
     route: bank-api
     config:
-      service_url:        "{vault://env/paz-url}"          # PingAuthorize, no /sideband in the path; the fallback
+      service_url:        "{vault://env/paz-url}"          # PingAuthorize, no /sideband in the path; the static PDP
       shared_secret:      "{vault://env/paz-secret}"       # bound to service_url alone
       secret_header_name: CLIENT-TOKEN
       pep_label: "PEP#2 (Bank API edge)"

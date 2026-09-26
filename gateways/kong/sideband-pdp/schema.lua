@@ -66,8 +66,8 @@ return {
         type = "record",
         fields = {
           -- The static PDP: PingAuthorize's base URL, without "/sideband..." in the path.
-          -- With discovery on, the fallback every mode ends at, and the one PDP that is
-          -- called with shared_secret.
+          -- With discovery on, the PDP for a resource that publishes nothing, and the one
+          -- PDP that is called with shared_secret.
           { service_url = { type = "string", required = true, referenceable = true } },
           -- The Sideband API shared secret PingAuthorize expects from this PEP, and the
           -- header it expects it in. Sent to service_url only: a discovered PDP is called
