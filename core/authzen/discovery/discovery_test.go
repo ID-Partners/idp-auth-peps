@@ -434,6 +434,9 @@ type miniFed struct {
 	leafStatus     int
 	leafNoResource bool
 	breakLeafSig   bool
+	// ssStatus, when set, is what the anchor's fetch endpoint answers about the leaf:
+	// 404 is the anchor no longer vouching for it.
+	ssStatus int
 }
 
 func newMiniFed(t *testing.T) *miniFed {
@@ -477,6 +480,10 @@ func newMiniFed(t *testing.T) *miniFed {
 	t.Cleanup(f.leaf.Close)
 	f.anchor = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/fetch" {
+			if f.ssStatus != 0 {
+				w.WriteHeader(f.ssStatus)
+				return
+			}
 			claims := map[string]any{
 				"iss": f.anchor.URL, "sub": f.leaf.URL, "iat": now - 10, "exp": now + 3600,
 				"jwks": map[string]any{"keys": []any{f.leafJWK}},

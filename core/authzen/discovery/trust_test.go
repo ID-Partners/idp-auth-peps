@@ -84,3 +84,25 @@ func TestACancelledRequestDoesNotPinTheResource(t *testing.T) {
 		t.Fatalf("a cancelled request must not decide for the next one: %+v %v", ep, err)
 	}
 }
+
+// P1 with a 404, through discovery: the anchor offboards the member. From the next
+// refresh the member is outside the federation — the operator's own PDP — rather than
+// decided for another MaxStale by a chain the anchor has withdrawn.
+func TestAnOffboardedMemberFallsToStatic(t *testing.T) {
+	good := newPDP(t, fullConfig)
+	static := newPDP(t, nil)
+	f := newMiniFed(t)
+	f.leafPDPs = []any{good.URL}
+	now := time.Now()
+	clock := func() time.Time { return now }
+	c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, TTL: time.Minute, Now: clock,
+		Federation: f.resolverAt(t, federation.Options{TTL: time.Minute, Now: clock})})
+	if ep, err := c.Resolve(ctx(), f.leaf.URL); err != nil || ep.Identifier != good.URL {
+		t.Fatalf("%+v %v", ep, err)
+	}
+	f.ssStatus = 404
+	now = now.Add(61 * time.Second) // past the TTL, well inside MaxStale
+	if ep, err := c.Resolve(ctx(), f.leaf.URL); err != nil || ep.Identifier != static.URL || ep.Resource != nil {
+		t.Fatalf("an offboarded member is not a member: %+v %v", ep, err)
+	}
+}

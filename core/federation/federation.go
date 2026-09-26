@@ -36,9 +36,13 @@ const (
 )
 
 var (
-	// ErrNotFederated: the entity publishes no Entity Configuration (404). The caller
-	// decides whether that is fine; the PEP falls back to its static PDP.
-	ErrNotFederated = errors.New("entity publishes no entity configuration")
+	// ErrNotFederated: the entity is not a member of any federation this resolver
+	// trusts. It publishes no Entity Configuration (404), or no superior it names
+	// vouches for it: every one asked answered 404, because it was never onboarded or
+	// has been offboarded. The caller decides whether that is fine; the PEP falls back
+	// to its static PDP. It replaces a cached chain at once — it is the federation's
+	// answer, not a failure to hear one.
+	ErrNotFederated = errors.New("entity is not a federation member")
 	// ErrInvalidChain is permanent: a statement failed validation, an invariant was
 	// broken, a constraint or a policy was violated. Never retried within NegativeTTL.
 	ErrInvalidChain = errors.New("trust chain invalid")
