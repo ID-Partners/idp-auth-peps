@@ -78,7 +78,8 @@
       <tr><td><code>forward_access_token</code></td><td>Hand the PDP the raw token as <code>context.access_token</code>. Only over a TLS, authenticated PDP connection.</td></tr>
       <tr><td><code>pdp_layers</code>, <code>fail_mode</code></td><td>The ordered PDPs to ask, every one of which must permit, and what a layer does when its PDP cannot be reached.</td></tr>
       <tr><td><code>federation_entity_url</code> / <code>FEDERATION_ENTITY_ID</code></td><td>Serve the resource's two well-known documents: coaz-pep holds the key; Kong and PingAccess relay from it.</td></tr>
-      <tr><td><code>coaz_defaults</code>, <code>legacy_subject_identity</code></td><td>Apply the COAZ binding's default mappings to undeclared methods; keep sending the pre-AuthZEN <code>subject.identity</code> field.</td></tr>
+      <tr><td><code>coaz_defaults</code>, <code>legacy_subject_identity</code></td><td>Decide every MCP method with the COAZ binding's default mappings where nothing is declared — on by default, <code>false</code> opts out; keep sending the pre-AuthZEN <code>subject.identity</code> field.</td></tr>
+      <tr><td><code>allow_insecure</code> / <code>PEP_ALLOW_INSECURE</code> / <code>allowInsecure</code></td><td>Start, or accept a configuration, despite missing security settings — logged every time. Every PEP refuses without it. Development and demos only.</td></tr>
     </tbody>
   </table>
   </div>

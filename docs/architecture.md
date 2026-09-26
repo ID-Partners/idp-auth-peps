@@ -90,13 +90,17 @@ when it is not.**
 
 - The Kong plugin can decode a JWT, map a REST request, render a challenge and fetch a
   JSON document. It cannot verify a signature (no JOSE library is available to a plugin)
-  or evaluate CEL. So it does the first list in Lua and delegates DPoP and COAZ tool calls
-  to `coaz-pep` over the HTTP check API.
+  or evaluate CEL. So with `coaz_url` set it hands the whole decision to `coaz-pep` over
+  the HTTP check API — REST routes included, and every request on an MCP route — and
+  `coaz-pep` verifies the tokens. Without `coaz_url` it decides natively, trusting the
+  access token only when the route declares an auth plugin validated it first, and never
+  reading `X-User-Token`.
 - The PingAccess rule makes the same split as Kong, in Java, with two additions its
   host makes safe: PingAccess validates the access token before any rule runs, so the
-  rule reads the identity the engine established rather than the token's own word; and
-  jose4j is on PingAccess's classpath, so `X-User-Token` is verified in-process when a
-  JWKS is configured. DPoP proofs and COAZ tool calls still go to `coaz-pep`.
+  rule reads the identity the engine established rather than the token's own word (and
+  a token it did not validate is a 401); and jose4j is on PingAccess's classpath, so
+  `X-User-Token` is verified in-process against a JWKS, and ignored without one. DPoP
+  proofs and every request on an MCP route go to `coaz-pep`.
 - The Node SDK can do more in-process, and does: a deliberately narrow CEL subset, so a
   mapping that needs more raises a mapping error rather than guessing. Anything past the
   subset is delegated, exactly as Kong does.
@@ -119,6 +123,14 @@ understanding: where a mapping sets `subject.id` from `$token.sub`, the PEP veri
 its resolved value equals that claim, so an MCP server cannot name a different subject.
 Deny and error semantics are JSON-RPC errors over HTTP 200, as the profile requires.
 
+Every message is decided, not only tool calls: a method with no declared mapping gets
+the binding's default one, and a method the binding does not know is denied. And every
+body is read one way or refused. A PEP that parses a body one way while the upstream
+parses it another has authorised nothing, so a batch, a truncated or encoded body, bytes
+after the object, and two member names a case-insensitive parser would treat as one are
+all refused before any PDP is asked. Kong, PingAccess and the SDK's delegate mode send
+every MCP request to `coaz-pep` for the same reason: one parser decides.
+
 ## Finding the PDP
 
 Until recently every PEP was *told* where the PDP is (`AUTHZEN_URL`) and assumed the
@@ -128,7 +140,7 @@ AuthZEN paths under it. Discovery replaces both assumptions with metadata:
 resource identifier (the route's `resource`; an MCP route's upstream URL)
   ├─ federation   resolved oauth_resource metadata from a Trust Chain     ← authoritative
   ├─ resource     {resource}/.well-known/oauth-protected-resource (RFC 9728) ← self-asserted
-  └─ static       AUTHZEN_URL                                             ← always the fallback
+  └─ static       AUTHZEN_URL          ← when the resource publishes nothing (404, or not a member)
 PDP identifier
   ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9, inserted after the host)
   └─ 404 → {pdp}/access/v1/evaluation, the spec's default paths
@@ -137,6 +149,13 @@ PDP identifier
 The endpoint names are always AuthZEN's own. What metadata tells a PEP is the *base* they
 hang off, and whether the PDP claims a batch endpoint at all — an identifier may carry a
 path, and a multi-tenant PDP is the ordinary reason it does.
+
+A 404 is an answer: the resource publishes nothing, so the static PDP decides. An outage
+is not an answer. Metadata that cannot be fetched, or does not validate, makes that layer
+*unavailable*: the last good copy is served for up to one more TTL
+(`PDP_METADATA_MAX_STALE`), never past its own expiry, and after that the layer fails
+closed unless it is marked fail-open. Falling quietly to the static PDP would let anyone
+who can take a resource's metadata down choose a different judge for it.
 
 No standard names a PDP from a protected resource: not RFC 9728, not AuthZEN 1.0, not the
 MCP profile, not OpenID Federation 1.0. So this repository mints one parameter and uses it
@@ -229,7 +248,7 @@ same request and the same context:
 | Layer | What it is |
 | --- | --- |
 | `static` | The configured PDP (`AUTHZEN_URL`), regardless of what discovery finds. The slot for an estate-wide PDP. |
-| `resource` | Whatever discovery resolves for the route's resource: federation, then RFC 9728, then static. The default, and the whole of today's behaviour when it is the only layer. |
+| `resource` | Whatever discovery resolves for the route's resource — the federation or RFC 9728, by mode, or the static PDP when the resource publishes nothing. The default, and the whole of today's behaviour when it is the only layer. |
 | a PDP identifier | An explicit PDP. Its metadata is read like any other. |
 
 Every layer must permit. The first that does not is the answer, advice and all, and the
@@ -290,8 +309,10 @@ What a document may and may not say:
   that is the operator's word about that PDP and it wins; otherwise the stricter of the
   two defaults.
 - **It cannot be read, it is not used.** An entry that is not a PDP identifier makes the
-  document invalid, and an invalid document takes the path it always took: the operator's
-  own PDP, logged.
+  document invalid, and an invalid document leaves the resource layer unavailable —
+  failing closed unless marked fail-open — rather than quietly handing the decision to
+  the operator's own PDP. In federation mode a vouched document the PEP cannot use is a
+  refusal.
 
 Where this earns its keep is the federation. An anchor or intermediate that wants its
 PDP in front of every member's writes a `metadata_policy` for `oauth_resource`:
@@ -334,13 +355,16 @@ for layers that do not:
 | a layer | `<layer> fail-open` / `<layer> fail-closed` — a suffix on the entry, in `PDP_LAYERS`, `pdp_layers`, the Kong array or the SDK's `layers` | This layer's own failure mode. It wins. |
 | the PEP | `PDP_FAIL_MODE` (service), `fail_mode` (route), Kong `fail_mode`, SDK `failMode` (client, middleware, guard, or per call) | The default for layers that say nothing. `closed` unless set. |
 
-Fail-open covers **availability** and nothing else: the PDP is unreachable, answers with
-an error, returns something that is not a decision, cannot be resolved at all, or is asked
-for a batch it advertises no endpoint for. A fail-open layer that fails is skipped and the
-remaining layers decide. If every layer was skipped the request is permitted, because that
+Fail-open covers **availability** and nothing else: the PDP is unreachable or times out,
+answers a 5xx or a 429, its metadata cannot be fetched, or it is asked for a batch it
+advertises no endpoint for. A PDP that answers a 3xx or 4xx, or with something that is
+not a decision, has *refused* — and a refusal fails closed on every layer, or a rotated
+key's 401, or a 413 a client provoked with an oversized argument, would switch an
+advisory layer off on demand. A fail-open layer that fails is skipped and the remaining
+layers decide. If every layer was skipped the request is permitted, because that
 is what the operator asked for, and the permit is marked: `X-PDP-Fail-Open` on the
-response names every layer that was skipped, the SDK's verdict carries `failedOpen`, and
-the PEP logs it. A permit that rests on fewer opinions than the policy asked for is always
+response names every layer that was skipped — by identifier, never the error, which is
+logged — the SDK's verdict carries `failedOpen`, and the PEP logs it. A permit that rests on fewer opinions than the policy asked for is always
 visible, never silent.
 
 Two things never fail open, whatever the setting says. A **deny** is a decision, not a
@@ -379,23 +403,29 @@ The split is deliberate, and it is the whole point:
   is self-asserted and says only which PDP the PEP is configured with; the
   `X-Resource-Metadata-Source` header says which it was.
 - **Both documents are signed with the same key.** The RFC 9728 document carries
-  `signed_metadata` (RFC 9728 §2.1) signed with the Federation Entity Key, so a consumer
-  that has resolved the chain can verify the plain document against the keys the
-  federation vouches for.
+  `signed_metadata` (RFC 9728 §2.1) signed with the Federation Entity Key, and a
+  `jwks_uri` — `/.well-known/oauth-protected-resource{path}/jwks.json`, served by the PEP —
+  so a consumer can verify the plain document. The signed claims are the metadata and
+  nothing a superior could turn into a token: JWT-registered claims are stripped, `iss`,
+  `iat` and a short `exp` are set by the PEP, and `metadata_source` says inside the
+  signature whether it is the federation's word or the PEP's own.
 
 Configuration is four variables on `coaz-pep` — `FEDERATION_ENTITY_ID`,
 `FEDERATION_ENTITY_KEY_FILE` (a private JWK; `FEDERATION_ENTITY_KEY_GENERATE=true` mints
 one on first start), `FEDERATION_AUTHORITY_HINTS`, and the trust anchors it already has
-for federation-mode discovery — plus a gateway route sending the two well-known paths to
-the PEP's HTTP port. Kong and PingAccess set `federation_entity_url` to that port
+for federation-mode discovery — plus a gateway route sending the well-known paths to the
+PEP's HTTP port. The key file is created so that two replicas on a shared volume cannot
+each mint their own. Kong and PingAccess set `federation_entity_url` to that port
 instead. The SDK has no chain resolver, so its document is self-asserted; put `coaz-pep`
 in front when the public document must be the controller's word.
 
 ### The rules that never relax
 
 - A URL outside an allowlist, or a chain that fails validation, **fails closed**. It never
-  falls through to a weaker source. Everything else degrades: a stale cache, then the
-  operator's own static PDP, and only when nothing is left is the request a 503.
+  falls through to a weaker source. Everything else degrades within bounds: the last good
+  metadata or chain for up to one more TTL, never past its own expiry, and after that the
+  layer is unavailable. The static PDP is where a resource that publishes nothing lands,
+  not where an outage lands.
 - A discovered PDP never receives the static API key. The key is bound to `AUTHZEN_URL`.
 - Fail-open covers outages only, and only where a layer or the PEP asked for it. A deny
   never opens, a refusal never opens, and a permit that skipped anything is marked.
@@ -405,9 +435,10 @@ in front when the public document must be the controller's word.
   controller says it; the PEP republishes it, and says which it is publishing.
 - A batch is never sent to a guessed path: a boxcar mapping needs the PDP to advertise
   `access_evaluations_endpoint`.
-- Metadata is cached per identifier with stale-while-failing, refresh throttling and
-  negative caching, so a metadata outage is not an authorisation outage and a down
-  resource does not put a fetch in every request's path.
+- Metadata is cached per identifier with bounded stale-while-failing, refresh throttling
+  and negative caching, so a metadata blip is not an authorisation outage and a down
+  resource does not put a fetch in every request's path. A refusal evicts: a chain the
+  anchor stops vouching for stops being honoured at the next refresh, not at restart.
 - Allowlists are re-applied on every call, not only when a document is fetched, because a
   cache is shared and a policy is per route.
 
@@ -426,10 +457,10 @@ PDP, and a different claim from a verified chain.
 - **A general REST-path-to-resource mapper in the SDK.** The Go and Kong PEPs carry one
   for a specific banking API, as a worked example. Guessing a resource from a URL is how
   a PEP authorises the wrong thing, so the SDK makes you write the mapping.
-- **Trust Marks, the federation resolve endpoint, historical keys, client authentication
-  at federation endpoints, and the PEP as a Federation Entity.** Chain resolution and
-  metadata policy are enough to answer "which PDP decides for this resource"; the rest is
-  a later phase if a deployment needs it.
+- **Trust Marks, a resolve endpoint of our own, historical keys and client authentication
+  at federation endpoints.** Chain resolution and metadata policy are enough to answer
+  "which PDP decides for this resource"; the rest is a later phase if a deployment needs
+  it.
 - **An AuthZEN entity type for the PDP.** No spec defines one. The PDP's own metadata is
   fetched directly and bound by its `policy_decision_point` echo; if the AuthZEN WG
   defines an entity type, the PDP-metadata step gains a federation branch symmetrical to

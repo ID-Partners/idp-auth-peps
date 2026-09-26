@@ -173,8 +173,8 @@ PDP identifier
 | --- | --- | --- |
 | `off` | nothing — static PDP, default paths, no HTTP | — |
 | `authzen` | `AUTHZEN_URL`'s `authzen-configuration` | default paths |
-| `resource` | the resource's RFC 9728 document, then the named PDP's metadata | static PDP |
-| `federation` | the resource's **resolved** `oauth_resource` metadata, then the named PDP's metadata | static PDP — never the resource's own document |
+| `resource` | the resource's RFC 9728 document, then the named PDP's metadata | static PDP when the resource publishes none (404) |
+| `federation` | the resource's **resolved** `oauth_resource` metadata, then the named PDP's metadata | static PDP when the resource is not a member — never the resource's own document |
 
 The parameter that names the PDP is not standardised anywhere (not in RFC 9728, AuthZEN
 1.0, the MCP profile, or OpenID Federation 1.0), so this PEP mints one and uses it in
@@ -196,10 +196,18 @@ federation operator can pin, per resource, which PDPs may decide for it:
   "subset_of": ["https://pdp.bank-a.example"], "essential": true } } }
 ```
 
-and a resource that names anything else has an **invalid** chain. The PEP then fails
-closed: an invalid chain, like a URL outside an allowlist, never falls through to a weaker
-source. Everything else degrades — stale cache, then the static PDP — and only when
-nothing is left is the request denied with a 503.
+and a resource the PEP cannot then use — its PDP list stripped to nothing, an entry it
+cannot read — is refused. An invalid chain, like a URL outside an allowlist, fails closed
+and never falls through to a weaker source.
+
+Everything else degrades within bounds. A 404 means the resource publishes nothing, and
+the static PDP decides. An outage or a document that does not validate is not a 404: the
+last good copy is served for up to one more TTL (`PDP_METADATA_MAX_STALE`) and never past
+its own expiry — a chain's expiry included — and after that the `resource` layer is
+unavailable, failing closed with a 503 unless it is marked fail-open. A refusal evicts,
+so a chain the anchor stops vouching for stops being honoured at the next refresh, not at
+restart. A PDP whose own metadata blips keeps its last good endpoints rather than
+reverting to the default paths.
 
 Two things a discovered PDP never gets: the static `AUTHZEN_API_KEY` (it is bound to
 `AUTHZEN_URL` alone), and a guessed batch path (a boxcar mapping needs the PDP to
