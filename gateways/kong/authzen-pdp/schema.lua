@@ -25,10 +25,31 @@ local function validate(config)
   if config.require_user_login == true and not delegated then
     return nil, "require_user_login needs coaz_url: this plugin cannot verify X-User-Token's signature, so the route is decided by coaz-pep"
   end
+  -- What follows is a missing or weakened security setting. allow_insecure is the one
+  -- explicit way past each, logged when the configuration loads.
+  if config.allow_insecure == true then return true end
+
   -- Decided here, the route reads the access token's claims without verifying its
   -- signature. That is safe only when something in front of it did.
-  if not delegated and config.access_token_verified_upstream ~= true and config.allow_insecure ~= true then
+  if not delegated and config.access_token_verified_upstream ~= true then
     return nil, "without coaz_url this plugin reads the access token's claims unverified: set access_token_verified_upstream when an openid-connect or jwt plugin validates Authorization first, or set coaz_url so coaz-pep verifies it"
+  end
+  -- coaz-pep's check API relays a caller-supplied Authorization header, so it
+  -- authenticates its callers (CHECK_API_TOKEN).
+  if delegated and not set(config.coaz_api_key) then
+    return nil, "coaz_url needs coaz_api_key: coaz-pep's check API authenticates its callers with CHECK_API_TOKEN"
+  end
+  -- An empty allowlist is any https PDP a resource names. With coaz_url set, discovery
+  -- is coaz-pep's, under its own PDP_ALLOWLIST.
+  if not delegated and (config.pdp_discovery or "off") ~= "off"
+    and not (type(config.pdp_allowlist) == "table" and #config.pdp_allowlist > 0) then
+    return nil, "pdp_discovery needs pdp_allowlist: without one, any https PDP a resource names would be asked"
+  end
+  if config.pdp_discovery_insecure == true then
+    return nil, "pdp_discovery_insecure needs allow_insecure: it lets a discovered URL be plain http"
+  end
+  if config.pdp_ssl_verify == false then
+    return nil, "pdp_ssl_verify=false needs allow_insecure: a PEP that accepts any certificate has no integrity on its decisions"
   end
   return true
 end
@@ -43,8 +64,9 @@ return {
           -- Base URL of the Go authzen-adapter (AuthZEN PDP in front of Ping Authorize).
           -- referenceable so it can be supplied via a {vault://env/...} reference.
           { authzen_url = { type = "string", required = true, referenceable = true } },
-          -- Bearer key the adapter expects (its API_KEY env var).
-          { authzen_api_key = { type = "string", required = true, referenceable = true } },
+          -- Bearer key the adapter expects (its API_KEY env var). Encrypted at rest where
+          -- Kong has a keyring; a vault reference keeps it out of the configuration.
+          { authzen_api_key = { type = "string", required = true, referenceable = true, encrypted = true } },
           -- Label shown in denials and the X-PDP-PEP response header, e.g. "PEP#2 (Bank API edge)".
           { pep_label = { type = "string", default = "kong-pep" } },
           -- Request-mapping style: "rest" (Resource Server) or "mcp" (MCP edge, which
@@ -70,14 +92,16 @@ return {
           -- plugin relays the resource's entity configuration and RFC 9728 document from
           -- it, since it cannot sign either itself.
           { federation_entity_url = { type = "string" } },
-          -- Shared secret for the engine's HTTP check API (its CHECK_API_TOKEN).
-          { coaz_api_key = { type = "string", referenceable = true } },
+          -- Shared secret for the engine's HTTP check API (its CHECK_API_TOKEN). Required
+          -- with coaz_url.
+          { coaz_api_key = { type = "string", referenceable = true, encrypted = true } },
           -- The MCP server whose tools/list declares the x-coaz-mapping
           -- objects (reached directly by the engine for discovery).
           { mcp_upstream_url = { type = "string" } },
           -- TLS verification on the PDP and engine calls. Defaults to ON: a PEP that
           -- silently accepts any certificate has no integrity on the decision it is
-          -- enforcing. Set false only for local development against self-signed certs.
+          -- enforcing. Off needs allow_insecure; against a self-signed PDP, trust its
+          -- certificate with lua_ssl_trusted_certificate instead.
           { pdp_ssl_verify = { type = "boolean", default = true } },
           -- Govern every MCP method by the COAZ-MCP binding's default mappings: tools
           -- that declare no mapping, and every method that is not a tools/call. On by
@@ -95,7 +119,8 @@ return {
           -- without it, or coaz_url, or allow_insecure, the configuration is refused.
           { access_token_verified_upstream = { type = "boolean", default = false } },
           -- The escape hatch: lets the route run with what would otherwise refuse it —
-          -- unverified claims. For development and demos only; logged when the
+          -- unverified claims, no pdp_allowlist, no coaz_api_key, plain-http discovery,
+          -- TLS verification off. For development and demos only; logged when the
           -- configuration loads.
           { allow_insecure = { type = "boolean", default = false } },
           -- The largest request body, in bytes, the plugin reads to authorise a request.
@@ -116,13 +141,13 @@ return {
           { resource = { type = "string" } },
           -- Cache TTL, seconds, for resource and PDP metadata.
           { pdp_metadata_ttl = { type = "number", default = 300, gt = 0 } },
-          -- Permitted discovered-PDP prefixes; authzen_url is always permitted.
-          -- Empty means any https PDP a resource names.
+          -- Permitted discovered-PDP prefixes; authzen_url is always permitted. Required
+          -- when pdp_discovery is on (empty would mean any https PDP a resource names).
           { pdp_allowlist = { type = "array", elements = { type = "string" } } },
           -- Permitted `resource` prefixes for metadata fetches. Empty means any.
           { resource_metadata_allowlist = { type = "array", elements = { type = "string" } } },
-          -- Allow http for discovered URLs (dev only; authzen_url's own origin is
-          -- always trusted over http).
+          -- Allow http for discovered URLs (dev only, and only with allow_insecure;
+          -- authzen_url's own origin is always trusted over http).
           { pdp_discovery_insecure = { type = "boolean", default = false } },
           -- Forward the raw access token to the PDP as context.access_token, so the
           -- PDP can examine it itself: verify the signature, read cnf, score the client.

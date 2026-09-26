@@ -138,6 +138,33 @@ local function ask(conf, ep, path, payload, classify)
   return classify(res, err, who, unencodable)
 end
 
+-- What allow_insecure lets a route run with, that the schema would otherwise refuse.
+local function relaxations(conf)
+  local out = {}
+  if (conf.pdp_discovery or "off") ~= "off"
+    and not (type(conf.pdp_allowlist) == "table" and #conf.pdp_allowlist > 0) then
+    out[#out + 1] = "any PDP a resource or the federation names may be asked (no pdp_allowlist)"
+  end
+  if conf.pdp_discovery_insecure == true then out[#out + 1] = "discovered URLs may be plain http" end
+  if conf.verify_service_certificate == false then out[#out + 1] = "TLS verification is off" end
+  if conf.pdp_discovery == "federation" and tostring(conf.federation_resolve_url or ""):lower():match("^http://") then
+    out[#out + 1] = "the federation resolver is plain http"
+  end
+  return out
+end
+
+-- Kong calls configure with every configuration of this plugin at worker start and on
+-- every change: where an escape hatch in use is said out loud.
+function SidebandPDP:configure(configs)
+  for _, conf in ipairs(configs or {}) do
+    if conf.allow_insecure == true then
+      local relaxed = relaxations(conf)
+      kong.log.warn("allow_insecure on route ", tostring(conf.pep_label), ": ",
+        #relaxed > 0 and table.concat(relaxed, "; ") or "nothing relaxed", " (development only)")
+    end
+  end
+end
+
 function SidebandPDP:access(conf)
   local c = kong.ctx.plugin
   c.pep = conf.pep_label or "kong-sideband-pep"

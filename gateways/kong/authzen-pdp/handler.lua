@@ -706,6 +706,36 @@ local function relay_well_known(conf, path)
   return kong.response.exit(res.status, res.body, { ["Content-Type"] = ct, ["Cache-Control"] = "no-cache" })
 end
 
+-- What allow_insecure lets a route run with, that the schema would otherwise refuse.
+local function relaxations(conf)
+  local out, delegated = {}, set(conf.coaz_url)
+  if not delegated and conf.access_token_verified_upstream ~= true then
+    out[#out + 1] = "access token claims are read unverified"
+  end
+  if delegated and not set(conf.coaz_api_key) then
+    out[#out + 1] = "coaz-pep is called without coaz_api_key"
+  end
+  if not delegated and (conf.pdp_discovery or "off") ~= "off"
+    and not (type(conf.pdp_allowlist) == "table" and #conf.pdp_allowlist > 0) then
+    out[#out + 1] = "any PDP a resource names may be asked (no pdp_allowlist)"
+  end
+  if conf.pdp_discovery_insecure == true then out[#out + 1] = "discovered URLs may be plain http" end
+  if conf.pdp_ssl_verify == false then out[#out + 1] = "TLS verification is off" end
+  return out
+end
+
+-- Kong calls configure with every configuration of this plugin at worker start and on
+-- every change: where an escape hatch in use is said out loud.
+function AuthzenPDP:configure(configs)
+  for _, conf in ipairs(configs or {}) do
+    if conf.allow_insecure == true then
+      local relaxed = relaxations(conf)
+      kong.log.warn("allow_insecure on route ", tostring(conf.pep_label), ": ",
+        #relaxed > 0 and table.concat(relaxed, "; ") or "nothing relaxed", " (development only)")
+    end
+  end
+end
+
 function AuthzenPDP:access(conf)
   local pep = conf.pep_label or "kong-pep"
 

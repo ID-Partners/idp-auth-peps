@@ -6,9 +6,56 @@
 -- credentials a discovered PDP is called with.
 local typedefs = require "kong.db.schema.typedefs"
 
+local function set(v) return type(v) == "string" and v ~= "" end
+
+-- A Kong vault reference ({vault://env/paz-url}): what a referenceable field holds when
+-- the validator sees it, dereferenced only when the plugin runs.
+local function reference(raw)
+  return type(raw) == "string" and raw:match("^{vault://.+}$") ~= nil
+end
+
+local function scheme_of(raw)
+  return tostring(raw or ""):lower():match("^(%a+)://[^/?#]+")
+end
+
 local function url_ok(raw)
-  local scheme, host = tostring(raw or ""):lower():match("^(%a+)://([^/?#]+)")
-  return (scheme == "http" or scheme == "https") and host ~= nil and host ~= ""
+  if reference(raw) then return true end
+  local scheme = scheme_of(raw)
+  return scheme == "http" or scheme == "https"
+end
+
+-- The cross-field rules. A missing or weakened security setting is a configuration
+-- error; allow_insecure is the one explicit way past it, logged when the configuration
+-- loads.
+local function validate(config)
+  if not url_ok(config.service_url) then
+    return nil, "service_url must be an http or https URL with a host"
+  end
+  local switch = config.pdp_discovery == "federation"
+  if switch and not set(config.federation_resolve_url) then
+    return nil, "pdp_discovery=federation needs federation_resolve_url: the resolve endpoint whose word is taken for the resource"
+  end
+  if switch and not set(config.federation_trust_anchor) then
+    return nil, "pdp_discovery=federation needs federation_trust_anchor: the anchor the resolver resolves under"
+  end
+  if config.allow_insecure == true then return true end
+
+  if (config.pdp_discovery or "off") ~= "off"
+    and not (type(config.pdp_allowlist) == "table" and #config.pdp_allowlist > 0) then
+    return nil, "pdp_discovery needs pdp_allowlist: without one, any https PDP a resource or the federation names would be asked"
+  end
+  if config.pdp_discovery_insecure == true then
+    return nil, "pdp_discovery_insecure needs allow_insecure: it lets a discovered URL be plain http"
+  end
+  if config.verify_service_certificate == false then
+    return nil, "verify_service_certificate=false needs allow_insecure: a PEP that accepts any certificate has no integrity on its decisions"
+  end
+  -- The resolver's answer is taken on transport, so the transport has to be worth
+  -- something.
+  if switch and not reference(config.federation_resolve_url) and scheme_of(config.federation_resolve_url) ~= "https" then
+    return nil, "pdp_discovery=federation needs an https federation_resolve_url: its answer is trusted on TLS alone"
+  end
+  return true
 end
 
 return {
@@ -25,12 +72,14 @@ return {
           -- The Sideband API shared secret PingAuthorize expects from this PEP, and the
           -- header it expects it in. Sent to service_url only: a discovered PDP is called
           -- with what pdp_credentials names for it, or with nothing.
-          { shared_secret = { type = "string", required = true, referenceable = true } },
+          { shared_secret = { type = "string", required = true, referenceable = true, encrypted = true } },
           { secret_header_name = { type = "string", required = true } },
           { connection_timeout_ms = { type = "integer", default = 10000, gt = 0 } },
           { connection_keepAlive_ms = { type = "integer", default = 60000, gt = 0 } },
           -- TLS verification on every sideband and metadata call. A PEP that accepts any
-          -- certificate has no integrity on the decision it enforces.
+          -- certificate has no integrity on the decision it enforces. Off needs
+          -- allow_insecure; PingAuthorize ships a self-signed certificate, which Kong is
+          -- told to trust with lua_ssl_trusted_certificate instead.
           { verify_service_certificate = { type = "boolean", default = true } },
           { enable_debug_logging = { type = "boolean", default = false } },
           -- Forward the client's TLS certificate, as a JWK with x5c, in
@@ -55,14 +104,19 @@ return {
           -- from. A route without one uses service_url.
           { resource = { type = "string" } },
           { pdp_metadata_ttl = { type = "number", default = 300, gt = 0 } },
-          -- Permitted discovered-PDP prefixes; service_url is always permitted. Empty
-          -- means any https PDP a resource, or the federation, names.
+          -- Permitted discovered-PDP prefixes; service_url is always permitted. Required
+          -- when pdp_discovery is on (empty would mean any https PDP a resource, or the
+          -- federation, names).
           { pdp_allowlist = { type = "array", elements = { type = "string" } } },
           -- Permitted `resource` prefixes for metadata lookups. Empty means any.
           { resource_metadata_allowlist = { type = "array", elements = { type = "string" } } },
-          -- Allow http for discovered URLs (dev only; service_url's own origin is always
-          -- trusted over http).
+          -- Allow http for discovered URLs (dev only, and only with allow_insecure;
+          -- service_url's own origin is always trusted over http).
           { pdp_discovery_insecure = { type = "boolean", default = false } },
+          -- The escape hatch: lets the route run without a pdp_allowlist, with plain-http
+          -- discovery or a plain-http resolver, or with TLS verification off. For
+          -- development and demos only; logged when the configuration loads.
+          { allow_insecure = { type = "boolean", default = false } },
           -- The switch to the federation: its resolve endpoint (OpenID Federation 1.0
           -- §8.3, usually the trust anchor's) and the trust anchor to resolve under. The
           -- resolver's answer is taken on transport — see the README for what that means.
@@ -86,28 +140,11 @@ return {
           -- name defaults to secret_header_name.
           { pdp_credentials = { type = "array", elements = { type = "record", fields = {
               { pdp = { type = "string", required = true } },
-              { shared_secret = { type = "string", required = true, referenceable = true } },
+              { shared_secret = { type = "string", required = true, referenceable = true, encrypted = true } },
               { secret_header_name = { type = "string" } },
           } } } },
         },
-        custom_validator = function(config)
-          if not url_ok(config.service_url) then
-            return nil, "service_url must be an http or https URL with a host"
-          end
-          return true
-        end,
-        entity_checks = {
-          { conditional = {
-              if_field = "pdp_discovery", if_match = { eq = "federation" },
-              then_field = "federation_resolve_url", then_match = { required = true },
-              then_err = "pdp_discovery=federation needs federation_resolve_url: the resolve endpoint whose word is taken for the resource",
-          } },
-          { conditional = {
-              if_field = "pdp_discovery", if_match = { eq = "federation" },
-              then_field = "federation_trust_anchor", then_match = { required = true },
-              then_err = "pdp_discovery=federation needs federation_trust_anchor: the anchor the resolver resolves under",
-          } },
-        },
+        custom_validator = validate,
       },
     },
   },
