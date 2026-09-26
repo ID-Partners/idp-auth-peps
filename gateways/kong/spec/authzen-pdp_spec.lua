@@ -835,6 +835,11 @@ describe('an MCP route refuses a body it cannot read in full or parse strictly',
   it('echoes the request id when it could be read', function()
     local _, _, _, id = refused('{"jsonrpc":"2.0","id":"req-9","method":"tools/call","params":{}}')
     assert.equal('req-9', id)
+    -- An id JSON cannot carry back out (1e999 decodes to infinity) is not echoed: Kong
+    -- would fail to encode the refusal and answer 500.
+    local status, _, _, big = refused('{"jsonrpc":"2.0","id":1e999,"method":"tools/call","params":{}}')
+    assert.equal(400, status)
+    assert.equal(mock.null, big)
   end)
 
   it('a body on anything but a POST is refused', function()
@@ -923,6 +928,18 @@ describe('claim handling and remaining denials', function()
     assert.is_truthy(state.exited)
     assert.equal(401, state.exited.status)
     assert.matches('no subject claim', state.exited.body.reason)
+  end)
+
+  it('joins a list-valued scope or acr, and reads a malformed one as absent rather than failing', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = token({ sub = 'alice', scope = { 'a', 'b' }, acr = { 'urn:x', { nested = true } } }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.is_nil(state.exited)
+    assert.equal('a b', state.upstream_headers['X-Auth-Scope'])
+    assert.is_nil(state.upstream_headers['X-Auth-Acr'])
   end)
 
   it('decodes an act claim that arrived as a JSON string', function()

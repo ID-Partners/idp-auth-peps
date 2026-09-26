@@ -151,7 +151,10 @@ local function mcp_body_refusal(body)
   if not contract.is_object(rpc) then
     return 400, -32600, "Invalid Request: the body is not a JSON-RPC object"
   end
+  -- The id is echoed in a refusal only when it can be: a string, or a finite number
+  -- (1e999 decodes to infinity, which no JSON encoder will write back).
   local id = rpc.id
+  if type(id) == "number" and (id ~= id or id == math.huge or id == -math.huge) then id = nil end
   if type(id) ~= "string" and type(id) ~= "number" then id = nil end
   local params = rpc.params
   if case_collision(rpc) or (contract.is_object(params) and case_collision(params)) then
@@ -270,7 +273,6 @@ local function delegate(conf, pep)
     end
   end
   if kind ~= "answer" then
-    c.decision = "DENY"
     if kind == "unavailable" then
       kong.log.err("coaz-pep unavailable (", detail, "); denying (fail-closed)")
       return deny(pep, 503, "Authorization service unavailable; denying (fail-closed).")
@@ -429,12 +431,6 @@ local function merge_permit(acc, layer)
   return out
 end
 
--- The claims of a token this plugin has not verified, read only because the
--- configuration says who did, or that nobody need have.
-local function trusted_claims(conf, token)
-  return token and jwt_claims(token) or {}
-end
-
 local function native(conf, pep)
   local c = kong.ctx.plugin
   c.pep = pep
@@ -465,24 +461,30 @@ local function native(conf, pep)
     return deny(pep, 401, "No access token presented to the gateway.")
   end
 
-  local claims = trusted_claims(conf, token)
+  -- Unverified here: read only because the configuration says who verified them (or,
+  -- with allow_insecure, that nobody need have).
+  local claims = token and jwt_claims(token) or {}
   local sub = contract.str(claims.sub)
   -- `act` (RFC 8693) may be a nested object (self-issued tokens) OR a JSON string
   -- (PingFederate's JWT ATM emits object-valued claims as strings) — handle both.
   local act_claim = claims.act
   if type(act_claim) == "string" then act_claim = cjson.decode(act_claim) end
   local act = contract.is_object(act_claim) and contract.str(act_claim.sub) or nil
-  local scope = claims.scope or claims.scp
-  if contract.is_array(scope) then scope = table.concat(scope, " ") end
-  scope = contract.str(scope)
+  -- A claim that is a string, or a list of strings joined by spaces; anything else is absent.
+  local function words(v)
+    if not contract.is_array(v) then return contract.str(v) end
+    for _, item in ipairs(v) do
+      if type(item) ~= "string" then return nil end
+    end
+    return table.concat(v, " ")
+  end
+  local scope = words(claims.scope or claims.scp)
   local client_id = contract.str(claims.client_id) or contract.str(claims.azp)
   -- The authentication context the AS asserted. Forwarded downstream so a resource server can
   -- decide "is this a staff channel?" from a CLAIM the OP made, instead of comparing the
   -- principal against a hardcoded username list (a self-registered user called `the approver` used to
   -- inherit staff authority over every customer that way).
-  local acr = claims.acr
-  if contract.is_array(acr) then acr = table.concat(acr, " ") end
-  acr = contract.str(acr)
+  local acr = words(claims.acr)
 
   if conf.require_token and not sub then
     return deny(pep, 401, "Access token missing or unreadable (no subject claim).")

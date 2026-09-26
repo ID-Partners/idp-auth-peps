@@ -507,6 +507,11 @@ function M.install(opts)
         if body ~= nil and type(body) ~= 'string' and type(body) ~= 'table' then
           error('body must be a nil, string or table', 2)
         end
+        -- Kong encodes a table body itself, and raises when it cannot.
+        if type(body) == 'table' then
+          local ok, err = pcall(json_encode, body)
+          if not ok then error('invalid body: ' .. tostring(err), 2) end
+        end
         for k, v in pairs(hdrs or {}) do check_header_value(k, v) end
         state.exited = { status = status, body = body, headers = hdrs }
         error({ __kong_exit = true }, 0) -- Kong's exit is non-local; unwind like it does
