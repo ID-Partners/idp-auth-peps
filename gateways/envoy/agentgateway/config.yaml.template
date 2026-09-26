@@ -36,9 +36,11 @@ binds:
           host: __EXTAUTHZ_HOST__
           failureMode: deny   # fail closed if the PEP extension is unreachable
           includeRequestBody:
-            # the PEP inspects JSON-RPC bodies (initialize handshake detection)
-            maxRequestBytes: 65536
-            allowPartialMessage: true
+            # The PEP decides every JSON-RPC message, so it must see the whole body: a
+            # truncated one would be judged on bytes the upstream never reads. A body
+            # over the limit is refused with a 413 instead.
+            maxRequestBytes: 1048576
+            allowPartialMessage: false
           protocol:
             grpc:
               context:
@@ -66,9 +68,10 @@ binds:
           host: __EXTAUTHZ_HOST__
           failureMode: deny
           includeRequestBody:
-            # the PEP inspects payment bodies (amount/accounts -> policy context)
-            maxRequestBytes: 65536
-            allowPartialMessage: true
+            # the PEP inspects payment bodies (amount/accounts -> policy context), so
+            # never a truncated one
+            maxRequestBytes: 1048576
+            allowPartialMessage: false
           protocol:
             grpc:
               context:

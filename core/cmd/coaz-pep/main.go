@@ -84,6 +84,9 @@ import (
 	"github.com/ID-Partners/idp-auth-peps/core/federation"
 )
 
+// version is set at build time (-ldflags "-X main.version=…").
+var version = "dev"
+
 // buildServer assembles the server, HTTP mux and http.Server from the environment.
 // All of the decision-bearing wiring lives here — validator config, the SSRF guards,
 // the check-token — so it is unit-testable; main() is left as the thin listen/serve
@@ -494,22 +497,27 @@ func loadOrGenerateKey(path string, generate bool) (crypto.Signer, error) {
 // grpcServerOptions and run, which are tested. Keep this function trivial.
 func main() {
 	setupLogging(os.Getenv("LOG_FORMAT"))
+	fatal := func(msg string, err error) {
+		slog.Error(msg, "error", err)
+		os.Exit(1)
+	}
+	log.Printf("coaz-pep %s", version)
 	srv, httpSrv, grpcPort, err := buildServer(os.Getenv)
 	if err != nil {
-		log.Fatal(err)
+		fatal("configuration refused", err)
 	}
 	opts, err := grpcServerOptions(os.Getenv)
 	if err != nil {
-		log.Fatal(err)
+		fatal("gRPC configuration refused", err)
 	}
 	lis, err := net.Listen("tcp", ":"+grpcPort) // dual-stack
 	if err != nil {
-		log.Fatalf("listen :%s: %v", grpcPort, err)
+		fatal("listen", err)
 	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
 	if err := run(srv, httpSrv, lis, opts, stop); err != nil {
-		log.Fatal(err)
+		fatal("serve", err)
 	}
 }
 

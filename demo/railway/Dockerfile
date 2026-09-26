@@ -6,16 +6,19 @@
 #
 #   docker build -f demo/railway/Dockerfile -t idp-auth-peps-demo .
 #   docker run --rm -p 8088:8088 idp-auth-peps-demo
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 WORKDIR /src
 COPY core/go.mod core/go.sum ./
 RUN go mod download
 COPY core/ ./
-RUN CGO_ENABLED=0 go build -o /coaz-pep ./cmd/coaz-pep && \
-    CGO_ENABLED=0 go build -o /demo-stubs ./cmd/demo-stubs && \
-    CGO_ENABLED=0 go build -o /demo-console ./cmd/demo-console
+ENV CGO_ENABLED=0 GOFLAGS=-trimpath
+RUN go build -ldflags "-s -w" -o /coaz-pep ./cmd/coaz-pep && \
+    go build -ldflags "-s -w" -o /demo-stubs ./cmd/demo-stubs && \
+    go build -ldflags "-s -w" -o /demo-console ./cmd/demo-console
 
-FROM alpine:3.20
+# Root, unlike the other images: entrypoint.sh maps "stubs" in /etc/hosts so the
+# identifiers match the compose run. Nothing in here is reachable but the console.
+FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 COPY --from=build /coaz-pep /demo-stubs /demo-console /usr/local/bin/
 COPY docs/reference /srv/docs
 COPY demo/railway/entrypoint.sh /usr/local/bin/demo

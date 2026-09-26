@@ -29,6 +29,12 @@ evaluation requests:
 
 **Always set `failureMode: deny`.** A PEP that fails open is not a PEP.
 
+**Never send it a partial body.** The PEP decides every MCP message and reads payment
+bodies, so it has to see what the upstream will. With `allowPartialMessage: true` a body
+over the limit reaches the PEP truncated while the upstream gets all of it — the PEP
+refuses a body Envoy marks partial (413), but the right setting is `false`, with a
+`maxRequestBytes` above your largest legitimate request.
+
 ## agentgateway (solo.io)
 
 [`agentgateway/`](agentgateway) holds a worked config — `config.yaml.template`, a
@@ -44,9 +50,9 @@ policies:
   extAuthz:
     host: coaz-pep:9191
     failureMode: deny
-    includeRequestBody:            # the PEP inspects JSON-RPC and payment bodies
-      maxRequestBytes: 65536
-      allowPartialMessage: true
+    includeRequestBody:            # the PEP decides every JSON-RPC message
+      maxRequestBytes: 1048576
+      allowPartialMessage: false
     protocol:
       grpc:
         context:
@@ -70,8 +76,8 @@ extensionProviders:
       service: coaz-pep.authz.svc.cluster.local
       port: 9191
       includeRequestBodyInCheck:
-        maxRequestBytes: 65536
-        allowPartialMessage: true
+        maxRequestBytes: 1048576
+        allowPartialMessage: false
 ```
 
 Then `action: CUSTOM` with `provider.name: coaz-pep` on the workloads you want guarded.
@@ -97,7 +103,7 @@ http_filters:
       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
       transport_api_version: V3
       failure_mode_allow: false        # fail closed
-      with_request_body: { max_request_bytes: 65536, allow_partial_message: true }
+      with_request_body: { max_request_bytes: 1048576, allow_partial_message: false }
       grpc_service:
         envoy_grpc: { cluster_name: coaz_pep }
         timeout: 2s
@@ -124,7 +130,8 @@ Read from `context_extensions` on every request:
 | `forward_access_token` | `false` | Send the raw access token to the PDP as `context.access_token`, so the PDP can verify and inspect it itself. Only over a PDP connection that is TLS and authenticated |
 | `pdp_layers` | `PDP_LAYERS` | Ordered PDPs to ask, comma-separated: `static`, `resource`, or a PDP identifier (which must be on `PDP_ALLOWLIST`), each optionally suffixed ` fail-open` / ` fail-closed`. Every layer must permit; the first deny is the answer |
 | `fail_mode` | `PDP_FAIL_MODE` | `closed` or `open`: what a layer does when its PDP cannot be reached, unless the layer says for itself. Open skips it and marks the permit with `X-PDP-Fail-Open`; a deny or a refusal never opens |
-| `coaz_defaults` | `false` | Apply the binding's default mappings to undeclared methods |
+| `coaz_defaults` | `true` | Decide every MCP method: a tool's declared mapping, otherwise the binding's default one, and an unknown method is denied. `"false"` keeps the old pass-through for everything but declared tools — an explicit opt-out |
+| `coaz_v2_only` | `false` | Refuse tools that declare only the superseded `coaz: true` mapping, whose subject can come from the caller's params |
 | `legacy_subject_identity` | `true` | Also send the non-standard `subject.identity` beside AuthZEN's `subject.id`. Set `"false"` once policies read `subject.id` — see [core/README.md](../../core/README.md#migrating-subjectidentity---subjectid) |
 
 ## The resource's well-known documents

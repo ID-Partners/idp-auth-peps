@@ -2,18 +2,34 @@
 #
 # Istio speaks the same `envoy.service.auth.v3.Authorization/Check` gRPC that
 # agentgateway and plain Envoy do, so the identical coaz-pep binary serves all three.
-# Four pieces are needed, in this order:
+# The pieces, in this order:
 #
-#   1. the deployment + service, so there is something to call;
+#   1. the secret, deployment, service, disruption budget and network policy;
 #   2. a MeshConfig extension provider naming it — that lives in the `istio` ConfigMap
 #      and cannot be expressed as a CRD (see README.md);
 #   3. an AuthorizationPolicy with `action: CUSTOM` selecting the workload to guard;
 #   4. an EnvoyFilter, IF you need per-route knobs — see the note at the bottom.
+#
+# coaz-pep refuses to start without its security settings (the check API token, the
+# upstream allowlist, the JWKS with issuer and audience). The values below are
+# placeholders: replace every one, and keep the secret out of git.
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: authz
+  labels:
+    istio-injection: enabled # the sidecar gives :9191 mesh mTLS
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: coaz-pep
+  namespace: authz
+type: Opaque
+stringData:
+  authzen-api-key: REPLACE-ME
+  check-api-token: REPLACE-ME
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -29,29 +45,71 @@ spec:
     metadata:
       labels: { app: coaz-pep }
     spec:
+      # SIGTERM drains: readiness drops, in-flight checks finish (up to 25s), then the
+      # listeners close. Give it that long.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: coaz-pep }
       containers:
         - name: coaz-pep
-          image: ghcr.io/id-partners/coaz-pep:latest
+          # Pin a release, never :latest — better still, pin its digest.
+          image: ghcr.io/id-partners/coaz-pep:0.4.0
           ports:
             - { name: grpc, containerPort: 9191 }
             - { name: http, containerPort: 9192 }
           env:
-            # The complete set the binary reads: AUTHZEN_URL (required), AUTHZEN_API_KEY,
-            # PORT, HTTP_PORT, COAZ_DISCOVERY_TTL, PDP_TLS_INSECURE. Everything else —
-            # style, require_token, require_dpop, mcp_upstream_url — is PER ROUTE and
-            # arrives as ext_authz context_extensions, not as env.
+            # The full reference is core/README.md. Per-route knobs — style,
+            # require_token, require_dpop, mcp_upstream_url and the rest — are not env:
+            # they arrive as ext_authz context_extensions (the EnvoyFilter below).
             - name: AUTHZEN_URL
               value: http://authzen-adapter.authz.svc.cluster.local:8080
             - name: AUTHZEN_API_KEY
               valueFrom:
                 secretKeyRef: { name: coaz-pep, key: authzen-api-key }
+            - name: CHECK_API_TOKEN
+              valueFrom:
+                secretKeyRef: { name: coaz-pep, key: check-api-token }
+            # The MCP servers this PEP may fetch tools/list from.
+            - name: MCP_UPSTREAM_ALLOWLIST
+              value: http://bank-mcp.default.svc.cluster.local:8090
+            # Verify the access token: signature, issuer, audience, expiry.
+            - name: ACCESS_TOKEN_JWKS_URL
+              value: https://as.example.com/.well-known/jwks.json
+            - name: ACCESS_TOKEN_ISSUER
+              value: https://as.example.com
+            - name: ACCESS_TOKEN_AUDIENCE
+              value: https://api.example.com
+            # The audience the logged-in user's own token carries. Without it
+            # X-User-Token is ignored and require_user_login routes deny.
+            - name: USER_TOKEN_AUDIENCE
+              value: banking-app
+            # The origin clients make DPoP proofs for, when routes require DPoP.
+            - name: DPOP_HTU_BASE
+              value: https://api.example.com
             - name: COAZ_DISCOVERY_TTL
               value: 60s
           readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          livenessProbe:
             httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
 ---
 apiVersion: v1
 kind: Service
@@ -63,6 +121,43 @@ spec:
   ports:
     - { name: grpc, port: 9191, targetPort: 9191, appProtocol: grpc }
     - { name: http, port: 9192, targetPort: 9192 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coaz-pep
+  namespace: authz
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: coaz-pep }
+---
+# Only the gateways may reach the PEP. :9191 takes its per-route configuration from the
+# request, so anything that can call it can choose the route's knobs; :9192 is the check
+# API for gateways that cannot speak ext_authz, behind CHECK_API_TOKEN. Label the
+# namespaces whose sidecars or gateways call coaz-pep, and scrape /metrics from your
+# monitoring namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coaz-pep
+  namespace: authz
+spec:
+  podSelector:
+    matchLabels: { app: coaz-pep }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { coaz-pep/client: "true" }
+      ports:
+        - { port: 9191 }
+        - { port: 9192 }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 9192 }
 ---
 # Guard one workload. `action: CUSTOM` hands the decision to the named provider;
 # `rules` narrows WHICH requests are sent for a decision, it does not decide them.
@@ -81,14 +176,16 @@ spec:
   rules:
     - to:
         - operation:
-            notPaths: ['/healthz', '/metrics']
+            # Only the health endpoint is exempt. Anything else — /metrics included —
+            # is decided by the PDP.
+            notPaths: ['/healthz']
 ---
 # Per-route knobs.
 #
-# AuthorizationPolicy has no field for ext_authz context_extensions, so with the three
-# resources above every request arrives at the PEP with the defaults: style=rest,
-# require_token=false, no COAZ. That is enough for a plain REST resource server whose
-# tokens are already validated by a RequestAuthentication.
+# AuthorizationPolicy has no field for ext_authz context_extensions, so with the pieces
+# above every request arrives at the PEP with the defaults: style=rest,
+# require_token=false. That is enough for a plain REST resource server whose tokens are
+# validated by the PEP (the JWKS above) or a RequestAuthentication.
 #
 # It is NOT enough for an MCP edge — `style` and `mcp_upstream_url` have no defaults that
 # could be right. Patch them in with an EnvoyFilter, or give the MCP edge its own
@@ -122,6 +219,6 @@ spec:
                   require_token: 'true'
                   require_dpop: 'false'
                   require_user_login: 'true'
-                  # Enables COAZ: the PEP discovers x-coaz-mapping from this server's
-                  # tools/list and authorises each tools/call against it.
+                  # Every MCP method is decided: a tool's x-authzen-mapping from this
+                  # server's tools/list, otherwise the binding's default mapping.
                   mcp_upstream_url: http://bank-mcp.default.svc.cluster.local:8090/mcp
