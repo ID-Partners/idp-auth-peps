@@ -34,9 +34,12 @@ func defaultEnvelope(action string, resource map[string]any, extraContext map[st
 }
 
 // serverResource identifies this MCP server. The binding derives it from `aud`, since
-// MCP requires tokens to be audience-bound to the target server (RFC 8707).
+// MCP requires tokens to be audience-bound to the target server (RFC 8707). RFC 7519
+// lets `aud` be an array, which the binding's `$token.aud` would hand the PDP as a list
+// where an identifier belongs — a mapping error on every handshake. So a list gives its
+// first audience; the PEP forwards the whole claim as context.token_aud regardless.
 func serverResource() map[string]any {
-	return map[string]any{"type": "mcp_server", "id": "$token.aud"}
+	return map[string]any{"type": "mcp_server", "id": "$type(token.aud) == list ? token.aud[0] : token.aud"}
 }
 
 // DefaultMappings returns the binding's default mapping for an MCP method, and whether

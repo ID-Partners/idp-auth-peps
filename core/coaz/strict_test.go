@@ -129,3 +129,31 @@ func TestNoBatchEndpointCountsAsUnavailable(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// An array audience still names the server: the first one.
+func TestDefaultServerResourceTakesAnArrayAudience(t *testing.T) {
+	cm, err := CompiledDefault("initialize")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for aud, want := range map[string]any{
+		"https://mcp.example": "https://mcp.example",
+		"list":                []any{"https://mcp.example", "https://api.example"},
+	} {
+		claim := any(aud)
+		if aud == "list" {
+			claim = want
+			want = "https://mcp.example"
+		}
+		b, err := cm.Build(map[string]any{}, map[string]any{"sub": "alice", "aud": claim}, nil)
+		if err != nil {
+			t.Fatalf("aud %v: %v", claim, err)
+		}
+		if !strings.Contains(string(b.Body), `"id":"`+want.(string)+`"`) {
+			t.Fatalf("aud %v: %s", claim, b.Body)
+		}
+	}
+	if _, err := cm.Build(map[string]any{}, map[string]any{"sub": "alice", "aud": []any{}}, nil); err == nil {
+		t.Fatal("an empty audience list names no server: a mapping error")
+	}
+}
