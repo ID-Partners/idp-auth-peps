@@ -12,7 +12,7 @@ ARG PA_IMAGE=pingidentity/pingaccess:9.1.0-latest
 
 FROM ${PA_IMAGE} AS sdk
 
-FROM maven:3.9-eclipse-temurin-17 AS build
+FROM maven:3-eclipse-temurin-24 AS build
 WORKDIR /src
 COPY --from=sdk /opt/server/lib/pingaccess-sdk-*.jar /pa/lib/
 COPY gateways/pingaccess/authzen-pdp/pom.xml .
