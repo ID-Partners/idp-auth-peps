@@ -116,7 +116,7 @@ describe('what the policy provider is sent', function()
     assert.equal('GET', sent.method)
     assert.equal('https://api.example:443/accounts/a1/balance?x=1&y=2', sent.url)
     assert.equal('1.1', sent.http_version)
-    assert.is_nil(sent.body)
+    assert.equal('', sent.body) -- Kong reads an absent body as "", never nil
     assert.is_nil(sent.client_certificate)
     assert.equal('Bearer tok', header_value(sent.headers, 'authorization'))
     assert.equal('v', header_value(sent.headers, 'x-custom'))
