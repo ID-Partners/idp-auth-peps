@@ -1,15 +1,17 @@
 {
   "name": "@id-partners/authzen-pep",
-  "version": "0.1.0",
-  "description": "AuthZEN 1.0 Policy Enforcement Point for Node \u2014 Express/Connect middleware for REST APIs and a COAZ (AuthZEN MCP profile) guard for MCP tools/call.",
+  "version": "0.4.0",
+  "description": "AuthZEN 1.0 Policy Enforcement Point for Node — Express/Connect middleware for REST APIs and a COAZ (AuthZEN MCP profile) guard for MCP tools/call.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "files": [
     "dist",
-    "README.md"
+    "src",
+    "README.md",
+    "LICENSE"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -29,6 +31,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prepack": "npm run clean && npm run build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:coverage": "vitest run --coverage"
@@ -50,9 +54,9 @@
     "directory": "sdk/node"
   },
   "devDependencies": {
-    "@types/node": "^20.16.0",
-    "@vitest/coverage-v8": "^2.1.0",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "@types/node": "^22.20.4",
+    "@vitest/coverage-v8": "^4.1.11",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   }
 }
