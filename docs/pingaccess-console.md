@@ -61,11 +61,26 @@ validates it twice, in this order:
    must be at least 1.
 2. *The rule's own check*, reported as a banner beginning **Invalid plugin
    configuration;** followed by the reason. This is where the rules that span two fields
-   live: *Require DPoP* without a *coaz-pep check API*, or a *Policy layers* entry the
-   rule cannot read. The same message comes back to an API caller as HTTP 422 with the
-   text in `flash`.
+   live, and the ones that decide whether a configuration is fit to run:
+   - a URL the rule could not call - not absolute http or https, no host (an underscore
+     in a host name counts), user info in it - or, for an identifier, one with a query or
+     fragment;
+   - *Style* `mcp` without a *coaz-pep check API*, or *Require DPoP* without one;
+   - a *Policy layers* entry the rule cannot read;
+   - and, unless *Allow insecure settings* is ticked, anything that leaves the rule less
+     safe than it should be: *Require a logged-in user* without a *X-User-Token JWKS*, a
+     JWKS without an audience or over http, an API key or a forwarded token over plain
+     http, a *coaz-pep check API* without its key, discovery without *Permitted PDPs*,
+     *Allow http for discovered URLs*, or *Verify TLS* unticked. The banner lists every
+     one it found.
+
+   The same message comes back to an API caller as HTTP 422 with the text in `flash`.
 
 A saved rule takes effect on the engines without a restart. Only a new jar needs one.
+A rule saved under an earlier jar is checked again when PingAccess starts with a new
+one; if it no longer passes, the rule is left unconfigured and every request through it
+is a 500 deny until it is fixed, so check each rule against the
+[upgrade notes](../gateways/pingaccess/README.md#upgrading-to-040) first.
 
 ## The fields
 
@@ -88,7 +103,8 @@ permitted, whatever discovery finds.*
 
 **PDP API key** is sent as a bearer token to the static PDP and to nothing else. A PDP
 found by discovery never receives it, because a key is bound to the PDP it was issued
-for. Help: *Bound to the static PDP.*
+for. It is sent over https only: with a plain-http *PDP URL* the rule refuses the key
+unless *Allow insecure settings* is ticked. Help: *Bound to the static PDP.*
 
 **PEP label** names this enforcement point in every deny and challenge body (`"pep"`) and
 in the `X-PDP-PEP` response header, so a client, or a support ticket, can say which
@@ -106,14 +122,18 @@ gateway said no. Help: *Who denied.*
 | Step-up action | `stepup_action` | TEXT | `make_payment` | advanced |
 
 **Style** chooses the request mapping. `rest` maps a REST request to an action and a
-resource (a balance read is `get_balance` on an account; a payment carries its amount).
-`mcp` treats the application as an MCP edge: access to the service is authorised on the
-JSON-RPC `initialize` handshake, other traffic passes on a valid token, and a
-`tools/call` is handed to coaz-pep when one is configured. Help: *Request mapping.*
+resource (a balance read is `get_balance` on an account; a payment carries its amount),
+reading the path as the upstream will route it and refusing a payment it cannot weigh.
+`mcp` treats the application as an MCP edge: every request, whatever its method, goes to
+coaz-pep to decide, once the rule is sure the body is one plain JSON-RPC message it has
+read in full - anything else is refused with a JSON-RPC error. `mcp` needs *coaz-pep
+check API*, and saving without one is refused. Help: *Request mapping.*
 
 **Require an access token** denies a request with no readable `Authorization: Bearer`
 or `DPoP` token, or one without a subject, with a 401. Unticked, an anonymous request
-still goes to the PDP, as `unknown-agent`, for the policy to decide.
+still goes to the PDP, as `unknown-agent`, for the policy to decide. Ticked or not, a
+token PingAccess did not validate - the application is unprotected - is a 401 unless
+*Allow insecure settings* is ticked.
 
 **Require DPoP** sends the request's DPoP proof to coaz-pep for verification: the
 proof's signature, freshness, replay and its binding to the token. The rule cannot verify
@@ -122,7 +142,8 @@ is refused with a banner. When PingAccess validates the token itself, prefer the
 application's own DPoP settings and leave this unticked. Help: *Delegated to coaz-pep.*
 
 **Require a logged-in user** denies, with an RFC 9470 login challenge, unless the request
-carries a valid `X-User-Token` for the person the agent acts for. Help: *RFC 9470 login
+carries a verified `X-User-Token` for the person the agent acts for. It needs *X-User-Token
+JWKS* to verify it against; saving without one is refused. Help: *RFC 9470 login
 challenge.*
 
 **Step-up scope** is the scope named in a step-up challenge when the PDP's advice names
@@ -136,17 +157,19 @@ The shared engine the rule delegates to for the two things it cannot do alone.
 
 | Label | Key | Widget | Default | Flags |
 | --- | --- | --- | --- | --- |
-| coaz-pep check API | `coaz_url` | TEXT | — | |
-| coaz-pep API key | `coaz_api_key` | CONCEALED | — | |
+| coaz-pep check API | `coaz_url` | TEXT | — | required for `mcp` |
+| coaz-pep API key | `coaz_api_key` | CONCEALED | — | required with the check API |
 | MCP upstream | `mcp_upstream_url` | TEXT | — | |
 | Federation entity relay | `federation_entity_url` | TEXT | — | advanced |
-| COAZ default mappings | `coaz_defaults` | CHECKBOX | unticked | advanced |
+| COAZ default mappings | `coaz_defaults` | CHECKBOX | ticked | advanced |
 
 **coaz-pep check API** is the base URL of coaz-pep's HTTP check API. Required by *Require
-DPoP*; on an `mcp` route it turns on per-tool-call authorisation. Help: *The shared
+DPoP*, and by *Style* `mcp`, where every request is sent to it. Help: *The shared
 engine.* **coaz-pep API key** is the shared secret that API requires (its
-`CHECK_API_TOKEN`); set it, because that endpoint fetches a caller-supplied URL with a
-caller-supplied header and must know who is asking. Help: *CHECK_API_TOKEN.*
+`CHECK_API_TOKEN`). Saving a check API without it is refused, as is sending it over
+plain http, unless *Allow insecure settings* is ticked: that endpoint fetches a
+caller-supplied URL with a caller-supplied header and must know who is asking. Help:
+*CHECK_API_TOKEN.*
 
 **MCP upstream** is the MCP server whose `tools/list` declares each tool's authorisation
 mapping; the engine reads it from there. On an `mcp` route with no *Resource identifier*
@@ -157,9 +180,12 @@ well-known documents, the entity configuration and the RFC 9728 metadata, are re
 from coaz-pep at this URL, which holds the key and signs them. PingAccess cannot sign,
 so it relays; nothing else on the route changes. Help: *The resource's federation face.*
 
-**COAZ default mappings** authorises tools that declare no mapping against the COAZ-MCP
-binding's defaults, as the binding requires. Off keeps the pass-through most deployed
-tools expect, which is not conformant. Help: *Conformance.*
+**COAZ default mappings** governs every MCP method by the COAZ-MCP binding's default
+table, as the binding requires: a tool that declares no mapping gets the default one,
+`ping`, notifications and responses pass, and a method the table does not know is
+denied. Ticked by default since 0.4.0. Unticked keeps the old pass-through for methods
+other than `tools/call`, which some deployed servers expect and which is not conformant.
+Help: *Conformance.*
 
 ### Discovery
 
@@ -168,9 +194,9 @@ tools expect, which is not conformant. Help: *Conformance.*
 | PDP discovery | `pdp_discovery` | SELECT: `off`, `authzen`, `resource` | `off` | |
 | Resource identifier | `resource` | TEXT | — | |
 | Metadata cache TTL, seconds | `pdp_metadata_ttl` | TEXT (number) | `300` | advanced, at least 1 |
-| Permitted PDPs | `pdp_allowlist` | LIST | empty | advanced |
+| Permitted PDPs | `pdp_allowlist` | LIST | empty | advanced, required when discovery is on |
 | Permitted resources | `resource_metadata_allowlist` | LIST | empty | advanced |
-| Allow http for discovered URLs | `pdp_discovery_insecure` | CHECKBOX | unticked | advanced |
+| Allow http for discovered URLs | `pdp_discovery_insecure` | CHECKBOX | unticked | advanced, needs *Allow insecure settings* |
 | Forward the raw access token | `forward_access_token` | CHECKBOX | unticked | |
 
 **PDP discovery** is how the rule finds the PDP. `off`: the static PDP at AuthZEN's
@@ -188,23 +214,26 @@ one uses the MCP upstream; a `rest` route without one uses the static PDP. Help:
 
 **Metadata cache TTL** is how long a resource's or a PDP's metadata is believed before
 it is re-read. Stale metadata is served while a refresh fails, so a metadata outage is
-not an authorization outage.
+not an authorization outage, and a PDP's metadata is replaced by AuthZEN's default paths
+only when the PDP publishes none.
 
 **Permitted PDPs** bounds what a resource may name: identifier prefixes, matched at a
-path boundary, so `https://pdp.example` does not admit `https://pdp.example.evil`. The
-static PDP is always permitted. Empty means any https PDP a resource names, which is
-the setting to change before going live. Help: *What a resource may name.* **Permitted
-resources** does the same for whose metadata the rule will fetch. Help: *Whose metadata
-is fetched.*
+path boundary, so `https://pdp.example` does not admit `https://pdp.example.evil`, and
+an entry with a path (`https://pdp.example/tenant1`) admits that PDP's own metadata. The
+static PDP is always permitted. It is required whenever *PDP discovery* is on: empty
+would let a resource name any PDP at all, and saving is refused. Help: *What a resource
+may name.* **Permitted resources** does the same for whose metadata the rule will fetch.
+Help: *Whose metadata is fetched.*
 
 **Allow http for discovered URLs** lets discovery follow plain-http URLs. For a
-development network only; the static PDP's own origin is trusted over http regardless.
-Help: *Development only.*
+development network only, and refused unless *Allow insecure settings* is ticked; the
+static PDP's own origin is trusted over http regardless. Help: *Development only.*
 
 **Forward the raw access token** sends the bearer token to the PDP as
 `context.access_token`, so the PDP can verify and inspect it itself rather than trust
-what the rule decoded. It puts a bearer token on the wire, so only to a PDP reached over
-TLS with a key on it. Help: *context.access_token.*
+what the rule decoded. It puts a bearer token on the wire, so the rule refuses it with a
+plain-http *PDP URL* unless *Allow insecure settings* is ticked. Help:
+*context.access_token.*
 
 ### Layers
 
@@ -220,46 +249,66 @@ not is the answer. An entry may carry its own failure mode as a suffix,
 `https://estate.example fail-open`; an entry the rule cannot read (`resource maybe`) is
 refused at save time with a banner. Help: *Ordered PDPs, every one of which must permit.*
 
-**Failure mode** is what a layer does when its PDP cannot be reached, unless the entry
-says for itself. `closed` denies with a 503. `open` skips the layer and, if every layer
-was skipped, permits, marking the response with `X-PDP-Fail-Open`. A deny is a decision
-and a refusal is the rule's own policy; neither ever opens. Help: *Outages only.*
+**Failure mode** is what a layer does when its PDP is down - no connection, a timeout, a
+5xx, a 429 - unless the entry says for itself. `closed` denies with a 503. `open` skips
+the layer and, if every layer was skipped, permits, marking the response with
+`X-PDP-Fail-Open`, which names the skipped layers and nothing more. A deny is a decision,
+and a PDP that refuses - a 4xx, a redirect, an answer that is not a decision - is not
+down; neither ever opens. Help: *Outages only.*
 
 ### The user token
 
 | Label | Key | Widget | Default | Flags |
 | --- | --- | --- | --- | --- |
-| X-User-Token JWKS | `user_token_jwks_url` | TEXT | — | |
+| X-User-Token JWKS | `user_token_jwks_url` | TEXT | — | https |
 | X-User-Token issuer | `user_token_issuer` | TEXT | — | advanced |
-| X-User-Token audience | `user_token_audience` | TEXT | — | advanced |
+| X-User-Token audience | `user_token_audience` | TEXT | — | required with the JWKS |
 
-**X-User-Token JWKS** turns on verification of the user's token: signature against this
-JWKS, expiry, not-before, and the issuer and audience below when set; `alg: none` is
-refused. A token that fails yields no claims, so *Require a logged-in user* denies and no
-user scope reaches the PDP. Left blank, the token is decoded without verification and
-the rule writes a warning to the log each time it is configured. Help: *Verify the user
-token.*
+**X-User-Token JWKS** is what the user's token is verified against: its signature, and
+an `exp`, a `sub` and the audience below, all required; the issuer too when it is set;
+`alg: none` refused. A token that fails yields no claims, so *Require a logged-in user*
+denies and no user scope reaches the PDP. Left blank, the token is ignored - it can open
+no gate - unless *Allow insecure settings* is ticked, when it is decoded without
+verification and the log says so. Help: *Verify the user token.* **X-User-Token
+audience** is the `aud` the token must carry, and saving a JWKS without it is refused:
+without it a token minted for any other API would do. Help: *Required with the JWKS.*
 
 ### Transport and compatibility
 
 | Label | Key | Widget | Default | Flags |
 | --- | --- | --- | --- | --- |
-| Verify TLS on outbound calls | `pdp_ssl_verify` | CHECKBOX | ticked | advanced |
+| Verify TLS on outbound calls | `pdp_ssl_verify` | CHECKBOX | ticked | advanced; unticked needs *Allow insecure settings* |
 | PDP timeout, ms | `pdp_timeout_ms` | TEXT (number) | `10000` | advanced, at least 1 |
 | coaz-pep timeout, ms | `coaz_timeout_ms` | TEXT (number) | `15000` | advanced, at least 1 |
 | Also send subject.identity | `legacy_subject_identity` | CHECKBOX | ticked | advanced |
+| Allow insecure settings | `allow_insecure` | CHECKBOX | unticked | advanced |
 
 **Verify TLS on outbound calls** covers every call the rule makes: the PDP, coaz-pep,
-metadata. Unticking it trusts any certificate and skips hostname checks, process-wide
-for JDK HTTP clients built afterwards, so it is for a developer's laptop and nothing
-else; the rule logs a warning when it is off. Help: *Development only when off.*
+metadata, the user token's JWKS. Unticking it trusts any certificate chain, so it is for
+a developer's laptop and nothing else, and saving it unticked is refused unless *Allow
+insecure settings* is ticked. The host name is still checked: the certificate must name
+the host the URL does. The JDK can only switch that off for every HTTP client in the
+JVM at once, and a rule has no business changing how the rest of PingAccess connects.
+Help: *Development only when off.*
 
-**PDP timeout** and **coaz-pep timeout** bound one call each. A call that times out
-counts as unreachable: a 503, or a skipped layer if that layer fails open.
+**PDP timeout** and **coaz-pep timeout** bound one call each, the whole exchange
+included: a PDP that sends its headers and then trickles the body is cut off at the same
+deadline as one that sends nothing. A call that times out counts as unavailable: a 503,
+or a skipped layer if that layer fails open.
 
 **Also send subject.identity** keeps the non-standard `subject.identity` beside AuthZEN's
 `subject.id` in every evaluation, so a policy written against the old field keeps
 working. Untick it once the policies read `subject.id`. Help: *Migration.*
+
+**Allow insecure settings** is the escape hatch, and the only one. Ticked, the rule
+starts with what it otherwise refuses: an access token PingAccess did not validate (an
+unprotected application), an unverified `X-User-Token`, an API key or a forwarded token
+over plain http, a *coaz-pep check API* without its key, discovery without *Permitted
+PDPs*, plain http for discovered URLs, and *Verify TLS* unticked. Each relaxation it is
+covering is written to `pingaccess.log` every time the rule is configured. The demo
+ticks it, because its tokens are unsigned and its stubs speak http; a production rule
+should never need it. It does not excuse *Style* `mcp` without a *coaz-pep check API*,
+or a URL the rule cannot call. Help: *Development only.*
 
 ## Error messages
 
@@ -268,7 +317,11 @@ working. Untick it once the policies read `subject.id`. Help: *Migration.*
 | on the field | `must not be blank` | *PDP URL* is empty |
 | on the field | `must be rest or mcp`, `must be off, authzen or resource`, `must be closed or open` | a value outside the drop-down's options, only possible through the API |
 | on the field | `must be greater than zero` | a TTL or timeout of 0 |
+| banner | `Invalid plugin configuration; style must be rest or mcp` and its siblings for `pdp_discovery` and `fail_mode` | a value outside the options, or a JSON `null`, sent through the API |
+| banner | `Invalid plugin configuration; authzen_url http://authzen_pdp:8080 has no host name the JDK can use (an underscore in it?)` and its siblings | a URL field the rule could not call: not absolute http or https, no host, user info in it, or - for an identifier - a query or fragment |
+| banner | `Invalid plugin configuration; style mcp needs coaz_url: every request on an MCP route is decided by coaz-pep` | *Style* `mcp` with no *coaz-pep check API* |
 | banner | `Invalid plugin configuration; require_dpop needs coaz_url: this rule cannot verify a DPoP proof signature itself, so verification is delegated to coaz-pep` | *Require DPoP* ticked with no *coaz-pep check API* |
+| banner | `Invalid plugin configuration; insecure configuration refused: <each setting>. Fix it, or set allow_insecure for development only` | a missing or weakened security setting, listed one by one; see *Allow insecure settings* |
 | banner | `Invalid plugin configuration; pdp_layers: layer <x>: unknown modifier <y>` and its siblings | a *Policy layers* entry that is not `static`, `resource` or a URL, or carries a suffix other than `fail-open` / `fail-closed` |
 | banner | `Invalid plugin configuration; authzen_url is required` | the same blank-URL check, when the field constraint was bypassed |
 

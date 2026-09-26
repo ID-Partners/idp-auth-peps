@@ -16,13 +16,14 @@ import java.util.function.Function;
 /**
  * A scripted transport, the counterpart of the Kong spec's router: routes map a URL (or
  * prefix) to a JSON tree (200 with that body), a String (200 raw), an Integer (that
- * status, empty body), Boolean.FALSE (connection refused) or a function of the request.
- * Longest prefix wins, so an exact well-known route beats a host-wide one; anything
- * unmatched is a 404. Every request is recorded.
+ * status, empty body), Boolean.FALSE (connection refused), a {@link Transport.Refused}
+ * (thrown) or a function of the request. Longest prefix wins, so an exact well-known
+ * route beats a host-wide one; anything unmatched is a 404. Every request is recorded.
+ * It keeps the real transport's contract: an answer over the request's cap is refused.
  */
 final class FakeTransport implements Transport {
     final Map<String, Object> routes = new LinkedHashMap<>();
-    final List<Request> hits = new ArrayList<>();
+    final List<Request> hits = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     FakeTransport route(String prefix, Object responder) {
         routes.put(prefix, responder);
@@ -30,22 +31,29 @@ final class FakeTransport implements Transport {
     }
 
     @Override
-    public Response send(Request r) throws IOException {
+    public Response send(Request r) throws IOException, Refused {
         hits.add(r);
         List<String> keys = new ArrayList<>(routes.keySet());
         keys.sort(Comparator.comparingInt(String::length).reversed());
         for (String prefix : keys) {
             if (r.url().equals(prefix) || r.url().startsWith(prefix)) {
-                return respond(routes.get(prefix), r);
+                Response res = respond(routes.get(prefix), r);
+                if (res.body() != null && res.body().length > r.maxResponseBytes()) {
+                    throw new Refused("the answer exceeds the " + r.maxResponseBytes() + "-byte cap");
+                }
+                return res;
             }
         }
         return new Response(404, Map.of(), new byte[0]);
     }
 
     @SuppressWarnings("unchecked")
-    private static Response respond(Object responder, Request r) throws IOException {
+    private static Response respond(Object responder, Request r) throws IOException, Refused {
         if (responder instanceof Function) {
             return ((Function<Request, Response>) responder).apply(r);
+        }
+        if (responder instanceof Refused) {
+            throw (Refused) responder;
         }
         if (Boolean.FALSE.equals(responder)) {
             throw new IOException("connection refused");

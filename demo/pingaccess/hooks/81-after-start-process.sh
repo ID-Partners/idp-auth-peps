@@ -66,7 +66,11 @@ must 200 "creating the site" POST /sites \
     "{\"name\":\"plain-resource\",\"targets\":[\"${site_target}\"],\"secure\":false,\"availabilityProfileId\":1}"
 site_id=$(jq -r .id "${out}")
 
-# The rule: the same knobs as demo/kong/kong.yml, spelled the same.
+# The rule: the same knobs as demo/kong/kong.yml, spelled the same. allow_insecure is the
+# demo's escape hatch and nothing else's: its tokens are unsigned on an unprotected
+# application, the PDP and the stubs speak plain http with a key, and discovery runs
+# without a pdp_allowlist. The rule refuses each of those without it, and logs every
+# relaxation at start-up with it.
 must 200 "creating the rule" POST /rules "{
   \"name\": \"authzen-pdp\",
   \"className\": \"com.idpartners.pa.authzen.AuthZenRule\",
@@ -81,7 +85,8 @@ must 200 "creating the rule" POST /rules "{
     \"resource\": \"${resource}\",
     \"pdp_discovery_insecure\": true,
     \"resource_metadata_allowlist\": [\"${resource}\"],
-    \"forward_access_token\": true
+    \"forward_access_token\": true,
+    \"allow_insecure\": true
   }
 }"
 rule_id=$(jq -r .id "${out}")
@@ -95,8 +100,9 @@ if test -z "${vhost_id}"; then
 fi
 
 # The application: API type, accessValidatorId 0 (PingAccess validates no token itself:
-# the demo's tokens are unsigned, and the rule decodes them as Kong does), the rule as
-# the whole of its API policy. Enabled explicitly: the API's default is off.
+# the demo's tokens are unsigned, and the rule decodes them, which only allow_insecure
+# permits), the rule as the whole of its API policy. Enabled explicitly: the API's
+# default is off.
 must 200 "creating the application" POST /applications "{
   \"name\": \"bank\",
   \"contextRoot\": \"/\",

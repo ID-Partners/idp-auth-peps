@@ -45,6 +45,11 @@ class PepTest {
     static final String EVAL = PDP + "/access/v1/evaluation";
     static final String COAZ = "http://coaz-pep:9192";
 
+    /**
+     * The decision path as the demo drives it: unsigned tokens on an unprotected
+     * application, which only allow_insecure admits. What the default refuses is pinned
+     * by its own tests below.
+     */
     static AuthZenRuleConfiguration baseConf() {
         AuthZenRuleConfiguration c = new AuthZenRuleConfiguration();
         c.authzen_url = PDP;
@@ -56,6 +61,7 @@ class PepTest {
         c.require_user_login = false;
         c.stepup_action = "make_payment";
         c.pdp_ssl_verify = true;
+        c.allow_insecure = true;
         return c;
     }
 
@@ -145,17 +151,53 @@ class PepTest {
 
     @Test
     void failsClosedWhenThePdpIsUnreachableOrUnusable() {
-        for (Object r : new Object[]{Boolean.FALSE, 500, 302}) {
+        for (Object r : new Object[]{Boolean.FALSE, 500, 503, 429}) {
             Verdict v = pep(baseConf(), pdp(r)).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
             assertEquals(503, v.status, String.valueOf(r));
-            assertTrue(body(v).get("reason").asText().contains("unreachable"));
+            assertEquals(Pep.UNREACHABLE, body(v).get("reason").asText(), String.valueOf(r));
         }
-        // A 200 that is not a decision is a deny, never a permit.
-        Verdict junk = pep(baseConf(), pdp("not json")).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
-        assertEquals(403, junk.status);
-        assertEquals("Denied by policy.", body(junk).get("reason").asText());
-        Verdict str = pep(baseConf(), pdp(obj("decision", "true"))).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
-        assertEquals(403, str.status, "a string is not a boolean decision");
+        // An answer that is there and unusable is a refusal: closed too, and said differently.
+        byte[] big = new byte[Transport.MAX_RESPONSE + 1];
+        for (Object r : new Object[]{302, 400, 401, 413, "not json", "[true]", obj("decision", "true"), obj("decision", 1), obj("context", obj()),
+            new Transport.Refused("cannot be built"), (Function<Transport.Request, Transport.Response>) q -> new Transport.Response(200, Map.of(), big)}) {
+            Verdict v = pep(baseConf(), pdp(r)).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
+            assertEquals(503, v.status, String.valueOf(r));
+            assertEquals(Pep.REFUSED, body(v).get("reason").asText(), String.valueOf(r));
+            assertFalse(v.permit);
+        }
+    }
+
+    @Test
+    void aFailOpenLayerIsSkippedOnAnOutageAndNeverOnARefusal() {
+        // A rotated key's 401, a client-padded 413, a redirect, an answer that is not a
+        // decision: none says the PDP is down, and none may switch the layer off.
+        for (Object r : new Object[]{302, 400, 401, 403, 413, "not json", obj("decision", "true"), new Transport.Refused("bad URL")}) {
+            AuthZenRuleConfiguration c = discoveryConf();
+            c.pdp_layers = List.of(DOWN + " fail-open", "resource");
+            FakeTransport t = failOpenRoutes(obj("decision", true)).route(DOWN + "/access/v1/evaluation", r);
+            Verdict v = drive(c, t);
+            assertFalse(v.permit, "a refusal (" + r + ") was skipped");
+            assertEquals(503, v.status);
+            assertEquals(0, t.count(GOOD + "/custom/eval"), "nothing after a refusal is asked");
+        }
+        for (Object r : new Object[]{500, 502, 503, 429, Boolean.FALSE}) {
+            AuthZenRuleConfiguration c = discoveryConf();
+            c.pdp_layers = List.of(DOWN + " fail-open", "resource");
+            Verdict v = drive(c, failOpenRoutes(obj("decision", true)).route(DOWN + "/access/v1/evaluation", r));
+            assertTrue(v.permit, "an outage (" + r + ") on a fail-open layer is skipped");
+            assertEquals(DOWN, v.responseHeaders.get("X-PDP-Fail-Open"), "named by identifier, never by error text");
+        }
+    }
+
+    @Test
+    void refusesToSendAnEvaluationRequestPastItsBound() {
+        FakeTransport t = pdp(obj("decision", true));
+        AuthZenRuleConfiguration c = baseConf();
+        c.forward_access_token = true;
+        String padded = jwt(obj("sub", "alice", "pad", "x".repeat(Pep.MAX_EVALUATION)));
+        Verdict v = pep(c, t).decide(req("GET", "/accounts/a/balance", Map.of("authorization", "Bearer " + padded), null));
+        assertEquals(413, v.status);
+        assertEquals(0, t.count("/access/v1/evaluation"), "never sent");
     }
 
     @Test
@@ -241,6 +283,9 @@ class PepTest {
         assertEquals(401, err.status);
         Verdict junk = (Verdict) withVerifier("not json", COAZ)[0];
         assertEquals(401, junk.status);
+        Verdict refused = (Verdict) withVerifier(new Transport.Refused("cannot be built"), COAZ)[0];
+        assertEquals(401, refused.status);
+        assertTrue(body(refused).get("reason").asText().contains("failed"));
     }
 
     @Test
@@ -280,11 +325,36 @@ class PepTest {
         FakeTransport t = pdp(obj("decision", false, "context", obj("step_up_required", true)));
         AuthZenRuleConfiguration c = baseConf();
         c.stepup_scope = "route:scope";
-        Verdict v = pep(c, t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), "{}"));
+        String pay = "{\"from_account\":\"a\",\"amount\":9000}";
+        Verdict v = pep(c, t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), pay));
         assertEquals("route:scope", body(v).get("scope").asText());
         AuthZenRuleConfiguration none = baseConf();
-        Verdict empty = pep(none, pdp(obj("decision", false, "context", obj("step_up_required", true)))).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), "{}"));
+        Verdict empty = pep(none, pdp(obj("decision", false, "context", obj("step_up_required", true)))).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), pay));
         assertEquals("", body(empty).get("scope").asText());
+    }
+
+    @Test
+    void aPaymentThePdpCannotWeighIsRefusedBeforeAnyPdpIsAsked() {
+        // The REST twin sent make_payment with no amount; the PDP's threshold had nothing
+        // to compare, and a policy that treats absent as zero said yes.
+        for (String body : new String[]{null, "{}", "{\"from_account\":\"a\",\"amount\":\"5,000\"}", "{\"from_account\":\"a\",\"amount\":10,\"Amount\":5000}"}) {
+            FakeTransport t = pdp(obj("decision", true));
+            Verdict v = pep(baseConf(), t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), body));
+            assertEquals(400, v.status, String.valueOf(body));
+            assertEquals(0, t.hits.size(), "no PDP asked: " + body);
+        }
+        FakeTransport t = pdp(obj("decision", true));
+        Verdict partial = pep(baseConf(), t).decide(new PepRequest("POST", "/payments", Map.of("authorization", List.of(bearer(obj("sub", "alice")))),
+            null, false, null));
+        assertEquals(400, partial.status);
+        // What the PDP is told is the path the upstream will route.
+        FakeTransport t2 = pdp(obj("decision", true));
+        pep(baseConf(), t2).decide(req("GET", "/x/../accounts/a1;v=1/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
+        assertEquals("/accounts/a1/balance", sent(t2).get("context").get("request").get("path").asText());
+        assertEquals("a1", sent(t2).get("resource").get("id").asText());
+        Verdict odd = pep(baseConf(), pdp(obj("decision", true))).decide(req("GET", "/accounts/a%2Fb/balance",
+            Map.of("authorization", bearer(obj("sub", "alice"))), null));
+        assertEquals(400, odd.status);
     }
 
     @Test
@@ -380,56 +450,122 @@ class PepTest {
             c.mcp_upstream_url = "http://mcp:8090/mcp";
         }
         Verdict v = pep(c, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice", "act", obj("sub", "agent-1"))),
-            "x-user-token", "ut", "content-type", "application/json"), TOOLS_CALL));
+            "x-user-token", "ut", "content-type", "application/json", "dpop", "proof", "content-encoding", "identity"), TOOLS_CALL));
         return new Object[]{v, t};
     }
 
+    static AuthZenRuleConfiguration mcpConf() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.style = "mcp";
+        c.coaz_url = COAZ;
+        c.coaz_api_key = "check-token";
+        return c;
+    }
+
+    static FakeTransport engine(Object verdict) {
+        return pdp(obj("decision", true)).route(COAZ + "/v1/mcp/check", verdict);
+    }
+
+    static Verdict mcpBody(FakeTransport t, byte[] body, String... headers) {
+        Map<String, java.util.List<String>> h = new java.util.LinkedHashMap<>();
+        h.put("authorization", List.of(bearer(obj("sub", "alice"))));
+        for (int i = 0; i + 1 < headers.length; i += 2) {
+            h.computeIfAbsent(headers[i], k -> new ArrayList<>()).add(headers[i + 1]);
+        }
+        return pep(mcpConf(), t).decide(new PepRequest("POST", "/mcp", h, body, true, null));
+    }
+
     @Test
-    void delegatesAToolsCallToTheEngineAndForwardsItsUpstreamHeaders() {
-        Object[] r = mcpRoute(obj("decision", true, "upstream_headers", obj("X-Auth-Principal", "alice", "X-Coaz", "permit"),
-            "response_headers", obj("X-PDP-Action", "tools/call:get_customer", "X-PDP-Reason", "ok")), null);
+    void delegatesAToolsCallToTheEngineWithTheFiveHeadersAndTheRawBody() {
+        Object[] r = mcpRoute(obj("decision", true, "upstream_headers", obj("X-Auth-Principal", "alice", "X-Auth-Agent", "agent-1",
+                "X-Auth-Scope", "", "X-Auth-Acr", "urn:mfa", "X-Coaz", "permit"),
+            "response_headers", obj("X-PDP-Action", "tools/call:get_customer", "X-PDP-Reason", "ok", "X-Trace", "t1", "Content-Length", "9")), null);
         Verdict v = (Verdict) r[0];
         FakeTransport t = (FakeTransport) r[1];
         assertTrue(v.permit);
-        assertTrue(t.hits.get(0).url().contains("/v1/mcp/check"), "the tools/call should go to the engine");
+        assertTrue(t.hits.get(0).url().endsWith("/v1/mcp/check"), "the tools/call should go to the engine");
+        assertEquals("alice", v.upstreamHeaders.get("X-Auth-Principal"));
+        assertEquals("", v.upstreamHeaders.get("X-Auth-Scope"), "empty means: leave the header off");
         assertEquals("permit", v.upstreamHeaders.get("X-Coaz"));
         assertEquals("tools/call:get_customer", v.responseHeaders.get("X-PDP-Action"));
         assertEquals("ok", v.responseHeaders.get("X-PDP-Reason"));
+        assertEquals("PERMIT", v.responseHeaders.get("X-PDP-Decision"));
+        assertEquals("t1", v.responseHeaders.get("X-Trace"), "response_headers are carried");
+        assertNull(v.responseHeaders.get("Content-Length"), "never a framing header");
         assertEquals(0, t.count("/access/v1/evaluation"), "the engine asked the PDP, not this rule");
         JsonNode sentBody = Json.parse(t.hits.get(0).body());
         assertEquals("mcp", sentBody.get("config").get("style").asText());
         assertEquals("http://mcp:8090/mcp", sentBody.get("config").get("mcp_upstream_url").asText());
-        assertEquals("false", sentBody.get("config").get("coaz_defaults").asText());
+        assertEquals("true", sentBody.get("config").get("coaz_defaults").asText(), "the binding's default table is on unless turned off");
         assertEquals("test-pep", sentBody.get("config").get("pep_label").asText());
         assertEquals("resource", sentBody.get("config").get("pdp_layers").asText());
         assertFalse(sentBody.get("config").has("fail_mode"));
         assertFalse(sentBody.get("config").has("resource"));
         assertFalse(sentBody.get("config").has("forward_access_token"));
-        assertEquals("ut", sentBody.get("headers").get("x-user-token").asText());
+        JsonNode h = sentBody.get("headers");
+        assertEquals("ut", h.get("x-user-token").asText());
+        assertEquals("application/json", h.get("content-type").asText());
+        assertEquals("proof", h.get("dpop").asText());
+        assertEquals("identity", h.get("content-encoding").asText());
+        assertTrue(h.get("authorization").asText().startsWith("Bearer "));
         assertEquals(TOOLS_CALL, sentBody.get("body").asText());
         assertEquals("POST", sentBody.get("method").asText());
         assertEquals("/mcp", sentBody.get("path").asText());
     }
 
     @Test
+    void aPermitWithoutUpstreamHeadersStillStripsEveryXAuthHeader() {
+        Verdict v = (Verdict) mcpRoute(obj("decision", true), null)[0];
+        assertTrue(v.permit);
+        for (String k : new String[]{"X-Auth-Principal", "X-Auth-Agent", "X-Auth-Scope", "X-Auth-Acr"}) {
+            assertEquals("", v.upstreamHeaders.get(k), k + " is removed: coaz-pep asserted nothing");
+        }
+        // coaz-pep's own fail-open marker is carried to the client.
+        Verdict marked = (Verdict) mcpRoute(obj("decision", true, "response_headers", obj("X-PDP-Fail-Open", "https://estate.example")), null)[0];
+        assertEquals("https://estate.example", marked.responseHeaders.get("X-PDP-Fail-Open"));
+    }
+
+    @Test
     void relaysTheEngineJsonRpcErrorBodyVerbatimOnADeny() {
         String rpcError = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"denied by policy\"}}";
         Verdict v = (Verdict) mcpRoute(obj("decision", false, "response", obj("status", 200, "body", rpcError,
-            "headers", obj("Content-Type", "application/json", "X-PDP-Reason", "no"))), null)[0];
+            "headers", obj("Content-Type", "application/json", "X-PDP-Reason", "no", "Transfer-Encoding", "chunked"))), null)[0];
         assertFalse(v.permit);
         // Relayed as-is: two renderings of one decision would drift.
         assertEquals(200, v.status);
         assertEquals(rpcError, v.bodyText());
         assertEquals("application/json", v.header("Content-Type"));
+        assertNull(v.header("Transfer-Encoding"), "framing belongs to this hop");
+        assertNull(v.header("X-PDP-Reason"), "each X-PDP-* header appears once, from the rule");
         assertEquals("DENY", v.responseHeaders.get("X-PDP-Decision"));
         assertEquals("tools/call:get_customer", v.responseHeaders.get("X-PDP-Action"));
         assertEquals("no", v.responseHeaders.get("X-PDP-Reason"));
-        // An engine verdict with nothing usable in it is still a deny, with defaults.
+        // A deny with no rendering, or one with a status that cannot be one, is a plain 403.
         Verdict bare = (Verdict) mcpRoute(obj("decision", false), null)[0];
-        assertEquals(200, bare.status);
-        assertEquals("", bare.bodyText());
-        Verdict junk = (Verdict) mcpRoute("[]", null)[0];
-        assertFalse(junk.permit);
+        assertEquals(403, bare.status);
+        assertEquals("authorization_failed", body(bare).get("error").asText());
+        for (Object status : new Object[]{0, 99, 600, "200"}) {
+            ObjectNode resp = obj("body", rpcError);
+            if (status instanceof Integer) {
+                resp.put("status", (Integer) status);
+            } else {
+                resp.put("status", (String) status);
+            }
+            assertEquals(403, ((Verdict) mcpRoute(obj("decision", false, "response", resp), null)[0]).status, String.valueOf(status));
+        }
+        Verdict noBody = (Verdict) mcpRoute(obj("decision", false, "response", obj("status", 401)), null)[0];
+        assertEquals(401, noBody.status);
+        assertEquals("", noBody.bodyText());
+    }
+
+    @Test
+    void theFederationRelayFailsClosedOnARefusalToo() {
+        FakeTransport t = pdp(obj("decision", true)).route(COAZ + "/.well-known/openid-federation", new Transport.Refused("too large"));
+        AuthZenRuleConfiguration c = baseConf();
+        c.federation_entity_url = COAZ;
+        Verdict v = pep(c, t).decide(req("GET", "/.well-known/openid-federation", Map.of(), null));
+        assertEquals(503, v.status);
+        assertEquals("federation_entity_unavailable", body(v).get("error").asText());
     }
 
     @Test
@@ -439,33 +575,129 @@ class PepTest {
         assertTrue(body(down).get("reason").asText().contains("unreachable"));
         Verdict err = (Verdict) mcpRoute((Function<Transport.Request, Transport.Response>) r -> FakeTransport.json(500, "boom"), null)[0];
         assertEquals(503, err.status);
+        assertTrue(body(err).get("reason").asText().contains("unreachable"));
+        // A refusal is closed as well, and said differently: a wrong CHECK_API_TOKEN is
+        // not an outage.
+        for (Object r : new Object[]{401, 400, 302, obj("decision", "true"), "[]", new Transport.Refused("cannot be built")}) {
+            Verdict v = (Verdict) mcpRoute(r, null)[0];
+            assertEquals(503, v.status, String.valueOf(r));
+            assertFalse(v.permit);
+            assertTrue(body(v).get("reason").asText().contains("refused"), String.valueOf(r));
+        }
     }
 
     @Test
-    void doesNotDelegateJsonRpcThatIsNotAToolsCallOrWhenCoazUrlIsUnset() {
-        FakeTransport t = pdp(obj("decision", true)).route(COAZ, obj("decision", true));
-        AuthZenRuleConfiguration c = baseConf();
-        c.style = "mcp";
-        c.coaz_url = COAZ;
-        Verdict v = pep(c, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"));
-        assertTrue(v.permit);
-        assertEquals(0, t.count("/v1/mcp/check"), "only tools/call is delegated");
-        assertEquals("mcp-handshake", v.responseHeaders.get("X-PDP-Action"));
-        assertEquals("alice", v.upstreamHeaders.get("X-Auth-Principal"));
-        assertEquals(0, t.count("/access/v1/evaluation"));
+    void sendsEveryRequestOnAnMcpRouteToCoazPepNotOnlyToolsCall() {
+        // What used to pass on a token alone is coaz-pep's to decide: every method, the
+        // handshake, notifications, a client's answer to the server, the SSE GET.
+        String[] bodies = {
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/read\",\"params\":{\"uri\":\"bank://accounts\"}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"s1\",\"result\":{\"content\":[]}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}",
+        };
+        String[] actions = {"initialize", "tools/list", "notifications/initialized", "resources/read", "jsonrpc-response", "ping"};
+        for (int i = 0; i < bodies.length; i++) {
+            FakeTransport t = engine(obj("decision", false, "response", obj("status", 200, "body", "{}")));
+            Verdict v = mcpBody(t, bodies[i].getBytes(StandardCharsets.UTF_8));
+            assertFalse(v.permit, bodies[i]);
+            assertEquals(1, t.count("/v1/mcp/check"), bodies[i]);
+            assertEquals(bodies[i], Json.parse(t.hits.get(0).body()).get("body").asText());
+            assertEquals(actions[i], v.responseHeaders.get("X-PDP-Action"), "the engine named none, so the rule does");
+            assertEquals(0, t.count("/access/v1/evaluation"), "the rule never asks the PDP itself on an MCP route");
+        }
+        // No body: the SSE GET and the session DELETE go too, and a body-less POST does not.
+        for (String method : new String[]{"GET", "DELETE", "OPTIONS"}) {
+            FakeTransport t = engine(obj("decision", true));
+            Verdict v = pep(mcpConf(), t).decide(req(method, "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), null));
+            assertTrue(v.permit, method);
+            assertEquals(method, Json.parse(t.hits.get(0).body()).get("method").asText());
+            assertEquals("", Json.parse(t.hits.get(0).body()).get("body").asText());
+            assertEquals("mcp:" + method.toLowerCase(java.util.Locale.ROOT), v.responseHeaders.get("X-PDP-Action"));
+        }
+    }
 
-        AuthZenRuleConfiguration noEngine = baseConf();
-        noEngine.style = "mcp";
-        FakeTransport t2 = pdp(obj("decision", true)).route(COAZ, obj("decision", true));
-        Verdict v2 = pep(noEngine, t2).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), TOOLS_CALL));
-        assertTrue(v2.permit);
-        assertEquals(0, t2.count("/v1/mcp/check"));
+    @Test
+    void refusesWhatItCannotReadExactlyOnceAndAsksNobody() {
+        // The contract's table: status, JSON-RPC code, and nothing sent anywhere.
+        Object[][] cases = {
+            {"[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}}]", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}} x", 400, -32700},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"Method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"a\",\"Name\":\"make_payment\"}}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"a\"},\"method\":\"ping\"}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":7}", 400, -32600},
+            {"", 400, -32700},
+            {"not json", 400, -32700},
+            {"﻿{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}", 400, -32700},
+        };
+        for (Object[] c : cases) {
+            FakeTransport t = engine(obj("decision", true));
+            Verdict v = mcpBody(t, ((String) c[0]).getBytes(StandardCharsets.UTF_8));
+            assertFalse(v.permit, (String) c[0]);
+            assertEquals(c[1], v.status, (String) c[0]);
+            JsonNode b = body(v);
+            assertEquals("2.0", b.get("jsonrpc").asText());
+            assertEquals(c[2], b.get("error").get("code").intValue(), (String) c[0]);
+            assertEquals("application/json", v.header("Content-Type"));
+            assertEquals("DENY", v.responseHeaders.get("X-PDP-Decision"));
+            assertEquals(0, t.hits.size(), "neither coaz-pep nor the PDP was asked: " + c[0]);
+        }
+        // The id is echoed when it could be read.
+        Verdict withId = mcpBody(engine(obj("decision", true)), "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{}}".getBytes(StandardCharsets.UTF_8));
+        assertEquals(42, body(withId).get("id").intValue());
+        assertTrue(body(mcpBody(engine(obj("decision", true)), "[]".getBytes(StandardCharsets.UTF_8))).get("id").isNull());
+        // Invalid UTF-8: Node and Go would run it with U+FFFD in it; the rule refuses it.
+        byte[] latin1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"aÿ\"}}".getBytes(StandardCharsets.ISO_8859_1);
+        FakeTransport t = engine(obj("decision", true));
+        Verdict bad = mcpBody(t, latin1);
+        assertEquals(400, bad.status);
+        assertEquals(-32700, body(bad).get("error").get("code").intValue());
+        assertEquals(0, t.hits.size());
+    }
 
-        // The initialize handshake is a PDP question: access to the MCP service.
-        FakeTransport t3 = pdp(obj("decision", true));
-        pep(noEngine, t3).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
-        assertEquals("access_mcp", sent(t3).get("action").get("name").asText());
-        assertEquals("mcp-service", sent(t3).get("resource").get("type").asText());
+    @Test
+    void refusesACompressedBodyAndOneItCouldNotReadInFull() {
+        byte[] call = TOOLS_CALL.getBytes(StandardCharsets.UTF_8);
+        for (String[] enc : new String[][]{{"content-encoding", "gzip"}, {"content-encoding", "identity, gzip"},
+            {"content-encoding", "identity", "content-encoding", "br"}, {"Content-Encoding", "GZIP"}}) {
+            FakeTransport t = engine(obj("decision", true));
+            Verdict v = mcpBody(t, call, enc);
+            assertEquals(415, v.status, String.join(" ", enc));
+            assertEquals("Invalid Request: Content-Encoding not supported by the PEP", body(v).get("error").get("message").asText());
+            assertEquals(-32600, body(v).get("error").get("code").intValue());
+            assertEquals(0, t.hits.size());
+        }
+        for (String[] enc : new String[][]{{"content-encoding", "identity"}, {"content-encoding", ""}, {"content-encoding", " IDENTITY "}}) {
+            assertTrue(mcpBody(engine(obj("decision", true)), call, enc).permit, String.join(" ", enc));
+        }
+        // A body PingAccess could not hand over whole: never judge part of one.
+        FakeTransport t = engine(obj("decision", true));
+        Verdict partial = pep(mcpConf(), t).decide(new PepRequest("POST", "/mcp", Map.of("authorization", List.of(bearer(obj("sub", "alice")))), null, false, null));
+        assertEquals(413, partial.status);
+        assertEquals("Invalid Request: request body too large for the PEP to authorise", body(partial).get("error").get("message").asText());
+        assertEquals(0, t.hits.size());
+        // Any method: a body is a body.
+        Verdict get = pep(mcpConf(), t).decide(new PepRequest("GET", "/mcp", Map.of("authorization", List.of(bearer(obj("sub", "alice")))), null, false, null));
+        assertEquals(413, get.status);
+        Verdict getWithJunk = pep(mcpConf(), t).decide(req("GET", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "not json"));
+        assertEquals(400, getWithJunk.status);
+        assertEquals(0, t.hits.size());
+    }
+
+    @Test
+    void anMcpRouteStillChecksTheTokenAndTheIdentityFirst() {
+        FakeTransport t = engine(obj("decision", true));
+        Verdict none = pep(mcpConf(), t).decide(req("POST", "/mcp", Map.of(), TOOLS_CALL));
+        assertEquals(401, none.status);
+        AuthZenRuleConfiguration strict = mcpConf();
+        strict.allow_insecure = false;
+        Verdict unverified = pep(strict, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), TOOLS_CALL));
+        assertEquals(401, unverified.status);
+        assertEquals(0, t.hits.size());
     }
 
     @Test
@@ -477,7 +709,7 @@ class PepTest {
         c.fail_mode = "open";
         c.resource = "https://api.example";
         c.forward_access_token = true;
-        c.coaz_defaults = true;
+        c.coaz_defaults = false;
         Object[] r = mcpRoute(obj("decision", true), c);
         assertTrue(((Verdict) r[0]).permit);
         JsonNode cfg = Json.parse(((FakeTransport) r[1]).hits.get(0).body()).get("config");
@@ -485,15 +717,16 @@ class PepTest {
         assertEquals("open", cfg.get("fail_mode").asText());
         assertEquals("https://api.example", cfg.get("resource").asText());
         assertEquals("true", cfg.get("forward_access_token").asText());
-        assertEquals("true", cfg.get("coaz_defaults").asText());
+        assertEquals("false", cfg.get("coaz_defaults").asText(), "only an explicit opt-out turns the default table off");
         // Header sanity: the engine call is authenticated when a key is configured.
         c.coaz_api_key = "demo";
         Object[] r2 = mcpRoute(obj("decision", true), c);
         assertEquals("Bearer demo", ((FakeTransport) r2[1]).hits.get(0).headers().get("Authorization"));
-        // And a tools/call without a name still gets an action.
+        // A tools/call without a name is refused, not sent with a made-up action.
         FakeTransport t = pdp(obj("decision", true)).route(COAZ + "/v1/mcp/check", obj("decision", true));
         Verdict v = pep(c, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"method\":\"tools/call\"}"));
-        assertEquals("tools/call:?", v.responseHeaders.get("X-PDP-Action"));
+        assertEquals(400, v.status);
+        assertEquals(0, t.hits.size());
     }
 
     // ---------- claim handling and remaining denials ----------
@@ -586,6 +819,102 @@ class PepTest {
         FakeTransport t2 = pdp(obj("decision", true));
         pep(baseConf(), t2).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
         assertEquals("unknown-agent", sent(t2).get("subject").get("id").asText());
+    }
+
+    // ---------- what the PDP says is someone else's text ----------
+
+    @Test
+    void cleansAndQuotesEveryHeaderBuiltFromWhatThePdpSaid() {
+        // A step-up scope that tries to close the quoted-string and start a header.
+        FakeTransport t = pdp(obj("decision", false, "context", obj("reason", "no\r\nX-Evil: 1 一",
+            "step_up_required", true, "step_up_scope", "a\" error=\"x\r\nX-Evil: 1\\")));
+        Verdict v = pep(baseConf(), t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"from_account\":\"a\",\"amount\":5}"));
+        assertEquals("Bearer error=\"insufficient_scope\", scope=\"a\\\" error=\\\"xX-Evil: 1\\\\\"", v.header("WWW-Authenticate"));
+        assertEquals("noX-Evil: 1 ", v.responseHeaders.get("X-PDP-Reason"), "no CR, no LF, nothing past Latin-1");
+        // The JSON body keeps the PDP's words as they were: JSON has no header rules.
+        assertEquals("no\r\nX-Evil: 1 一", body(v).get("reason").asText());
+        FakeTransport d = pdp(obj("decision", false, "context", obj("identity_proofing_required", true, "identity_proofing_doctype", "org.\"x\"\r\n")));
+        Verdict dv = pep(baseConf(), d).decide(req("POST", "/accounts", Map.of("authorization", bearer(obj("sub", "alice"))), "{}"));
+        assertEquals("Bearer error=\"identity_verification_required\", doctype=\"org.\\\"x\\\"\"", dv.header("WWW-Authenticate"));
+        // Even the rule's own label, which an administrator typed.
+        AuthZenRuleConfiguration c = baseConf();
+        c.pep_label = "edge\r\nX-Evil: 1";
+        assertEquals("edgeX-Evil: 1", pep(c, pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance",
+            Map.of("authorization", bearer(obj("sub", "alice"))), null)).responseHeaders.get("X-PDP-PEP"));
+    }
+
+    @Test
+    void neverForwardsAnIdentityItCannotCarryIntact() {
+        // Cleaning "ad一min" would make it "admin": refused instead, on both paths.
+        for (String sub : new String[]{"ad一min", "alice\r\nX-Auth-Principal: admin", "bob\u0000"}) {
+            Verdict v = pep(baseConf(), pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance",
+                Map.of("authorization", bearer(obj("sub", sub))), null));
+            assertFalse(v.permit, sub);
+            assertEquals(403, v.status);
+        }
+        assertTrue(pep(baseConf(), pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance",
+            Map.of("authorization", bearer(obj("sub", "zoë"))), null)).permit, "Latin-1 is carried as it is");
+        Verdict mcp = (Verdict) mcpRoute(obj("decision", true, "upstream_headers", obj("X-Auth-Principal", "ad一min")), null)[0];
+        assertEquals(403, mcp.status);
+    }
+
+    @Test
+    void takesOnlyHeadersThatAreHeadersFromCoazPep() {
+        Verdict v = (Verdict) mcpRoute(obj("decision", true, "upstream_headers", obj("x-auth-principal", "alice", "X-Custom", "a\r\nb",
+            "Content-Length", "0", "Host", "evil.example", "Bad Header", "x")), null)[0];
+        assertTrue(v.permit);
+        assertEquals("alice", v.upstreamHeaders.get("X-Auth-Principal"), "under its own name, replacing the removal");
+        assertFalse(v.upstreamHeaders.containsKey("x-auth-principal"));
+        assertEquals("ab", v.upstreamHeaders.get("X-Custom"));
+        assertFalse(v.upstreamHeaders.containsKey("Content-Length"));
+        assertFalse(v.upstreamHeaders.containsKey("Host"));
+        assertFalse(v.upstreamHeaders.containsKey("Bad Header"));
+        Verdict deny = (Verdict) mcpRoute(obj("decision", false, "response", obj("status", 403, "body", "{}",
+            "headers", obj("WWW-Authenticate", "Bearer\r\nSet-Cookie: s=1", "Bad Header", "x", "X-PDP-Reason", "why\r\n"))), null)[0];
+        assertEquals("BearerSet-Cookie: s=1", deny.header("WWW-Authenticate"));
+        assertNull(deny.header("Bad Header"));
+        assertEquals("why", deny.responseHeaders.get("X-PDP-Reason"));
+    }
+
+    // ---------- an identity PingAccess did not establish is not an identity ----------
+
+    @Test
+    void anAccessTokenPingAccessDidNotValidateIsRefusedByDefault() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.allow_insecure = false;
+        FakeTransport t = pdp(obj("decision", true));
+        // An unsigned token on an unprotected application: its claims are the client's word.
+        Verdict v = pep(c, t).decide(req("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "admin"))), null));
+        assertEquals(401, v.status);
+        assertFalse(v.upstreamHeaders.containsKey("X-Auth-Principal"));
+        assertEquals(0, t.hits.size(), "never reached the PDP");
+        // The same request on a protected application: PingAccess's identity is the subject.
+        PepRequest validated = new PepRequest("GET", "/accounts/a/balance", Map.of("authorization", bearer(obj("sub", "admin"))), null,
+            obj("sub", "alice"));
+        Verdict ok = pep(c, t).decide(validated);
+        assertTrue(ok.permit);
+        assertEquals("alice", ok.upstreamHeaders.get("X-Auth-Principal"));
+        // No token at all on a route that allows it: anonymous, no claims to take on trust.
+        c.require_token = false;
+        Verdict anon = pep(c, pdp(obj("decision", true))).decide(req("GET", "/accounts/a/balance", Map.of(), null));
+        assertTrue(anon.permit);
+        assertEquals("", anon.upstreamHeaders.get("X-Auth-Principal"));
+    }
+
+    @Test
+    void anUnverifiedUserTokenOpensNoGateAndCarriesNoScope() {
+        FakeTransport t = pdp(obj("decision", true));
+        AuthZenRuleConfiguration c = baseConf();
+        Pep ignoring = new Pep(c, t, new Discovery(t, () -> 1_000_000L), UserTokens.ignored());
+        String forged = jwt(obj("sub", "alice", "scope", "payments:approve"));
+        ignoring.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", forged),
+            "{\"from_account\":\"a\",\"amount\":5000}"));
+        assertEquals("", sent(t).get("context").get("user_scope").asText(), "a forged approval never reaches the PDP");
+        c.require_user_login = true;
+        Verdict v = new Pep(c, t, new Discovery(t, () -> 1_000_000L), UserTokens.ignored()).decide(req("GET", "/accounts/a/balance",
+            Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", forged), null));
+        assertEquals(401, v.status);
+        assertEquals("login_required", body(v).get("error").asText());
     }
 
     // ---------- what PingAccess established wins ----------
@@ -714,7 +1043,7 @@ class PepTest {
         Verdict v = drive(c, t);
         assertTrue(v.permit);
         assertEquals(GOOD + "/custom/eval", t.last().url());
-        assertTrue(v.responseHeaders.get("X-PDP-Fail-Open").startsWith(DOWN));
+        assertEquals(DOWN, v.responseHeaders.get("X-PDP-Fail-Open"));
         assertEquals("PERMIT", v.responseHeaders.get("X-PDP-Decision"));
         // Nothing skipped, no marker.
         AuthZenRuleConfiguration clean = discoveryConf();
@@ -741,7 +1070,13 @@ class PepTest {
         all.pdp_layers = List.of(DOWN);
         Verdict av = drive(all, failOpenRoutes(obj("decision", true)));
         assertTrue(av.permit);
-        assertTrue(av.responseHeaders.get("X-PDP-Reason").contains("fail-open"));
+        assertEquals("fail-open: no policy layer could be reached", av.responseHeaders.get("X-PDP-Reason"), "no error text on the wire");
+        // A layer whose discovery is down is skipped and named the same way.
+        AuthZenRuleConfiguration meta = discoveryConf();
+        meta.pdp_layers = List.of("https://meta-down.example fail-open", "resource");
+        Verdict mv = drive(meta, failOpenRoutes(obj("decision", true)).route("https://meta-down.example", 503));
+        assertTrue(mv.permit);
+        assertEquals("https://meta-down.example", mv.responseHeaders.get("X-PDP-Fail-Open"));
     }
 
     @Test
@@ -818,31 +1153,114 @@ class PepTest {
         server.start();
         try {
             String jwksUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/jwks";
-            UserTokens.Reader reader = UserTokens.verified(jwksUrl, "https://as.example", "https://api.example");
+            UserTokens.Reader reader = UserTokens.verified(jwksUrl, "https://as.example", "https://api.example", new JdkTransport(), true);
             AuthZenRuleConfiguration c = baseConf();
             c.require_user_login = true;
             FakeTransport t = pdp(obj("decision", true));
             Pep p = new Pep(c, t, new Discovery(t, () -> 1_000_000L), reader);
+            long exp = System.currentTimeMillis() / 1000 + 600;
+            String claims = ",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}";
 
-            String good = sign(key, "{\"sub\":\"alice\",\"scope\":\"payments:approve\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}");
-            Verdict ok = p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", good), "{\"amount\":5}"));
+            String good = sign(key, "{\"sub\":\"alice\",\"scope\":\"payments:approve\"" + claims);
+            Verdict ok = p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", good), "{\"from_account\":\"a\",\"amount\":5}"));
             assertTrue(ok.permit);
             assertEquals("payments:approve", sent(t).get("context").get("user_scope").asText());
 
-            String forged = sign(other, "{\"sub\":\"alice\",\"scope\":\"payments:approve\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}");
+            String forged = sign(other, "{\"sub\":\"alice\",\"scope\":\"payments:approve\"" + claims);
             assertEquals(401, p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", forged), "{}")).status);
-            String wrongIssuer = sign(key, "{\"sub\":\"alice\",\"iss\":\"https://evil.example\",\"aud\":\"https://api.example\"}");
+            String wrongIssuer = sign(key, "{\"sub\":\"alice\",\"iss\":\"https://evil.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}");
             assertEquals(401, p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", wrongIssuer), "{}")).status);
             String none = jwt(obj("sub", "alice", "iss", "https://as.example", "aud", "https://api.example"));
             assertEquals(401, p.decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice")), "x-user-token", none), "{}")).status, "alg none is refused");
             assertNull(reader.claims(null));
 
-            // Without an expected issuer or audience, only the signature and times gate.
-            UserTokens.Reader lax = UserTokens.verified(jwksUrl, null, null);
-            assertEquals("alice", lax.claims(sign(key, "{\"sub\":\"alice\"}")).get("sub").asText());
+            // exp, sub and the configured audience are required, not merely checked when present.
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}")), "no exp");
+            assertNull(reader.claims(sign(key, "{\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}")), "no sub");
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"exp\":" + exp + "}")), "no aud");
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://other.example\",\"exp\":" + exp + "}")), "wrong aud");
+            assertNull(reader.claims(sign(key, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":1000}")), "expired");
+
+            // Without an expected issuer or audience (allow_insecure only), the signature, exp and sub still gate.
+            UserTokens.Reader lax = UserTokens.verified(jwksUrl, null, null, new JdkTransport(), true);
+            assertEquals("alice", lax.claims(sign(key, "{\"sub\":\"alice\",\"exp\":" + exp + "}")).get("sub").asText());
+            UserTokens.Reader blank = UserTokens.verified(jwksUrl, "", "", new JdkTransport(), true);
+            assertEquals("alice", blank.claims(sign(key, "{\"sub\":\"alice\",\"exp\":" + exp + "}")).get("sub").asText());
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void aRejectedUserTokenIsLoggedByReasonNeverByContent() throws Exception {
+        EllipticCurveJsonWebKey key = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        key.setKeyId("k1");
+        String jwks = new JsonWebKeySet(key).toJson(JsonWebKey.OutputControlLevel.PUBLIC_ONLY);
+        FakeTransport t = new FakeTransport().route("https://as.example/jwks", jwks);
+        UserTokens.Reader reader = UserTokens.verified("https://as.example/jwks", "https://as.example", "https://api.example", t, true);
+        long exp = System.currentTimeMillis() / 1000 + 600;
+        Map<String, String> cases = new java.util.LinkedHashMap<>();
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":1000}", "expired");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\"}", "no exp");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + (exp + 1200) + ",\"nbf\":" + exp + "}", "not yet valid");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://x.example\",\"exp\":" + exp + "}", "wrong audience");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"exp\":" + exp + "}", "no audience");
+        cases.put("{\"sub\":\"alice\",\"iss\":\"https://x.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}", "wrong issuer");
+        cases.put("{\"sub\":\"alice\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}", "no issuer");
+        cases.put("{\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}", "no subject");
+        org.jose4j.jwt.consumer.JwtConsumer consumer = new org.jose4j.jwt.consumer.JwtConsumerBuilder()
+            .setVerificationKey(key.getPublicKey()).setRequireExpirationTime().setRequireSubject()
+            .setExpectedIssuer("https://as.example").setExpectedAudience(true, "https://api.example").build();
+        for (Map.Entry<String, String> c : cases.entrySet()) {
+            String token = sign(key, c.getKey());
+            assertNull(reader.claims(token), c.getValue());
+            org.jose4j.jwt.consumer.InvalidJwtException e = org.junit.jupiter.api.Assertions.assertThrows(
+                org.jose4j.jwt.consumer.InvalidJwtException.class, () -> consumer.processToClaims(token));
+            assertEquals(c.getValue(), UserTokens.reason(e));
+            assertFalse(UserTokens.reason(e).contains("alice"), "no claims in the log");
+        }
+        EllipticCurveJsonWebKey other = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        other.setKeyId("k1");
+        String forged = sign(other, "{\"sub\":\"alice\",\"iss\":\"https://as.example\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}");
+        org.jose4j.jwt.consumer.InvalidJwtException bad = org.junit.jupiter.api.Assertions.assertThrows(
+            org.jose4j.jwt.consumer.InvalidJwtException.class, () -> consumer.processToClaims(forged));
+        assertEquals("signature invalid", UserTokens.reason(bad));
+        org.jose4j.jwt.consumer.InvalidJwtException garbage = org.junit.jupiter.api.Assertions.assertThrows(
+            org.jose4j.jwt.consumer.InvalidJwtException.class, () -> consumer.processToClaims("not.a.token"));
+        assertTrue(UserTokens.reason(garbage).startsWith("not a verifiable token"));
+    }
+
+    @Test
+    void theJwksIsFetchedThroughTheRulesOwnBoundedTransport() throws Exception {
+        EllipticCurveJsonWebKey key = EcJwkGenerator.generateJwk(EllipticCurves.P256);
+        key.setKeyId("k1");
+        String jwks = new JsonWebKeySet(key).toJson(JsonWebKey.OutputControlLevel.PUBLIC_ONLY);
+        FakeTransport t = new FakeTransport().route("https://as.example/jwks", (Function<Transport.Request, Transport.Response>) r ->
+            new Transport.Response(200, Map.of("Content-Type", "application/json", "Cache-Control", "max-age=600"), jwks.getBytes(StandardCharsets.UTF_8)));
+        UserTokens.Reader reader = UserTokens.verified("https://as.example/jwks", null, "https://api.example", t, false);
+        long exp = System.currentTimeMillis() / 1000 + 600;
+        assertEquals("alice", reader.claims(sign(key, "{\"sub\":\"alice\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}")).get("sub").asText());
+        Transport.Request fetch = t.to("/jwks").get(0);
+        assertEquals(UserTokens.JWKS_TIMEOUT_MS, fetch.timeoutMs());
+        assertEquals(UserTokens.JWKS_MAX_BYTES, fetch.maxResponseBytes());
+        assertFalse(fetch.verifyTls(), "pdp_ssl_verify applies to the JWKS fetch too");
+        // A key set that cannot be fetched verifies nothing.
+        for (Object down : new Object[]{500, Boolean.FALSE, new Transport.Refused("too large")}) {
+            FakeTransport dt = new FakeTransport().route("https://as.example/jwks", down);
+            UserTokens.Reader r = UserTokens.verified("https://as.example/jwks", null, "https://api.example", dt, true);
+            assertNull(r.claims(sign(key, "{\"sub\":\"alice\",\"aud\":\"https://api.example\",\"exp\":" + exp + "}")), String.valueOf(down));
+        }
+        // The response adapter jose4j reads headers and status through.
+        org.jose4j.http.SimpleResponse sr = new UserTokens.TransportGet(t, true).get("https://as.example/jwks");
+        assertEquals(200, sr.getStatusCode());
+        assertEquals("", sr.getStatusMessage());
+        assertTrue(sr.getHeaderNames().contains("Cache-Control"));
+        assertEquals(List.of("max-age=600"), sr.getHeaderValues("cache-control"));
+        assertEquals(List.of(), sr.getHeaderValues("expires"));
+        org.jose4j.http.SimpleResponse empty = new UserTokens.TransportGet(new FakeTransport().route("https://e.example",
+            (Function<Transport.Request, Transport.Response>) r -> new Transport.Response(200, null, null)), true).get("https://e.example/");
+        assertEquals("", empty.getBody());
+        assertTrue(empty.getHeaderNames().isEmpty());
     }
 
     private static String sign(EllipticCurveJsonWebKey key, String payload) throws Exception {

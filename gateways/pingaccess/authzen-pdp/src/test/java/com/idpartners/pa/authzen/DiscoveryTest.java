@@ -126,6 +126,9 @@ class DiscoveryTest {
         assertNotAllowed("/x", open);
         assertNotAllowed("https://no.example/x", new Discovery.Policy(false, null, List.of("https://ok.example"), true, 5000));
         Discovery.checkUrl("https://ok.example/x", new Discovery.Policy(false, null, List.of("https://ok.example"), true, 5000));
+        // A URL the transport could not call is refused here, where the reason is clear.
+        assertNotAllowed("http://authzen_pdp:8080/x", new Discovery.Policy(true, null, null, true, 5000));
+        assertNotAllowed("https://user:pw@ok.example/x", open);
     }
 
     private static void assertNotAllowed(String url, Discovery.Policy p) {
@@ -196,12 +199,17 @@ class DiscoveryTest {
     }
 
     @Test
-    void fallsBackToTheDefaultPathsOn404And500AndConnectionFailure() throws Exception {
-        for (Object r : new Object[]{404, 500, Boolean.FALSE}) {
+    void usesTheDefaultPathsOnlyWhenThePdpPublishesNothing() throws Exception {
+        FakeTransport none = new FakeTransport().route(STATIC, 404);
+        AuthZenRuleConfiguration c = conf();
+        c.pdp_discovery = "authzen";
+        assertEquals(STATIC + "/access/v1/evaluation", discovery(none).resolve(c, "").evaluation);
+        // An outage is an outage, not "this PDP has no metadata": cached as the answer it
+        // would stand in for the PDP's own endpoints for a whole TTL.
+        for (Object r : new Object[]{500, 503, 429, Boolean.FALSE}) {
             FakeTransport t = new FakeTransport().route(STATIC, r);
-            AuthZenRuleConfiguration c = conf();
-            c.pdp_discovery = "authzen";
-            assertEquals(STATIC + "/access/v1/evaluation", discovery(t).resolve(c, "").evaluation, String.valueOf(r));
+            Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> discovery(t).resolve(c, ""), String.valueOf(r));
+            assertEquals(Discovery.Kind.TRANSIENT, f.kind, String.valueOf(r));
         }
     }
 
@@ -218,9 +226,200 @@ class DiscoveryTest {
             AuthZenRuleConfiguration conf = conf();
             conf.pdp_discovery = "authzen";
             Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> discovery(t).resolve(conf, ""));
-            assertEquals(Discovery.Kind.TRANSIENT, f.kind);
+            assertEquals(Discovery.Kind.REFUSED, f.kind, "every candidate answered, and none usably: a refusal, not an outage");
             assertTrue(f.getMessage().contains((String) c[1]), f.getMessage());
         }
+    }
+
+    @Test
+    void aPdpMetadataBlipServesTheLastGoodEntryNotTheDefaults() throws Exception {
+        FakeTransport t = resourceRoutes();
+        Clock clock = new Clock();
+        Discovery d = discovery(t, clock);
+        assertEquals(GOOD + "/custom/eval", d.resolve(conf(), RES).evaluation);
+        for (Object blip : new Object[]{500, Boolean.FALSE, 302, "<html>"}) {
+            t.route(GOOD + "/.well-known/authzen-configuration", blip);
+            clock.now += 301;
+            assertEquals(GOOD + "/custom/eval", d.resolve(conf(), RES).evaluation, String.valueOf(blip));
+        }
+        // Cold, an outage fails the resolution rather than caching the default paths, and
+        // is not retried on every request.
+        FakeTransport cold = resourceRoutes().route(GOOD + "/.well-known/authzen-configuration", 503);
+        Clock c2 = new Clock();
+        Discovery d2 = discovery(cold, c2);
+        assertThrows(Discovery.Failure.class, () -> d2.resolve(conf(), RES));
+        int before = cold.count(GOOD);
+        assertThrows(Discovery.Failure.class, () -> d2.resolve(conf(), RES));
+        assertEquals(before, cold.count(GOOD), "negatively cached");
+        cold.route(GOOD + "/.well-known/authzen-configuration", pdpConfig(GOOD));
+        c2.now += Discovery.MIN_REFRESH + 1;
+        assertEquals(GOOD + "/custom/eval", d2.resolve(conf(), RES).evaluation);
+    }
+
+    @Test
+    void aRefreshRunsOutsideTheLockAndEveryoneElseGetsTheStaleValue() throws Exception {
+        java.util.concurrent.CountDownLatch inFetch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        FakeTransport t = resourceRoutes();
+        Clock clock = new Clock();
+        Discovery d = discovery(t, clock);
+        assertEquals(GOOD, d.resolve(conf(), RES).identifier);
+        t.route(RES + "/.well-known/oauth-protected-resource", (Function<Transport.Request, Transport.Response>) r -> {
+            inFetch.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FakeTransport.json(200, resourceDoc(GOOD));
+        });
+        clock.now += 301;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try {
+            java.util.concurrent.Future<String> refresher = pool.submit(() -> d.resolve(conf(), RES).identifier);
+            assertTrue(inFetch.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            // The refresh is stuck on the network; this request is not stuck behind it.
+            long t0 = System.nanoTime();
+            assertEquals(GOOD, d.resolve(conf(), RES).identifier);
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 1000, "served stale without waiting");
+            release.countDown();
+            assertEquals(GOOD, refresher.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void aColdFetchIsSharedByTheRequestsThatArriveWhileItRuns() throws Exception {
+        java.util.concurrent.CountDownLatch inFetch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger fetches = new java.util.concurrent.atomic.AtomicInteger();
+        FakeTransport t = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", (Function<Transport.Request, Transport.Response>) r -> {
+            fetches.incrementAndGet();
+            inFetch.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FakeTransport.json(200, resourceDoc(GOOD));
+        });
+        Discovery d = discovery(t);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Future<String> first = pool.submit(() -> d.resolve(conf(), RES).identifier);
+            assertTrue(inFetch.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            java.util.concurrent.Future<String> second = pool.submit(() -> d.resolve(conf(), RES).identifier);
+            Thread.sleep(100);
+            release.countDown();
+            assertEquals(GOOD, first.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(GOOD, second.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(1, fetches.get(), "one fetch for both");
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+        // A waiter gets the fetch's failure, not a hang.
+        java.util.concurrent.CountDownLatch in2 = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch rel2 = new java.util.concurrent.CountDownLatch(1);
+        FakeTransport failing = resourceRoutes()
+            .route(RES + "/.well-known/oauth-protected-resource", resourceDoc(GOOD))
+            .route(GOOD + "/.well-known/authzen-configuration", (Function<Transport.Request, Transport.Response>) r -> {
+                in2.countDown();
+                try {
+                    rel2.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return FakeTransport.json(200, "<html>");
+            });
+        AuthZenRuleConfiguration noStatic = conf();
+        noStatic.authzen_url = "";
+        Discovery d2 = discovery(failing);
+        java.util.concurrent.ExecutorService pool2 = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Future<Object> a = pool2.submit(() -> d2.resolve(noStatic, RES));
+            assertTrue(in2.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            java.util.concurrent.Future<Object> b = pool2.submit(() -> d2.resolve(noStatic, RES));
+            Thread.sleep(100);
+            rel2.countDown();
+            for (java.util.concurrent.Future<Object> f : List.of(a, b)) {
+                java.util.concurrent.ExecutionException x = assertThrows(java.util.concurrent.ExecutionException.class,
+                    () -> f.get(5, java.util.concurrent.TimeUnit.SECONDS));
+                assertTrue(x.getCause() instanceof Discovery.Failure);
+            }
+        } finally {
+            rel2.countDown();
+            pool2.shutdownNow();
+        }
+    }
+
+    @Test
+    void aWaiterGivesUpAfterItsBoundOrWhenInterrupted() throws Exception {
+        java.util.concurrent.CountDownLatch inFetch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        FakeTransport t = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", (Function<Transport.Request, Transport.Response>) r -> {
+            inFetch.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return FakeTransport.json(200, resourceDoc(GOOD));
+        });
+        AuthZenRuleConfiguration noStatic = conf();
+        noStatic.authzen_url = "";
+        Discovery d = discovery(t);
+        d.waitMs = 100;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try {
+            pool.submit(() -> d.resolve(noStatic, RES));
+            assertTrue(inFetch.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            Discovery.Failure timedOut = assertThrows(Discovery.Failure.class, () -> d.resolve(noStatic, RES));
+            assertEquals(Discovery.Kind.TRANSIENT, timedOut.kind);
+            assertTrue(timedOut.getMessage().contains("timed out waiting"), timedOut.getMessage());
+            d.waitMs = 5000;
+            Thread.currentThread().interrupt();
+            Discovery.Failure interrupted = assertThrows(Discovery.Failure.class, () -> d.resolve(noStatic, RES));
+            assertEquals(Discovery.Kind.TRANSIENT, interrupted.kind, "wrapped by resolve as no PDP");
+            assertTrue(Thread.interrupted(), "the interrupt is kept");
+        } finally {
+            Thread.interrupted();
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void aPathBearingAllowlistEntryAdmitsItsOwnWellKnownDocument() throws Exception {
+        String tenant = GOOD + "/tenants/bank-a";
+        ObjectNode doc = obj("resource", RES + "/api");
+        doc.putArray(Discovery.PARAM).add(tenant);
+        FakeTransport t = new FakeTransport()
+            .route("https://api.example/.well-known/oauth-protected-resource/api", doc)
+            .route(GOOD + "/.well-known/authzen-configuration/tenants/bank-a", pdpConfig(tenant, tenant + "/eval", null));
+        AuthZenRuleConfiguration c = conf();
+        c.pdp_allowlist = List.of(tenant);
+        c.resource_metadata_allowlist = List.of(RES + "/api");
+        Discovery.Endpoints ep = discovery(t).resolve(c, RES + "/api");
+        assertEquals(tenant, ep.identifier);
+        assertEquals(tenant + "/eval", ep.evaluation);
+        // The identifiers themselves are still held to the lists.
+        c.pdp_allowlist = List.of(GOOD + "/tenants/bank-b");
+        assertEquals(Discovery.Kind.NOT_ALLOWED, assertThrows(Discovery.Failure.class, () -> discovery(t).resolve(c, RES + "/api")).kind);
+    }
+
+    @Test
+    void aFetchThatThrowsSomethingUnexpectedFreesItsEntry() throws Exception {
+        FakeTransport t = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", (Function<Transport.Request, Transport.Response>) r -> {
+            throw new IllegalStateException("bug");
+        });
+        Discovery d = discovery(t);
+        assertThrows(IllegalStateException.class, () -> d.resolve(conf(), RES));
+        assertNull(d.resourceEntry(RES).inflight, "the next request may fetch");
+        t.route(RES + "/.well-known/oauth-protected-resource", resourceDoc(GOOD));
+        assertEquals(GOOD, d.resolve(conf(), RES).identifier);
     }
 
     @Test
@@ -246,10 +445,12 @@ class DiscoveryTest {
     }
 
     @Test
-    void treatsARedirectOrAnOversizedOrMissingBodyAsATransportFailure() throws Exception {
+    void aRedirectAnAnswerOverTheCapOrNoBodyIsARefusalNotTheDefaultPaths() {
         byte[] big = new byte[Discovery.MAX_BODY + 1];
         Object[] responders = {
             302,
+            403,
+            new Transport.Refused("cannot be built"),
             (Function<Transport.Request, Transport.Response>) r -> new Transport.Response(200, Map.of(), big),
             (Function<Transport.Request, Transport.Response>) r -> new Transport.Response(200, Map.of(), null),
         };
@@ -257,7 +458,27 @@ class DiscoveryTest {
             FakeTransport t = new FakeTransport().route(STATIC, r);
             AuthZenRuleConfiguration c = conf();
             c.pdp_discovery = "authzen";
-            assertEquals(STATIC + "/access/v1/evaluation", discovery(t).resolve(c, "").evaluation);
+            Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> discovery(t).resolve(c, ""), String.valueOf(r));
+            assertEquals(Discovery.Kind.REFUSED, f.kind, String.valueOf(r));
+            assertEquals(Discovery.MAX_BODY, t.hits.get(0).maxResponseBytes(), "metadata is read under its own cap");
+        }
+    }
+
+    @Test
+    void aResourceMetadataFetchThatFailsNeverReplacesTheLastGoodList() throws Exception {
+        for (Object blip : new Object[]{500, 403, 302, Boolean.FALSE}) {
+            FakeTransport t = resourceRoutes();
+            Clock clock = new Clock();
+            Discovery d = discovery(t, clock);
+            assertEquals(GOOD, d.resolve(conf(), RES).identifier);
+            t.route(RES + "/.well-known/oauth-protected-resource", blip);
+            clock.now += 301;
+            assertEquals(GOOD, d.resolve(conf(), RES).identifier, String.valueOf(blip));
+            // Cold, it is the static PDP for this request, and not cached as the answer.
+            FakeTransport cold = resourceRoutes().route(RES + "/.well-known/oauth-protected-resource", blip);
+            Discovery dc = discovery(cold);
+            assertEquals(STATIC, dc.resolve(conf(), RES).identifier, String.valueOf(blip));
+            assertFalse(dc.resourceEntry(RES).ok, String.valueOf(blip));
         }
     }
 
@@ -425,8 +646,14 @@ class DiscoveryTest {
         AuthZenRuleConfiguration c = conf();
         c.authzen_url = "";
         Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> discovery(t).resolve(c, RES));
-        assertEquals(Discovery.Kind.TRANSIENT, f.kind);
+        assertEquals(Discovery.Kind.REFUSED, f.kind, "the one candidate answered, unusably");
         assertTrue(f.getMessage().contains("no PDP could be resolved"));
+        // An outage among the candidates is an outage.
+        FakeTransport down = new FakeTransport()
+            .route(RES + "/.well-known/oauth-protected-resource", resourceDoc(ROGUE, GOOD))
+            .route(ROGUE + "/.well-known/authzen-configuration", pdpConfig("https://x.example"))
+            .route(GOOD + "/.well-known/authzen-configuration", 503);
+        assertEquals(Discovery.Kind.TRANSIENT, assertThrows(Discovery.Failure.class, () -> discovery(down).resolve(c, RES)).kind);
         // No metadata and no static PDP either.
         Discovery.Failure f2 = assertThrows(Discovery.Failure.class, () -> discovery(new FakeTransport()).resolve(c, RES));
         assertEquals(Discovery.Kind.TRANSIENT, f2.kind);
@@ -511,26 +738,34 @@ class DiscoveryTest {
     }
 
     @Test
-    void aFailOpenLayerThatCannotBeResolvedIsSkippedARefusalNeverIs() throws Exception {
-        Discovery d = discovery(layerRoutes());
-        String bad = "https://p.example/?x=1"; // invalid identifier: fails at resolution
-        Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> d.resolveLayers(conf(), RES, List.of(bad, "resource"), false));
+    void aFailOpenLayerThatIsDownIsSkippedARefusalNeverIs() throws Exception {
+        String down = "https://down.example"; // its metadata is unavailable: an outage
+        Discovery d = discovery(layerRoutes().route(down + "/.well-known/authzen-configuration", 503));
+        Discovery.Failure f = assertThrows(Discovery.Failure.class, () -> d.resolveLayers(conf(), RES, List.of(down, "resource"), false));
         assertTrue(f.getMessage().contains("layer"));
-        Discovery.Layers r = d.resolveLayers(conf(), RES, List.of(bad + " fail-open", "resource"), false);
+        Discovery.Layers r = d.resolveLayers(conf(), RES, List.of(down + " fail-open", "resource"), false);
         assertEquals(1, r.pdps().size());
         assertEquals(GOOD, r.pdps().get(0).identifier);
         assertFalse(r.pdps().get(0).failOpen);
-        assertEquals(1, r.skipped().size());
-        assertTrue(r.skipped().get(0).startsWith(bad));
+        // Named by its identifier alone: the error is in the log, not on the wire.
+        assertEquals(List.of(down), r.skipped());
         // The route default applies to layers that say nothing; the layer's own word wins.
-        r = d.resolveLayers(conf(), RES, List.of(bad, "resource fail-closed"), true);
+        r = d.resolveLayers(conf(), RES, List.of(down, "resource fail-closed"), true);
         assertEquals(1, r.skipped().size());
         assertFalse(r.pdps().get(0).failOpen);
-        assertThrows(Discovery.Failure.class, () -> d.resolveLayers(conf(), RES, List.of(bad + " fail-closed"), true));
+        assertThrows(Discovery.Failure.class, () -> d.resolveLayers(conf(), RES, List.of(down + " fail-closed"), true));
         // Everything skipped is still a resolution, with nothing to ask.
-        r = d.resolveLayers(conf(), RES, List.of(bad), true);
+        r = d.resolveLayers(conf(), RES, List.of(down), true);
         assertTrue(r.pdps().isEmpty());
         assertEquals(1, r.skipped().size());
+        // A layer that cannot be resolved for any other reason is never skipped: an
+        // identifier that cannot be one, metadata that answers unusably.
+        String bad = "https://p.example/?x=1";
+        Discovery.Failure invalid = assertThrows(Discovery.Failure.class, () -> d.resolveLayers(conf(), RES, List.of(bad + " fail-open", "resource"), true));
+        assertEquals(Discovery.Kind.INVALID, invalid.kind);
+        Discovery refusing = discovery(layerRoutes().route(down + "/.well-known/authzen-configuration", 401));
+        Discovery.Failure refused = assertThrows(Discovery.Failure.class, () -> refusing.resolveLayers(conf(), RES, List.of(down + " fail-open", "resource"), true));
+        assertEquals(Discovery.Kind.REFUSED, refused.kind);
         // A duplicate takes the stricter mode.
         r = d.resolveLayers(conf(), RES, List.of(GOOD + " fail-open", "resource fail-closed"), false);
         assertEquals(1, r.pdps().size());

@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -46,6 +47,10 @@ final class Pep {
     private static final String JSON = "application/json";
     private static final String DEFAULT_DOCTYPE = "org.iso.18013.5.1.mDL";
     private static final String LOGIN_ACR = "urn:pingidentity:loa:password";
+    /** The largest evaluation request the rule will send: well over any real one, and under what a client could pad one to. */
+    static final int MAX_EVALUATION = 2 * 1024 * 1024;
+    static final String UNREACHABLE = "Authorization service unreachable; denying (fail-closed).";
+    static final String REFUSED = "Authorization service refused the request; denying (fail-closed).";
 
     private final AuthZenRuleConfiguration conf;
     private final Transport transport;
@@ -95,6 +100,15 @@ final class Pep {
         if (token == null && conf.require_token) {
             return deny(pep, 401, "No access token presented to the gateway.", null);
         }
+        // 1a) Whose word is the token? On a protected application PingAccess validated it
+        //     before this rule ran and hands over an identity. With none (an unprotected
+        //     application) its claims are the client's own, and an unsigned token would
+        //     become the subject and X-Auth-Principal. Refused, unless allow_insecure.
+        if (token != null && req.identityClaims == null && !conf.allow_insecure) {
+            log.warn("authzen-pdp '{}': an access token arrived that PingAccess did not validate (is the application "
+                + "unprotected?); denying", pep);
+            return deny(pep, 401, "The access token was not validated by the gateway.", null);
+        }
         ObjectNode claims = mergeClaims(token == null ? null : Jwt.claims(token.value()), req.identityClaims);
         String sub = Json.text(claims, "sub");
         String act = actSub(claims);
@@ -116,25 +130,24 @@ final class Pep {
             }
         }
 
-        // 2b) COAZ: tools/call on an MCP route goes to the engine, which discovers the
-        //     tool's mapping, evaluates it, asks the PDP and returns either a permit or
-        //     the profile's JSON-RPC error to relay verbatim.
-        if ("mcp".equals(conf.style) && !blank(conf.coaz_url)) {
-            JsonNode rpc = Json.parse(req.body);
-            if (rpc instanceof ObjectNode && "tools/call".equals(Json.text(rpc, "method"))) {
-                return coazCheck(req, pep, rpc);
-            }
+        // 2b) MCP: every request on the route is coaz-pep's to decide, whatever its
+        //     method, once the rule is sure coaz-pep will judge exactly what the upstream
+        //     would run. Nothing on an MCP route is let through on a token alone.
+        if ("mcp".equals(conf.style)) {
+            return mcp(req, pep);
         }
 
-        // 3) build the AuthZEN evaluation request
-        RequestMapper.Mapped m = RequestMapper.map(conf.style, req.method, req.path, req.body);
+        // 3) build the AuthZEN evaluation request. A request the rule cannot map to what
+        //    the upstream will do (a payment with no readable amount, a path that routes
+        //    two ways) is refused, never sent to the PDP as something vaguer.
+        RequestMapper.Mapped m;
+        try {
+            m = RequestMapper.map(req.method, req.path, req.body, req.bodyReadable);
+        } catch (RequestMapper.Unmappable e) {
+            log.warn("authzen-pdp '{}': cannot map {} {}: {}", pep, req.method, HeaderValues.brief(req.path, 200), e.getMessage());
+            return deny(pep, 400, "The request cannot be authorised as sent.", null);
+        }
         Map<String, String> upstream = authHeaders(sub, act, scope, acr);
-
-        // MCP handshake / non-tool traffic: allow on a valid token, skip the PDP.
-        if (RequestMapper.ALLOW.equals(m.action())) {
-            return Verdict.permit(upstream, pdpHeaders(pep, "PERMIT", "mcp-handshake",
-                "MCP handshake allowed (authenticated); policy applies to tool calls.", null));
-        }
 
         // 3b) Carry the USER's consented scope into the context. The step-up decision is
         //     the PDP's: it compares the amount to its threshold and checks whether this
@@ -187,52 +200,45 @@ final class Pep {
         }
         ObjectNode request = m.ctx().putObject("request");
         request.put("method", req.method);
-        request.put("path", req.path);
+        request.put("path", m.path());
         if (conf.forward_access_token && token != null) {
             m.ctx().put("access_token", token.value());
         }
 
         // 4) ask each layer in order. Every layer must permit; the first that does not
-        //    is the answer, advice and all. A PDP error fails closed unless the layer is
-        //    fail-open, in which case it is skipped and named. A deny is never skipped.
+        //    is the answer, advice and all. An unavailable PDP fails closed unless the
+        //    layer is fail-open, in which case it is skipped and named. A deny is never
+        //    skipped, and neither is a refusal: a 4xx, a redirect or an answer that is not
+        //    a decision says nothing about the PDP being down, and a client must not be
+        //    able to switch a layer off by provoking one.
         byte[] body = Json.bytes(authzenReq);
+        if (body.length > MAX_EVALUATION) {
+            log.error("the evaluation request is {} bytes, over the {}-byte bound; refusing to send it", body.length, MAX_EVALUATION);
+            return deny(pep, 413, "The request is too large for the gateway to authorise.", null);
+        }
         List<String> skipped = new ArrayList<>(layers.skipped());
         boolean decided = false;
         boolean decision = false;
         ObjectNode dctx = Json.object();
         String reason = null;
         for (Discovery.Endpoints ep : layers.pdps()) {
-            Map<String, String> h = new LinkedHashMap<>();
-            h.put("Content-Type", JSON);
-            if (ep.apiKey != null) {
-                h.put("Authorization", "Bearer " + ep.apiKey); // bound to the PDP it was configured for
+            Answer a = ask(ep, body);
+            if (a.refused != null) {
+                log.error("PDP layer {} refused: {}; denying (a refusal never fails open)", ep.identifier, a.refused);
+                return deny(pep, 503, REFUSED, null);
             }
-            Transport.Response res = null;
-            String failure = null;
-            try {
-                res = transport.send(new Transport.Request("POST", ep.evaluation, h, body, conf.pdp_timeout_ms, conf.pdp_ssl_verify));
-                if (res.status() < 200 || res.status() >= 300) {
-                    failure = "returned " + res.status();
-                }
-            } catch (IOException e) {
-                failure = String.valueOf(e.getMessage());
-            }
-            if (failure != null) {
+            if (a.unavailable != null) {
                 if (!ep.failOpen) {
-                    log.error("PDP call failed ({}): {}", ep.identifier, failure);
-                    return deny(pep, 503, "Authorization service unreachable; denying (fail-closed).", null);
+                    log.error("PDP layer {} unavailable: {}; denying (fail-closed)", ep.identifier, a.unavailable);
+                    return deny(pep, 503, UNREACHABLE, null);
                 }
-                log.warn("PDP layer {} failed open: {}", ep.identifier, failure);
-                skipped.add(ep.identifier + " (" + failure + ")");
+                log.warn("PDP layer {} unavailable, failing open: {}", ep.identifier, a.unavailable);
+                skipped.add(ep.identifier);
                 continue;
             }
             decided = true;
-            JsonNode data = Json.parse(res.body());
-            JsonNode d = data == null ? Json.object() : data;
-            JsonNode dec = d.get("decision");
-            decision = dec != null && dec.isBoolean() && dec.booleanValue();
-            JsonNode c = d.get("context");
-            ObjectNode lctx = c instanceof ObjectNode ? (ObjectNode) c : Json.object();
+            decision = a.decision;
+            ObjectNode lctx = a.context;
             String r = Json.text(lctx, "reason");
             String lreason = r != null ? r : decision ? "Permitted by policy." : "Denied by policy.";
             if (!decision) {
@@ -250,7 +256,7 @@ final class Pep {
         if (!decided) {
             decision = true;
             dctx = Json.object();
-            reason = "fail-open: no policy layer could be reached (" + String.join("; ", skipped) + ")";
+            reason = "fail-open: no policy layer could be reached";
         }
         String failOpen = null;
         if (!skipped.isEmpty()) {
@@ -278,7 +284,7 @@ final class Pep {
             ch.put("reason", reason);
             ch.put("pep", pep);
             return Verdict.respond(401, headers(JSON, "WWW-Authenticate",
-                "Bearer error=\"identity_verification_required\", doctype=\"" + doctype + "\""), Json.bytes(out), rh);
+                "Bearer error=\"identity_verification_required\", doctype=\"" + HeaderValues.quoted(doctype) + "\""), Json.bytes(out), rh);
         }
 
         // Step-up advice: this payment is over the threshold and the user has not
@@ -299,7 +305,7 @@ final class Pep {
             ch.put("reason", reason);
             ch.put("pep", pep);
             return Verdict.respond(401, headers(JSON, "WWW-Authenticate",
-                "Bearer error=\"insufficient_scope\", scope=\"" + scopeReq + "\""), Json.bytes(out), rh);
+                "Bearer error=\"insufficient_scope\", scope=\"" + HeaderValues.quoted(scopeReq) + "\""), Json.bytes(out), rh);
         }
 
         if (!decision) {
@@ -307,7 +313,49 @@ final class Pep {
         }
 
         // PERMIT: pass the delegation identity to the upstream for its audit trail.
-        return Verdict.permit(upstream, rh);
+        return permit(pep, upstream, rh);
+    }
+
+    // ---------- asking a PDP ----------
+
+    /**
+     * One layer's answer. Exactly one of three: a decision with its context, unavailable
+     * (a transport failure, a timeout, a 5xx or a 429: the only thing a fail-open layer
+     * may skip), or refused (a 3xx or another 4xx, an answer that is not a decision, a
+     * call that could not be made).
+     */
+    record Answer(boolean decision, ObjectNode context, String unavailable, String refused) {
+    }
+
+    private Answer ask(Discovery.Endpoints ep, byte[] body) {
+        Map<String, String> h = new LinkedHashMap<>();
+        h.put("Content-Type", JSON);
+        if (ep.apiKey != null) {
+            h.put("Authorization", "Bearer " + ep.apiKey); // bound to the PDP it was configured for
+        }
+        Transport.Response res;
+        try {
+            res = transport.send(new Transport.Request("POST", ep.evaluation, h, body, conf.pdp_timeout_ms, conf.pdp_ssl_verify));
+        } catch (IOException e) {
+            return new Answer(false, null, String.valueOf(e.getMessage()), null);
+        } catch (Transport.Refused e) {
+            return new Answer(false, null, null, e.getMessage());
+        }
+        if (res.unavailable()) {
+            return new Answer(false, null, "HTTP " + res.status(), null);
+        }
+        if (!res.ok()) {
+            return new Answer(false, null, null, "HTTP " + res.status());
+        }
+        // A permit is the JSON boolean true and nothing else; an answer without a boolean
+        // decision is not a deny either, it is not an answer.
+        JsonNode d = Json.parse(res.body());
+        JsonNode dec = d instanceof ObjectNode ? d.get("decision") : null;
+        if (dec == null || !dec.isBoolean()) {
+            return new Answer(false, null, null, "the answer is not a decision");
+        }
+        JsonNode c = d.get("context");
+        return new Answer(dec.booleanValue(), c instanceof ObjectNode ? (ObjectNode) c : Json.object(), null, null);
     }
 
     // ---------- the delegated checks ----------
@@ -335,8 +383,11 @@ final class Pep {
             res = transport.send(new Transport.Request("POST", conf.coaz_url + "/v1/dpop/verify",
                 coazHeaders(), Json.bytes(body), 5000, conf.pdp_ssl_verify));
         } catch (IOException e) {
-            log.error("DPoP verification call failed: {}", e.getMessage());
+            log.error("DPoP verification unavailable: {}", e.getMessage());
             return deny(pep, 401, "DPoP verification service unreachable; denying (fail-closed).", null);
+        } catch (Transport.Refused e) {
+            log.error("DPoP verification call refused: {}", e.getMessage());
+            return deny(pep, 401, "DPoP verification failed; denying (fail-closed).", null);
         }
         if (res.status() != 200) {
             log.error("DPoP verification returned {}", res.status());
@@ -345,13 +396,68 @@ final class Pep {
         JsonNode verdict = Json.parse(res.body());
         JsonNode valid = verdict == null ? null : verdict.get("valid");
         if (!(verdict instanceof ObjectNode) || valid == null || !valid.isBoolean() || !valid.booleanValue()) {
+            // The verifier's reason is about the client's own proof, so the client gets
+            // it, briefly and cleaned; anything longer is the log's.
             String reason = Json.text(verdict, "reason");
-            return deny(pep, 401, reason != null ? reason : "DPoP proof is not valid for this request.", null);
+            if (reason != null) {
+                log.warn("DPoP proof rejected: {}", HeaderValues.brief(reason, 500));
+            }
+            return deny(pep, 401, reason != null ? HeaderValues.brief(reason, 120) : "DPoP proof is not valid for this request.", null);
         }
         return null;
     }
 
-    private Verdict coazCheck(PepRequest req, String pep, JsonNode rpc) {
+    /**
+     * An MCP request. A body is judged only when it is exactly one JSON-RPC message the
+     * rule has read in full, in plain JSON; anything else is refused here with the
+     * JSON-RPC error the contract names, and neither coaz-pep nor the upstream sees it.
+     * Then coaz-pep decides, every method, every time.
+     */
+    private Verdict mcp(PepRequest req, String pep) {
+        JsonRpc.Message msg = null;
+        boolean hasBody = req.body != null && req.body.length > 0;
+        if ("POST".equalsIgnoreCase(req.method) || hasBody || !req.bodyReadable) {
+            if (!identityEncoding(req.headerValues("content-encoding"))) {
+                return refusal(pep, 415, JsonRpc.INVALID_REQUEST, "Invalid Request: Content-Encoding not supported by the PEP", null);
+            }
+            if (!req.bodyReadable) {
+                return refusal(pep, 413, JsonRpc.INVALID_REQUEST, "Invalid Request: request body too large for the PEP to authorise", null);
+            }
+            try {
+                msg = JsonRpc.classify(req.body);
+            } catch (JsonRpc.Refusal r) {
+                log.warn("authzen-pdp '{}': refused an MCP body: {}", pep, r.getMessage());
+                return refusal(pep, r.status, r.code, r.getMessage(), r.id);
+            }
+        }
+        return coazCheck(req, pep, msg);
+    }
+
+    /** Absent, empty or identity, and nothing else: a body the rule cannot read as sent is not one it can judge. */
+    static boolean identityEncoding(List<String> values) {
+        for (String v : values) {
+            for (String coding : v.split(",")) {
+                String c = coding.trim();
+                if (!c.isEmpty() && !c.equalsIgnoreCase("identity")) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** The contract's refusal: a JSON-RPC error with the request's id when it was readable, and X-PDP-Decision: DENY. */
+    static Verdict refusal(String pep, int status, int code, String message, JsonNode id) {
+        ObjectNode body = Json.object();
+        body.put("jsonrpc", "2.0");
+        body.set("id", id == null ? Json.MAPPER.nullNode() : id);
+        ObjectNode err = body.putObject("error");
+        err.put("code", code);
+        err.put("message", message);
+        return Verdict.respond(status, headers(JSON), Json.bytes(body), pdpHeaders(pep, "DENY", "mcp", message, null));
+    }
+
+    private Verdict coazCheck(PepRequest req, String pep, JsonRpc.Message msg) {
         ObjectNode config = Json.object();
         config.put("pep_label", pep);
         config.put("style", "mcp");
@@ -378,42 +484,121 @@ final class Pep {
         ObjectNode h = body.putObject("headers");
         putIf(h, "authorization", req.header("authorization"));
         putIf(h, "x-user-token", req.header("x-user-token"));
+        putIf(h, "dpop", req.header("dpop"));
+        putIf(h, "content-type", req.header("content-type"));
+        List<String> encodings = req.headerValues("content-encoding");
+        if (!encodings.isEmpty()) {
+            h.put("content-encoding", String.join(", ", encodings));
+        }
+        // The body as the upstream will read it: validated UTF-8, so this is lossless.
         body.put("body", req.body == null ? "" : new String(req.body, StandardCharsets.UTF_8));
 
-        JsonNode params = rpc.get("params");
-        String toolName = Json.text(params, "name");
-        String fallbackAction = "tools/call:" + (toolName == null ? "?" : toolName);
+        String fallbackAction = msg == null ? "mcp:" + req.method.toLowerCase(Locale.ROOT)
+            : msg.tool() != null ? "tools/call:" + msg.tool()
+            : msg.method() != null ? msg.method() : "jsonrpc-response";
 
         Transport.Response res;
         try {
             res = transport.send(new Transport.Request("POST", conf.coaz_url + "/v1/mcp/check",
                 coazHeaders(), Json.bytes(body), conf.coaz_timeout_ms, conf.pdp_ssl_verify));
         } catch (IOException e) {
-            log.error("coaz-pep engine call failed: {}", e.getMessage());
+            log.error("coaz-pep engine unavailable: {}", e.getMessage());
             return deny(pep, 503, "COAZ authorization engine unreachable; denying (fail-closed).", null);
+        } catch (Transport.Refused e) {
+            log.error("coaz-pep engine call refused: {}", e.getMessage());
+            return deny(pep, 503, "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
         if (res.status() != 200) {
-            log.error("coaz-pep engine call failed: {}", res.status());
-            return deny(pep, 503, "COAZ authorization engine unreachable; denying (fail-closed).", null);
+            log.error("coaz-pep engine returned {}", res.status());
+            return deny(pep, 503, res.unavailable() ? "COAZ authorization engine unreachable; denying (fail-closed)."
+                : "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
         JsonNode verdict = Json.parse(res.body());
-        if (!(verdict instanceof ObjectNode)) {
-            verdict = Json.object();
+        JsonNode dec = verdict instanceof ObjectNode ? verdict.get("decision") : null;
+        if (dec == null || !dec.isBoolean()) {
+            log.error("coaz-pep engine answered without a boolean decision");
+            return deny(pep, 503, "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
-        JsonNode dec = verdict.get("decision");
-        if (dec != null && dec.isBoolean() && dec.booleanValue()) {
+        if (dec.booleanValue()) {
+            // Every X-Auth-* header the client sent goes; coaz-pep's upstream_headers say
+            // which come back, an empty value meaning "leave it off".
+            Map<String, String> upstream = authHeaders(null, null, null, null);
+            upstream.putAll(forwardable(stringMap(verdict.get("upstream_headers"))));
             Map<String, String> rh = stringMap(verdict.get("response_headers"));
-            String action = rh.getOrDefault("X-PDP-Action", fallbackAction);
-            return Verdict.permit(stringMap(verdict.get("upstream_headers")),
-                pdpHeaders(pep, "PERMIT", action, rh.get("X-PDP-Reason"), null));
+            Map<String, String> out = pdpHeaders(pep, "PERMIT", headerOr(rh, "X-PDP-Action", fallbackAction),
+                headerOr(rh, "X-PDP-Reason", null), headerOr(rh, "X-PDP-Fail-Open", null));
+            relayable(rh).forEach(out::putIfAbsent);
+            return permit(pep, upstream, out);
         }
+        // A deny is coaz-pep's rendering, relayed as it is (for a tools/call, the COAZ
+        // JSON-RPC error at HTTP 200); one with no rendering is a plain deny.
         JsonNode resp = verdict.get("response");
-        Map<String, String> rh = resp == null ? new LinkedHashMap<>() : stringMap(resp.get("headers"));
-        String action = rh.getOrDefault("X-PDP-Action", fallbackAction);
-        int status = resp != null && resp.get("status") != null && resp.get("status").isInt() ? resp.get("status").intValue() : 200;
-        String respBody = resp == null ? null : Json.text(resp, "body");
-        return Verdict.respond(status, rh, (respBody == null ? "" : respBody).getBytes(StandardCharsets.UTF_8),
-            pdpHeaders(pep, "DENY", action, rh.get("X-PDP-Reason"), null));
+        if (!(resp instanceof ObjectNode)) {
+            return deny(pep, 403, "Denied by policy.", pdpHeaders(pep, "DENY", fallbackAction, null, null));
+        }
+        Map<String, String> rh = stringMap(resp.get("headers"));
+        JsonNode s = resp.get("status");
+        int status = s != null && s.isInt() && s.intValue() >= 200 && s.intValue() <= 599 ? s.intValue() : 403;
+        String respBody = Json.text(resp, "body");
+        return Verdict.respond(status, relayable(rh), (respBody == null ? "" : respBody).getBytes(StandardCharsets.UTF_8),
+            pdpHeaders(pep, "DENY", headerOr(rh, "X-PDP-Action", fallbackAction), headerOr(rh, "X-PDP-Reason", null), null));
+    }
+
+    /**
+     * What of coaz-pep's upstream_headers may go on the request to the upstream: header
+     * names that are names, no framing headers, the identity headers under their own
+     * names (so they replace the removals) and kept as they are for permit() to judge,
+     * every other value cleaned.
+     */
+    private static Map<String, String> forwardable(Map<String, String> in) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : in.entrySet()) {
+            String k = e.getKey();
+            if (!HeaderValues.name(k) || HOP.contains(k.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            String identity = null;
+            for (String x : X_AUTH) {
+                if (x.equalsIgnoreCase(k)) {
+                    identity = x;
+                }
+            }
+            if (identity != null) {
+                out.put(identity, e.getValue());
+            } else {
+                out.put(k, HeaderValues.clean(e.getValue()));
+            }
+        }
+        return out;
+    }
+
+    private static String headerOr(Map<String, String> headers, String name, String otherwise) {
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(name)) {
+                return e.getValue();
+            }
+        }
+        return otherwise;
+    }
+
+    /** Headers that decide how a message is framed or routed belong to this hop, never to a relayed answer. */
+    private static final java.util.Set<String> HOP = java.util.Set.of("content-length", "transfer-encoding", "connection",
+        "keep-alive", "upgrade", "te", "trailer", "proxy-connection", "host");
+
+    /**
+     * What of a coaz-pep header map may be put on a message: a header name that is one,
+     * not a framing header, not X-PDP-* (the rule sets those itself so each appears
+     * once), and a value cleaned for a header.
+     */
+    private static Map<String, String> relayable(Map<String, String> in) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : in.entrySet()) {
+            String k = e.getKey().toLowerCase(Locale.ROOT);
+            if (HeaderValues.name(e.getKey()) && !HOP.contains(k) && !k.startsWith("x-pdp-")) {
+                out.put(e.getKey(), HeaderValues.clean(e.getValue()));
+            }
+        }
+        return out;
     }
 
     /**
@@ -425,7 +610,7 @@ final class Pep {
         Transport.Response res;
         try {
             res = transport.send(new Transport.Request("GET", conf.federation_entity_url + path, Map.of(), null, 5000, conf.pdp_ssl_verify));
-        } catch (IOException e) {
+        } catch (IOException | Transport.Refused e) {
             log.error("federation entity relay failed: {}", e.getMessage());
             return Verdict.respond(503, headers(JSON), "{\"error\":\"federation_entity_unavailable\"}".getBytes(StandardCharsets.UTF_8), null);
         }
@@ -447,7 +632,8 @@ final class Pep {
     /**
      * The token's own payload, overlaid with what PingAccess established about it. When
      * PingAccess validated the token its view wins; when the application is unprotected
-     * there is only the payload, decoded and not verified, exactly as in Kong.
+     * there is only the payload, decoded and not verified, which decide() accepts only
+     * under allow_insecure.
      */
     static ObjectNode mergeClaims(ObjectNode fromToken, ObjectNode fromIdentity) {
         ObjectNode out = Json.object();
@@ -508,20 +694,43 @@ final class Pep {
         return Verdict.respond(status, headers(JSON), Json.bytes(body), responseHeaders);
     }
 
-    /** The response headers the demo transcript reads. Present only once a decision was made. */
+    /**
+     * The response headers the demo transcript reads. Present only once a decision was
+     * made. The reason is the PDP's text and the action may be coaz-pep's, so every
+     * value is cleaned for a header.
+     */
     static Map<String, String> pdpHeaders(String pep, String decision, String action, String reason, String failOpen) {
         Map<String, String> h = new LinkedHashMap<>();
-        h.put("X-PDP-PEP", pep);
+        h.put("X-PDP-PEP", HeaderValues.clean(pep));
         h.put("X-PDP-Decision", decision);
         if (failOpen != null) {
-            h.put("X-PDP-Fail-Open", failOpen);
+            h.put("X-PDP-Fail-Open", HeaderValues.clean(failOpen));
         }
-        h.put("X-PDP-Action", action == null ? "" : action);
+        h.put("X-PDP-Action", action == null ? "" : HeaderValues.clean(action));
         if (reason != null) {
-            h.put("X-PDP-Reason", reason);
+            h.put("X-PDP-Reason", HeaderValues.clean(reason));
         }
         return h;
     }
+
+    /**
+     * A permit, unless an identity header would reach the upstream mangled. A principal
+     * with a control character or a character past Latin-1 cannot be carried in a header
+     * as it is, and cleaning it could turn one principal into another, so the request is
+     * refused instead.
+     */
+    private static Verdict permit(String pep, Map<String, String> upstream, Map<String, String> responseHeaders) {
+        for (String k : X_AUTH) {
+            if (!HeaderValues.faithful(upstream.get(k))) {
+                log.error("authzen-pdp '{}': {} cannot be carried in a header as it is; denying", pep, k);
+                return deny(pep, 403, "The caller's identity cannot be forwarded to the upstream intact.", null);
+            }
+        }
+        return Verdict.permit(upstream, responseHeaders);
+    }
+
+    /** The identity headers every permit sets or removes on the request to the upstream. */
+    static final List<String> X_AUTH = List.of("X-Auth-Principal", "X-Auth-Agent", "X-Auth-Scope", "X-Auth-Acr");
 
     private static Map<String, String> authHeaders(String sub, String act, String scope, String acr) {
         Map<String, String> h = new LinkedHashMap<>();

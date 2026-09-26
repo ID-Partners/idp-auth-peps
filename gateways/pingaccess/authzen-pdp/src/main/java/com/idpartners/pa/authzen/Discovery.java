@@ -11,7 +11,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -43,13 +47,20 @@ final class Discovery {
     static final String PARAM = "authzen_policy_decision_points";
     static final int MAX_BODY = 1048576;
     static final long MIN_REFRESH = 30;
+    static final int FETCH_TIMEOUT_MS = 5000;
 
     private static final Logger log = LoggerFactory.getLogger(Discovery.class);
     private static final Pattern URL = Pattern.compile("^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]+)(.*)$");
     private static final Pattern SPACES = Pattern.compile("\\s+");
 
-    /** Error kinds. NOT_ALLOWED is the one the chain never swallows. */
-    enum Kind { NOT_ALLOWED, INVALID, NO_METADATA, TRANSIENT }
+    /**
+     * Error kinds. NOT_ALLOWED is the one the chain never swallows. TRANSIENT is the only
+     * outage (a network failure, a timeout, a 5xx or a 429) and the only kind a fail-open
+     * layer may skip. REFUSED is an answer that arrived and cannot be used (a 3xx or
+     * another 4xx, an answer over the size cap, a URL that cannot be called), INVALID a
+     * document that says the wrong thing; neither is ever skipped.
+     */
+    enum Kind { NOT_ALLOWED, INVALID, NO_METADATA, TRANSIENT, REFUSED }
 
     static final class Failure extends Exception {
         final Kind kind;
@@ -65,6 +76,15 @@ final class Discovery {
 
     /** URL policy for one kind of fetch: https unless insecure or same-origin as the trusted (static) PDP, then the allowlist. */
     record Policy(boolean insecure, String trustedOrigin, List<String> allowlist, boolean sslVerify, int timeoutMs) {
+        /**
+         * For an identifier's own well-known document, once the identifier has passed the
+         * allowlist: the document sits on the identifier's origin by construction, and a
+         * path-bearing entry ("https://pdp.example/tenant1") would otherwise refuse the
+         * very document it allows (".../.well-known/authzen-configuration/tenant1").
+         */
+        Policy wellKnown() {
+            return new Policy(insecure, trustedOrigin, null, sslVerify, timeoutMs);
+        }
     }
 
     /** The resource's metadata as published, when a document named the PDP; forwarded to the PDP verbatim and read by nothing here. */
@@ -113,9 +133,10 @@ final class Discovery {
 
     /**
      * A cache entry, keyed by identifier: the documents are public, so no credential in
-     * the key. Serves stale while a refresh fails, throttles retries, and negatively
-     * caches a transient failure so a down resource does not put a fetch in every
-     * request's path.
+     * the key. Serves stale while a refresh fails or is under way, throttles retries,
+     * negatively caches a failure so a down resource does not put a fetch in every
+     * request's path, and lets one request fetch while the others use the stale value
+     * or, when there is none yet, wait for that one fetch.
      */
     static final class Entry {
         boolean ok;
@@ -124,12 +145,15 @@ final class Discovery {
         long expires;
         long negUntil;
         long lastAttempt;
+        CompletableFuture<Object> inflight;
     }
 
     private final Transport transport;
     private final LongSupplier clock;
     private final Map<String, Entry> resources = new ConcurrentHashMap<>();
     private final Map<String, Entry> pdps = new ConcurrentHashMap<>();
+    /** How long a request waits for another's fetch of the same document: the fetch's own timeout, and a margin. */
+    long waitMs = FETCH_TIMEOUT_MS + 1000L;
 
     Discovery(Transport transport, LongSupplier clockSeconds) {
         this.transport = transport;
@@ -226,6 +250,10 @@ final class Discovery {
         } else if (!u.scheme.equals("https")) {
             throw new Failure(Kind.NOT_ALLOWED, raw + " has scheme " + u.scheme);
         }
+        String problem = Urls.problem(raw, false);
+        if (problem != null) {
+            throw new Failure(Kind.NOT_ALLOWED, raw + " " + problem);
+        }
         if (!allowed(p.allowlist, raw)) {
             throw new Failure(Kind.NOT_ALLOWED, raw + " is outside the allowlist");
         }
@@ -238,20 +266,25 @@ final class Discovery {
         checkUrl(url, p);
         Transport.Response res;
         try {
-            res = transport.send(new Transport.Request("GET", url, Map.of("Accept", "application/json"), null, p.timeoutMs, p.sslVerify));
+            res = transport.send(new Transport.Request("GET", url, Map.of("Accept", "application/json"), null, p.timeoutMs, p.sslVerify, MAX_BODY));
         } catch (IOException e) {
             throw new Failure(Kind.TRANSIENT, "GET " + url + ": " + e.getMessage());
+        } catch (Transport.Refused e) {
+            throw new Failure(Kind.REFUSED, "GET " + url + ": " + e.getMessage());
         }
         if (res.status() == 404) {
             throw new Failure(Kind.NO_METADATA, url + " returned 404");
         }
-        // Redirects are not followed, so a 3xx lands here: a document that tries to send
-        // the PEP elsewhere is a failure, never a hop.
-        if (res.status() < 200 || res.status() >= 300) {
+        if (res.unavailable()) {
             throw new Failure(Kind.TRANSIENT, "GET " + url + " returned " + res.status());
         }
-        if (res.body() == null || res.body().length > MAX_BODY) {
-            throw new Failure(Kind.TRANSIENT, url + " body is missing or too large");
+        // Redirects are not followed, so a 3xx lands here: a document that tries to send
+        // the PEP elsewhere is a failure, never a hop.
+        if (!res.ok()) {
+            throw new Failure(Kind.REFUSED, "GET " + url + " returned " + res.status());
+        }
+        if (res.body() == null) {
+            throw new Failure(Kind.REFUSED, url + " has no body");
         }
         JsonNode doc = Json.parse(res.body());
         if (!(doc instanceof ObjectNode)) {
@@ -262,9 +295,17 @@ final class Discovery {
 
     // ---------- cache ----------
 
+    /**
+     * The cached value for key, fetched when it is missing or due. The fetch runs outside
+     * the entry's lock: while one request refreshes, the others are served the stale
+     * value or, when there is none yet, wait (bounded) for that one fetch rather than
+     * start their own.
+     */
     @SuppressWarnings("unchecked")
     private <T> T cacheGet(Map<String, Entry> store, String key, long ttl, long negativeTtl, Fetch<T> fetch) throws Failure {
         Entry e = store.computeIfAbsent(key, k -> new Entry());
+        CompletableFuture<Object> mine = null;
+        CompletableFuture<Object> theirs = null;
         synchronized (e) {
             long t = clock.getAsLong();
             if (e.ok && t < e.expires) {
@@ -276,28 +317,77 @@ final class Discovery {
             if (e.ok && e.err != null && (t - e.lastAttempt) < MIN_REFRESH) {
                 return (T) e.val;
             }
-            e.lastAttempt = t;
-            T val;
-            try {
-                val = fetch.get(key);
-            } catch (Failure err) {
-                e.err = err;
-                if (e.ok) {
-                    return (T) e.val; // stale beats failing every request
-                }
-                // A policy refusal cost no fetch and belongs to one route's allowlist;
-                // another route sharing this cache must not inherit it.
-                if (negativeTtl > 0 && err.kind != Kind.NOT_ALLOWED) {
-                    e.negUntil = t + negativeTtl;
-                }
-                throw err;
+            if (e.inflight == null) {
+                mine = new CompletableFuture<>();
+                e.inflight = mine;
+                e.lastAttempt = t;
+            } else if (e.ok) {
+                return (T) e.val; // stale while another request refreshes it
+            } else {
+                theirs = e.inflight;
             }
-            e.val = val;
-            e.ok = true;
-            e.expires = t + ttl;
-            e.err = null;
-            e.negUntil = 0;
-            return val;
+        }
+        if (theirs != null) {
+            return (T) await(theirs, key);
+        }
+        T val = null;
+        Failure err = null;
+        boolean fetched = false;
+        try {
+            val = fetch.get(key);
+            fetched = true;
+        } catch (Failure f) {
+            err = f;
+            fetched = true;
+        } finally {
+            if (!fetched) {
+                // A bug in the fetch: let it surface, but never leave the entry claimed.
+                synchronized (e) {
+                    e.inflight = null;
+                }
+                mine.completeExceptionally(new Failure(Kind.REFUSED, "the metadata fetch for " + key + " failed"));
+            }
+        }
+        synchronized (e) {
+            e.inflight = null;
+            long t = clock.getAsLong();
+            if (err == null) {
+                e.val = val;
+                e.ok = true;
+                e.expires = t + ttl;
+                e.err = null;
+                e.negUntil = 0;
+                mine.complete(val);
+                return val;
+            }
+            e.err = err;
+            if (e.ok) {
+                mine.complete(e.val);
+                return (T) e.val; // stale beats failing every request
+            }
+            // A policy refusal cost no fetch and belongs to one route's allowlist;
+            // another route sharing this cache must not inherit it.
+            if (negativeTtl > 0 && err.kind != Kind.NOT_ALLOWED) {
+                e.negUntil = t + negativeTtl;
+            }
+            mine.completeExceptionally(err);
+            throw err;
+        }
+    }
+
+    /** Wait, bounded, for another request's fetch of the same key. */
+    private Object await(CompletableFuture<Object> f, String key) throws Failure {
+        try {
+            return f.get(waitMs, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException x) {
+            // The fetching request completes its future with a value or a Failure, never
+            // anything else: see cacheGet.
+            throw (Failure) x.getCause();
+        } catch (TimeoutException x) {
+            throw new Failure(Kind.TRANSIENT, "timed out waiting for the metadata fetch for " + key);
+        } catch (InterruptedException x) {
+            Thread.currentThread().interrupt();
+            throw new Failure(Kind.REFUSED, "interrupted waiting for the metadata fetch for " + key);
         }
     }
 
@@ -333,7 +423,7 @@ final class Discovery {
      */
     private Meta rfc9728Lookup(String resource, Options o) throws Failure {
         String wk = wellKnownUrl(resource, "oauth-protected-resource");
-        JsonNode doc = getJson(wk, o.resourcePolicy);
+        JsonNode doc = getJson(wk, o.resourcePolicy.wellKnown());
         // s3.3: the echoed identifier MUST be identical, or whoever answers at that path
         // has just named a PDP for someone else's resource.
         if (!resource.equals(Json.text(doc, "resource"))) {
@@ -342,19 +432,21 @@ final class Discovery {
         return new Meta(pdpList(doc.get(PARAM), wk), doc, "rfc9728");
     }
 
-    /** AuthZEN 1.0 s9: the PDP's own metadata, or the default paths when it has none. */
+    /**
+     * AuthZEN 1.0 s9: the PDP's own metadata, or the default paths when it has none (a
+     * 404). Any other failure stays a failure: cached as the answer, the default paths
+     * would stand in for the PDP's own for a whole TTL. The cache serves the last good
+     * entry instead or, with none, the layer fails according to its mode.
+     */
     private Endpoints fetchConfig(String pdp, Options o) throws Failure {
         checkUrl(pdp, o.pdpPolicy);
         String wk = wellKnownUrl(pdp, "authzen-configuration");
         JsonNode doc;
         try {
-            doc = getJson(wk, o.pdpPolicy);
+            doc = getJson(wk, o.pdpPolicy.wellKnown());
         } catch (Failure ferr) {
-            if (ferr.kind == Kind.NOT_ALLOWED || ferr.kind == Kind.INVALID) {
-                throw ferr;
-            }
             if (ferr.kind != Kind.NO_METADATA) {
-                log.warn("pdp discovery: {}; using default AuthZEN paths", ferr.getMessage());
+                throw ferr;
             }
             return defaultEndpoints(pdp);
         }
@@ -415,8 +507,8 @@ final class Discovery {
             pdpAllow.addAll(conf.pdp_allowlist);
         }
         return new Options(staticPdp, ttl,
-            new Policy(insecure, null, conf.resource_metadata_allowlist, conf.pdp_ssl_verify, 5000),
-            new Policy(insecure, staticPdp, pdpAllow, conf.pdp_ssl_verify, 5000));
+            new Policy(insecure, null, conf.resource_metadata_allowlist, conf.pdp_ssl_verify, FETCH_TIMEOUT_MS),
+            new Policy(insecure, staticPdp, pdpAllow, conf.pdp_ssl_verify, FETCH_TIMEOUT_MS));
     }
 
     private static Endpoints withKey(Endpoints ep, String source, AuthZenRuleConfiguration conf, Options o) {
@@ -445,7 +537,7 @@ final class Discovery {
             return withKey(ep, "layer", conf, o);
         }
         checkUrl(pdp, o.pdpPolicy);
-        Endpoints cached = cacheGet(pdps, pdp, o.ttl, 0, key -> fetchConfig(key, o));
+        Endpoints cached = cacheGet(pdps, pdp, o.ttl, MIN_REFRESH, key -> fetchConfig(key, o));
         checkUrl(cached.evaluation, o.pdpPolicy);
         if (cached.evaluations != null) {
             checkUrl(cached.evaluations, o.pdpPolicy);
@@ -487,8 +579,9 @@ final class Discovery {
      * Resolve every layer of a route's policy, in order, duplicates collapsed. Layering
      * is what lets a generic PDP that judges the token and the client sit in front of
      * the resource's own. defaultOpen is the route's fail_mode; a layer's own setting
-     * wins. A layer that cannot be resolved fails the request unless it is fail-open, in
-     * which case it is skipped and named. A refusal is never skipped.
+     * wins. A layer that cannot be resolved fails the request unless it is fail-open and
+     * the failure is an outage, in which case it is skipped and named. A refusal, an
+     * invalid document or an allowlist miss is never skipped.
      */
     Layers resolveLayers(AuthZenRuleConfiguration conf, String resource, List<String> layers, boolean defaultOpen) throws Failure {
         if (layers == null || layers.isEmpty()) {
@@ -511,10 +604,11 @@ final class Discovery {
                     ep = resolvePdp(conf, spec.name);
                 }
             } catch (Failure err) {
-                if (err.kind == Kind.NOT_ALLOWED || !open) {
+                if (err.kind != Kind.TRANSIENT || !open) {
                     throw new Failure(err.kind, "layer " + spec.name + ": " + err.getMessage());
                 }
-                skipped.add(spec.name + " (" + err.getMessage() + ")");
+                log.warn("pdp discovery: layer {} unavailable, failing open: {}", spec.name, err.getMessage());
+                skipped.add(spec.name);
                 continue;
             }
             ep.failOpen = open;
@@ -565,7 +659,10 @@ final class Discovery {
                     try {
                         return rfc9728Lookup(key, o);
                     } catch (Failure perr) {
-                        if (perr.kind == Kind.NOT_ALLOWED || perr.kind == Kind.TRANSIENT) {
+                        // Only "publishes nothing" (a 404) and a document that says the
+                        // wrong thing are an answer; a fetch that failed must not replace
+                        // the last good list with the static PDP.
+                        if (perr.kind == Kind.NOT_ALLOWED || perr.kind == Kind.TRANSIENT || perr.kind == Kind.REFUSED) {
                             throw perr;
                         }
                         if (perr.kind == Kind.INVALID) {
@@ -594,16 +691,18 @@ final class Discovery {
         }
 
         Failure last = null;
+        boolean outage = false;
         for (String pdp : candidates) {
             checkUrl(pdp, o.pdpPolicy);
             Endpoints cached;
             try {
-                cached = cacheGet(pdps, pdp, o.ttl, 0, key -> fetchConfig(key, o));
+                cached = cacheGet(pdps, pdp, o.ttl, MIN_REFRESH, key -> fetchConfig(key, o));
             } catch (Failure err) {
                 if (err.kind == Kind.NOT_ALLOWED) {
                     throw err;
                 }
                 log.warn("pdp discovery: {}: {}", pdp, err.getMessage());
+                outage |= err.kind == Kind.TRANSIENT;
                 last = err;
                 continue;
             }
@@ -616,6 +715,8 @@ final class Discovery {
             ep.resource = from;
             return withKey(ep, pdp.equals(o.staticPdp) ? "static" : "rfc9728", conf, o);
         }
-        throw new Failure(Kind.TRANSIENT, "no PDP could be resolved" + (last != null ? ": " + last.getMessage() : ""));
+        // An outage among the candidates may have hidden the one that works, so it is an
+        // outage; candidates that all answered, and were all unusable, are a refusal.
+        throw new Failure(outage ? Kind.TRANSIENT : Kind.REFUSED, "no PDP could be resolved: " + last.getMessage());
     }
 }

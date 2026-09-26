@@ -6,7 +6,7 @@
 
   <groupId>com.idpartners.authzen</groupId>
   <artifactId>authzen-pdp-pingaccess</artifactId>
-  <version>0.1.0</version>
+  <version>0.4.0</version>
   <packaging>jar</packaging>
 
   <name>AuthZEN PDP rule for PingAccess</name>
@@ -18,7 +18,8 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <!-- PingAccess 8.x runs on Java 17 and 9.x on Java 21; 17 bytecode loads on both. -->
+    <!-- Java 17 bytecode, so it needs a Java 17 or later runtime. Tested on PingAccess
+         9.1.0.1, which runs on Java 21; no earlier PingAccess has been tried. -->
     <maven.compiler.release>17</maven.compiler.release>
 
     <!-- The PingAccess Add-on SDK is not on any public Maven repository. It is taken
@@ -39,8 +40,8 @@
     <!-- Coverage floor, set just under the number on the day it was added. A change
          that drops coverage fails the build; one that raises it needs nothing here.
          Raise it when coverage rises; never lower it to make the build pass. -->
-    <coverage.line.floor>0.97</coverage.line.floor>
-    <coverage.branch.floor>0.90</coverage.branch.floor>
+    <coverage.line.floor>0.99</coverage.line.floor>
+    <coverage.branch.floor>0.95</coverage.branch.floor>
   </properties>
 
   <dependencies>
@@ -137,16 +138,17 @@
         </configuration>
       </plugin>
       <!--
-        Coverage ratchet, the same contract as the Go, Lua and TypeScript gates. Two
-        things are deliberately excluded, and only these two, each because it needs a
-        running PingAccess or a socket rather than because it is hard:
+        Coverage ratchet, the same contract as the Go, Lua and TypeScript gates. One
+        class is excluded, because it needs a running PingAccess rather than because it
+        is hard:
 
           PaResponses    builds a com.pingidentity.pa.sdk.http.Response through the
                          SDK's ResponseBuilder, whose implementation is registered by
-                         the engine at boot. Exercised by the live-server run in demo/.
-          JdkTransport   opens real sockets; its request/response mapping is covered
-                         against a loopback server, but the trust-all TLS path can
-                         only be tried against a TLS endpoint.
+                         the engine at boot. Exercised by the live-server run in demo/
+                         (every deny the demo shows is written by it).
+
+        The trust-all TLS client behind pdp_ssl_verify=false is not excluded: the unit
+        suite runs it against a loopback TLS server with a self-signed certificate.
       -->
       <plugin>
         <groupId>org.jacoco</groupId>
@@ -169,7 +171,6 @@
             <configuration>
               <excludes>
                 <exclude>com/idpartners/pa/authzen/PaResponses.class</exclude>
-                <exclude>com/idpartners/pa/authzen/JdkTransport$Insecure.class</exclude>
               </excludes>
               <rules>
                 <rule>
