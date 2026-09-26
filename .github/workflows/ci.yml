@@ -89,6 +89,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run test:coverage
       - run: npm run build
+      - name: What would be published
+        run: npm pack --dry-run
       - name: Known vulnerabilities
         run: npm audit --audit-level=moderate
 

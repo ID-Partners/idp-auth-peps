@@ -94,7 +94,7 @@ demo/run-local.sh --console    # also serve the console on :8088 and stay up
 Add `--profile kong` to `docker compose up` to also run Kong (:8000) with the Lua plugin
 doing the same discovery in front of the `plain` resource; `demo.sh` notices and adds a
 section. The Node SDK version is `node demo/node-sdk.mjs` after
-`cd sdk/node && npm install && npm run build`.
+`cd sdk/node && npm ci && npm run build`.
 
 Watch the stubs while it runs: `docker compose logs -f stubs` (or `stubs.log` under
 `$TMPDIR/idp-auth-peps-demo` for the local runner). Every PDP decision and every metadata
