@@ -163,7 +163,7 @@ paths under it. `PDP_DISCOVERY` replaces both assumptions with metadata, in four
 resource identifier (the route's `resource`, or `mcp_upstream_url` on an MCP route)
   ├─ federation  resolved oauth_resource metadata from a Trust Chain     ← authoritative
   ├─ resource    {resource}/.well-known/oauth-protected-resource (RFC 9728) ← self-asserted
-  └─ static      AUTHZEN_URL                                              ← always the fallback
+  └─ static      AUTHZEN_URL                                              ← when the resource publishes nothing
 PDP identifier
   ├─ {pdp}/.well-known/authzen-configuration (AuthZEN 1.0 §9): access_evaluation_endpoint, …
   └─ 404 → {pdp}/access/v1/evaluation, the spec's default paths

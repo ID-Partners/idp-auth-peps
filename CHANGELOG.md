@@ -41,9 +41,11 @@ These change behaviour on purpose. Each is a secure default with an explicit way
   forwarded `user_sub`.
 - **Fail-open covers unavailability only.** A PDP that answers a 3xx or 4xx, or something
   that is not a decision, now fails closed on every layer, fail-open or not.
-- **Resource metadata that cannot be fetched no longer falls back to the static PDP.**
-  After a bounded stale period the `resource` layer is unavailable and fails closed
-  unless marked fail-open. A 404 still means "this resource publishes nothing".
+- **Resource metadata that cannot be fetched, or does not validate, no longer falls back
+  to the static PDP.** The last good copy is served for up to one more TTL; after that
+  the `resource` layer is unavailable and fails closed unless marked fail-open. A 404, or
+  a document naming no PDP, still means "this resource publishes nothing". Likewise a PDP
+  whose metadata cannot be read is unavailable, not called at the default paths.
 - **Kong:** `style: mcp` requires `coaz_url`; with `coaz_url` set the plugin hands the
   whole decision to coaz-pep, REST included. A route without `coaz_url` must declare
   `access_token_verified_upstream` (an auth plugin validated the token) or it is refused.

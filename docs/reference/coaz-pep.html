@@ -72,7 +72,7 @@ docker run -p 9191:9191 -p 9192:9192 \
   coaz-pep:
     image: ghcr.io/id-partners/coaz-pep:0.4.0 <span class="c"># pin a release — better, its digest</span>
     environment:
-      <span class="c"># the static PDP: always the fallback, the only PDP that gets the key</span>
+      <span class="c"># the static PDP: for a resource that publishes nothing; the only PDP that gets the key</span>
       AUTHZEN_URL: https://pdp.bank.example
       AUTHZEN_API_KEY: ${AUTHZEN_API_KEY}
       <span class="c"># the HTTP check API is reachable by Kong / PingAccess: authenticate it, bound what it may fetch</span>
@@ -112,7 +112,7 @@ docker run -p 9191:9191 -p 9192:9192 \
   <div class="wide"><table>
     <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>AUTHZEN_URL</code> <span class="req">required</span></td><td class="d">—</td><td>The static PDP's base URL, e.g. <code>https://pdp.bank.example</code>. With discovery off the AuthZEN default paths are appended; with discovery on it is the fallback every mode ends at, and the one PDP that receives <code>AUTHZEN_API_KEY</code>. A trailing slash is trimmed.</td></tr>
+      <tr><td><code>AUTHZEN_URL</code> <span class="req">required</span></td><td class="d">—</td><td>The static PDP's base URL, e.g. <code>https://pdp.bank.example</code>. With discovery off the AuthZEN default paths are appended; with discovery on it decides for a resource that publishes nothing, and it is the one PDP that receives <code>AUTHZEN_API_KEY</code>. A trailing slash is trimmed.</td></tr>
       <tr><td><code>AUTHZEN_API_KEY</code></td><td class="d">—</td><td>Sent as <code>Authorization: Bearer</code> to <code>AUTHZEN_URL</code> only. A discovered PDP never receives it.</td></tr>
       <tr><td><code>PORT</code></td><td class="d">9191</td><td>The ext_authz gRPC port. Dual-stack.</td></tr>
       <tr><td><code>HTTP_PORT</code></td><td class="d">9192</td><td>The HTTP check API port, also where the well-known documents are served.</td></tr>
@@ -155,7 +155,7 @@ docker run -p 9191:9191 -p 9192:9192 \
   <div class="wide"><table>
     <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
     <tbody>
-      <tr><td><code>PDP_DISCOVERY</code></td><td class="d">off</td><td><code>off</code>: the static PDP, default paths, no HTTP. <code>authzen</code>: read <code>AUTHZEN_URL</code>'s <code>/.well-known/authzen-configuration</code>. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code>, then that PDP's metadata; fall back to static. <code>federation</code>: resolve the resource's trust chain to a configured anchor and read the resolved <code>oauth_resource</code> metadata; never consult the resource's own document; fall back to static only for a resource that is not a member.</td></tr>
+      <tr><td><code>PDP_DISCOVERY</code></td><td class="d">off</td><td><code>off</code>: the static PDP, default paths, no HTTP. <code>authzen</code>: read <code>AUTHZEN_URL</code>'s <code>/.well-known/authzen-configuration</code>. <code>resource</code>: read the route's resource's RFC 9728 document for <code>authzen_policy_decision_points</code>, then that PDP's metadata; fall back to static only when the resource publishes nothing (a 404, or no PDP named). <code>federation</code>: resolve the resource's trust chain to a configured anchor and read the resolved <code>oauth_resource</code> metadata; never consult the resource's own document; fall back to static only for a resource that is not a member.</td></tr>
       <tr><td><code>PDP_METADATA_TTL</code></td><td class="d">5m</td><td>Cache TTL for resource and PDP metadata, and for resolved chains. A short value also shortens how long a failed chain is remembered.</td></tr>
       <tr><td><code>PDP_ALLOWLIST</code></td><td class="d"><span class="req">required</span> in resource and federation modes</td><td>Comma-separated prefixes a discovered PDP must match. <code>AUTHZEN_URL</code> and any identifier named in <code>PDP_LAYERS</code> are always permitted.</td></tr>
       <tr><td><code>RESOURCE_METADATA_ALLOWLIST</code></td><td class="d"><span class="req">required</span> in resource and federation modes</td><td>Comma-separated prefixes a route's <code>resource</code> must match before its metadata or entity configuration is fetched. Governs the subject's own document in every mode.</td></tr>

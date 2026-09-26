@@ -66,7 +66,7 @@
   <table>
     <thead><tr><th>Setting</th><th>What it decides</th></tr></thead>
     <tbody>
-      <tr><td><code>authzen_url</code> / <code>AUTHZEN_URL</code></td><td>The static PDP. Always the fallback, always permitted; the one PDP that receives the configured API key.</td></tr>
+      <tr><td><code>authzen_url</code> / <code>AUTHZEN_URL</code></td><td>The static PDP. It decides when discovery is off or a resource publishes nothing, it is always permitted, and it is the one PDP that receives the configured API key.</td></tr>
       <tr><td><code>style</code></td><td><code>rest</code> maps an HTTP request to an evaluation; <code>mcp</code> treats the route as an MCP edge and authorises JSON-RPC.</td></tr>
       <tr><td><code>require_token</code></td><td>Deny a request that carries no readable access token.</td></tr>
       <tr><td><code>require_dpop</code></td><td>Enforce the RFC 9449 sender constraint. Kong and PingAccess delegate the proof check to coaz-pep.</td></tr>
