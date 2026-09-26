@@ -132,6 +132,7 @@ Read from `context_extensions` on every request:
 | `fail_mode` | `PDP_FAIL_MODE` | `closed` or `open`: what a layer does when its PDP cannot be reached, unless the layer says for itself. Open skips it and marks the permit with `X-PDP-Fail-Open`; a deny or a refusal never opens |
 | `coaz_defaults` | `true` | Decide every MCP method: a tool's declared mapping, otherwise the binding's default one, and an unknown method is denied. `"false"` keeps the old pass-through for everything but declared tools — an explicit opt-out |
 | `coaz_v2_only` | `false` | Refuse tools that declare only the superseded `coaz: true` mapping, whose subject can come from the caller's params |
+| `user_token_subject` | `principal` | Whose `X-User-Token` counts: the access token's own subject's login, or with `pdp` also an approver's, for the PDP to judge with `user_sub` |
 | `legacy_subject_identity` | `true` | Also send the non-standard `subject.identity` beside AuthZEN's `subject.id`. Set `"false"` once policies read `subject.id` — see [core/README.md](../../core/README.md#migrating-subjectidentity---subjectid) |
 
 ## The resource's well-known documents

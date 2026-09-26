@@ -396,7 +396,10 @@ turn on. Unverified, a forged one walks through both. And a *genuine* one is onl
 user's login if it is this principal's:
 
 - its `sub` must be the access token's `sub` — customer B's consent does not authorise
-  customer A's payment;
+  customer A's payment. A route where someone else may approve — a staff member for a
+  customer — says `user_token_subject: "pdp"`: there another subject's verified login
+  counts, and the PDP, which always receives `user_sub` and `user_iss`, decides whether
+  that person may approve for this principal;
 - it must not be delegated (no `act`) or be the access token itself — an agent's own
   token is not a user having logged in;
 - its audience must be `USER_TOKEN_AUDIENCE`. Without that setting `X-User-Token` is

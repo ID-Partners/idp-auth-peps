@@ -74,6 +74,7 @@
       <tr><td><code>fail_mode</code></td><td class="d"><code>PDP_FAIL_MODE</code></td><td><code>closed</code> or <code>open</code> for this route's layers that say nothing for themselves. Open marks the permit with <code>X-PDP-Fail-Open</code>; a deny or a refusal never opens.</td></tr>
       <tr><td><code>coaz_defaults</code></td><td class="d">true</td><td>Decide every MCP method: a tool's declared mapping, otherwise the binding's default one; an unknown method is denied. <code>"false"</code> keeps the old pass-through for everything but declared tools — an explicit opt-out.</td></tr>
       <tr><td><code>coaz_v2_only</code></td><td class="d">false</td><td>Refuse tools that declare only the superseded <code>coaz: true</code> mapping.</td></tr>
+      <tr><td><code>user_token_subject</code></td><td class="d">principal</td><td>Whose <code>X-User-Token</code> counts: the principal's own login, or with <code>pdp</code> also an approver's, for the PDP to judge with <code>user_sub</code>.</td></tr>
       <tr><td><code>legacy_subject_identity</code></td><td class="d">true</td><td>Also send <code>subject.identity</code> beside <code>subject.id</code>. Set <code>"false"</code> once policies read <code>subject.id</code>.</td></tr>
     </tbody>
   </table></div>
