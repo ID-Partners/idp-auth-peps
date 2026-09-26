@@ -93,42 +93,23 @@ the spec in it would guarantee drift:
 
 ```sh
 cd core
-go build ./... && go test ./...
+go build ./... && go test -race ./...
 docker build -t coaz-pep .
-docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… coaz-pep
+docker run -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… \
+  -e CHECK_API_TOKEN=… -e MCP_UPSTREAM_ALLOWLIST=… \
+  -e ACCESS_TOKEN_JWKS_URL=… -e ACCESS_TOKEN_ISSUER=… -e ACCESS_TOKEN_AUDIENCE=… coaz-pep
 ```
 
-| Env | Meaning | Default |
-| --- | --- | --- |
-| `AUTHZEN_URL` | AuthZEN PDP base URL | required |
-| `AUTHZEN_API_KEY` | Bearer key for the PDP | — |
-| `PORT` | ext_authz gRPC port | 9191 |
-| `HTTP_PORT` | HTTP check API port | 9192 |
-| `COAZ_DISCOVERY_TTL` | `tools/list` cache TTL | 60s |
-| `PDP_TLS_INSECURE` | skip PDP TLS verification (dev only) | false |
-| `CHECK_API_TOKEN` | shared secret required on the HTTP check API | unset — **warns**, endpoint open |
-| `MCP_UPSTREAM_ALLOWLIST` | permitted `mcp_upstream_url` prefixes, comma-separated | unset — **warns**, any upstream fetched |
-| `HTTP_ADDR` | bind address for the check API | all interfaces |
-| `ACCESS_TOKEN_JWKS_URL` | JWKS for validating the access token | unset — **warns**, token decoded not verified |
-| `ACCESS_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` | — |
-| `USER_TOKEN_JWKS_URL` | JWKS for `X-User-Token` | falls back to the access-token JWKS |
-| `USER_TOKEN_ISSUER` / `_AUDIENCE` | expected `iss` / `aud` for `X-User-Token` | issuer falls back to the access-token issuer |
-| `PDP_DISCOVERY` | `off`, `authzen`, `resource` or `federation` — see [PDP discovery](core/README.md#pdp-discovery) | `off` |
-| `PDP_METADATA_TTL` | cache TTL for resource and PDP metadata | 5m |
-| `PDP_ALLOWLIST` | permitted discovered-PDP prefixes; `AUTHZEN_URL` is always permitted | unset — **warns**, any https PDP a resource names |
-| `RESOURCE_METADATA_ALLOWLIST` | permitted `resource` prefixes for metadata fetches | unset — **warns**, any resource fetched |
-| `PDP_DISCOVERY_INSECURE` | allow `http` for discovered URLs (dev only) | false |
-| `FEDERATION_TRUST_ANCHORS_FILE` | JSON `{"<entity id>": {"keys": [JWK…]}}` — required in `federation` mode | — |
-| `FEDERATION_FETCH_ALLOWLIST` | permitted prefixes for the climb to the anchor (Superiors' Entity Configurations and fetch endpoints); the resource's own is governed by `RESOURCE_METADATA_ALLOWLIST` | unset — **warns** |
-| `FEDERATION_MAX_PATH_LENGTH` | intermediates allowed between a resource and its anchor | 4 |
-| `PDP_LAYERS` | ordered PDPs every route asks unless it names its own: `static`, `resource`, or a PDP identifier, each optionally suffixed ` fail-open` / ` fail-closed`; every layer must permit. `resource` is the resource's PDP behind any layers its metadata publishes in `authzen_policy_layers` | `resource` |
-| `PDP_FAIL_MODE` | what a layer does when its PDP cannot be reached, unless the layer says for itself: `closed` denies, `open` skips it and marks the permit with `X-PDP-Fail-Open`. A deny or a refusal never opens | `closed` |
-| `FEDERATION_ENTITY_ID` | make this PEP the federation entity for the resource it fronts: a minimal Entity Configuration at `{id}/.well-known/openid-federation` for the controller to onboard, and RFC 9728 metadata at `/.well-known/oauth-protected-resource{path}` republishing what the federation resolved (self-asserted until onboarded) | — |
-| `FEDERATION_ENTITY_KEY_FILE` | the private JWK the entity signs with; `FEDERATION_ENTITY_KEY_GENERATE=true` mints a P-256 key into it when absent | — |
-| `FEDERATION_AUTHORITY_HINTS` | comma-separated superiors the trust controller is reached through | — |
+It will not start without its security settings — the check API token, the upstream
+allowlist, and the JWKS, issuer and audience to verify tokens against (plus the discovery
+allowlists when discovery is on) — and says which are missing, all at once.
+`PEP_ALLOW_INSECURE=true` starts it anyway for development, logging each gap. The full
+environment reference, and how to operate it (readiness, the SIGTERM drain, audit logs,
+metrics), is in [`core/README.md`](core/README.md#build-and-run).
 
-Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url` — is
-**per route**, and arrives as ext_authz `context_extensions` or the Kong plugin's config.
+Everything else — `style`, `require_token`, `require_dpop`, `mcp_upstream_url`,
+`coaz_defaults` — is **per route**, and arrives as ext_authz `context_extensions` or the Kong
+plugin's config.
 
 ### `sdk/node/` — when there is no gateway
 
@@ -198,13 +179,16 @@ The demo that exercises all of this end to end is
 ## Tests
 
 ```sh
-cd core       && go test ./...
-cd sdk/node   && npm test
+cd core       && go test -race ./...
+cd sdk/node   && npm ci && npm test
 cd gateways/kong && busted --lpath="./?.lua;./?/init.lua" spec/
-cd gateways/pingaccess/authzen-pdp && mvn verify   # needs the SDK jar: see its README
+cd gateways/pingaccess/authzen-pdp && mvn verify   # needs the SDK jar: scripts/pingaccess-sdk.sh
+demo/run-local.sh                                  # the whole walkthrough, no Docker
 ```
 
-All four run offline. CI enforces a coverage **ratchet** — floors set just under the
+All four suites run offline. CI also runs govulncheck and `npm audit`, builds the image
+and checks it refuses to start without its security settings, and runs the demo
+walkthrough end to end. CI enforces a coverage **ratchet** — floors set just under the
 current numbers, so a change that drops coverage fails while one that raises it does not
 need the gate touched. Raise a floor when coverage rises; never lower one to make CI pass.
 
@@ -221,10 +205,10 @@ coverage-number fetish. Two things are deliberately excluded from the Go gate, a
 these two (the PingAccess gate names its own two, for the same reason: they need the
 running engine or a TLS peer):
 
-- **`main()`'s listen-and-serve loop.** All of its config-bearing logic is extracted into
-  `buildServer`, which is tested across the configuration matrix; `main()` itself only
-  binds sockets, so a test would be exercising the standard library. It is a thin,
-  documented shell.
+- **`main()` itself.** Its configuration is `buildServer` and `grpcServerOptions`, tested
+  across the configuration matrix, and serving and draining is `run`, tested with a real
+  listener and a signal; `main()` only binds the socket and wires the signal, so a test
+  would be exercising the standard library. It is a thin, documented shell.
 - **Defensive `err != nil` / type-guard branches that cannot fire on validated input** —
   a `json.Marshal` of a struct that always marshals, an AST fall-through the CEL compiler
   rules out, an object-claim that has already been type-checked. Forcing these with
@@ -235,6 +219,14 @@ data frames, CRLF, keepalive comments, oversized frames, the session handshake, 
 content-type confusion, each driven end to end so a framing bug surfaces as a wrong
 authorization decision rather than a parser detail. See `core/coaz/sse_torture_test.go`
 and the matching SDK suite.
+
+## Releases
+
+A `v*` tag releases every component at one version: the `coaz-pep` image on
+`ghcr.io/id-partners/coaz-pep` (amd64 and arm64, signed with cosign, with an SBOM and build
+provenance), both Kong rocks, the PingAccess rule's jar, and `@id-partners/authzen-pep` on
+npm with provenance. What changed, and what to do about it when upgrading, is in
+[CHANGELOG.md](CHANGELOG.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Licence
 
