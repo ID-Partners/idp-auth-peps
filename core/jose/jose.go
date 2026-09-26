@@ -351,7 +351,7 @@ func VerifyJWS(token string, jwk map[string]any, alg string) error {
 			return fmt.Errorf("token signature does not verify")
 		}
 		return nil
-	case strings.HasPrefix(alg, "RS"):
+	default: // RS*: HashFor admits nothing else — HS* would mean a shared secret the PEP does not hold
 		pub, err := RSAFromJWK(jwk)
 		if err != nil {
 			return err
@@ -361,6 +361,4 @@ func VerifyJWS(token string, jwk map[string]any, alg string) error {
 		}
 		return nil
 	}
-	// HS* would mean a shared secret the PEP does not hold; anything else is unknown.
-	return fmt.Errorf("unsupported token alg %q", alg)
 }
