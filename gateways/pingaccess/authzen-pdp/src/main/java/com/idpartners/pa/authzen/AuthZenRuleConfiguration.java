@@ -144,7 +144,7 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
     @UIElement(order = 270, type = ConfigurationType.TEXT, label = "X-User-Token issuer (user_token_issuer)", advanced = true)
     public String user_token_issuer;
 
-    @UIElement(order = 280, type = ConfigurationType.TEXT, label = "X-User-Token audience (user_token_audience)", advanced = true,
+    @UIElement(order = 280, type = ConfigurationType.TEXT, label = "X-User-Token audience (user_token_audience)",
         help = @Help(title = "Required with the JWKS", content = "The aud a user token must carry. Without it a token minted for any other audience would pass.", url = ""))
     public String user_token_audience;
 

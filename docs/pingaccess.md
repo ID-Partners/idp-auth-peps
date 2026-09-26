@@ -13,8 +13,10 @@ This page is for two readers who arrive from opposite sides: the PingAccess
 administrator who knows applications and rules but not AuthZEN, and the person who has
 read [architecture.md](architecture.md) and wants to know where PingAccess's own
 machinery ends and the rule begins. The [README](../gateways/pingaccess/README.md) next
-to the code is the reference card: every knob, the build, the tests. This is the
-explainer.
+to the code is the reference card: every knob, the build, the tests, and what changed in
+0.4.0 - read [its upgrade notes](../gateways/pingaccess/README.md#upgrading-to-040)
+before deploying 0.4.0 over a 0.3 configuration, because it refuses things 0.3 let
+through. This is the explainer.
 
 ## Two vocabularies
 
@@ -100,24 +102,32 @@ client the same way:
 1. **The well-known relay.** If the route is the resource's federation face
    (`federation_entity_url`), the two well-known documents are relayed from `coaz-pep`
    before any token is looked at. They are public by definition.
-2. **The user.** With `require_user_login`, no valid `X-User-Token` is a login challenge.
+2. **The user.** With `require_user_login`, no verified `X-User-Token` is a login
+   challenge.
 3. **The token.** `Authorization: Bearer` or `DPoP`. With `require_token`, none is a 401.
-   The claims come from the token's payload overlaid with what PingAccess established
-   (below). No readable subject is a 401.
+   A token PingAccess did not validate - an unprotected application - is a 401 too,
+   unless `allow_insecure` is set. The claims come from the token's payload overlaid
+   with what PingAccess established (below). No readable subject is a 401.
 4. **DPoP**, when required, is verified by `coaz-pep`, which checks the proof's signature,
    freshness, replay and binding. Anything that cannot be verified is denied.
-5. **COAZ.** On an `mcp` route with `coaz_url`, a `tools/call` goes to the engine, which
-   discovers the tool's mapping, evaluates it, asks the PDP and returns either a permit
-   or a JSON-RPC error to relay verbatim. Other MCP traffic passes on a valid token.
+5. **MCP.** On an `mcp` route every request goes to `coaz-pep`, whatever its method: the
+   engine applies the tool's mapping or the COAZ binding's default table, asks the PDP,
+   and returns a permit or a JSON-RPC error to relay verbatim. Before that, a body the
+   rule cannot read as exactly one JSON-RPC message is refused, and nobody is asked.
 6. **The mapping.** The request becomes an action, a resource and a context: a balance
    read is `get_balance` on `account a1`; a payment carries the amount and currency. The
-   subject is the agent (`act.sub`, or the client), acting for the person (`sub`).
+   subject is the agent (`act.sub`, or the client), acting for the person (`sub`). The
+   path is read as the upstream will route it, and a payment with no readable amount is
+   a 400, not a question for the PDP.
 7. **Discovery.** Which PDPs decide for this resource, and where they evaluate. The
    resource's metadata rides along in the context, verbatim.
 8. **The layers.** Each PDP is asked in order. Every one must permit; the first deny is
-   the answer. An unreachable PDP is a 503 unless that layer was told to fail open.
-9. **The answer.** A permit continues with the `X-Auth-*` headers on the request. Advice
-   in the decision becomes a challenge; a plain deny is a 403 with the policy's reason.
+   the answer. A PDP that is down - no connection, a timeout, a 5xx, a 429 - is a 503
+   unless that layer was told to fail open. One that answers with a 4xx, a redirect or
+   something that is not a decision is a 503 whatever the layer was told.
+9. **The answer.** A permit continues with the `X-Auth-*` headers on the request, the
+   client's own copies removed first. Advice in the decision becomes a challenge; a plain
+   deny is a 403 with the policy's reason.
 
 ## What PingAccess validates, and what the rule reads
 
@@ -129,11 +139,13 @@ not surface every claim the policy wants (`act`, `cnf`, `acr`), and lets PingAcc
 view win wherever the two overlap. An opaque token validated by introspection works the
 same way: the identity is all there is, and it is enough.
 
-When the application is **Unprotected**, there is only the payload, decoded and not
-verified. The demo runs that way because its tokens are unsigned, and the rule logs
-nothing special about it; the authorization decision is still the PDP's, but the claims
-it is given are the client's word. That is the Kong plugin's posture too, and the reason
-production wants a protected application.
+When the application is **Unprotected**, PingAccess hands over no identity and there is
+only the payload, decoded and not verified - the client's own word about who it is. The
+rule refuses a token like that with a 401. Taken as it came, an unsigned token would
+become the subject the PDP judges and the `X-Auth-Principal` the API trusts. The demo
+runs unprotected because its tokens are unsigned, so it sets `allow_insecure`, and the
+rule logs that at start-up. Production wants a protected application, and the rule now
+insists on one.
 
 **DPoP is PingAccess's when it validates the token.** The application's DPoP settings
 enforce RFC 9449 natively, and that is where it belongs. `require_dpop` on the rule is
@@ -144,10 +156,14 @@ when the proof carries the very JWK being compared.
 
 **`X-User-Token` is the rule's.** It is the one token PingAccess has no native way to
 validate, and the one whose claims feed the login gate and the step-up decision, which
-is exactly what a forged one would walk through. With `user_token_jwks_url` set the rule
-verifies it (signature, `exp`, `nbf`, `iss`, `aud`, `alg: none` refused) and a token that
-fails yields no claims at all, so those gates close rather than open. Unset, it is
-decoded only, and the rule says so in the log each time it is configured.
+is exactly what a forged one would walk through. The rule verifies it against
+`user_token_jwks_url`: the signature, `alg: none` refused, and an `exp`, a `sub` and the
+configured audience all required, not merely checked when present. A token that fails
+yields no claims at all, so those gates close rather than open, and the log names the
+reason without quoting the token. Without a JWKS the token is ignored - no login, no
+`user_scope` - and `require_user_login` without one is refused when the rule is saved.
+Under `allow_insecure` it is decoded instead, and the rule says so each time it is
+configured.
 
 ## Finding the PDP
 
@@ -179,12 +195,23 @@ explicit PDP identifier, each optionally ` fail-open` or ` fail-closed`. It is h
 estate-wide PDP that judges the token and the client sits in front of the resource's
 own. Across permitting layers the obligations accumulate, so a generic PDP's "permit,
 but step up" survives the resource PDP's plain permit. A permit that skipped a
-fail-open layer says so in `X-PDP-Fail-Open`.
+fail-open layer says so in `X-PDP-Fail-Open`, which names the layer and nothing else.
 
-Three rules never relax: a URL outside an allowlist fails closed rather than falling to
-a weaker source; a discovered PDP never receives `authzen_api_key`; and metadata is
-cached per identifier with stale-while-failing, so a metadata outage is not an
-authorization outage.
+Failing open is for outages, and only outages. A PDP call ends one of four ways: a
+permit, a deny, a refusal, or no answer at all. No answer - a connection or TLS failure,
+a timeout, a 5xx, a 429 - is the one a fail-open layer may skip. A refusal is an answer
+that says something other than "down": a 401 because the key was rotated, a 413 because
+a client padded its token, a redirect, a body that is not a boolean decision. If the rule
+skipped those, anyone who could provoke one could switch a layer off, so a refusal is a
+503 on every layer and goes in the log as a refusal.
+
+Four rules never relax: a URL outside an allowlist fails closed rather than falling to a
+weaker source; a discovered PDP never receives `authzen_api_key`; a refusal never
+fails open; and metadata is cached per identifier with stale-while-failing, so a
+metadata outage is not an authorization outage. A PDP's metadata falls back to
+AuthZEN's default paths only when the PDP publishes none, never because a fetch failed.
+With discovery on, `pdp_allowlist` is required: an empty one would let a resource name
+any PDP at all.
 
 ## The deny, on the wire
 
@@ -230,16 +257,35 @@ WWW-Authenticate: Bearer error="insufficient_user_authentication", error_descrip
 ```
 
 Everything else is `{"error":"authorization_failed","pep":...,"reason":...}`: 401 with no
-token or no readable subject, 403 when the policy simply says no, 503 when the PDP or
-the discovery it depends on cannot be reached. On an MCP route, a denied `tools/call` is
-the engine's JSON-RPC error relayed untouched, HTTP 200 and all, because that is what
-the COAZ profile requires and two renderings of one decision would drift.
+token, a token PingAccess did not validate, or no readable subject; 400 for a request the
+rule cannot map to what the upstream will do (a payment with no amount, a path that
+routes two ways); 403 when the policy simply says no; 503 when the PDP or the discovery
+it depends on cannot be reached or refuses. The reasons are generic on purpose: the
+detail - which URL, which status, which error - is in the log, never on the wire.
+
+On an MCP route, a denied `tools/call` is the engine's JSON-RPC error relayed untouched,
+HTTP 200 and all, because that is what the COAZ profile requires and two renderings of
+one decision would drift. A body the rule will not judge at all is refused in JSON-RPC's
+own terms before anyone is asked: 400 with `-32700` for anything that is not one valid
+JSON value, 400 with `-32600` for a batch or an ambiguous message, 413 for a body it
+could not read whole, 415 for a compressed one.
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+X-PDP-Decision: DENY
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request: batch requests are not supported"}}
+```
 
 A permit carries the delegation chain to the site, `X-Auth-Principal`, `X-Auth-Agent`,
 `X-Auth-Scope` and `X-Auth-Acr`, so the API can record who acted for whom and under what
-authentication context, rather than inferring a channel from a username. The `X-PDP-*`
-response headers are the demo transcript's; they are harmless in production and useful
-in a support ticket.
+authentication context, rather than inferring a channel from a username. Whatever the
+client sent under those names is removed first, in any case it was spelled, so the site
+sees only what the PEP asserts. The `X-PDP-*` response headers are the demo transcript's;
+they are harmless in production and useful in a support ticket. Every header value built
+from what a PDP said is cleaned first: no CR or LF, nothing past Latin-1, and
+quoted-string escaping inside `WWW-Authenticate`.
 
 **How that is written, for anyone porting another rule.** PingAccess's contract for a
 rule is that `Outcome.RETURN` means *this rule rejects the request; call its error
@@ -248,8 +294,10 @@ rules work. Setting a response yourself and returning `RETURN` gets you the call
 output, not yours. So the rule parks its verdict on the exchange and the callback
 renders it: status, `WWW-Authenticate`, the JSON body, the `X-PDP-*` headers. On a
 permit the request headers go on in `handleRequest` and the response headers in
-`handleResponse`. In an Agent deployment the response never passes through PingAccess,
-so the `X-Auth-*` headers reach the agent as with any rule and the `X-PDP-*` ones do not.
+`handleResponse`, each removed before it is set, so neither the client nor the upstream
+can put words in the PEP's mouth. In an Agent deployment the response never passes
+through PingAccess, so the `X-Auth-*` headers reach the agent as with any rule and the
+`X-PDP-*` ones do not.
 
 ## Wiring it up
 
@@ -286,14 +334,16 @@ for introspection); the rule finds the PDP from the API's own metadata.
     "pdp_allowlist": ["https://pdp.bank.example"],
     "forward_access_token": true,
     "user_token_jwks_url": "https://as.bank.example/jwks",
-    "user_token_issuer": "https://as.bank.example"
+    "user_token_issuer": "https://as.bank.example",
+    "user_token_audience": "https://api.bank.example"
   }
 }
 ```
 
-**An MCP edge.** The rule authorises access to the MCP service on the `initialize`
-handshake and hands every `tools/call` to `coaz-pep`, which does the per-tool mapping;
-the resource identifier defaults to the MCP upstream.
+**An MCP edge.** The rule checks the token and hands every request to `coaz-pep`, which
+reads each tool's mapping from the MCP server's `tools/list`, applies the COAZ binding's
+default table to the rest, and asks the PDP; the resource identifier defaults to the MCP
+upstream. `coaz_url` is not optional here: an MCP route without it does not start.
 
 ```json
 {
@@ -304,10 +354,13 @@ the resource identifier defaults to the MCP upstream.
     "style": "mcp",
     "require_token": true,
     "require_user_login": true,
+    "user_token_jwks_url": "https://as.bank.example/jwks",
+    "user_token_audience": "https://bank-mcp.example",
     "coaz_url": "https://coaz-pep.internal:9192",
     "coaz_api_key": "...",
     "mcp_upstream_url": "https://bank-mcp.internal/mcp",
-    "pdp_discovery": "resource"
+    "pdp_discovery": "resource",
+    "pdp_allowlist": ["https://pdp.bank.example"]
   }
 }
 ```
@@ -353,7 +406,8 @@ rule runs, which is easy to mistake for the rule denying.
 `lib/pingaccess-sdk-<version>.jar` from an install or from the public Docker image,
 then `mvn verify`. The README has the commands. Nothing from the SDK, Jackson, jose4j
 or slf4j is bundled; PingAccess supplies them all. The bytecode is Java 17, so the jar
-loads on PingAccess 8.x and 9.x alike.
+needs a Java 17 or later runtime; it has been tested on PingAccess 9.1.0.1 (Java 21),
+and nothing earlier has been tried.
 
 **Install** by copying the jar to `<PA_HOME>/deploy/` and restarting; PingAccess reads
 that directory at start and nothing hot-loads. With the DevOps image, the local server
@@ -365,61 +419,81 @@ engine and on the admin node, which validates the configuration.
 **Check** it arrived: `GET /pa-admin-api/v3/rules/descriptors` lists
 `AuthZenPdpRule` with every knob, and the console offers *AuthZEN PDP* as a rule type.
 
-**Threads.** Every decision runs on the rule's own bounded pool of daemon workers, so a
-slow PDP never holds one of the engine's I/O threads. Saturation is a 503 deny rather
-than a queue that grows without end; `-Dauthzen.pdp.threads=N` in the JVM options sets
-the size, 64 by default.
+**Threads.** Every decision runs on a bounded pool of daemon workers that belongs to the
+rule, so a slow PDP never holds one of the engine's I/O threads and one rule's stuck
+dependency cannot starve another rule. Every outbound call has one deadline over the
+whole exchange - a PDP that sends its headers and then trickles the body gets no longer
+than one that sends nothing - and a 1 MiB cap on the answer. Saturation is a 503 deny
+rather than a queue that grows without end; `-Dauthzen.pdp.threads=N` in the JVM options
+sets the size per rule, 64 by default. Threads start when needed and go when idle, so
+the copy of the rule PingAccess builds on the admin node costs nothing.
 
 **Logs** go to `pingaccess.log` under the logger `com.idpartners.pa.authzen`: a warning
-per rule instance at configure time when `pdp_ssl_verify` is off or `X-User-Token` is
-unverified, an error line for every deny the rule made on its own account (PDP or
-engine unreachable, discovery refused, verification failed), and a warning for every
-layer that failed open. The PDP's reason for a deny is in the response, not the log.
+per rule instance at configure time naming every relaxation `allow_insecure` is
+covering, an error line for every deny the rule made on its own account (a PDP or
+engine unavailable, a PDP or engine that refused, discovery refused, verification
+failed), a warning for every layer that failed open and every body or token refused,
+with the reason. The PDP's reason for a deny is in the response; the detail behind the
+rule's own denies is in the log and only there.
 
 ## Production posture
 
+Most of this the rule now enforces: a configuration that misses it is refused when it is
+saved, unless `allow_insecure` is ticked.
+
+- **`allow_insecure` off.** It exists for a developer's laptop and the demo, and the rule
+  says so in the log each time it is configured with it.
 - A **protected application**: a JWT validator or Remote validation, so the token the
-  rule reads has been verified by PingAccess. Unprotected is for demos with unsigned
-  tokens and nothing else.
+  rule reads has been verified by PingAccess. The rule refuses a token PingAccess did
+  not validate.
 - **DPoP on the application** when the AS issues sender-constrained tokens; `require_dpop`
   only when the application is unprotected and `coaz-pep` is reachable.
-- **`user_token_jwks_url`** wherever `require_user_login` or a step-up decision depends
-  on `X-User-Token`.
-- **Allowlists set**: `resource_metadata_allowlist` to the resources this route fronts,
-  `pdp_allowlist` to the PDPs a resource may name. Empty means any, which is a warning
-  in `coaz-pep` and should be read as one here.
-- **`pdp_ssl_verify` on.** Off is process-wide for JDK HTTP clients built afterwards and
-  exists for local development only.
-- **`forward_access_token`** only to a PDP reached over TLS with a key on it: it puts a
-  bearer token on the wire.
+- **`user_token_jwks_url` and `user_token_audience`** wherever `require_user_login` or a
+  step-up decision depends on `X-User-Token`. Without them the token is ignored.
+- **Allowlists set**: `pdp_allowlist` to the PDPs a resource may name, which the rule
+  requires whenever discovery is on, and `resource_metadata_allowlist` to the resources
+  this route fronts.
+- **`pdp_ssl_verify` on.** Off trusts any certificate chain (the host name is still
+  checked) and exists for local development only.
+- **`forward_access_token`** only to a PDP reached over TLS: it puts a bearer token on
+  the wire, and the rule refuses it over plain http.
 - **`coaz_api_key`** set, and `CHECK_API_TOKEN` on the `coaz-pep` it points at: that
-  endpoint fetches a caller-supplied URL with a caller-supplied header.
+  endpoint fetches a caller-supplied URL with a caller-supplied header, and the rule
+  refuses a `coaz_url` without the key.
 - **`fail_mode` closed** unless a layer has earned otherwise. A PEP that fails open is
-  not a PEP; a layer that fails open is a choice, made per layer, and marked on every
-  permit it affects.
+  not a PEP; a layer that fails open is a choice, made per layer, marked on every permit
+  it affects, and taken only when its PDP is down, never when it refuses.
 
 ## Troubleshooting
 
 | What you see | What it is | What to do |
 | --- | --- | --- |
 | *AuthZEN PDP* is not offered as a rule type; no `AuthZenPdpRule` in `/rules/descriptors` | the jar is not in `deploy/`, or PingAccess was not restarted after it was | copy it, restart, check `pingaccess.log` for a classloading error |
+| saving the rule fails with **Invalid plugin configuration; insecure configuration refused: ...** | a security setting is missing or weakened; the banner lists each one | fix what it names; `allow_insecure` only on a development PingAccess |
+| every request through the rule is a **500** after upgrading the jar | a configuration saved under 0.3 fails 0.4.0's checks, so the rule never configured | `pingaccess.log` has the reason; see [the upgrade notes](../gateways/pingaccess/README.md#upgrading-to-040) |
 | every request gets an HTML **403 Forbidden** page | the application is disabled, or no resource matched | `"enabled": true`; check the context root and virtual host |
 | **401** `authorization_failed` "No access token presented" | the request had no `Authorization` header, or PingAccess consumed it | on a protected application the token still reaches the rule; check the client |
-| **401** "no subject claim" | an opaque token on an unprotected application, or a JWT without `sub` | protect the application so introspection yields a subject, or fix the token |
-| **503** "could not be resolved" | discovery refused: a resource or PDP outside an allowlist, an invalid chain, or a resource with no usable metadata and no static PDP | the log names the URL and the rule it broke; widen the allowlist deliberately or fix the metadata |
-| **503** "unreachable" | the PDP (or `coaz-pep`) did not answer, or answered with an error | network, TLS trust, the key; nothing fails open unless told to |
+| **401** "The access token was not validated by the gateway" | the application is unprotected, so PingAccess established no identity | protect the application with an access token validator; `allow_insecure` for development |
+| **401** "no subject claim" | a JWT without `sub`, or an identity from PingAccess without a subject | fix the token, or the validator's attribute mapping |
+| **400** "cannot be authorised as sent" | a payment or new account with no readable body, no `from_account` or no numeric amount, or a path that routes more than one way | the log says which; fix the client |
+| **400** / **413** / **415** with a JSON-RPC `error` on an MCP route | the body is not one plain JSON-RPC message the rule read in full: a batch, invalid UTF-8, a case-variant member, a partial body, gzip | the `message` says which; send one uncompressed message |
+| **503** "could not be resolved" | discovery refused: a resource or PDP outside an allowlist, metadata that answers wrongly, or no usable PDP | the log names the URL and the rule it broke; widen the allowlist deliberately or fix the metadata |
+| **503** "unreachable" | the PDP (or `coaz-pep`) did not answer: no connection, a timeout, a 5xx, a 429 | network, TLS trust; nothing fails open unless told to |
+| **503** "refused the request" | the PDP (or `coaz-pep`) answered with a 3xx or 4xx, or with something that is not a decision; this never fails open | usually the key: `authzen_api_key`, or `coaz_api_key` against `CHECK_API_TOKEN`; the log has the status |
 | **500** "The authorization rule failed" | the rule threw, or PingAccess failed it; fail-closed | the stack trace is in `pingaccess.log` |
 | a step-up loops | the client retries with the same token; the step-up scope must be obtained from the AS first | the challenge names the scope; get it, then retry |
-| `X-User-Token` never counts as logged in | verification is on and the token fails it: wrong issuer or audience, expired, unknown `kid`, or `alg: none` | the log says which; the demo's unsigned tokens cannot pass a JWKS |
-| the site sees no `X-Auth-*` headers | the request was denied before they were set, or a processing rule after this one stripped them | check `X-PDP-Decision`; look at the processing rules on the policy |
+| `X-User-Token` never counts as logged in | no JWKS, so it is ignored; or it fails verification: wrong issuer or audience, expired, no `exp` or `sub`, unknown `kid`, `alg: none` | the log says which; the demo's unsigned tokens cannot pass a JWKS |
+| the site sees no `X-Auth-*` headers | the request was denied before they were set, the PEP had no value for them, or a processing rule after this one stripped them | check `X-PDP-Decision`; look at the processing rules on the policy |
 | responses carry no `X-PDP-*` headers | Agent destination, where the response does not pass through PingAccess | expected; the request headers still arrive |
 
 ## What it deliberately does not do
 
 - **Resolve a federation.** That is `coaz-pep`'s, and only `coaz-pep`'s, so the Trust
   Chain rules cannot drift. The rule relays the documents for a resource whose face it is.
-- **Evaluate COAZ mappings.** The CEL that maps a tool call's arguments into an AuthZEN
-  request is compiled and evaluated in one place. The rule hands `tools/call` over.
+- **Decide an MCP request.** The CEL that maps a tool call's arguments into an AuthZEN
+  request, and the binding's default table for every other method, are compiled and
+  evaluated in one place. The rule makes sure the body is one it can hand over intact,
+  and hands every request over.
 - **Validate the access token.** PingAccess does, on a protected application, with its
   own validators and providers; a second implementation would be a second opinion.
 - **Web sessions.** It is an API rule. On a Web+API application it runs on the API side.
