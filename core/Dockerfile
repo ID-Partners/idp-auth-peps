@@ -25,9 +25,12 @@ RUN go build -ldflags "-s -w -X main.version=${VERSION}" -o /coaz-pep ./cmd/coaz
     go build -ldflags "-s -w" -o /demo-stubs ./cmd/demo-stubs && \
     go build -ldflags "-s -w" -o /demo-console ./cmd/demo-console
 
-# The demo images keep a shell and wget: compose healthchecks use them.
+# The demo images keep a shell and wget: compose healthchecks use them. /shared is where
+# the stubs write the anchors file for the PEPs; creating it here, owned by the demo
+# user, makes a fresh named volume mounted there writable without root. (A volume left
+# over from an older, root-run demo is not: `docker compose down -v` clears it.)
 FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0 AS demo-base
-RUN adduser -D -u 65532 demo
+RUN adduser -D -u 65532 demo && mkdir -p /shared && chown demo:demo /shared
 
 FROM demo-base AS demo-stubs
 COPY --from=build /demo-stubs /usr/local/bin/demo-stubs
