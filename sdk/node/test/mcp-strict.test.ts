@@ -280,6 +280,84 @@ describe('with the raw body, the guard judges the bytes, not a parse of them', (
 
 // ---------------------------------------------------------------------------
 
+describe('folded duplicates are refused at every depth, and nesting past 64, as the Go engine does', () => {
+  const body = (params: string) => `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":${params}}`;
+  const args = (extra: string) => body(`{"name":"make_payment","arguments":{"payment_id":"p1",${extra}}}`);
+
+  // Each pair is one name to Go's encoding/json, which matches a key to a struct field
+  // with strings.EqualFold: a Go MCP server would read whichever came last.
+  const folded: Array<[string, string]> = [
+    ['a case variant inside arguments', args('"amount":1,"Amount":1000000')],
+    ['a case variant nested deeper', args('"limits":{"max":1,"MAX":1000000}')],
+    ['a case variant in an object inside an array', args('"items":[{"sku":"a"},{"sku":"b","SKU":"c"}]')],
+    ['the long s beside s', args('"sku":"a","\\u017fku":"b"')],
+    ['the Kelvin sign beside k', args('"kind":"a","\\u212aind":"b"')],
+    ['the micro sign beside a capital mu', args('"\\u00b5":"a","\\u039c":"b"')],
+    ['a sharp s beside a capital sharp s', args('"\\u00df":"a","\\u1e9e":"b"')],
+    ['a theta beside the theta symbol', args('"\\u03b8":"a","\\u03d1":"b"')],
+    ['two lone surrogates, which Go reads as one U+FFFD', args('"\\ud800":"a","\\udbff":"b"')],
+  ];
+
+  for (const [name, raw] of folded) {
+    it(`refuses ${name}, from the bytes or from a parse of them`, async () => {
+      const { g, asked } = guard();
+      const fromBytes = await g.checkToolCall({ raw: { headers: {}, body: raw }, claims: token });
+      expect(fromBytes.jsonRpcError?.error.code, name).toBe(CODE_INVALID_REQUEST);
+      expect(fromBytes.jsonRpcError?.error.message, name).toMatch(/are the same name to a case-insensitive parser$/);
+      expect(fromBytes.response?.status, name).toBe(400);
+      expect(fromBytes.jsonRpcError?.id, name).toBe(1);
+      const fromObject = await g.checkToolCall({ rpc: JSON.parse(raw), claims: token });
+      expect(fromObject.jsonRpcError?.error.code, name).toBe(CODE_INVALID_REQUEST);
+      expect(fromObject.response?.status, name).toBe(400);
+      expect(asked, name).toHaveLength(0);
+    });
+  }
+
+  it('keeps apart what Go keeps apart', async () => {
+    for (const extra of ['"\\u00df":"a","ss":"b"', '"\\u0131":"a","i":"b"', '"\\u0130":"a","i":"b"', '"\\ufb00":"a","ff":"b"', '"a":{"x":1},"b":{"x":2}']) {
+      const { g, asked } = guard();
+      const v = await g.checkToolCall({ raw: { headers: {}, body: args(extra) }, claims: token });
+      expect(v.allow, extra).toBe(true);
+      expect(asked, extra).toHaveLength(1);
+    }
+  });
+
+  it('names both members', async () => {
+    const { g } = guard();
+    const v = await g.checkToolCall({ raw: { headers: {}, body: args('"amount":1,"Amount":2') }, claims: token });
+    expect(v.jsonRpcError?.error.message).toBe('Invalid Request: member names "amount" and "Amount" are the same name to a case-insensitive parser');
+  });
+
+  // params sits at depth 1 and its member at depth 2, so n arrays put the innermost
+  // value at depth n + 2: 62 of them reach Go's limit of 64, and 63 pass it.
+  const nested = (n: number) => `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"a":${'['.repeat(n)}0${']'.repeat(n)}}}`;
+
+  it('reads nesting to depth 64, from the bytes or from a parse of them', async () => {
+    const { g } = guard();
+    expect((await g.checkToolCall({ raw: { headers: {}, body: nested(62) }, claims: token })).allow).toBe(true);
+    expect((await g.checkToolCall({ rpc: JSON.parse(nested(62)), claims: token })).allow).toBe(true);
+  });
+
+  it('refuses nesting past 64, from the bytes or from a parse of them', async () => {
+    const { g } = guard();
+    for (const v of [await g.checkToolCall({ raw: { headers: {}, body: nested(63) }, claims: token }), await g.checkToolCall({ rpc: JSON.parse(nested(63)), claims: token })]) {
+      expect(v.jsonRpcError?.error).toEqual({ code: CODE_INVALID_REQUEST, message: 'Invalid Request: the body is nested too deeply' });
+      expect(v.response?.status).toBe(400);
+    }
+  });
+
+  it('refuses a message built in memory with a cycle, rather than following it', async () => {
+    const { g, asked } = guard();
+    const params: Record<string, unknown> = {};
+    params['self'] = params;
+    const v = await g.checkToolCall({ rpc: { jsonrpc: '2.0', id: 1, method: 'ping', params }, claims: token });
+    expect(v.jsonRpcError?.error.message).toBe('Invalid Request: the body is nested too deeply');
+    expect(asked).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
 describe('wrap() runs the handler only on an explicit allow', () => {
   it('returns the refusal and never runs the handler for anything unreadable', async () => {
     const { g } = guard();

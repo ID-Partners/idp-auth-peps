@@ -184,8 +184,15 @@ never asked about a refusal.
 | a JSON-RPC response (`id`, and one of `result` / `error`) | passed through — it answers the server |
 | a batch (a top-level array) | 400, `-32600` |
 | not one object, a `method` or `id` of the wrong type, `params` that is not an object | 400, `-32600` |
-| two members of the top level or of `params` that differ only in case (`Params` beside `params`) | 400, `-32600` |
+| an object, at any depth, with two member names a case-insensitive parser reads as one (`Params` beside `params`, `Amount` beside `amount` in the arguments) | 400, `-32600` |
+| nesting deeper than 64 | 400, `-32600` |
 | a `tools/call` without a non-empty string `params.name` | 400, `-32600` |
+
+"Reads as one" is Go's rule, the one its `encoding/json` matches a key to a struct field
+by: Unicode simple case folding, so the long s beside `s` and the Kelvin sign beside `k`
+count too. A Go MCP server behind a gateway would act on whichever came last, so the
+guard refuses both, in the arguments as much as at the top level, exactly as coaz-pep
+does.
 
 Pass the untouched request as `raw: { headers, body }` and the guard judges the bytes
 rather than your parse of them: a `Content-Encoding` other than identity is a 415, a
