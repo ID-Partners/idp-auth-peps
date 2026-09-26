@@ -77,24 +77,6 @@ final class Pep {
             return relayWellKnown(req.path);
         }
 
-        // 0) Step-up: require a logged-in END USER (RFC 9470). The principal
-        //    authenticates at the AS; the app forwards their token down the agent chain
-        //    as X-User-Token. Without a valid one, push back a login challenge.
-        if (conf.require_user_login) {
-            ObjectNode user = userClaims(req);
-            if (user == null || !user.hasNonNull("sub")) {
-                ObjectNode body = Json.object();
-                body.put("error", "login_required");
-                body.put("pep", pep);
-                body.put("reason", "The gateway requires an authenticated user (no valid X-User-Token).");
-                body.put("acr_values", LOGIN_ACR);
-                return Verdict.respond(401, headers(JSON,
-                        "WWW-Authenticate", "Bearer error=\"insufficient_user_authentication\", "
-                            + "error_description=\"Login required\", acr_values=\"" + LOGIN_ACR + "\""),
-                    Json.bytes(body), null);
-            }
-        }
-
         // 1) token + claims
         Jwt.Token token = Jwt.extractToken(req.header("authorization"));
         if (token == null && conf.require_token) {
@@ -120,6 +102,24 @@ final class Pep {
 
         if (conf.require_token && sub == null) {
             return deny(pep, 401, "Access token missing or unreadable (no subject claim).", null);
+        }
+
+        // 1b) Step-up: require a logged-in END USER (RFC 9470). The principal
+        //     authenticates at the AS; the app forwards their token down the agent chain
+        //     as X-User-Token. It counts only as the principal's own login (see
+        //     userClaims), so this comes after the access token that names the principal,
+        //     in coaz-pep's order. Without one, push back a login challenge.
+        ObjectNode user = userClaims(req, sub, token);
+        if (conf.require_user_login && user == null) {
+            ObjectNode body = Json.object();
+            body.put("error", "login_required");
+            body.put("pep", pep);
+            body.put("reason", "The gateway requires an authenticated user (no valid X-User-Token).");
+            body.put("acr_values", LOGIN_ACR);
+            return Verdict.respond(401, headers(JSON,
+                    "WWW-Authenticate", "Bearer error=\"insufficient_user_authentication\", "
+                        + "error_description=\"Login required\", acr_values=\"" + LOGIN_ACR + "\""),
+                Json.bytes(body), null);
         }
 
         // 2) DPoP sender-constraint binding, delegated
@@ -149,12 +149,10 @@ final class Pep {
         }
         Map<String, String> upstream = authHeaders(sub, act, scope, acr);
 
-        // 3b) Carry the USER's consented scope into the context. The step-up decision is
-        //     the PDP's: it compares the amount to its threshold and checks whether this
-        //     scope already satisfies it, then returns advice honoured below.
-        ObjectNode user = userClaims(req);
-        String uscope = user == null ? null : joined(user, "scope", "scp");
-        m.ctx().put("user_scope", uscope == null ? "" : uscope);
+        // 3b) Carry the USER's consent into the context. The step-up decision is the
+        //     PDP's: it compares the amount to its threshold and checks whether the
+        //     consent already satisfies it, then returns advice honoured below.
+        m.ctx().setAll(userContext(user, claims));
 
         // AuthZEN 1.0 names the subject identifier `id`. The legacy `identity` is sent
         // beside it while legacy_subject_identity is on, in lockstep with the other PEPs.
@@ -463,6 +461,8 @@ final class Pep {
         config.put("style", "mcp");
         putIf(config, "mcp_upstream_url", conf.mcp_upstream_url);
         config.put("coaz_defaults", conf.coaz_defaults ? "true" : "false");
+        // coaz-pep reads the X-User-Token itself on this route, by the same rule.
+        putIf(config, "user_token_subject", conf.user_token_subject);
         // The engine runs its own PDP discovery (federation included); an explicit
         // resource identifier is passed so both PEPs key off the same one.
         if (!blank(conf.resource)) {
@@ -624,9 +624,104 @@ final class Pep {
 
     // ---------- claims ----------
 
-    private ObjectNode userClaims(PepRequest req) {
-        String ut = req.header("x-user-token");
-        return ut == null ? null : userTokens.claims(ut);
+    /**
+     * The X-User-Token's claims, or null when it does not count. They drive user_scope,
+     * user_acr, authorization_details and the consented amount, the step-up and consent
+     * gates. A forged token is a bypass of both, and so is a genuine one belonging to
+     * someone else: customer B's consent must not authorise customer A's payment. So the
+     * token counts only when it verifies (or decoding was allowed), it is not the access
+     * token itself, it is not a delegated token (an act claim: an agent's own token is not
+     * a user having logged in), it has a subject, and that subject is the principal's.
+     *
+     * <p>The last rule has one deliberate exception. A route with user_token_subject "pdp"
+     * is one where someone else may approve, a staff member approving for a customer, so
+     * a verified login with another subject counts there, and the PDP, which receives
+     * user_sub and user_iss, decides whether that person may approve for this principal.
+     * The same rules as coaz-pep's userClaims.
+     */
+    private ObjectNode userClaims(PepRequest req, String principal, Jwt.Token token) {
+        String raw = req.header("x-user-token");
+        if (raw == null) {
+            return null;
+        }
+        ObjectNode u = userTokens.claims(raw);
+        if (u == null) {
+            return null;
+        }
+        String sub = strClaim(u, "sub");
+        String ignored = null;
+        if (token != null && raw.equals(token.value())) {
+            ignored = "it is the access token";
+        } else if (u.hasNonNull("act")) {
+            ignored = "it is a delegated token (act), not a user's login";
+        } else if (sub.isEmpty()) {
+            ignored = "it has no subject";
+        } else if (!"pdp".equals(conf.user_token_subject) && !sub.equals(principal)) {
+            ignored = "its subject is not the access token's";
+        }
+        if (ignored != null) {
+            log.warn("X-User-Token ignored: {}", ignored);
+            return null;
+        }
+        return u;
+    }
+
+    /**
+     * What the PDP is told about the user's login, key for key what coaz-pep sends: a
+     * payment authorised at the MCP edge must not be re-challenged at this one, or the
+     * flow loops on step-up. user_scope; token_aud, the agent token's audience (RFC 8707);
+     * user_acr, how the user authenticated, by which the staff-approval channel is
+     * recognised; user_sub and user_iss, whose login it is, when one counts; and the
+     * RFC 9396 authorization_details with the consented amount and creditor taken from
+     * its first payment_initiation entry.
+     */
+    static ObjectNode userContext(ObjectNode user, ObjectNode claims) {
+        ObjectNode ctx = Json.object();
+        String uscope = user == null ? null : joined(user, "scope", "scp");
+        ctx.put("user_scope", uscope == null ? "" : uscope);
+        ctx.put("token_aud", audString(claims));
+        ctx.put("user_acr", strClaim(user, "acr"));
+        String usub = strClaim(user, "sub");
+        if (!usub.isEmpty()) {
+            ctx.put("user_sub", usub);
+            ctx.put("user_iss", strClaim(user, "iss"));
+        }
+        JsonNode ad = user == null ? null : user.get("authorization_details");
+        if (ad != null && !ad.isNull()) {
+            ctx.set("authorization_details", ad);
+            for (JsonNode e : ad.isArray() ? ad : Json.MAPPER.createArrayNode()) {
+                if (e.isObject() && "payment_initiation".equals(strClaim(e, "type"))) {
+                    JsonNode amount = e.get("amount");
+                    ctx.put("consented_amount", amount != null && amount.isNumber() ? amount.doubleValue() : 0.0);
+                    ctx.put("consented_creditor", strClaim(e, "creditorAccount"));
+                    break;
+                }
+            }
+        }
+        return ctx;
+    }
+
+    /** A string claim, or "" when it is absent or not a string, as coaz-pep reads one. */
+    static String strClaim(JsonNode claims, String name) {
+        JsonNode v = claims == null ? null : claims.get(name);
+        return v != null && v.isTextual() ? v.asText() : "";
+    }
+
+    /** A token's audience: the string, or an array's strings joined with commas. */
+    static String audString(ObjectNode claims) {
+        JsonNode a = claims.get("aud");
+        if (a != null && a.isTextual()) {
+            return a.asText();
+        }
+        List<String> parts = new ArrayList<>();
+        if (a != null && a.isArray()) {
+            for (JsonNode p : a) {
+                if (p.isTextual()) {
+                    parts.add(p.asText());
+                }
+            }
+        }
+        return String.join(",", parts);
     }
 
     /**

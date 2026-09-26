@@ -148,6 +148,13 @@ public class AuthZenRuleConfiguration extends SimplePluginConfiguration {
         help = @Help(title = "Required with the JWKS", content = "The aud a user token must carry. Without it a token minted for any other audience would pass.", url = ""))
     public String user_token_audience;
 
+    @UIElement(order = 285, type = ConfigurationType.SELECT, label = "Whose login counts (user_token_subject)", defaultValue = "principal", advanced = true,
+        options = {@Option(label = "principal: only the principal's own login", value = "principal"),
+            @Option(label = "pdp: another person's verified login, for the PDP to judge", value = "pdp")},
+        help = @Help(title = "Approvals by someone else", content = "principal: an X-User-Token counts only when its sub is the access token's subject. pdp: a verified login by someone else (a staff member approving for a customer) counts too, and the PDP, which receives user_sub and user_iss, decides whether that person may approve.", url = ""))
+    @Pattern(regexp = "principal|pdp", message = "must be principal or pdp")
+    public String user_token_subject = "principal";
+
     @UIElement(order = 290, type = ConfigurationType.TEXT, label = "PDP timeout, ms (pdp_timeout_ms)", defaultValue = "10000", advanced = true)
     @Min(value = 1, message = "must be greater than zero")
     public int pdp_timeout_ms = 10000;

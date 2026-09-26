@@ -205,6 +205,24 @@ class AuthZenRuleTest {
         AuthZenRuleConfiguration fail = conf();
         fail.fail_mode = null;
         assertTrue(refused(fail).getMessage().contains("fail_mode"));
+        AuthZenRuleConfiguration subject = conf();
+        subject.user_token_subject = null;
+        assertTrue(refused(subject).getMessage().contains("user_token_subject"));
+    }
+
+    @Test
+    void userTokenSubjectIsPrincipalByDefaultOrPdpAndNothingElse() {
+        assertEquals("principal", new AuthZenRuleConfiguration().user_token_subject);
+        for (String ok : new String[]{"principal", "pdp"}) {
+            AuthZenRuleConfiguration c = secure();
+            c.user_token_subject = ok;
+            AuthZenRule.validate(c);
+        }
+        for (String bad : new String[]{"PDP", "anyone", ""}) {
+            AuthZenRuleConfiguration c = secure();
+            c.user_token_subject = bad;
+            assertEquals("user_token_subject must be principal or pdp", refused(c).getMessage(), bad);
+        }
     }
 
     @Test
@@ -338,6 +356,7 @@ class AuthZenRuleTest {
         assertEquals("rest|mcp", style.getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
         assertEquals("off|authzen|resource", AuthZenRuleConfiguration.class.getField("pdp_discovery").getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
         assertEquals("closed|open", AuthZenRuleConfiguration.class.getField("fail_mode").getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
+        assertEquals("principal|pdp", AuthZenRuleConfiguration.class.getField("user_token_subject").getAnnotation(jakarta.validation.constraints.Pattern.class).regexp());
         for (String f : new String[]{"pdp_metadata_ttl", "pdp_timeout_ms", "coaz_timeout_ms"}) {
             assertEquals(1, AuthZenRuleConfiguration.class.getField(f).getAnnotation(jakarta.validation.constraints.Min.class).value(), f);
         }
@@ -367,7 +386,7 @@ class AuthZenRuleTest {
             "require_user_login", "stepup_scope", "coaz_url", "coaz_api_key", "mcp_upstream_url", "federation_entity_url",
             "pdp_ssl_verify", "coaz_defaults", "legacy_subject_identity", "pdp_discovery", "resource", "pdp_metadata_ttl",
             "pdp_allowlist", "resource_metadata_allowlist", "pdp_discovery_insecure", "forward_access_token", "pdp_layers",
-            "fail_mode", "user_token_jwks_url", "user_token_issuer", "user_token_audience", "allow_insecure"}) {
+            "fail_mode", "user_token_jwks_url", "user_token_issuer", "user_token_audience", "user_token_subject", "allow_insecure"}) {
             assertTrue(names.contains(knob), knob);
         }
         // With a JWKS, the user token is verified; without one it is ignored, or decoded
