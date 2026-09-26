@@ -2,7 +2,8 @@
 # One container, the whole demo: the stubs, three PEPs and the console, all on
 # localhost, the console on $PORT (Railway sets it; 8088 otherwise). The wiring is
 # ../run-local.sh's and ../docker-compose.yml's. PDP_DISCOVERY_INSECURE is here because
-# everything is plain http inside one container — do not copy that anywhere real.
+# everything is plain http inside one container, and PEP_ALLOW_INSECURE because the
+# demo's tokens are unsigned — do not copy either anywhere real.
 set -eu
 
 # The stubs' identifiers carry a host name. "stubs" keeps them identical to the compose
@@ -22,7 +23,7 @@ ready 9099
 
 # What every PEP shares. PDP_METADATA_TTL is short so the console's trace shows the
 # fetches on every run; the shipped default is 5m.
-export AUTHZEN_URL="http://$host:9002/tenants/bank-a" AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo
+export AUTHZEN_URL="http://$host:9002/tenants/bank-a" AUTHZEN_API_KEY=static-pdp-key CHECK_API_TOKEN=demo PEP_ALLOW_INSECURE=true
 export HTTP_ADDR=127.0.0.1 PDP_METADATA_TTL=15s
 export MCP_UPSTREAM_ALLOWLIST="http://$host:9001,http://$host:9004,http://$host:9005,http://$host:9006,http://$host:9009"
 # Allowlists match scheme + host + port at a path boundary, so each stub is listed.
@@ -31,8 +32,8 @@ resources="http://$host:9001,http://$host:9004,http://$host:9005,http://$host:90
 # pep-static: told where its PDP is, no discovery.
 PORT=9291 HTTP_PORT=9192 coaz-pep &
 pids="$pids $!"
-# pep-resource: trusts each resource's own well-known. Deliberately no PDP_ALLOWLIST (it
-# warns at boot): scenario 2 is what happens when a resource's own word is the only
+# pep-resource: trusts each resource's own well-known. Deliberately no PDP_ALLOWLIST
+# (logged at boot): scenario 2 is what happens when a resource's own word is the only
 # bound on who decides.
 PORT=9292 HTTP_PORT=9193 PDP_DISCOVERY=resource PDP_DISCOVERY_INSECURE=true \
   RESOURCE_METADATA_ALLOWLIST="$resources" coaz-pep &

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -703,7 +704,7 @@ func TestCheckEnforcesDpopWhenRequired(t *testing.T) {
 	thumb := jwkThumbprint(publicJWK(key))
 	token := mintUnsigned(map[string]any{"sub": "alice", "cnf": map[string]any{"jkt": thumb}})
 	proof := mintProof(t, key, map[string]any{
-		"htm": "GET", "ath": accessTokenHash(token),
+		"htm": "GET", "htu": "https://api.example.com/accounts/a/balance", "ath": accessTokenHash(token),
 		"iat": float64(time.Now().Unix()), "jti": "check-dpop-1",
 	})
 
@@ -1056,9 +1057,9 @@ func TestJWKSServesStaleKeyOnRefreshFailure(t *testing.T) {
 	// A cache with a known key whose refresh then fails must serve the stale key rather
 	// than failing every request during a transient JWKS outage.
 	key := newKey(t)
-	var fail bool
+	var fail atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if fail {
+		if fail.Load() {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -1073,7 +1074,7 @@ func TestJWKSServesStaleKeyOnRefreshFailure(t *testing.T) {
 	if _, err := c.key(context.Background(), "k1"); err != nil {
 		t.Fatal(err)
 	}
-	fail = true
+	fail.Store(true)
 	// TTL has passed, refresh fails, but the key is known — serve it.
 	if _, err := c.key(context.Background(), "k1"); err != nil {
 		t.Fatalf("a known key should survive a failed refresh: %v", err)

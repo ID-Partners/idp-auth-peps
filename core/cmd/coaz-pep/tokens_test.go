@@ -8,8 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -379,7 +382,7 @@ func TestJWKSSkipsEncryptionKeysAndEmptySets(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
-		if err := c.refresh(context.Background()); err == nil {
+		if _, err := c.fetch(context.Background()); err == nil {
 			t.Fatal("a JWKS of only encryption keys has no usable signing key")
 		}
 	})
@@ -394,7 +397,7 @@ func TestJWKSSkipsEncryptionKeysAndEmptySets(t *testing.T) {
 			}))
 			defer srv.Close()
 			c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
-			if err := c.refresh(context.Background()); err == nil {
+			if _, err := c.fetch(context.Background()); err == nil {
 				t.Fatalf("%s should fail", name)
 			}
 		})
@@ -406,7 +409,7 @@ func TestJWKSSkipsEncryptionKeysAndEmptySets(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
-		if err := c.refresh(context.Background()); err == nil {
+		if _, err := c.fetch(context.Background()); err == nil {
 			t.Fatal("a 500 from the JWKS endpoint should fail")
 		}
 	})
@@ -454,5 +457,149 @@ func TestValidateUnreadableClaims(t *testing.T) {
 	hdr := b64urlEncode([]byte(`{"alg":"ES256","kid":"k1"}`))
 	if _, err := v.Validate(context.Background(), hdr+"."+b64urlEncode([]byte("not json"))+".sig"); err == nil {
 		t.Fatal("unreadable claims must fail validation")
+	}
+}
+
+// A cold cache fetches once however many requests arrive together.
+func TestJWKSColdFetchIsShared(t *testing.T) {
+	key := newKey(t)
+	var hits atomic.Int32
+	jwk := publicJWK(key)
+	jwk["kid"] = "k1"
+	body, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	v := newTestValidator(t, srv.URL)
+	tok := mintJWT(t, key, "k1", validClaims())
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := v.Validate(context.Background(), tok); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("40 concurrent cold validations should share one fetch, got %d", n)
+	}
+}
+
+// A stale cache with a slow or dead JWKS endpoint serves the keys it has at once and
+// refreshes in the background, instead of every request waiting for its deadline.
+func TestJWKSStaleKeysDoNotWaitForARefresh(t *testing.T) {
+	key := newKey(t)
+	var slow atomic.Bool
+	jwk := publicJWK(key)
+	jwk["kid"] = "k1"
+	body, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if slow.Load() {
+			select {
+			case <-time.After(3 * time.Second):
+			case <-r.Context().Done():
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	v := newTestValidator(t, srv.URL)
+	tok := mintJWT(t, key, "k1", validClaims())
+	if _, err := v.Validate(context.Background(), tok); err != nil {
+		t.Fatal(err)
+	}
+	slow.Store(true)
+	v.jwks.mu.Lock()
+	v.jwks.fetchedAt = time.Now().Add(-11 * time.Minute)
+	v.jwks.nextAttempt = time.Time{}
+	v.jwks.mu.Unlock()
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if _, err := v.Validate(ctx, tok); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("stale keys should be served without waiting, took %v", d)
+	}
+}
+
+// Past the staleness cap the old keys are not trusted: a key the issuer withdrew must
+// stop verifying even while the endpoint is down.
+func TestJWKSStopsTrustingKeysPastMaxStale(t *testing.T) {
+	key := newKey(t)
+	var fail atomic.Bool
+	jwk := publicJWK(key)
+	jwk["kid"] = "k1"
+	body, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute, maxStale: time.Minute}
+	if _, err := c.key(context.Background(), "k1"); err != nil {
+		t.Fatal(err)
+	}
+	fail.Store(true)
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-3 * time.Minute)
+	c.nextAttempt = time.Time{}
+	c.mu.Unlock()
+	if _, err := c.key(context.Background(), "k1"); err == nil {
+		t.Fatal("keys past max-stale must not verify while the refresh fails")
+	}
+	// And the failure backs off: the next call does not fetch again at once.
+	c.mu.Lock()
+	next := c.nextAttempt
+	c.mu.Unlock()
+	if !next.After(time.Now()) {
+		t.Fatal("a failed fetch must hold further fetches back")
+	}
+}
+
+func TestJWKSReadyLoadsTheKeysOnce(t *testing.T) {
+	key := newKey(t)
+	srv := jwksServer(t, key, "k1")
+	defer srv.Close()
+	c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
+	if err := c.ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dead := &jwksCache{url: "http://127.0.0.1:1", client: &http.Client{Timeout: time.Second}, ttl: time.Minute}
+	if err := dead.ready(context.Background()); err == nil {
+		t.Fatal("an unreachable JWKS is not ready")
+	}
+}
+
+func TestJWKSRefusesAnOversizedKeySet(t *testing.T) {
+	keys := make([]any, maxJWKSKeys+1)
+	for i := range keys {
+		j := publicJWK(newKey(t))
+		j["kid"] = fmt.Sprint(i)
+		keys[i] = j
+	}
+	body, _ := json.Marshal(map[string]any{"keys": keys})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
+	defer srv.Close()
+	c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
+	if _, err := c.fetch(context.Background()); err == nil {
+		t.Fatal("a JWKS with more keys than any issuer publishes is refused")
 	}
 }

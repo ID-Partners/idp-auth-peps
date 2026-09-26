@@ -16,6 +16,13 @@ package main
 //   HTTP_PORT            HTTP check API port (default 9192)
 //   COAZ_DISCOVERY_TTL   tools/list cache TTL, Go duration (default 60s)
 //   PDP_TLS_INSECURE     "true" to skip PDP TLS verification (demo only)
+//   PEP_ALLOW_INSECURE   "true" to start despite missing security settings, each of which
+//                        is then logged; without it they refuse startup. Development only.
+//   GRPC_TLS_CERT_FILE / GRPC_TLS_KEY_FILE  serve ext_authz over TLS; add
+//   GRPC_TLS_CLIENT_CA_FILE to require client certificates (mTLS)
+//   LOG_FORMAT           json (default) or text
+//   DPOP_HTU_BASE        the external origin clients send DPoP proofs for, e.g.
+//                        https://api.example.com; htu must be it plus the request path
 //
 // PDP discovery (see core/authzen/discovery):
 //   PDP_DISCOVERY                off | authzen | resource | federation (default off)
@@ -56,12 +63,15 @@ import (
 	"fmt"
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -86,23 +96,40 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		}
 		return def
 	}
+	// Every security setting left unset is collected here. Unless PEP_ALLOW_INSECURE is
+	// set they refuse startup, all of them named at once; with it, each is logged. A PEP
+	// that comes up with an open check API or unverified tokens is worse than one that
+	// does not come up.
+	var gaps []string
+	insecure := func(format string, args ...any) { gaps = append(gaps, fmt.Sprintf(format, args...)) }
+
 	grpcPort := env("PORT", "9191")
 	httpPort := env("HTTP_PORT", "9192")
 	authzenURL := strings.TrimRight(getenv("AUTHZEN_URL"), "/")
 	if authzenURL == "" {
 		return nil, nil, "", fmt.Errorf("AUTHZEN_URL is required (e.g. http://authzen-adapter:8080)")
 	}
-	ttl := 60 * time.Second
-	if v := getenv("COAZ_DISCOVERY_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			ttl = d
-		}
+	if u, err := url.Parse(authzenURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, nil, "", fmt.Errorf("AUTHZEN_URL %q is not an absolute http(s) URL", authzenURL)
+	}
+	ttl, err := durationEnv(getenv, "COAZ_DISCOVERY_TTL", 60*time.Second)
+	if err != nil {
+		return nil, nil, "", err
 	}
 
-	httpc := &http.Client{Timeout: 10 * time.Second}
+	// The PDP is asked, never followed: a redirect would send the request — and a
+	// forwarded access token — somewhere the allowlist never approved.
+	httpc := &http.Client{Timeout: 10 * time.Second, CheckRedirect: noRedirects}
 	if strings.EqualFold(getenv("PDP_TLS_INSECURE"), "true") {
-		httpc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		httpc.Transport = t
+		insecure("PDP_TLS_INSECURE is set: the PDP's TLS certificate is not verified")
 	}
+	// Metadata and federation fetches get their own client: PDP_TLS_INSECURE is about the
+	// PDP, and must not quietly switch off TLS for the trust chain as well. metafetch
+	// re-checks its allowlist on every redirect hop itself.
+	metac := &http.Client{Timeout: 10 * time.Second}
 
 	layers, err := discovery.ParseLayers(getenv("PDP_LAYERS"))
 	if err != nil {
@@ -113,17 +140,17 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 	case "", "closed":
 	case "open":
 		failOpen = true
-		log.Printf("WARNING: PDP_FAIL_MODE=open — a PDP that cannot be reached is SKIPPED and the request " +
+		slog.Warn("PDP_FAIL_MODE=open — a PDP that cannot be reached is SKIPPED and the request " +
 			"may be permitted with X-PDP-Fail-Open set. Refusals still fail closed. Make sure that is the intent.")
 	default:
 		return nil, nil, "", fmt.Errorf("PDP_FAIL_MODE %q is neither open nor closed", getenv("PDP_FAIL_MODE"))
 	}
 	for _, l := range layers {
 		if l.FailOpen != nil && *l.FailOpen {
-			log.Printf("WARNING: PDP_LAYERS: %s is fail-open — when it cannot be reached it is skipped.", l.Name)
+			slog.Warn(fmt.Sprintf("PDP_LAYERS: %s is fail-open — when it cannot be reached it is skipped.", l.Name))
 		}
 	}
-	resolver, fed, err := buildResolver(getenv, authzenURL, httpc, layers)
+	resolver, fed, err := buildResolver(getenv, authzenURL, metac, layers, insecure)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -135,37 +162,51 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		resolver:      resolver,
 		defaultLayers: layers,
 		failOpen:      failOpen,
+		dpopHTUBase:   strings.TrimRight(getenv("DPOP_HTU_BASE"), "/"),
+		metrics:       newMetrics(),
 		coaz: coaz.NewEngine(coaz.Options{
-			PDP:          coaz.PDPConfig{URL: authzenURL, APIKey: getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
-			Resolver:     resolver,
-			DiscoveryTTL: ttl,
+			PDP:                 coaz.PDPConfig{URL: authzenURL, APIKey: getenv("AUTHZEN_API_KEY"), HTTPClient: httpc},
+			Resolver:            resolver,
+			DiscoveryTTL:        ttl,
+			DiscoveryHTTPClient: &http.Client{Timeout: 15 * time.Second, CheckRedirect: noRedirects},
 		}),
+	}
+	if srv.dpopHTUBase != "" {
+		if u, err := url.Parse(srv.dpopHTUBase); err != nil || !u.IsAbs() || u.Host == "" || (u.Path != "" && u.Path != "/") {
+			return nil, nil, "", fmt.Errorf("DPOP_HTU_BASE %q is not an origin like https://api.example.com", srv.dpopHTUBase)
+		}
 	}
 
 	// This endpoint takes a caller-supplied mcp_upstream_url AND a caller-supplied
 	// authorization header, then fetches that URL with that header. Left open, it is an
 	// SSRF and credential-relay primitive, so it takes two guards: a shared secret and
-	// an upstream allowlist. Both warn loudly when unset rather than silently failing
-	// open, because an operator who has not configured them should know.
+	// an upstream allowlist.
 	checkToken := getenv("CHECK_API_TOKEN")
 	if checkToken == "" {
-		log.Printf("WARNING: CHECK_API_TOKEN is unset — the HTTP check API on :%s is "+
-			"UNAUTHENTICATED. Set it, or keep the port off any untrusted network.", httpPort)
+		insecure("CHECK_API_TOKEN is unset: the HTTP check API on :%s is unauthenticated", httpPort)
 	}
 	srv.upstreamAllowlist = parseAllowlist(getenv("MCP_UPSTREAM_ALLOWLIST"))
 	if len(srv.upstreamAllowlist) == 0 {
-		log.Printf("WARNING: MCP_UPSTREAM_ALLOWLIST is unset — any caller-supplied " +
-			"mcp_upstream_url will be fetched server-side. Set it to the MCP servers you govern.")
+		insecure("MCP_UPSTREAM_ALLOWLIST is unset: any caller-supplied mcp_upstream_url is fetched server-side")
 	}
 
-	// Token validation. Configured -> fail closed; unconfigured -> decode and warn.
-	// X-User-Token is the sharper of the two: its claims drive the step-up and consent
-	// gates, so an unverified one is a bypass of both.
+	// Token validation. The binding: "The PEP MUST verify the token signature, issuer,
+	// audience, and expiration." Each of those left unconfigured is a gap.
 	srv.accessValidator = NewValidator(ValidatorConfig{
 		JWKSURL:  getenv("ACCESS_TOKEN_JWKS_URL"),
 		Issuer:   getenv("ACCESS_TOKEN_ISSUER"),
 		Audience: getenv("ACCESS_TOKEN_AUDIENCE"),
 	})
+	if srv.accessValidator == nil {
+		insecure("ACCESS_TOKEN_JWKS_URL is unset: access tokens and X-User-Token are decoded, not verified")
+	} else {
+		if getenv("ACCESS_TOKEN_ISSUER") == "" {
+			insecure("ACCESS_TOKEN_ISSUER is unset: the access token's issuer is not checked")
+		}
+		if getenv("ACCESS_TOKEN_AUDIENCE") == "" {
+			insecure("ACCESS_TOKEN_AUDIENCE is unset: a token minted for another resource is accepted")
+		}
+	}
 	// X-User-Token needs an audience as well as a key: the agent's own access token comes
 	// from the same issuer and verifies against the same JWKS, and without an audience it
 	// would pass as the user having logged in.
@@ -178,27 +219,23 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 			Audience: userAud,
 		})
 	case userJWKS != "":
-		log.Printf("WARNING: USER_TOKEN_AUDIENCE is unset — X-User-Token is IGNORED, so require_user_login " +
+		slog.Warn("USER_TOKEN_AUDIENCE is unset — X-User-Token is IGNORED, so require_user_login " +
 			"routes deny. Set it to the audience the user's own login token carries.")
 	default:
+		// Only reachable without any JWKS, which is itself a gap above.
 		srv.decodeUserTokens = true
-		log.Printf("WARNING: no JWKS configured for X-User-Token — it is DECODED, NOT VERIFIED. " +
-			"Its claims drive the step-up and consent gates, so a forged one bypasses them.")
-	}
-	if srv.accessValidator == nil {
-		log.Printf("WARNING: ACCESS_TOKEN_JWKS_URL is unset — access tokens are DECODED, " +
-			"NOT VERIFIED. The COAZ-MCP binding requires validation before claims are used.")
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/mcp/check", requireCheckToken(checkToken, srv.handleHTTPCheck))
-	// Sender-constraint verification for gateways that cannot do it themselves — the
-	// Kong plugin, which has no JOSE verifier available to it.
+	// Sender-constraint verification for gateways that cannot do it themselves.
 	mux.HandleFunc("/v1/dpop/verify", requireCheckToken(checkToken, srv.handleDpopVerify))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/readyz", srv.handleReady)
+	mux.Handle("/metrics", srv.metrics)
 	// The PEP as the resource's federation face: the gateway routes the resource's two
 	// well-known paths here.
 	if id := strings.TrimRight(getenv("FEDERATION_ENTITY_ID"), "/"); id != "" {
@@ -212,10 +249,23 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 		mux.Handle(resPath, ent.Handler())
 		log.Printf("federation entity %s: entity configuration at %s, protected resource metadata at %s", id, fedPath, resPath)
 		if fed == nil {
-			log.Printf("WARNING: FEDERATION_TRUST_ANCHORS_FILE is unset — %s publishes the PDP it is configured "+
-				"with, not what a federation resolves for it. Set the anchors so the RFC 9728 document is the controller's word.", id)
+			slog.Warn(fmt.Sprintf("FEDERATION_TRUST_ANCHORS_FILE is unset — %s publishes the PDP it is configured "+
+				"with, not what a federation resolves for it. Set the anchors so the RFC 9728 document is the controller's word.", id))
 		}
 	}
+
+	if len(gaps) > 0 {
+		if !strings.EqualFold(getenv("PEP_ALLOW_INSECURE"), "true") {
+			return nil, nil, "", fmt.Errorf("refusing to start with insecure settings:\n  - %s\n"+
+				"Configure them, or set PEP_ALLOW_INSECURE=true for development — never for anything a real client reaches",
+				strings.Join(gaps, "\n  - "))
+		}
+		for _, g := range gaps {
+			slog.Warn("insecure setting allowed by PEP_ALLOW_INSECURE", "gap", g)
+		}
+		srv.insecure = true
+	}
+
 	httpSrv := &http.Server{
 		Addr:              env("HTTP_ADDR", "") + ":" + httpPort,
 		Handler:           mux,
@@ -227,25 +277,38 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 	return srv, httpSrv, grpcPort, nil
 }
 
+// noRedirects makes a client return a redirect instead of following it.
+func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// durationEnv reads a Go duration, refusing one that does not parse: a typo in a TTL
+// must not silently become the default.
+func durationEnv(getenv func(string) string, key string, def time.Duration) (time.Duration, error) {
+	v := getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s %q is not a positive duration", key, v)
+	}
+	return d, nil
+}
+
 // buildResolver assembles PDP discovery from the environment. Off (the default) is the
 // static PDP with the AuthZEN default paths and no HTTP — byte-for-byte today's
 // behaviour. Warm-up failures are logged, not fatal: the resolver degrades to the
 // default paths, and a PDP that is down at boot is a runtime condition, not a config
 // error.
-func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client, layers []discovery.LayerSpec) (*discovery.Chain, *federation.Resolver, error) {
+func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Client, layers []discovery.LayerSpec, insecure func(string, ...any)) (*discovery.Chain, *federation.Resolver, error) {
 	mode, err := discovery.ParseMode(getenv("PDP_DISCOVERY"))
 	if err != nil {
 		return nil, nil, err
 	}
-	metaTTL := 5 * time.Minute
-	if v := getenv("PDP_METADATA_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			metaTTL = d
-		} else {
-			log.Printf("WARNING: PDP_METADATA_TTL %q is not a duration; using %s", v, metaTTL)
-		}
+	metaTTL, err := durationEnv(getenv, "PDP_METADATA_TTL", 5*time.Minute)
+	if err != nil {
+		return nil, nil, err
 	}
-	insecure := strings.EqualFold(getenv("PDP_DISCOVERY_INSECURE"), "true")
+	allowHTTP := strings.EqualFold(getenv("PDP_DISCOVERY_INSECURE"), "true")
 	resAllow := parseAllowlist(getenv("RESOURCE_METADATA_ALLOWLIST"))
 
 	opts := discovery.Options{
@@ -254,7 +317,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 		APIKeys:       map[string]string{authzenURL: getenv("AUTHZEN_API_KEY")},
 		HTTPClient:    httpc,
 		TTL:           metaTTL,
-		AllowInsecure: insecure,
+		AllowInsecure: allowHTTP,
 	}
 	// The static PDP is the operator's own and is always permitted, and so is any PDP
 	// the operator named as a layer in this service's own configuration; the allowlist
@@ -270,14 +333,12 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 	}
 	if mode == discovery.ModeResource || mode == discovery.ModeFederation {
 		if len(resAllow) == 0 {
-			log.Printf("WARNING: RESOURCE_METADATA_ALLOWLIST is unset — any caller-supplied " +
-				"`resource` will have its metadata fetched server-side. Set it to the resources you govern.")
+			insecure("RESOURCE_METADATA_ALLOWLIST is unset: any caller-supplied resource has its metadata fetched server-side")
 		} else {
 			opts.ResourceAllowed = func(u string) bool { return upstreamAllowed(resAllow, u) }
 		}
 		if getenv("PDP_ALLOWLIST") == "" {
-			log.Printf("WARNING: PDP_ALLOWLIST is unset — a resource's metadata may point this PEP at " +
-				"any https PDP. Set it to the PDPs you trust.")
+			insecure("PDP_ALLOWLIST is unset: a resource's metadata may point this PEP at any https PDP")
 		}
 	}
 	// A chain resolver is built whenever anchors are configured: federation-mode
@@ -285,7 +346,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 	// may run in any discovery mode.
 	var fed *federation.Resolver
 	if mode == discovery.ModeFederation || getenv("FEDERATION_TRUST_ANCHORS_FILE") != "" {
-		f, err := buildFederation(getenv, httpc, insecure, opts.ResourceAllowed, metaTTL)
+		f, err := buildFederation(getenv, httpc, allowHTTP, opts.ResourceAllowed, metaTTL, insecure)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -294,8 +355,8 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 			opts.Federation = fed
 		}
 	}
-	if mode != discovery.ModeOff && insecure {
-		log.Printf("WARNING: PDP_DISCOVERY_INSECURE is set — discovered http URLs are accepted. Dev only.")
+	if mode != discovery.ModeOff && allowHTTP {
+		insecure("PDP_DISCOVERY_INSECURE is set: discovered http URLs are accepted")
 	}
 	chain, err := discovery.New(opts)
 	if err != nil {
@@ -305,7 +366,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := chain.Warm(ctx); err != nil {
-			log.Printf("WARNING: PDP discovery warm-up for %s failed: %v", authzenURL, err)
+			slog.Warn(fmt.Sprintf("PDP discovery warm-up for %s failed: %v", authzenURL, err))
 		} else if ep, err := chain.Resolve(ctx, ""); err == nil {
 			log.Printf("PDP discovery (%s): %s evaluates at %s", mode, ep.Identifier, ep.Evaluation)
 		}
@@ -314,7 +375,7 @@ func buildResolver(getenv func(string) string, authzenURL string, httpc *http.Cl
 }
 
 // buildFederation loads the Trust Anchors and builds the chain resolver.
-func buildFederation(getenv func(string) string, httpc *http.Client, insecure bool, resourceAllowed func(string) bool, ttl time.Duration) (*federation.Resolver, error) {
+func buildFederation(getenv func(string) string, httpc *http.Client, allowHTTP bool, resourceAllowed func(string) bool, ttl time.Duration, insecure func(string, ...any)) (*federation.Resolver, error) {
 	path := getenv("FEDERATION_TRUST_ANCHORS_FILE")
 	if path == "" {
 		return nil, fmt.Errorf("PDP_DISCOVERY=federation requires FEDERATION_TRUST_ANCHORS_FILE")
@@ -335,7 +396,7 @@ func buildFederation(getenv func(string) string, httpc *http.Client, insecure bo
 	}
 	// The resource allowlist governs the subject's own Entity Configuration; the fetch
 	// allowlist governs the climb from there to the anchor.
-	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: insecure, SubjectAllowed: resourceAllowed}
+	fopts := federation.Options{TrustAnchors: anchors, HTTPClient: httpc, AllowInsecure: allowHTTP, SubjectAllowed: resourceAllowed}
 	// PDP_METADATA_TTL bounds a resolved chain as it bounds any other metadata, and a
 	// short one also shortens how long a failed chain is remembered — so an entity
 	// onboarded a moment ago is seen a moment later.
@@ -355,8 +416,7 @@ func buildFederation(getenv func(string) string, httpc *http.Client, insecure bo
 	if allow := parseAllowlist(getenv("FEDERATION_FETCH_ALLOWLIST")); len(allow) > 0 {
 		fopts.FetchAllowed = func(u string) bool { return upstreamAllowed(allow, u) }
 	} else {
-		log.Printf("WARNING: FEDERATION_FETCH_ALLOWLIST is unset — walking a trust chain may fetch " +
-			"from any https host an authority_hints names.")
+		insecure("FEDERATION_FETCH_ALLOWLIST is unset: walking a trust chain may fetch from any https host an authority_hints names")
 	}
 	return federation.New(fopts)
 }
@@ -411,8 +471,8 @@ func loadOrGenerateKey(path string, generate bool) (crypto.Signer, error) {
 		if err := os.WriteFile(path, out, 0o600); err != nil {
 			return nil, fmt.Errorf("writing FEDERATION_ENTITY_KEY_FILE: %w", err)
 		}
-		log.Printf("WARNING: minted a new federation entity key into %s (kid %s) — the trust controller "+
-			"must onboard this key before the chain resolves.", path, jwk["kid"])
+		slog.Warn(fmt.Sprintf("minted a new federation entity key into %s (kid %s) — the trust controller "+
+			"must onboard this key before the chain resolves.", path, jwk["kid"]))
 		return key, nil
 	}
 	if err != nil {
@@ -429,31 +489,73 @@ func loadOrGenerateKey(path string, generate bool) (crypto.Signer, error) {
 	return key, nil
 }
 
-// main is the listen/serve shell: it binds real sockets, so it is the one function that
-// cannot be meaningfully unit-tested and is excluded from the coverage bar. Everything it
-// decides is in buildServer, which is tested. Keep this function trivial — anything with
-// a branch worth asserting belongs in buildServer.
+// main is the listen shell: it binds real sockets and waits for a signal, so it is the
+// one function excluded from the coverage bar. Everything it decides is in buildServer,
+// grpcServerOptions and run, which are tested. Keep this function trivial.
 func main() {
+	setupLogging(os.Getenv("LOG_FORMAT"))
 	srv, httpSrv, grpcPort, err := buildServer(os.Getenv)
 	if err != nil {
 		log.Fatal(err)
 	}
-	go func() {
-		log.Printf("coaz-pep HTTP check API listening on %s", httpSrv.Addr)
-		if err := httpSrv.ListenAndServe(); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
+	opts, err := grpcServerOptions(os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
 	lis, err := net.Listen("tcp", ":"+grpcPort) // dual-stack
 	if err != nil {
 		log.Fatalf("listen :%s: %v", grpcPort, err)
 	}
-	gs := grpc.NewServer()
-	authv3.RegisterAuthorizationServer(gs, srv)
-	healthpb.RegisterHealthServer(gs, health.NewServer())
-	log.Printf("coaz-pep ext_authz (Envoy gRPC) listening on :%s, PDP at %s", grpcPort, srv.authzenURL)
-	if err := gs.Serve(lis); err != nil {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
+	if err := run(srv, httpSrv, lis, opts, stop); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// run serves ext_authz on lis and the HTTP API on httpSrv until one of them fails or
+// stop fires. On stop it drains rather than drops: readiness goes false so the gateway
+// stops sending new checks, in-flight ones finish, and only then do the listeners close.
+// A check cut off mid-flight is a deny the client never earned.
+func run(srv *server, httpSrv *http.Server, lis net.Listener, opts []grpc.ServerOption, stop <-chan os.Signal) error {
+	gs := grpc.NewServer(opts...)
+	authv3.RegisterAuthorizationServer(gs, srv)
+	hs := health.NewServer()
+	healthpb.RegisterHealthServer(gs, hs)
+
+	errc := make(chan error, 2)
+	go func() {
+		log.Printf("coaz-pep HTTP check API listening on %s", httpSrv.Addr)
+		if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			errc <- err
+		}
+	}()
+	go func() {
+		log.Printf("coaz-pep ext_authz (Envoy gRPC) listening on %s, PDP at %s", lis.Addr(), srv.authzenURL)
+		if err := gs.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			errc <- err
+		}
+	}()
+
+	select {
+	case err := <-errc:
+		gs.Stop()
+		_ = httpSrv.Close()
+		return err
+	case sig := <-stop:
+		log.Printf("coaz-pep: %v received, draining for up to %s", sig, drainTimeout)
+	}
+	srv.draining.Store(true)
+	hs.Shutdown()
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+	_ = httpSrv.Shutdown(ctx)
+	done := make(chan struct{})
+	go func() { gs.GracefulStop(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		gs.Stop()
+	}
+	return nil
 }

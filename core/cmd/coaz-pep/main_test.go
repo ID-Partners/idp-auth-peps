@@ -1,6 +1,40 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// insecureEnv is a test environment with PEP_ALLOW_INSECURE set unless m says otherwise:
+// for tests about something other than the security settings themselves.
+func insecureEnv(m map[string]string) func(string) string {
+	return func(k string) string {
+		if v, ok := m[k]; ok {
+			return v
+		}
+		if k == "PEP_ALLOW_INSECURE" {
+			return "true"
+		}
+		return ""
+	}
+}
+
+// secureEnv is the least a production PEP starts with.
+func secureEnv(over map[string]string) func(string) string {
+	m := map[string]string{
+		"AUTHZEN_URL":            "http://pdp:8080",
+		"CHECK_API_TOKEN":        "secret",
+		"MCP_UPSTREAM_ALLOWLIST": "http://a:8090/mcp, http://b:8090/mcp",
+		"ACCESS_TOKEN_JWKS_URL":  "https://as/jwks",
+		"ACCESS_TOKEN_ISSUER":    "https://as",
+		"ACCESS_TOKEN_AUDIENCE":  "https://api",
+		"USER_TOKEN_AUDIENCE":    "banking-app",
+	}
+	for k, v := range over {
+		m[k] = v
+	}
+	return func(k string) string { return m[k] }
+}
 
 // buildServer holds all of main's config-bearing logic. main() itself is the
 // listen/serve shell and is the one documented coverage exclusion.
@@ -9,14 +43,36 @@ func TestBuildServer(t *testing.T) {
 		return func(k string) string { return m[k] }
 	}
 
-	t.Run("requires AUTHZEN_URL", func(t *testing.T) {
-		if _, _, _, err := buildServer(env(map[string]string{})); err == nil {
+	t.Run("requires AUTHZEN_URL, and an absolute one", func(t *testing.T) {
+		if _, _, _, err := buildServer(insecureEnv(map[string]string{})); err == nil {
 			t.Fatal("AUTHZEN_URL is mandatory")
+		}
+		if _, _, _, err := buildServer(insecureEnv(map[string]string{"AUTHZEN_URL": "authzen_pdp:8080"})); err == nil {
+			t.Fatal("AUTHZEN_URL must be an absolute http(s) URL")
 		}
 	})
 
-	t.Run("minimal config wires the server and warns", func(t *testing.T) {
-		srv, httpSrv, grpcPort, err := buildServer(env(map[string]string{"AUTHZEN_URL": "http://pdp:8080/"}))
+	t.Run("insecure settings refuse startup, all named at once", func(t *testing.T) {
+		_, _, _, err := buildServer(env(map[string]string{"AUTHZEN_URL": "http://pdp:8080"}))
+		if err == nil {
+			t.Fatal("a PEP with an open check API and unverified tokens must not start")
+		}
+		for _, want := range []string{"CHECK_API_TOKEN", "MCP_UPSTREAM_ALLOWLIST", "ACCESS_TOKEN_JWKS_URL", "PEP_ALLOW_INSECURE"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal should name %s: %v", want, err)
+			}
+		}
+		if _, _, _, err := buildServer(secureEnv(map[string]string{"ACCESS_TOKEN_ISSUER": "", "ACCESS_TOKEN_AUDIENCE": ""})); err == nil ||
+			!strings.Contains(err.Error(), "ACCESS_TOKEN_ISSUER") || !strings.Contains(err.Error(), "ACCESS_TOKEN_AUDIENCE") {
+			t.Fatalf("a JWKS without issuer and audience checks is a gap: %v", err)
+		}
+		if _, _, _, err := buildServer(secureEnv(map[string]string{"PDP_TLS_INSECURE": "true"})); err == nil {
+			t.Fatal("PDP_TLS_INSECURE needs the hatch")
+		}
+	})
+
+	t.Run("the hatch starts an insecure PEP, and marks it", func(t *testing.T) {
+		srv, httpSrv, grpcPort, err := buildServer(insecureEnv(map[string]string{"AUTHZEN_URL": "http://pdp:8080/"}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -26,30 +82,19 @@ func TestBuildServer(t *testing.T) {
 		if grpcPort != "9191" || httpSrv.Addr != ":9192" {
 			t.Fatalf("default ports wrong: grpc=%q http=%q", grpcPort, httpSrv.Addr)
 		}
-		// Unconfigured validators — decode-and-warn, not nil-panic.
-		if srv.accessValidator != nil || srv.userValidator != nil {
-			t.Fatal("no JWKS configured should leave the validators nil (decode mode)")
-		}
-		if len(srv.upstreamAllowlist) != 0 {
-			t.Fatal("no allowlist configured should be empty")
+		if !srv.insecure || srv.accessValidator != nil || srv.userValidator != nil || !srv.decodeUserTokens {
+			t.Fatalf("with the hatch and no JWKS tokens are decoded, and the PEP says so: %+v", srv)
 		}
 	})
 
 	t.Run("full config is threaded through", func(t *testing.T) {
-		srv, httpSrv, grpcPort, err := buildServer(env(map[string]string{
-			"AUTHZEN_URL":            "http://pdp:8080",
-			"AUTHZEN_API_KEY":        "k",
-			"PORT":                   "7001",
-			"HTTP_PORT":              "7002",
-			"HTTP_ADDR":              "127.0.0.1",
-			"COAZ_DISCOVERY_TTL":     "5s",
-			"PDP_TLS_INSECURE":       "true",
-			"CHECK_API_TOKEN":        "secret",
-			"MCP_UPSTREAM_ALLOWLIST": "http://a:8090/mcp, http://b:8090/mcp",
-			"ACCESS_TOKEN_JWKS_URL":  "https://as/jwks",
-			"ACCESS_TOKEN_ISSUER":    "https://as",
-			"ACCESS_TOKEN_AUDIENCE":  "https://api",
-			"USER_TOKEN_AUDIENCE":    "banking-app",
+		srv, httpSrv, grpcPort, err := buildServer(secureEnv(map[string]string{
+			"AUTHZEN_API_KEY":    "k",
+			"PORT":               "7001",
+			"HTTP_PORT":          "7002",
+			"HTTP_ADDR":          "127.0.0.1",
+			"COAZ_DISCOVERY_TTL": "5s",
+			"DPOP_HTU_BASE":      "https://api.example.com/",
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -57,23 +102,16 @@ func TestBuildServer(t *testing.T) {
 		if grpcPort != "7001" || httpSrv.Addr != "127.0.0.1:7002" {
 			t.Fatalf("ports/addr not threaded: grpc=%q http=%q", grpcPort, httpSrv.Addr)
 		}
-		if len(srv.upstreamAllowlist) != 2 {
-			t.Fatalf("allowlist should have two entries, got %v", srv.upstreamAllowlist)
+		if len(srv.upstreamAllowlist) != 2 || srv.accessValidator == nil || srv.userValidator == nil || srv.insecure {
+			t.Fatalf("secure config: %+v", srv)
 		}
-		if srv.accessValidator == nil {
-			t.Fatal("a configured JWKS should build an access validator")
-		}
-		// USER_TOKEN_* fall back to the access-token config.
-		if srv.userValidator == nil {
-			t.Fatal("the user validator should fall back to the access-token JWKS")
+		if srv.dpopHTUBase != "https://api.example.com" {
+			t.Fatalf("DPOP_HTU_BASE: %q", srv.dpopHTUBase)
 		}
 	})
 
 	t.Run("a user token with no audience to check is ignored, not decoded", func(t *testing.T) {
-		srv, _, _, err := buildServer(env(map[string]string{
-			"AUTHZEN_URL":           "http://pdp:8080",
-			"ACCESS_TOKEN_JWKS_URL": "https://as/jwks",
-		}))
+		srv, _, _, err := buildServer(secureEnv(map[string]string{"USER_TOKEN_AUDIENCE": ""}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,29 +121,27 @@ func TestBuildServer(t *testing.T) {
 	})
 
 	t.Run("user validator can be configured independently", func(t *testing.T) {
-		srv, _, _, err := buildServer(env(map[string]string{
-			"AUTHZEN_URL":         "http://pdp:8080",
+		srv, _, _, err := buildServer(secureEnv(map[string]string{
 			"USER_TOKEN_JWKS_URL": "https://as/user-jwks",
 			"USER_TOKEN_ISSUER":   "https://as",
-			"USER_TOKEN_AUDIENCE": "banking-app",
 		}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if srv.userValidator == nil {
-			t.Fatal("USER_TOKEN_JWKS_URL alone should build the user validator")
-		}
-		if srv.accessValidator != nil {
-			t.Fatal("no ACCESS_TOKEN_JWKS_URL should leave the access validator nil")
+		if srv.userValidator == nil || srv.userValidator.jwks.url != "https://as/user-jwks" {
+			t.Fatal("USER_TOKEN_JWKS_URL should build the user validator")
 		}
 	})
 
-	t.Run("a bad TTL falls back to the default", func(t *testing.T) {
-		// An unparseable duration must not fail startup; it falls back to 60s.
-		if _, _, _, err := buildServer(env(map[string]string{
-			"AUTHZEN_URL": "http://pdp:8080", "COAZ_DISCOVERY_TTL": "not-a-duration",
-		})); err != nil {
-			t.Fatalf("a bad TTL should not fail startup: %v", err)
+	t.Run("bad values are refused, not replaced", func(t *testing.T) {
+		for k, v := range map[string]string{
+			"COAZ_DISCOVERY_TTL": "not-a-duration",
+			"DPOP_HTU_BASE":      "https://api.example.com/v1",
+			"PDP_FAIL_MODE":      "sometimes",
+		} {
+			if _, _, _, err := buildServer(secureEnv(map[string]string{k: v})); err == nil {
+				t.Errorf("%s=%q should fail startup", k, v)
+			}
 		}
 	})
 }

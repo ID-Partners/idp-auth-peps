@@ -79,7 +79,7 @@ func freshProofClaims(jti string) map[string]any {
 func TestDpopAcceptsAValidProof(t *testing.T) {
 	key := newKey(t)
 	proof := mintProof(t, key, freshProofClaims("jti-valid-1"))
-	got := checkDpop("test", "dpop", "POST", "/payments", testToken,
+	got := checkDpop("test", "dpop", "POST", "/payments", "", testToken,
 		map[string]string{"dpop": proof}, boundClaims(key))
 	if got != nil {
 		t.Fatalf("expected the proof to be accepted, got a denial")
@@ -100,7 +100,7 @@ func TestDpopRejectsAForgedProofWithACopiedJWK(t *testing.T) {
 	parts := splitJWS(t, forged)
 	swapped := base64.RawURLEncoding.EncodeToString(raw) + "." + parts[1] + "." + parts[2]
 
-	got := checkDpop("test", "dpop", "POST", "/payments", testToken,
+	got := checkDpop("test", "dpop", "POST", "/payments", "", testToken,
 		map[string]string{"dpop": swapped}, boundClaims(victim))
 	if got == nil {
 		t.Fatal("a proof signed by the wrong key was accepted")
@@ -114,7 +114,7 @@ func TestDpopRejectsAthForADifferentToken(t *testing.T) {
 	claims["ath"] = accessTokenHash("a.different.token")
 	proof := mintProof(t, key, claims)
 
-	got := checkDpop("test", "dpop", "POST", "/payments", testToken,
+	got := checkDpop("test", "dpop", "POST", "/payments", "", testToken,
 		map[string]string{"dpop": proof}, boundClaims(key))
 	if got == nil {
 		t.Fatal("a proof bound to a different access token was accepted")
@@ -126,10 +126,10 @@ func TestDpopRejectsReplayOfTheSameJti(t *testing.T) {
 	proof := mintProof(t, key, freshProofClaims("jti-replay-1"))
 	headers := map[string]string{"dpop": proof}
 
-	if got := checkDpop("test", "dpop", "POST", "/payments", testToken, headers, boundClaims(key)); got != nil {
+	if got := checkDpop("test", "dpop", "POST", "/payments", "", testToken, headers, boundClaims(key)); got != nil {
 		t.Fatal("first use should be accepted")
 	}
-	if got := checkDpop("test", "dpop", "POST", "/payments", testToken, headers, boundClaims(key)); got == nil {
+	if got := checkDpop("test", "dpop", "POST", "/payments", "", testToken, headers, boundClaims(key)); got == nil {
 		t.Fatal("the same proof was accepted twice")
 	}
 }
@@ -140,7 +140,7 @@ func TestDpopRejectsAStaleProof(t *testing.T) {
 	claims["iat"] = float64(time.Now().Add(-2 * dpopMaxAge).Unix())
 	proof := mintProof(t, key, claims)
 
-	got := checkDpop("test", "dpop", "POST", "/payments", testToken,
+	got := checkDpop("test", "dpop", "POST", "/payments", "", testToken,
 		map[string]string{"dpop": proof}, boundClaims(key))
 	if got == nil {
 		t.Fatal("a proof well outside the acceptance window was accepted")
@@ -175,7 +175,7 @@ func TestDpopRejectsUnboundAndMalformedProofs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := checkDpop("test", tc.scheme, tc.method, "/payments", tc.token,
+			got := checkDpop("test", tc.scheme, tc.method, "/payments", "", tc.token,
 				map[string]string{"dpop": tc.proof}, tc.claims)
 			if tc.wantErr && got == nil {
 				t.Fatal("expected a denial, got none")
@@ -194,26 +194,74 @@ func TestDpopRejectsAProofLeakingPrivateKeyMaterial(t *testing.T) {
 	parts := splitJWS(t, proof)
 	tainted := base64.RawURLEncoding.EncodeToString(raw) + "." + parts[1] + "." + parts[2]
 
-	if got := checkDpop("test", "dpop", "POST", "/payments", testToken,
+	if got := checkDpop("test", "dpop", "POST", "/payments", "", testToken,
 		map[string]string{"dpop": tainted}, boundClaims(key)); got == nil {
 		t.Fatal("a proof carrying private key material was accepted")
 	}
 }
 
 func TestReplayCacheExpiresEntries(t *testing.T) {
-	c := newReplayCache(50 * time.Millisecond)
+	c := newReplayCache(10 * time.Second)
 	now := time.Now()
-	if !c.observe("a", now) {
+	if !c.observe("k", "a", now, now) {
 		t.Fatal("first observation should be fresh")
 	}
-	if c.observe("a", now) {
+	if c.observe("k", "a", now, now) {
 		t.Fatal("immediate repeat should be a replay")
 	}
-	if !c.observe("a", now.Add(100*time.Millisecond)) {
+	if !c.observe("other-key", "a", now, now) {
+		t.Fatal("the same jti under another key is another proof")
+	}
+	if !c.observe("k", "a", now, now.Add(12*time.Second)) {
 		t.Fatal("the entry should have aged out of the window")
 	}
-	if c.observe("", now) {
+	if c.observe("k", "", now, now) {
 		t.Fatal("an empty jti must never be accepted")
+	}
+}
+
+// A future-dated proof is held until it could no longer pass the iat check, not merely
+// for the window after first use — or it could be replayed once its entry lapsed.
+func TestReplayCacheHoldsAFutureProofUntilItsIatExpires(t *testing.T) {
+	c := newReplayCache(10 * time.Second)
+	now := time.Now()
+	iat := now.Add(8 * time.Second)
+	if !c.observe("k", "f", iat, now) {
+		t.Fatal("first use is fresh")
+	}
+	if c.observe("k", "f", iat, now.Add(12*time.Second)) {
+		t.Fatal("still within iat + window: a replay")
+	}
+	if !c.observe("k", "f", iat, now.Add(20*time.Second)) {
+		t.Fatal("past iat + window the entry may go")
+	}
+}
+
+// The cache must not be a lever against everyone: one key flooding fresh jtis is held
+// to its quota, and at the global cap old entries make way instead of new proofs being
+// refused for all.
+func TestReplayCacheQuotaAndCap(t *testing.T) {
+	c := newReplayCache(time.Hour)
+	c.maxPerKey, c.maxSize = 2, 4
+	now := time.Now()
+	if !c.observe("flood", "1", now, now) || !c.observe("flood", "2", now, now) {
+		t.Fatal("under quota")
+	}
+	if c.observe("flood", "3", now, now) {
+		t.Fatal("a key over its quota is refused")
+	}
+	if !c.observe("honest", "1", now, now) {
+		t.Fatal("another key is unaffected by the flooder's quota")
+	}
+	later := now.Add(time.Second)
+	if !c.observe("b", "1", later, later) || !c.observe("c", "1", later, later) {
+		t.Fatal("at the cap, the oldest entries make way")
+	}
+	if len(c.seen) > c.maxSize {
+		t.Fatalf("the cache grew past its cap: %d", len(c.seen))
+	}
+	if c.observe("c", "1", later, later) {
+		t.Fatal("the newest entries are still remembered")
 	}
 }
 
@@ -360,26 +408,6 @@ func TestVerifyProofSignatureRejectsMalformed(t *testing.T) {
 	}
 }
 
-func TestReplayCacheRefusesWhenFullOfLiveEntries(t *testing.T) {
-	c := newReplayCache(time.Hour)
-	c.maxSize = 3
-	now := time.Now()
-	for i, jti := range []string{"a", "b", "c"} {
-		if !c.observe(jti, now) {
-			t.Fatalf("entry %d should be accepted", i)
-		}
-	}
-	// Full, nothing expired: refuse rather than grow without bound. Failing closed
-	// under a jti flood is the safe direction.
-	if c.observe("d", now) {
-		t.Fatal("a full cache with no expired entries must refuse, not grow")
-	}
-	// Once entries age out, it accepts again.
-	if !c.observe("d", now.Add(2*time.Hour)) {
-		t.Fatal("expired entries should be reclaimed")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // The delegated verification endpoint the Kong plugin calls.
 
@@ -408,7 +436,7 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 
 	t.Run("valid proof", func(t *testing.T) {
 		proof := mintProof(t, key, map[string]any{
-			"htm": "POST", "ath": accessTokenHash(token),
+			"htm": "POST", "htu": "https://api.example.com/payments", "ath": accessTokenHash(token),
 			"iat": float64(time.Now().Unix()), "jti": "verify-ok-1",
 		})
 		code, out := postVerify(t, s, makeBody(proof))
@@ -422,7 +450,7 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 		// thumbprint-only check would accept, and the reason this endpoint exists.
 		attacker := newKey(t)
 		forged := mintProof(t, attacker, map[string]any{
-			"htm": "POST", "ath": accessTokenHash(token),
+			"htm": "POST", "htu": "https://api.example.com/payments", "ath": accessTokenHash(token),
 			"iat": float64(time.Now().Unix()), "jti": "verify-forged-1",
 		})
 		hdr, _ := json.Marshal(map[string]any{"typ": "dpop+jwt", "alg": "ES256", "jwk": publicJWK(key)})
@@ -453,7 +481,7 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 
 	t.Run("replay", func(t *testing.T) {
 		proof := mintProof(t, key, map[string]any{
-			"htm": "POST", "ath": accessTokenHash(token),
+			"htm": "POST", "htu": "https://api.example.com/payments", "ath": accessTokenHash(token),
 			"iat": float64(time.Now().Unix()), "jti": "verify-replay-1",
 		})
 		if _, out := postVerify(t, s, makeBody(proof)); !out.Valid {
@@ -486,7 +514,7 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 		// Kong sends whatever case the client used; a case-sensitive lookup would make
 		// every proof look absent.
 		proof := mintProof(t, key, map[string]any{
-			"htm": "POST", "ath": accessTokenHash(token),
+			"htm": "POST", "htu": "https://api.example.com/payments", "ath": accessTokenHash(token),
 			"iat": float64(time.Now().Unix()), "jti": "verify-case-1",
 		})
 		raw, _ := json.Marshal(map[string]any{
@@ -506,31 +534,54 @@ func TestDpopProofHeaderGuards(t *testing.T) {
 
 	// typ must be dpop+jwt.
 	badTyp := signWithHeader(t, key, map[string]any{"typ": "jwt", "alg": "ES256", "jwk": publicJWK(key)}, base)
-	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": badTyp}, claims) == nil {
+	if checkDpop("t", "dpop", "POST", "/p", "", testToken, map[string]string{"dpop": badTyp}, claims) == nil {
 		t.Error("a proof without typ=dpop+jwt must be rejected")
 	}
 	// alg none.
 	noneAlg := signWithHeader(t, key, map[string]any{"typ": "dpop+jwt", "alg": "none", "jwk": publicJWK(key)}, base)
-	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": noneAlg}, claims) == nil {
+	if checkDpop("t", "dpop", "POST", "/p", "", testToken, map[string]string{"dpop": noneAlg}, claims) == nil {
 		t.Error("alg=none must be rejected")
 	}
 	// missing ath.
 	noAth := freshProofClaims("guard-ath")
 	delete(noAth, "ath")
-	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": mintProof(t, key, noAth)}, claims) == nil {
+	if checkDpop("t", "dpop", "POST", "/p", "", testToken, map[string]string{"dpop": mintProof(t, key, noAth)}, claims) == nil {
 		t.Error("a proof with no ath must be rejected")
 	}
 	// missing iat.
 	noIat := freshProofClaims("guard-iat")
 	delete(noIat, "iat")
-	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": mintProof(t, key, noIat)}, claims) == nil {
+	if checkDpop("t", "dpop", "POST", "/p", "", testToken, map[string]string{"dpop": mintProof(t, key, noIat)}, claims) == nil {
 		t.Error("a proof with no iat must be rejected")
 	}
-	// htu mismatch is logged, not fatal — a proof otherwise valid still passes.
-	withHtu := freshProofClaims("guard-htu")
-	withHtu["htu"] = "https://elsewhere.example/totally-different"
-	if r := checkDpop("t", "dpop", "POST", "/payments", testToken, map[string]string{"dpop": mintProof(t, key, withHtu)}, claims); r != nil {
-		t.Error("an htu mismatch should be logged, not fatal")
+	// htu names the request the proof was made for (RFC 9449 §4.3).
+	for htu, ok := range map[string]bool{
+		"https://api.example.com/payments":          true,
+		"https://api.example.com/payments?x=1#frag": true,
+		"https://elsewhere.example/payments":        false, // another origin, with the base set
+		"https://api.example.com/payments/extra":    false,
+		"https://api.example.com/pay":               false,
+		"/payments":                                 false,
+		"":                                          false,
+	} {
+		pc := freshProofClaims("guard-htu-" + htu)
+		pc["htu"] = htu
+		r := checkDpop("t", "dpop", "POST", "/payments", "https://api.example.com", testToken, map[string]string{"dpop": mintProof(t, key, pc)}, claims)
+		if (r == nil) != ok {
+			t.Errorf("htu %q: accepted=%v, want %v", htu, r == nil, ok)
+		}
+	}
+	// Without a configured base only the path is compared — never a substring.
+	pc := freshProofClaims("guard-htu-nobase")
+	pc["htu"] = "https://gateway.internal:8443/payments"
+	if r := checkDpop("t", "dpop", "POST", "/payments", "", testToken, map[string]string{"dpop": mintProof(t, key, pc)}, claims); r != nil {
+		t.Error("without DPOP_HTU_BASE the path alone decides")
+	}
+	// A future iat beyond the skew allowance is not freshness.
+	future := freshProofClaims("guard-future")
+	future["iat"] = float64(time.Now().Add(2 * dpopMaxSkew).Unix())
+	if checkDpop("t", "dpop", "POST", "/payments", "", testToken, map[string]string{"dpop": mintProof(t, key, future)}, claims) == nil {
+		t.Error("a proof dated beyond the skew allowance must be rejected")
 	}
 }
 
@@ -606,7 +657,7 @@ func TestDpopProofWithNoJWK(t *testing.T) {
 	key := newKey(t)
 	hdr := map[string]any{"typ": "dpop+jwt", "alg": "ES256"} // no jwk
 	proof := signWithHeader(t, key, hdr, freshProofClaims("nojwk"))
-	if checkDpop("t", "dpop", "POST", "/p", testToken, map[string]string{"dpop": proof}, boundClaims(key)) == nil {
+	if checkDpop("t", "dpop", "POST", "/p", "", testToken, map[string]string{"dpop": proof}, boundClaims(key)) == nil {
 		t.Fatal("a proof with no jwk in its header must be rejected")
 	}
 }

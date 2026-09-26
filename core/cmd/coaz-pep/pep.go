@@ -33,7 +33,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -64,6 +66,9 @@ type pepConfig struct {
 	// a tool that declares no mapping included. On unless the route says "false", which
 	// keeps the pre-binding pass-through as an explicit opt-out.
 	coazDefaults bool
+	// coazV2Only refuses tools that declare only the superseded `coaz: true` mapping,
+	// whose subject can come from the caller's params.
+	coazV2Only bool
 	// legacySubjectIdentity additionally sends the non-standard `subject.identity`
 	// alongside the correct `subject.id`. On by default so upgrading the PEP alone
 	// cannot break a policy that still reads the old field; turn it off once the
@@ -133,6 +138,7 @@ func configFrom(ext map[string]string) pepConfig {
 		stepupAction:     get("stepup_action", "make_payment"),
 		mcpUpstreamURL:   ext["mcp_upstream_url"],
 		coazDefaults:     flag("coaz_defaults", true),
+		coazV2Only:       flag("coaz_v2_only", false),
 		// Defaults ON: absent config must not silently drop a field a deployed policy
 		// may still be reading. Only an explicit "false" removes it.
 		legacySubjectIdentity: flag("legacy_subject_identity", true),
@@ -188,6 +194,14 @@ type server struct {
 	// decodeUserTokens lets an unverifiable X-User-Token count, decoded. Without it a
 	// user token that cannot be verified counts for nothing.
 	decodeUserTokens bool
+	// dpopHTUBase is the external origin DPoP proofs are made for (DPOP_HTU_BASE).
+	dpopHTUBase string
+	// insecure records that the PEP started with PEP_ALLOW_INSECURE and a gap; every
+	// audit record says so.
+	insecure bool
+	// draining is set on SIGTERM so readiness drops before the listeners close.
+	draining atomic.Bool
+	metrics  *metrics
 }
 
 // userClaims returns the claims of the X-User-Token, or nil when it does not count.
@@ -360,7 +374,10 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	if raw := httpReq.GetRawBody(); len(raw) > 0 {
 		body = string(raw)
 	}
-	return s.check(ctx, conf, httpReq.GetMethod(), path, headers, body), nil
+	started := time.Now()
+	resp := s.check(ctx, conf, httpReq.GetMethod(), path, headers, body)
+	s.audit("grpc", conf, httpReq.GetMethod(), path, headers, resp, started)
+	return resp, nil
 }
 
 // check is the transport-independent pipeline, shared by the ext_authz gRPC
@@ -427,9 +444,12 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		})
 	}
 
-	// 3) DPoP sender-constraint binding (RFC 9449)
-	if conf.requireDpop {
-		if resp := checkDpop(pep, scheme, method, path, token, headers, claims); resp != nil {
+	// 3) DPoP sender-constraint binding (RFC 9449). A route that requires it checks every
+	//    request; any route checks a token that is bound (cnf.jkt) or presented as DPoP —
+	//    §7.2: a DPoP-bound token presented as a bearer token MUST be rejected, or a
+	//    stolen bound token is as good as a bearer one wherever require_dpop is off.
+	if conf.requireDpop || scheme == "dpop" || dpopBound(claims) {
+		if resp := checkDpop(pep, scheme, method, path, s.dpopHTUBase, token, headers, claims); resp != nil {
 			return resp
 		}
 	}
@@ -516,8 +536,8 @@ func (s *server) checkMCP(ctx context.Context, conf pepConfig, method, path stri
 		return denySimple(pep, typev3.StatusCode_Forbidden, codes.PermissionDenied,
 			"Configured MCP upstream is not permitted by this PEP.", nil)
 	}
-	callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, Resource: conf.resourceID(), Method: method, Path: path,
-		Layers: s.layersFor(conf), FailOpen: s.failOpenFor(conf)}
+	callOpts := coaz.CallOptions{ApplyDefaultMappings: conf.coazDefaults, RequireV2: conf.coazV2Only,
+		Resource: conf.resourceID(), Method: method, Path: path, Layers: s.layersFor(conf), FailOpen: s.failOpenFor(conf)}
 	if conf.forwardAccessToken {
 		callOpts.AccessToken = token
 	}
@@ -734,14 +754,29 @@ func extractToken(auth string) (token, scheme string) {
 // dpopReplay tracks jti values already accepted, for the proof-acceptance window.
 var dpopReplay = newReplayCache(dpopMaxAge)
 
+// dpopBound reports whether the token is sender-constrained: it carries cnf.jkt.
+func dpopBound(claims map[string]any) bool {
+	cnf, ok := claims["cnf"].(map[string]any)
+	if !ok {
+		return false
+	}
+	jkt, _ := cnf["jkt"].(string)
+	return jkt != ""
+}
+
 // checkDpop enforces the DPoP proof (RFC 9449); nil means pass.
 //
-// Order matters. The cnf.jkt comparison is only meaningful AFTER the proof's signature
-// verifies under the JWK it carries — the JWK is public in every proof, so without that
-// step anyone who has observed one proof can mint proofs for a stolen token.
-func checkDpop(pep, scheme, method, path, accessToken string, headers map[string]string, claims map[string]any) *authv3.CheckResponse {
+// Order matters. The cnf.jkt comparison is cheap and comes first, so a proof carrying a
+// key the token was never bound to costs no signature verification — a proof header can
+// carry an RSA key big enough to make that expensive. The comparison only MEANS anything
+// once the proof's signature verifies under that key: the JWK is public in every proof,
+// so without the signature anyone who has observed one proof can mint more.
+func checkDpop(pep, scheme, method, path, htuBase, accessToken string, headers map[string]string, claims map[string]any) *authv3.CheckResponse {
 	fail := func(reason string) *authv3.CheckResponse {
-		return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated, reason, nil)
+		log.Printf("[%s] 401 DPoP: %s", pep, reason)
+		return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated, reason, map[string]string{
+			"WWW-Authenticate": `DPoP error="invalid_dpop_proof"`,
+		})
 	}
 	if scheme != "dpop" {
 		return fail("DPoP-bound token required but Authorization scheme was not DPoP.")
@@ -773,10 +808,6 @@ func checkDpop(pep, scheme, method, path, accessToken string, headers map[string
 	if alg == "" || alg == "none" {
 		return fail("DPoP proof has no usable alg.")
 	}
-	if err := verifyProofSignature(proof, jwk, alg); err != nil {
-		return fail("DPoP proof signature is invalid: " + err.Error())
-	}
-
 	jkt := jwkThumbprint(jwk)
 	var cnfJkt string
 	if cnf, ok := claims["cnf"].(map[string]any); ok {
@@ -785,8 +816,14 @@ func checkDpop(pep, scheme, method, path, accessToken string, headers map[string
 	if jkt == "" || cnfJkt == "" || !constantTimeEqual(jkt, cnfJkt) {
 		return fail("DPoP proof key does not match the token's cnf.jkt binding.")
 	}
+	if err := verifyProofSignature(proof, jwk, alg); err != nil {
+		return fail("DPoP proof signature is invalid.")
+	}
 	if claimString(pclaims, "htm") != method {
 		return fail("DPoP proof htm does not match the request method.")
+	}
+	if !htuMatches(claimString(pclaims, "htu"), htuBase, path) {
+		return fail("DPoP proof htu does not match the request URI.")
 	}
 
 	// ath binds this proof to THIS access token. Presence alone is worthless: without
@@ -801,26 +838,57 @@ func checkDpop(pep, scheme, method, path, accessToken string, headers map[string
 
 	// Freshness, then single-use. A proof with no iat, or one outside the window, is
 	// replayable indefinitely.
-	iat, ok := numericClaim(pclaims, "iat")
+	iatClaim, ok := numericClaim(pclaims, "iat")
 	if !ok {
 		return fail("DPoP proof missing iat.")
 	}
 	now := time.Now()
-	age := now.Sub(time.Unix(int64(iat), 0))
-	if age > dpopMaxAge || age < -dpopMaxAge {
+	iat := time.Unix(int64(iatClaim), 0)
+	if age := now.Sub(iat); age > dpopMaxAge || age < -dpopMaxSkew {
 		return fail("DPoP proof iat is outside the acceptance window.")
 	}
-	if !dpopReplay.observe(claimString(pclaims, "jti"), now) {
+	if !dpopReplay.observe(jkt, claimString(pclaims, "jti"), iat, now) {
 		return fail("DPoP proof jti is missing or has already been used.")
 	}
-
-	// htu is compared best-effort: hosts get rewritten behind platform proxies, so a
-	// path mismatch is logged rather than fatal. The ath + jti + signature checks above
-	// are what actually bind the proof.
-	if htu := claimString(pclaims, "htu"); htu != "" && !strings.Contains(htu, path) {
-		log.Printf("[%s] DPoP htu path mismatch: %s", pep, htu)
-	}
 	return nil
+}
+
+// htuMatches compares a proof's htu with the request (RFC 9449 §4.3: ignoring query and
+// fragment). Behind a gateway the PEP does not see the origin the client used, so with
+// DPOP_HTU_BASE set the origin must be exactly that and the path the request's; without
+// it only the path is compared — never a substring, which let a proof made for another
+// server's /payments pass on this one.
+func htuMatches(htu, base, path string) bool {
+	u, err := url.Parse(htu)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return false
+	}
+	p := u.EscapedPath()
+	if p == "" {
+		p = "/"
+	}
+	if p != path {
+		return false
+	}
+	if base == "" {
+		return true
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, b.Scheme) && strings.EqualFold(hostPort(u), hostPort(b))
+}
+
+// hostPort is host:port with the scheme's default port made explicit.
+func hostPort(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return u.Hostname() + ":443"
+	}
+	return u.Hostname() + ":80"
 }
 
 // numericClaim reads a JSON number claim, which decodes as float64.
@@ -973,8 +1041,7 @@ func (s *server) evaluate(ctx context.Context, resource string, authzenReq map[s
 	return s.evaluateAt(ctx, ep, authzenReq)
 }
 
-func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, authzenReq map[string]any) (pepOutcome, error) {
-	var out pepOutcome
+func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, authzenReq map[string]any) (out pepOutcome, err error) {
 	payload, err := json.Marshal(authzenReq)
 	if err != nil {
 		return out, fmt.Errorf("PDP request could not be encoded: %w", err)
@@ -987,6 +1054,17 @@ func (s *server) evaluateAt(ctx context.Context, ep discovery.PDPEndpoints, auth
 	if ep.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+ep.APIKey)
 	}
+	started := time.Now()
+	defer func() {
+		switch {
+		case err == nil:
+			s.metrics.pdpCall("ok", time.Since(started))
+		case errors.Is(err, coaz.ErrPDPUnavailable):
+			s.metrics.pdpCall("unavailable", time.Since(started))
+		default:
+			s.metrics.pdpCall("refused", time.Since(started))
+		}
+	}()
 	resp, err := s.httpc.Do(req)
 	if err != nil {
 		return out, fmt.Errorf("%w: %v", coaz.ErrPDPUnavailable, err)

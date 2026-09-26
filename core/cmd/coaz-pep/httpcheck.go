@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -70,7 +71,9 @@ func (s *server) handleHTTPCheck(w http.ResponseWriter, r *http.Request) {
 		lower[toLower(k)] = v
 	}
 	conf := configFrom(req.Config)
+	started := time.Now()
 	resp := s.check(r.Context(), conf, req.Method, req.Path, lower, req.Body)
+	s.audit("http", conf, req.Method, req.Path, lower, resp, started)
 
 	out := checkResponse{}
 	switch hr := resp.HttpResponse.(type) {

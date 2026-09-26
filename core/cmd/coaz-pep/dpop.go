@@ -30,8 +30,12 @@ func ecdsaFromJWK(jwk map[string]any) (*ecdsa.PublicKey, error) { return jose.EC
 func rsaFromJWK(jwk map[string]any) (*rsa.PublicKey, error)     { return jose.RSAFromJWK(jwk) }
 
 // dpopMaxAge bounds how old a proof's iat may be. RFC 9449 §11.1 leaves the window to
-// the server; 300s is the commonly deployed value and tolerates modest clock skew.
-const dpopMaxAge = 300 * time.Second
+// the server; 300s is the commonly deployed value. dpopMaxSkew bounds how far in the
+// future it may be: clock skew, not a licence to mint proofs for later.
+const (
+	dpopMaxAge  = 300 * time.Second
+	dpopMaxSkew = 60 * time.Second
+)
 
 // verifyProofSignature checks the compact JWS in `proof` against the JWK embedded in its
 // own header. Supports ES256/384/512 and RS256/384/512 + PS256/384/512 — between them,
@@ -90,11 +94,6 @@ func verifyProofSignature(proof string, jwk map[string]any, alg string) error {
 	return fmt.Errorf("unsupported DPoP alg %q", alg)
 }
 
-func str(v any) string {
-	s, _ := v.(string)
-	return s
-}
-
 // accessTokenHash is the RFC 9449 `ath`: base64url(SHA-256(access token)).
 func accessTokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
@@ -106,41 +105,99 @@ func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// replayCache rejects a DPoP `jti` seen before, within the proof-acceptance window.
-// Bounded so a flood of unique jtis cannot grow it without limit.
+// replayCache rejects a DPoP proof (jkt, jti) seen before, for as long as that proof
+// could still be accepted: until its iat plus the acceptance window.
+//
+// It must not be a lever against everyone else. The old cache refused every new proof
+// once it held 100k live entries — about 333 proofs a second per replica — so heavy
+// traffic, or one client minting fresh jtis, switched DPoP off for all. Now a single key
+// is held to maxPerKey live proofs (that client is refused, nobody else), and at the
+// global cap the entries closest to expiry are dropped instead of new proofs refused:
+// dropping an old entry reopens replay of that one proof for its last seconds, refusing
+// new proofs is an outage.
 type replayCache struct {
-	mu      sync.Mutex
-	seen    map[string]time.Time
-	ttl     time.Duration
-	maxSize int
+	mu        sync.Mutex
+	window    time.Duration
+	maxSize   int
+	maxPerKey int
+	seen      map[string]int64 // jkt|jti -> expiry, unix seconds
+	perKey    map[string]int   // jkt -> live entries
+	buckets   map[int64][]string
+	oldest    int64 // no bucket below this second holds entries
 }
 
-func newReplayCache(ttl time.Duration) *replayCache {
-	return &replayCache{seen: make(map[string]time.Time), ttl: ttl, maxSize: 100_000}
+func newReplayCache(window time.Duration) *replayCache {
+	return &replayCache{window: window, maxSize: 500_000, maxPerKey: 20_000,
+		seen: map[string]int64{}, perKey: map[string]int{}, buckets: map[int64][]string{}}
 }
 
-// observe records jti and reports whether it is fresh (true) or a replay (false).
-func (r *replayCache) observe(jti string, now time.Time) bool {
+// observe records the proof and reports whether it is fresh (true) or a replay, or a
+// key over its quota (false).
+func (r *replayCache) observe(jkt, jti string, iat, now time.Time) bool {
 	if jti == "" {
 		return false
 	}
+	key := jkt + "|" + jti
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if at, ok := r.seen[jti]; ok && now.Sub(at) < r.ttl {
+	r.expireLocked(now.Unix())
+	if _, dup := r.seen[key]; dup {
 		return false
 	}
-	if len(r.seen) >= r.maxSize {
-		for k, at := range r.seen {
-			if now.Sub(at) >= r.ttl {
-				delete(r.seen, k)
-			}
+	if r.perKey[jkt] >= r.maxPerKey {
+		return false
+	}
+	for len(r.seen) >= r.maxSize {
+		r.dropOldestLocked()
+	}
+	// Held until the proof could no longer pass the iat check — later of now and iat,
+	// plus the window — so a future-dated proof cannot be replayed once its entry lapses.
+	from := now
+	if iat.After(from) {
+		from = iat
+	}
+	exp := from.Add(r.window).Unix() + 1
+	r.seen[key] = exp
+	r.perKey[jkt]++
+	r.buckets[exp] = append(r.buckets[exp], key)
+	if exp < r.oldest || r.oldest == 0 {
+		r.oldest = exp
+	}
+	return true
+}
+
+// expireLocked drops every bucket that has lapsed. Buckets are one second wide, so this
+// walks at most the seconds since the last call.
+func (r *replayCache) expireLocked(now int64) {
+	if r.oldest == 0 {
+		return
+	}
+	for sec := r.oldest; sec <= now; sec++ {
+		r.dropBucketLocked(sec)
+		r.oldest = sec + 1
+	}
+}
+
+func (r *replayCache) dropOldestLocked() {
+	for len(r.buckets) > 0 {
+		if _, ok := r.buckets[r.oldest]; ok {
+			r.dropBucketLocked(r.oldest)
+			return
 		}
-		// Still full of live entries: refuse rather than grow without bound. Failing
-		// closed under a jti flood is the safe direction.
-		if len(r.seen) >= r.maxSize {
-			return false
+		r.oldest++
+	}
+}
+
+func (r *replayCache) dropBucketLocked(sec int64) {
+	for _, key := range r.buckets[sec] {
+		if r.seen[key] != sec {
+			continue
+		}
+		delete(r.seen, key)
+		jkt, _, _ := strings.Cut(key, "|")
+		if r.perKey[jkt]--; r.perKey[jkt] <= 0 {
+			delete(r.perKey, jkt)
 		}
 	}
-	r.seen[jti] = now
-	return true
+	delete(r.buckets, sec)
 }

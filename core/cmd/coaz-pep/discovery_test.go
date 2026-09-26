@@ -199,7 +199,7 @@ func TestLayersOnTheService(t *testing.T) {
 			"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "resource", "PDP_DISCOVERY_INSECURE": "true",
 			"PDP_LAYERS": "static," + estate.URL, "PDP_ALLOWLIST": "https://nowhere.example",
 		}
-		srv, _, _, err := buildServer(func(k string) string { return env[k] })
+		srv, _, _, err := buildServer(insecureEnv(env))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -211,10 +211,7 @@ func TestLayersOnTheService(t *testing.T) {
 		if resp.GetDeniedResponse() != nil || len(estate.paths) != before+1 {
 			t.Fatalf("the estate layer should be asked by default and be allowlisted: %v", resp.GetDeniedResponse())
 		}
-		if _, _, _, err := buildServer(func(k string) string {
-			m := map[string]string{"AUTHZEN_URL": static.URL, "PDP_LAYERS": "bogus"}
-			return m[k]
-		}); err == nil {
+		if _, _, _, err := buildServer(insecureEnv(map[string]string{"AUTHZEN_URL": static.URL, "PDP_LAYERS": "bogus"})); err == nil {
 			t.Fatal("an unknown layer name must fail startup")
 		}
 	})
@@ -323,7 +320,7 @@ func TestFailOpenOnTheService(t *testing.T) {
 	t.Run("PDP_FAIL_MODE is the service default", func(t *testing.T) {
 		env := map[string]string{"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "resource", "PDP_DISCOVERY_INSECURE": "true",
 			"PDP_FAIL_MODE": "open", "PDP_LAYERS": down.URL + ", static fail-closed"}
-		srv, _, _, err := buildServer(func(k string) string { return env[k] })
+		srv, _, _, err := buildServer(insecureEnv(env))
 		if err != nil || !srv.failOpen {
 			t.Fatalf("%v %+v", err, srv)
 		}
@@ -332,7 +329,7 @@ func TestFailOpenOnTheService(t *testing.T) {
 			t.Fatalf("%v", resp.GetDeniedResponse())
 		}
 		env["PDP_FAIL_MODE"] = "sometimes"
-		if _, _, _, err := buildServer(func(k string) string { return env[k] }); err == nil {
+		if _, _, _, err := buildServer(insecureEnv(env)); err == nil {
 			t.Fatal("an unknown fail mode must fail startup")
 		}
 	})
@@ -560,6 +557,7 @@ func fedEnv(f *fedFixture, t *testing.T, static string, extra map[string]string)
 		"AUTHZEN_URL":                   static,
 		"PDP_DISCOVERY":                 "federation",
 		"PDP_DISCOVERY_INSECURE":        "true",
+		"PEP_ALLOW_INSECURE":            "true",
 		"FEDERATION_TRUST_ANCHORS_FILE": f.anchorsFile(t),
 	}
 	for k, v := range extra {
@@ -659,9 +657,7 @@ func TestFederationEndToEnd(t *testing.T) {
 }
 
 func TestBuildServerDiscoveryConfig(t *testing.T) {
-	env := func(m map[string]string) func(string) string {
-		return func(k string) string { return m[k] }
-	}
+	env := insecureEnv
 	static := newDiscoPDP(t, true)
 
 	t.Run("off by default, no HTTP", func(t *testing.T) {
@@ -741,17 +737,30 @@ func TestBuildServerDiscoveryConfig(t *testing.T) {
 			})
 		}
 	})
-	t.Run("bad metadata TTL falls back", func(t *testing.T) {
-		if _, _, _, err := buildServer(env(map[string]string{"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "authzen", "PDP_METADATA_TTL": "soon"})); err != nil {
-			t.Fatal(err)
+	t.Run("a bad metadata TTL is refused, not replaced", func(t *testing.T) {
+		if _, _, _, err := buildServer(env(map[string]string{"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "authzen", "PDP_METADATA_TTL": "soon"})); err == nil {
+			t.Fatal("a typo in a TTL must not silently become the default")
 		}
 	})
-	t.Run("insecure flag warns but works", func(t *testing.T) {
-		if _, _, _, err := buildServer(env(map[string]string{"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "resource", "PDP_DISCOVERY_INSECURE": "true"})); err != nil {
-			t.Fatal(err)
+	t.Run("discovery gaps refuse startup without the hatch", func(t *testing.T) {
+		secure := map[string]string{
+			"AUTHZEN_URL": static.URL, "PDP_DISCOVERY": "resource", "PEP_ALLOW_INSECURE": "false",
+			"CHECK_API_TOKEN": "t", "MCP_UPSTREAM_ALLOWLIST": "https://mcp.example",
+			"ACCESS_TOKEN_JWKS_URL": "https://as/jwks", "ACCESS_TOKEN_ISSUER": "https://as", "ACCESS_TOKEN_AUDIENCE": "https://api",
+		}
+		_, _, _, err := buildServer(env(secure))
+		if err == nil || !strings.Contains(err.Error(), "RESOURCE_METADATA_ALLOWLIST") || !strings.Contains(err.Error(), "PDP_ALLOWLIST") {
+			t.Fatalf("resource mode without allowlists must refuse, naming both: %v", err)
+		}
+		secure["RESOURCE_METADATA_ALLOWLIST"], secure["PDP_ALLOWLIST"] = "https://api.example", "https://pdp.example"
+		if _, _, _, err := buildServer(env(secure)); err != nil {
+			t.Fatalf("with its allowlists resource mode starts: %v", err)
+		}
+		secure["PDP_DISCOVERY_INSECURE"] = "true"
+		if _, _, _, err := buildServer(env(secure)); err == nil || !strings.Contains(err.Error(), "PDP_DISCOVERY_INSECURE") {
+			t.Fatalf("plain-http discovery needs the hatch: %v", err)
 		}
 	})
-	_ = strings.TrimSpace
 }
 
 func writeFile(t *testing.T, content string) string {

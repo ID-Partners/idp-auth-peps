@@ -48,7 +48,7 @@ func TestFederationEntityOnTheService(t *testing.T) {
 		for k, v := range over {
 			env[k] = v
 		}
-		srv, httpSrv, _, err := buildServer(func(k string) string { return env[k] })
+		srv, httpSrv, _, err := buildServer(insecureEnv(env))
 		if err != nil {
 			return nil, nil, err
 		}

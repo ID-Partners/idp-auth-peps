@@ -76,7 +76,7 @@ func (s *server) handleDpopVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := dpopVerifyResponse{Valid: true}
-	if resp := checkDpop(pep, scheme, req.Method, req.Path, token, lower, claims); resp != nil {
+	if resp := checkDpop(pep, scheme, req.Method, req.Path, s.dpopHTUBase, token, lower, claims); resp != nil {
 		out.Valid = false
 		out.Status = int(typev3.StatusCode_Unauthorized)
 		out.Reason = resp.GetDeniedResponse().GetBody()
