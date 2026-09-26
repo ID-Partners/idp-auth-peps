@@ -92,6 +92,7 @@ demo/run-local.sh --console                    <span class="c"># the same withou
       AUTHZEN_URL: http://stubs:9002/tenants/bank-a
       AUTHZEN_API_KEY: static-pdp-key
       CHECK_API_TOKEN: demo
+      PEP_ALLOW_INSECURE: "true"   <span class="c"># unsigned demo tokens, no JWKS: coaz-pep refuses to start without this. Never anywhere real</span>
       MCP_UPSTREAM_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9009
       PDP_METADATA_TTL: 15s        <span class="c"># short so the console's trace shows fetches on every run; the shipped default is 5m</span>
     ports: [ "9192:9192" ]
@@ -104,7 +105,7 @@ demo/run-local.sh --console                    <span class="c"># the same withou
       PDP_DISCOVERY: resource
       PDP_DISCOVERY_INSECURE: "true"
       RESOURCE_METADATA_ALLOWLIST: http://stubs:9001,http://stubs:9004,http://stubs:9005,http://stubs:9006,http://stubs:9007,http://stubs:9009,http://pep-federation:9192
-      <span class="c"># deliberately no PDP_ALLOWLIST (it warns at boot): the impostor may name the rogue</span>
+      <span class="c"># deliberately no PDP_ALLOWLIST (logged at boot): the impostor may name the rogue</span>
     ports: [ "9193:9192" ]
     depends_on: { stubs: { condition: service_healthy } }
 

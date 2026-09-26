@@ -63,16 +63,17 @@
       <tr><td><code>pep_label</code></td><td class="d">coaz-pep</td><td>Identifies this PEP in challenges, logs and <code>X-PDP-PEP</code>.</td></tr>
       <tr><td><code>style</code></td><td class="d">rest</td><td><code>rest</code> (resource server) or <code>mcp</code> (MCP edge).</td></tr>
       <tr><td><code>require_token</code></td><td class="d">false</td><td>Deny without a readable access token.</td></tr>
-      <tr><td><code>require_dpop</code></td><td class="d">false</td><td>Enforce the <code>cnf.jkt</code> sender constraint.</td></tr>
+      <tr><td><code>require_dpop</code></td><td class="d">false</td><td>Enforce the RFC 9449 sender constraint on every request. Off, a DPoP-bound token is still checked, and one presented as a bearer token is rejected.</td></tr>
       <tr><td><code>require_user_login</code></td><td class="d">false</td><td>Deny without a valid <code>X-User-Token</code>, with a login challenge.</td></tr>
       <tr><td><code>stepup_scope</code></td><td class="d">—</td><td>Scope demanded for <code>stepup_action</code>.</td></tr>
       <tr><td><code>stepup_action</code></td><td class="d">make_payment</td><td>The action the step-up applies to.</td></tr>
-      <tr><td><code>mcp_upstream_url</code></td><td class="d">—</td><td>Set to enable COAZ: where to discover <code>tools/list</code>.</td></tr>
+      <tr><td><code>mcp_upstream_url</code></td><td class="d">—</td><td>The MCP server whose <code>tools/list</code> declares per-tool mappings. Without it every tool call gets the binding's default mapping.</td></tr>
       <tr><td><code>resource</code></td><td class="d">—</td><td>The protected resource's identifier (RFC 8707), the key PDP discovery starts from. MCP routes default to <code>mcp_upstream_url</code>; REST routes without it use the static PDP.</td></tr>
       <tr><td><code>forward_access_token</code></td><td class="d">false</td><td>Send the raw token to the PDP as <code>context.access_token</code>. Only over a TLS, authenticated PDP connection.</td></tr>
       <tr><td><code>pdp_layers</code></td><td class="d"><code>PDP_LAYERS</code></td><td>Ordered PDPs to ask, comma-separated: <code>static</code>, <code>resource</code>, or a PDP identifier (which must be on <code>PDP_ALLOWLIST</code>), each optionally suffixed <code> fail-open</code> or <code> fail-closed</code>. Every layer must permit.</td></tr>
       <tr><td><code>fail_mode</code></td><td class="d"><code>PDP_FAIL_MODE</code></td><td><code>closed</code> or <code>open</code> for this route's layers that say nothing for themselves. Open marks the permit with <code>X-PDP-Fail-Open</code>; a deny or a refusal never opens.</td></tr>
-      <tr><td><code>coaz_defaults</code></td><td class="d">false</td><td>Apply the COAZ binding's default mappings to undeclared methods.</td></tr>
+      <tr><td><code>coaz_defaults</code></td><td class="d">true</td><td>Decide every MCP method: a tool's declared mapping, otherwise the binding's default one; an unknown method is denied. <code>"false"</code> keeps the old pass-through for everything but declared tools — an explicit opt-out.</td></tr>
+      <tr><td><code>coaz_v2_only</code></td><td class="d">false</td><td>Refuse tools that declare only the superseded <code>coaz: true</code> mapping.</td></tr>
       <tr><td><code>legacy_subject_identity</code></td><td class="d">true</td><td>Also send <code>subject.identity</code> beside <code>subject.id</code>. Set <code>"false"</code> once policies read <code>subject.id</code>.</td></tr>
     </tbody>
   </table></div>
@@ -95,7 +96,7 @@
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
                       transport_api_version: V3
                       failure_mode_allow: false        <span class="c"># fail closed</span>
-                      with_request_body: { max_request_bytes: 65536, allow_partial_message: true }
+                      with_request_body: { max_request_bytes: 1048576, allow_partial_message: false }
                       grpc_service:
                         envoy_grpc: { cluster_name: coaz_pep }
                         timeout: 2s
@@ -188,8 +189,8 @@ extensionProviders:
       service: coaz-pep.authz.svc.cluster.local
       port: 9191
       includeRequestBodyInCheck:
-        maxRequestBytes: 65536
-        allowPartialMessage: true</code></pre>
+        maxRequestBytes: 1048576
+        allowPartialMessage: false</code></pre>
   <pre><code>apiVersion: v1
 kind: Namespace
 metadata:
@@ -211,23 +212,41 @@ spec:
     spec:
       containers:
         - name: coaz-pep
-          image: ghcr.io/id-partners/coaz-pep:latest
+          image: ghcr.io/id-partners/coaz-pep:0.4.0 <span class="c"># pin a release, never :latest</span>
           ports:
             - { name: grpc, containerPort: 9191 }
             - { name: http, containerPort: 9192 }
           env:
+            <span class="c"># coaz-pep will not start without these — see its page</span>
             - name: AUTHZEN_URL
               value: http://authzen-adapter.authz.svc.cluster.local:8080
             - name: AUTHZEN_API_KEY
               valueFrom:
                 secretKeyRef: { name: coaz-pep, key: authzen-api-key }
-            - name: COAZ_DISCOVERY_TTL
-              value: 60s
+            - name: CHECK_API_TOKEN
+              valueFrom:
+                secretKeyRef: { name: coaz-pep, key: check-api-token }
+            - name: MCP_UPSTREAM_ALLOWLIST
+              value: http://bank-mcp.default.svc.cluster.local:8090
+            - name: ACCESS_TOKEN_JWKS_URL
+              value: https://as.example.com/.well-known/jwks.json
+            - name: ACCESS_TOKEN_ISSUER
+              value: https://as.example.com
+            - name: ACCESS_TOKEN_AUDIENCE
+              value: https://api.example.com
+            - name: USER_TOKEN_AUDIENCE
+              value: banking-app
           readinessProbe:
+            httpGet: { path: /readyz, port: http }
+          livenessProbe:
             httpGet: { path: /healthz, port: http }
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
 ---
 apiVersion: v1
 kind: Service
@@ -310,8 +329,8 @@ spec:
           host: __EXTAUTHZ_HOST__          <span class="c"># coaz-pep:9191</span>
           failureMode: deny               <span class="c"># fail closed if the PEP is unreachable</span>
           includeRequestBody:
-            maxRequestBytes: 65536        <span class="c"># the PEP inspects JSON-RPC bodies</span>
-            allowPartialMessage: true
+            maxRequestBytes: 1048576      <span class="c"># the PEP decides every JSON-RPC message</span>
+            allowPartialMessage: false    <span class="c"># never a truncated body</span>
           protocol:
             grpc:
               context:
@@ -333,8 +352,8 @@ spec:
           host: __EXTAUTHZ_HOST__
           failureMode: deny
           includeRequestBody:
-            maxRequestBytes: 65536        <span class="c"># the PEP inspects payment bodies</span>
-            allowPartialMessage: true
+            maxRequestBytes: 1048576      <span class="c"># the PEP inspects payment bodies</span>
+            allowPartialMessage: false
           protocol:
             grpc:
               context:
@@ -352,6 +371,10 @@ spec:
 
   <h2 id="wellknown">The well-known documents</h2>
   <p>When coaz-pep is the federation entity for the resource it fronts (<code>FEDERATION_ENTITY_ID</code> on <a href="coaz-pep.html#env-entity">its page</a>), it serves <code>{path}/.well-known/openid-federation</code> and <code>/.well-known/oauth-protected-resource{path}</code> on its HTTP port. Route those two paths, on the resource's host, to that port as an ordinary upstream with the ext_authz filter disabled for them, as the plain Envoy sample does. They are public documents; the trust controller fetches the first to onboard the resource.</p>
+
+  <h2 id="bodies">Whole bodies only</h2>
+  <div class="note warn"><p><b>Set <code>allow_partial_message: false</code>.</b> coaz-pep decides every MCP message and reads payment bodies, so it must see the body the upstream will. With partial messages allowed, a body over the limit reaches the PEP truncated while the upstream receives all of it — the PEP refuses a body Envoy marks partial with a 413, but the right configuration never sends one. Set <code>max_request_bytes</code> above your largest legitimate request, and leave <code>pack_as_bytes</code> as you like: the PEP reads whichever field the body arrives in.</p></div>
+  <p>The sample manifest in <code>gateways/envoy/istio/coaz-pep.yaml</code> also carries a PodDisruptionBudget, topology spread, a 30 second grace period for the SIGTERM drain, and a NetworkPolicy that lets only the gateways reach <code>:9191</code> — a caller there chooses the route's knobs.</p>
 
   <h2 id="failure">Failure mode</h2>
   <div class="note warn"><p><b>Always fail closed at the gateway.</b> <code>failure_mode_allow: false</code> in Envoy, <code>failureMode: deny</code> in agentgateway, and Istio's CUSTOM action already denies when the provider is unreachable. A PEP that fails open at the gateway is not a PEP. The place to decide that an individual policy layer may be skipped when its PDP is down is coaz-pep's <code>pdp_layers</code> and <code>fail_mode</code>, which mark every such permit with <code>X-PDP-Fail-Open</code>; the gateway's own failure mode is about coaz-pep itself being unreachable, and that must deny.</p></div>
