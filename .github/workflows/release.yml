@@ -25,8 +25,8 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           fail=0
           check() { if ! eval "$2"; then echo "::error::$1 does not say $v"; fail=1; fi; }
-          check "Kong authzen-pdp rockspec" "test -f gateways/kong/authzen-pdp/authzen-pdp-$v-1.rockspec"
-          check "Kong sideband-pdp rockspec" "test -f gateways/kong/sideband-pdp/sideband-pdp-$v-1.rockspec"
+          check "Kong authzen-pdp rockspec" "test -f gateways/kong/authzen-pdp/kong-plugin-authzen-pdp-$v-1.rockspec"
+          check "Kong sideband-pdp rockspec" "test -f gateways/kong/sideband-pdp/kong-plugin-sideband-pdp-$v-1.rockspec"
           check "Kong authzen-pdp handler" "grep -q 'VERSION = \"$v\"' gateways/kong/authzen-pdp/handler.lua"
           check "Kong sideband-pdp handler" "grep -q 'VERSION = \"$v\"' gateways/kong/sideband-pdp/handler.lua"
           check "PingAccess pom" "grep -q '<version>$v</version>' gateways/pingaccess/authzen-pdp/pom.xml"
@@ -91,12 +91,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Pack both rocks from the tag
+        # Source rocks built from the tag: the rockspecs' module paths are repo-relative.
+        # authzen-pdp first, because sideband-pdp depends on it — install them in that
+        # order too.
         run: |
           sudo apt-get update && sudo apt-get install -y lua5.4 luarocks lua-sec
           v="${{ needs.versions.outputs.version }}"
           mkdir -p dist
           for p in authzen-pdp sideband-pdp; do
-            spec="gateways/kong/$p/$p-$v-1.rockspec"
+            spec="gateways/kong/$p/kong-plugin-$p-$v-1.rockspec"
+            luarocks --lua-version=5.4 lint "$spec"
             cp "$spec" dist/
             (cd dist && luarocks --lua-version=5.4 pack "$(basename "$spec")")
           done
