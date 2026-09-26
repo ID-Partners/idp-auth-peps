@@ -109,21 +109,31 @@ func (s *FederationSource) Lookup(ctx context.Context, resource string) (Resourc
 	if res.Subject != resource {
 		return ResourceMetadata{}, fmt.Errorf("%w: federation resolved %q, expected %q", ErrNotAllowed, res.Subject, resource)
 	}
+	// From here the federation vouches for the resource, so what it resolved is the
+	// only word that counts. If the PEP cannot use it — no oauth_resource metadata, no
+	// PDP, a list a policy's subset_of stripped to [] (which essential accepts,
+	// §6.1.3.1.8), an entry that is not a PDP identifier — that is a refusal. Falling
+	// back to the static PDP would drop whatever else the anchor resolved: the layers
+	// it added in front of every member, the acr floor it set.
+	from := "resolved metadata of " + resource
 	meta, ok := res.Metadata[entityTypeResource]
 	if !ok {
-		return ResourceMetadata{}, ErrNoMetadata
+		return ResourceMetadata{}, fmt.Errorf("%w: the federation vouches for %s but resolves no %s metadata", ErrNotAllowed, resource, entityTypeResource)
 	}
 	raw, _ := meta[ParamPolicyDecisionPoints].([]any)
-	pdps, err := pdpList(raw, "resolved metadata of "+resource)
+	pdps, err := identifiers(raw, from)
 	if err != nil {
-		return ResourceMetadata{}, err
+		return ResourceMetadata{}, fmt.Errorf("%w: %v", ErrNotAllowed, err)
+	}
+	if len(pdps) == 0 {
+		return ResourceMetadata{}, fmt.Errorf("%w: %s names no PDP the federation allows", ErrNotAllowed, from)
 	}
 	// The same goes for the layers: a metadata_policy `add` on ParamPolicyLayers is
 	// how a federation puts its own PDP in front of every member's, and a member
 	// cannot take it out again by editing its own configuration.
-	layers, err := layerList(meta, "resolved metadata of "+resource)
+	layers, err := layerList(meta, from)
 	if err != nil {
-		return ResourceMetadata{}, err
+		return ResourceMetadata{}, fmt.Errorf("%w: %v", ErrNotAllowed, err)
 	}
 	// What travels to the PDP is the RESOLVED metadata: what survived every superior's
 	// metadata_policy, not what the resource wrote. A federation that pins a floor on

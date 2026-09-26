@@ -3,6 +3,8 @@ package discovery
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -104,5 +106,59 @@ func TestAnOffboardedMemberFallsToStatic(t *testing.T) {
 	now = now.Add(61 * time.Second) // past the TTL, well inside MaxStale
 	if ep, err := c.Resolve(ctx(), f.leaf.URL); err != nil || ep.Identifier != static.URL || ep.Resource != nil {
 		t.Fatalf("an offboarded member is not a member: %+v %v", ep, err)
+	}
+}
+
+// P2: a member whose chain validates could make the PEP ignore the resolved document.
+// With the demo anchor's policy — PDPs {subset_of: [bank-a], essential} and layers
+// {add: [estate], essential} — a member naming an off-subset PDP had its list stripped
+// to [] (which essential accepts: §6.1.3.1.8, Table 1), fell to the static PDP with no
+// document and no layers, and the anchor's estate gate and acr floor vanished. In
+// federation mode a chain the federation vouches for, whose word the PEP cannot use, is
+// a refusal: never the resource's own word, never the static PDP.
+func TestAnUnusableResolvedDocumentIsARefusal(t *testing.T) {
+	good := newPDP(t, fullConfig)
+	rogue := newPDP(t, fullConfig)
+	estate := newPDP(t, fullConfig)
+	static := newPDP(t, nil)
+	anchorPolicy := map[string]any{"oauth_resource": map[string]any{
+		ParamPolicyDecisionPoints: map[string]any{"subset_of": []any{good.URL}, "essential": true},
+		ParamPolicyLayers:         map[string]any{"add": []any{estate.URL}, "essential": true},
+	}}
+	cases := map[string]func(f *miniFed){
+		"the policy strips every PDP": func(f *miniFed) { f.leafPDPs = []any{rogue.URL} },
+		"the PDP list is empty":       func(f *miniFed) { f.leafPDPs = []any{}; f.policy = nil },
+		"the PDP list is absent":      func(f *miniFed) { f.leafPDPs = nil; f.policy = nil },
+		"no oauth_resource metadata":  func(f *miniFed) { f.leafNoResource = true; f.policy = nil },
+		"an unreadable PDP entry":     func(f *miniFed) { f.leafPDPs = []any{good.URL, "not a PDP"}; f.policy = nil },
+		"an unreadable layer entry": func(f *miniFed) {
+			f.leafPDPs = []any{good.URL}
+			f.leafLayers = []any{"not a PDP"}
+			f.policy = nil
+		},
+	}
+	for name, bend := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMiniFed(t)
+			f.policy = anchorPolicy
+			bend(f)
+			c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
+			r, err := ResolveLayers(ctx(), c, f.leaf.URL, nil, true)
+			if !errors.Is(err, ErrNotAllowed) {
+				t.Fatalf("want a refusal, got %+v %v", r, err)
+			}
+			if atomic.LoadInt32(&static.hits)+atomic.LoadInt32(&rogue.hits) != 0 {
+				t.Fatal("neither the static PDP nor the rogue one may be consulted")
+			}
+		})
+	}
+	// The same member, naming a PDP the anchor allows: the anchor's gate runs first.
+	f := newMiniFed(t)
+	f.policy = anchorPolicy
+	f.leafPDPs = []any{rogue.URL, good.URL}
+	c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
+	r, err := ResolveLayers(ctx(), c, f.leaf.URL, nil, false)
+	if err != nil || !reflect.DeepEqual(idsOf(r.PDPs), []string{estate.URL, good.URL}) {
+		t.Fatalf("%v %v", idsOf(r.PDPs), err)
 	}
 }

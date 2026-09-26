@@ -461,7 +461,10 @@ func newMiniFed(t *testing.T) *miniFed {
 		}
 		meta := map[string]any{}
 		if !f.leafNoResource {
-			res := map[string]any{ParamPolicyDecisionPoints: f.leafPDPs}
+			res := map[string]any{"resource": f.leaf.URL}
+			if f.leafPDPs != nil { // nil: the member names no PDP at all
+				res[ParamPolicyDecisionPoints] = f.leafPDPs
+			}
 			if f.leafLayers != nil {
 				res[ParamPolicyLayers] = f.leafLayers
 			}
@@ -588,19 +591,22 @@ func TestFederationMode(t *testing.T) {
 			t.Fatalf("err=%v calls=%d", err, calls)
 		}
 	})
-	t.Run("federated but no oauth_resource metadata falls to static", func(t *testing.T) {
+	// A chain the federation vouches for is the only word that counts: when the PEP
+	// cannot use it, that is a refusal, not the static PDP (see
+	// TestAnUnusableResolvedDocumentIsARefusal).
+	t.Run("federated but no oauth_resource metadata is a refusal", func(t *testing.T) {
 		f := newMiniFed(t)
 		f.leafNoResource = true
 		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
-		if ep, err := c.Resolve(ctx(), f.leaf.URL); err != nil || ep.Identifier != static.URL {
+		if ep, err := c.Resolve(ctx(), f.leaf.URL); !errors.Is(err, ErrNotAllowed) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
-	t.Run("federated with an empty list falls to static", func(t *testing.T) {
+	t.Run("federated with an empty list is a refusal", func(t *testing.T) {
 		f := newMiniFed(t)
 		f.leafPDPs = []any{}
 		c := mustNew(t, Options{Mode: ModeFederation, StaticPDP: static.URL, Federation: f.resolver(t)})
-		if ep, err := c.Resolve(ctx(), f.leaf.URL); err != nil || ep.Identifier != static.URL {
+		if ep, err := c.Resolve(ctx(), f.leaf.URL); !errors.Is(err, ErrNotAllowed) {
 			t.Fatalf("%+v %v", ep, err)
 		}
 	})
