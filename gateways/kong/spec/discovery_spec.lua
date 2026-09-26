@@ -490,7 +490,8 @@ describe('discovery: layers', function()
         headers = { authorization = 'Bearer ' .. mock.jwt(claims) }, pdp = fn,
       })
       mock.run_access(plugin, { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest', require_token = true,
-        pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES, pdp_layers = { ESTATE, 'resource' } })
+        pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES, pdp_layers = { ESTATE, 'resource' },
+        access_token_verified_upstream = true })
       return state
     end
     local state = drive({ sub = 'alice', client_id = 'good-client' })
@@ -512,7 +513,8 @@ describe('discovery: fail-open through access()', function()
       headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = pdp_fn,
     })
     local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
-      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES }
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES,
+      access_token_verified_upstream = true }
     for k, v in pairs(over or {}) do c[k] = v end
     mock.run_access(plugin, c)
     plugin:header_filter(c)
@@ -595,7 +597,7 @@ describe('federation entity relay', function()
     local drive = function(path, over)
       local plugin, state = load_plugin({ method = 'GET', path = path, headers = {}, pdp = fn })
       local c = { authzen_url = STATIC, pep_label = 'test-pep', style = 'rest', require_token = true, pdp_ssl_verify = true,
-        federation_entity_url = 'http://coaz-pep:9192' }
+        federation_entity_url = 'http://coaz-pep:9192', access_token_verified_upstream = true }
       for k, v in pairs(over or {}) do c[k] = v end
       mock.run_access(plugin, c)
       return state
@@ -623,7 +625,7 @@ describe('discovery: through access()', function()
       pdp = pdp_fn,
     })
     local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
-      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment' }
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', access_token_verified_upstream = true }
     for k, v in pairs(over or {}) do c[k] = v end
     mock.run_access(plugin, c)
     return state
@@ -691,18 +693,14 @@ describe('discovery: through access()', function()
     assert.equal(0, #hits)
   end)
 
-  it('an MCP route is keyed by its upstream', function()
+  it('an MCP route runs no discovery of its own: coaz-pep keys it by its upstream', function()
     local mcp = 'https://mcp.example/mcp'
-    local fn = router({
-      [mcp .. '/.well-known/oauth-protected-resource'] = 404,
-      ['https://mcp.example/.well-known/oauth-protected-resource/mcp'] = { resource = mcp, authzen_policy_decision_points = { GOOD } },
-      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
-      [GOOD .. '/custom/eval'] = { decision = true },
-    })
-    local state = drive({ pdp_discovery = 'resource', style = 'mcp', mcp_upstream_url = mcp }, fn,
+    local fn, hits = router({ ['http://coaz-pep:9192/v1/mcp/check'] = { decision = true, upstream_headers = {} } })
+    local state = drive({ pdp_discovery = 'resource', style = 'mcp', coaz_url = 'http://coaz-pep:9192', mcp_upstream_url = mcp }, fn,
       '{"jsonrpc":"2.0","id":1,"method":"initialize"}', 'POST', '/mcp')
     assert.is_nil(state.exited)
-    assert.equal(GOOD .. '/custom/eval', state.pdp_requests[#state.pdp_requests].url)
+    assert.equal(1, #hits)
+    assert.equal(mcp, mock.json_decode(state.pdp_requests[1].body).config.mcp_upstream_url)
   end)
 
   it('passes an explicit resource to the COAZ engine', function()

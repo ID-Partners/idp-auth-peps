@@ -1,9 +1,10 @@
 -- Behavioural tests for the authzen-pdp Kong plugin.
 --
 -- Kong is mocked (see mock_kong.lua), so these run anywhere Lua does — no gateway, no
--- database, no network. They cover the pure helpers, the request mapping both gateways
--- must agree on, and the access() decision paths that matter: fail closed on a PDP
--- error, honour a deny, forward identity on a permit.
+-- database, no network. They cover the pure helpers, the request mapping, the two ways a
+-- route is decided (natively, on claims an auth plugin verified; or by coaz-pep, which
+-- verifies them itself) and the access() paths that matter: fail closed on a PDP error,
+-- honour a deny, forward identity on a permit, refuse an MCP body it cannot read.
 
 local mock = require 'spec.mock_kong'
 
@@ -15,6 +16,7 @@ local function load_plugin(opts)
   return chunk(), state
 end
 
+-- A native route: decided here, on claims an openid-connect or jwt plugin verified.
 local function base_conf(over)
   local conf = {
     authzen_url = 'http://pdp:8080',
@@ -26,9 +28,34 @@ local function base_conf(over)
     require_user_login = false,
     stepup_action = 'make_payment',
     pdp_ssl_verify = true,
+    access_token_verified_upstream = true,
+    fail_mode = 'closed',
   }
   for k, v in pairs(over or {}) do conf[k] = v end
   return conf
+end
+
+local COAZ = 'http://coaz-pep:9192'
+
+-- A delegated route: coaz-pep decides the whole request.
+local function coaz_conf(over)
+  return base_conf((function()
+    local o = { coaz_url = COAZ, coaz_api_key = 'check-token', access_token_verified_upstream = false }
+    for k, v in pairs(over or {}) do o[k] = v end
+    return o
+  end)())
+end
+
+local function mcp_conf(over)
+  return coaz_conf((function()
+    local o = { style = 'mcp', mcp_upstream_url = 'http://mcp:8090/mcp' }
+    for k, v in pairs(over or {}) do o[k] = v end
+    return o
+  end)())
+end
+
+local function token(claims)
+  return 'Bearer ' .. mock.jwt(claims or { sub = 'alice', act = { sub = 'agent-1' } })
 end
 
 describe('pure helpers', function()
@@ -47,13 +74,15 @@ describe('pure helpers', function()
 
   it('decodes JWT claims and header, and refuses malformed tokens', function()
     local T = helpers()
-    local token = mock.jwt({ sub = 'alice@example.com', scope = 'a b' }, { alg = 'ES256', kid = 'k1' })
-    assert.equal('alice@example.com', T.jwt_claims(token).sub)
+    local tok = mock.jwt({ sub = 'alice@example.com', scope = 'a b' }, { alg = 'ES256', kid = 'k1' })
+    assert.equal('alice@example.com', T.jwt_claims(tok).sub)
 
     for _, bad in ipairs({ 'nodots', 'only.one' }) do
       assert.is_nil(T.jwt_claims(bad))
     end
     assert.is_nil(T.jwt_claims(nil))
+    -- A payload that is JSON but not an object is no claims at all.
+    assert.is_nil(T.jwt_claims('h.' .. mock.b64url('"a string"') .. '.s'))
   end)
 
   it('extracts the token and lower-cases the scheme', function()
@@ -68,7 +97,6 @@ describe('pure helpers', function()
     assert.is_nil((T.extract_token(nil)))
     assert.is_nil((T.extract_token('Malformed')))
   end)
-
 end)
 
 describe('request mapping', function()
@@ -79,50 +107,21 @@ describe('request mapping', function()
     }
     for _, c in ipairs(cases) do
       local plugin = load_plugin({ method = c.method, path = c.path })
-      local action, rtype, rid = plugin._TEST.map_request(base_conf())
-      assert.equal(c.action, action, c.path)
-      assert.equal(c.rtype, rtype, c.path)
-      assert.equal(c.rid, rid, c.path)
+      local m = plugin._TEST.map_request(base_conf())
+      assert.equal(c.action, m.action, c.path)
+      assert.equal(c.rtype, m.rtype, c.path)
+      assert.equal(c.rid, m.rid, c.path)
     end
-  end)
-
-  it('matches routes regardless of a stripped gateway prefix', function()
-    -- The patterns are prefix-tolerant on purpose: it must not matter whether the
-    -- gateway strips /bank before or after the PEP sees the request.
-    local plugin = load_plugin({ method = 'GET', path = '/bank/accounts/acc-9/balance' })
-    local action, _, rid = plugin._TEST.map_request(base_conf())
-    assert.equal('get_balance', action)
-    assert.equal('acc-9', rid)
-  end)
-
-  it('treats an MCP initialize handshake differently from other JSON-RPC', function()
-    local init = load_plugin({
-      method = 'POST', path = '/mcp',
-      body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
-    })
-    local action = init._TEST.map_request(base_conf({ style = 'mcp' }))
-    assert.equal('access_mcp', action)
-
-    local other = load_plugin({
-      method = 'POST', path = '/mcp',
-      body = '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
-    })
-    local action2 = other._TEST.map_request(base_conf({ style = 'mcp' }))
-    assert.are_not.equal('access_mcp', action2)
   end)
 
   it('always tags the channel so policy can see it is agent traffic', function()
     local plugin = load_plugin({ method = 'GET', path = '/anything' })
-    local _, _, _, _, ctx = plugin._TEST.map_request(base_conf())
-    assert.equal('ai-agent', ctx.channel)
+    local m = plugin._TEST.map_request(base_conf())
+    assert.equal('ai-agent', m.ctx.channel)
   end)
 end)
 
 describe('access(): the decision path', function()
-  local function token(claims)
-    return 'Bearer ' .. mock.jwt(claims)
-  end
-
   it('denies a request with no token when one is required', function()
     local plugin, state = load_plugin({ method = 'GET', path = '/accounts/a/balance' })
     mock.run_access(plugin, base_conf())
@@ -186,7 +185,7 @@ describe('access(): the decision path', function()
       headers = { authorization = token({ sub = 'alice' }) },
       pdp = { decision = true },
     })
-    mock.run_access(plugin, base_conf({ pdp_ssl_verify = false }))
+    mock.run_access(plugin, base_conf({ pdp_ssl_verify = false, allow_insecure = true }))
     assert.is_false(state.pdp_requests[1].ssl_verify)
   end)
 
@@ -204,101 +203,73 @@ describe('access(): the decision path', function()
   end)
 end)
 
-describe('DPoP is delegated, and fails closed', function()
-  -- The plugin no longer verifies proofs itself. It cannot: a thumbprint comparison
-  -- proves nothing when the proof carries the very JWK being compared. Verification
-  -- goes to coaz-pep, and anything that cannot be verified is denied.
-  local function with_verifier(verdict_or_fn, over)
-    local calls = {}
-    local pdp_fn = function(url, req)
-      calls[#calls + 1] = { url = url, body = req.body }
-      if url:find('/v1/dpop/verify', 1, true) then
-        if type(verdict_or_fn) == 'function' then return verdict_or_fn(url, req) end
-        if verdict_or_fn == false then return nil, 'connection refused' end
-        return { status = 200, body = mock.json_encode(verdict_or_fn) }
-      end
-      return { status = 200, body = mock.json_encode({ decision = true }) }
-    end
+describe('a native route trusts only verified claims', function()
+  -- Without coaz_url the plugin reads the access token's claims itself, and it has no
+  -- JOSE verifier. That is safe only when an auth plugin validated Authorization first,
+  -- and the route has to say so; X-User-Token is never read here at all.
+  it('never reads X-User-Token: no user_scope reaches the PDP', function()
     local plugin, state = load_plugin({
-      method = 'GET', path = '/accounts/a/balance',
+      method = 'POST', path = '/payments',
       headers = {
-        authorization = 'DPoP ' .. mock.jwt({ sub = 'alice', cnf = { jkt = 'THUMB' } }),
-        dpop = mock.jwt({ htm = 'GET', ath = 'AAA' }, { typ = 'dpop+jwt', alg = 'ES256' }),
+        authorization = token({ sub = 'alice' }),
+        ['x-user-token'] = mock.jwt({ sub = 'mallory', scope = 'payments:approve' }),
       },
-      pdp = pdp_fn,
-    })
-    local conf = base_conf({ require_dpop = true, coaz_url = 'http://coaz-pep:9192' })
-    for k, v in pairs(over or {}) do conf[k] = v end
-    mock.run_access(plugin, conf)
-    return state, calls
-  end
-
-  it('permits when the verifier says the proof is valid', function()
-    local state, calls = with_verifier({ valid = true })
-    assert.is_nil(state.exited)
-    -- The proof went to the verifier, and the request still reached the PDP.
-    local saw_verify, saw_pdp = false, false
-    for _, c in ipairs(calls) do
-      if c.url:find('/v1/dpop/verify', 1, true) then saw_verify = true end
-      if c.url:find('/access/v1/evaluation', 1, true) then saw_pdp = true end
-    end
-    assert.is_true(saw_verify, 'the proof should be sent for verification')
-    assert.is_true(saw_pdp, 'a valid proof should let the request reach the PDP')
-  end)
-
-  it('relays the verifier reason on an invalid proof', function()
-    local state = with_verifier({ valid = false, reason = 'DPoP proof signature is invalid' })
-    assert.is_truthy(state.exited)
-    assert.equal(401, state.exited.status)
-    assert.matches('signature is invalid', state.exited.body.reason)
-  end)
-
-  it('FAILS CLOSED when the verifier is unreachable', function()
-    local state = with_verifier(false)
-    assert.is_truthy(state.exited)
-    assert.equal(401, state.exited.status)
-    assert.matches('unreachable', state.exited.body.reason)
-  end)
-
-  it('FAILS CLOSED when the verifier errors', function()
-    local state = with_verifier(function() return { status = 500, body = 'boom' } end)
-    assert.is_truthy(state.exited)
-    assert.equal(401, state.exited.status)
-  end)
-
-  it('FAILS CLOSED on an unusable verifier body', function()
-    local state = with_verifier(function() return { status = 200, body = 'not json' } end)
-    assert.is_truthy(state.exited)
-    assert.equal(401, state.exited.status)
-  end)
-
-  it('FAILS CLOSED rather than falling back when coaz_url is unset', function()
-    -- The schema forbids this combination, so it should be unreachable — but a route
-    -- that demands sender-constrained tokens and cannot verify them must deny, never
-    -- silently downgrade to the weaker local check that used to live here.
-    local state = with_verifier({ valid = true }, { coaz_url = '' })
-    assert.is_truthy(state.exited)
-    assert.equal(401, state.exited.status)
-    assert.matches('verification is unavailable', state.exited.body.reason)
-  end)
-
-  it('never sends the proof anywhere when the route does not require DPoP', function()
-    local plugin, state = load_plugin({
-      method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      body = '{"from_account":"a","amount":50}',
       pdp = { decision = true },
     })
-    mock.run_access(plugin, base_conf({ require_dpop = false }))
+    mock.run_access(plugin, base_conf())
     assert.is_nil(state.exited)
-    for _, r in ipairs(state.pdp_requests) do
-      assert.is_nil(r.url:find('/v1/dpop/verify', 1, true))
+    local sent = mock.json_decode(state.pdp_requests[1].body)
+    assert.is_nil(sent.context.user_scope)
+    assert.is_nil(state.pdp_requests[1].body:find('mallory', 1, true))
+  end)
+
+  it('refuses to decide on unverified claims when the route has not said who verified them', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = token({ sub = 'alice' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf({ access_token_verified_upstream = false }))
+    assert.equal(503, state.exited.status)
+    assert.equal(0, #state.pdp_requests)
+    -- The escape hatch, and only the escape hatch, lets the claims through unverified.
+    local plugin2, state2 = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = token({ sub = 'alice' }) },
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin2, base_conf({ access_token_verified_upstream = false, allow_insecure = true }))
+    assert.is_nil(state2.exited)
+  end)
+
+  it('fails closed on an MCP route with nowhere to send it', function()
+    -- The schema requires coaz_url for style=mcp; a route that got here anyway must not
+    -- be decided by REST mapping of JSON-RPC.
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/mcp', headers = { authorization = token() },
+      body = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t"}}',
+    })
+    mock.run_access(plugin, base_conf({ style = 'mcp' }))
+    assert.equal(503, state.exited.status)
+    assert.equal(0, #state.pdp_requests)
+  end)
+
+  it('fails closed on require_dpop or require_user_login without coaz-pep to verify them', function()
+    for _, over in ipairs({ { require_dpop = true }, { require_user_login = true } }) do
+      local plugin, state = load_plugin({
+        method = 'GET', path = '/accounts/a/balance', headers = { authorization = token() },
+      })
+      mock.run_access(plugin, base_conf(over))
+      assert.equal(503, state.exited.status)
+      assert.equal(0, #state.pdp_requests)
     end
   end)
 end)
 
 describe('step-up and PDP advice', function()
   local function permit_token()
-    return 'Bearer ' .. mock.jwt({ sub = 'alice', scope = 'accounts:read' })
+    return token({ sub = 'alice', scope = 'accounts:read' })
   end
 
   it('relays a step-up challenge rather than a flat deny', function()
@@ -333,34 +304,6 @@ describe('step-up and PDP advice', function()
     assert.is_truthy(state.exited)
     assert.matches('mDL', mock.json_encode(state.exited.body))
   end)
-
-  it('requires a logged-in user when the route says so', function()
-    local plugin, state = load_plugin({
-      method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = permit_token() }, -- no X-User-Token
-      pdp = { decision = true },
-    })
-    mock.run_access(plugin, base_conf({ require_user_login = true }))
-    assert.is_truthy(state.exited)
-    assert.equal(401, state.exited.status)
-    assert.equal(0, #state.pdp_requests) -- challenged before the PDP is consulted
-  end)
-
-  it('carries the user token scope into the PDP context', function()
-    local plugin, state = load_plugin({
-      method = 'POST', path = '/payments',
-      headers = {
-        authorization = permit_token(),
-        ['x-user-token'] = mock.jwt({ sub = 'alice', scope = 'payments:approve', acr = 'urn:mfa' }),
-      },
-      body = '{"from_account":"a","amount":50}',
-      pdp = { decision = true },
-    })
-    mock.run_access(plugin, base_conf({ require_user_login = true }))
-    assert.is_nil(state.exited)
-    local sent = mock.json_decode(state.pdp_requests[1].body)
-    assert.equal('payments:approve', sent.context.user_scope)
-  end)
 end)
 
 describe('challenge parity with the other PEPs', function()
@@ -369,7 +312,7 @@ describe('challenge parity with the other PEPs', function()
   it('renders a step-up identically to the Go PEP', function()
     local plugin, state = load_plugin({
       method = 'POST', path = '/payments',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       body = '{"from_account":"a","amount":9000}',
       pdp = { decision = false, context = { reason = 'approve it', step_up_required = true, step_up_scope = 'pay:approve' } },
     })
@@ -385,7 +328,7 @@ describe('challenge parity with the other PEPs', function()
   it('renders identity proofing identically to the Go PEP', function()
     local plugin, state = load_plugin({
       method = 'POST', path = '/accounts',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       body = '{}',
       pdp = { decision = false, context = { identity_proofing_required = true, identity_proofing_doctype = 'org.iso.18013.5.1.mDL' } },
     })
@@ -400,7 +343,7 @@ describe('challenge parity with the other PEPs', function()
   it('defaults the doctype when the policy names none', function()
     local plugin, state = load_plugin({
       method = 'POST', path = '/accounts',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       body = '{}',
       pdp = { decision = false, context = { identity_proofing_required = true } },
     })
@@ -411,7 +354,7 @@ describe('challenge parity with the other PEPs', function()
   it('resolves identity before step-up when a policy asks for both', function()
     local plugin, state = load_plugin({
       method = 'POST', path = '/payments',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       body = '{"from_account":"a","amount":9000}',
       pdp = { decision = false, context = {
         identity_proofing_required = true, step_up_required = true, step_up_scope = 's' } },
@@ -421,98 +364,344 @@ describe('challenge parity with the other PEPs', function()
   end)
 end)
 
-describe('COAZ delegation on an MCP route', function()
-  local tools_call = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}'
+-- The engine's side of a check, as a responder: `engine` is a table (the JSON answer),
+-- false (connection refused), a number (that status, empty body) or a function.
+local function engine_route(engine, opts)
+  local calls = {}
+  opts = opts or {}
+  opts.pdp = function(url, req)
+    calls[#calls + 1] = { url = url, body = req.body, headers = req.headers, ssl_verify = req.ssl_verify }
+    if url:find('/v1/mcp/check', 1, true) then
+      if type(engine) == 'function' then return engine(url, req) end
+      if engine == false then return nil, 'connection refused' end
+      if type(engine) == 'number' then return { status = engine, body = '' } end
+      return { status = 200, body = mock.json_encode(engine or { decision = true, upstream_headers = {} }) }
+    end
+    return { status = 200, body = mock.json_encode({ decision = true }) }
+  end
+  local plugin, state = load_plugin(opts)
+  return plugin, state, calls
+end
 
-  local function mcp_route(engine, over)
-    local calls = {}
-    local plugin, state = load_plugin({
-      method = 'POST', path = '/mcp',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice', act = { sub = 'agent-1' } }) },
-      body = tools_call,
-      pdp = function(url, req)
-        calls[#calls + 1] = url
-        if url:find('/v1/mcp/check', 1, true) then
-          if type(engine) == 'function' then return engine(url, req) end
-          if engine == false then return nil, 'connection refused' end
-          return { status = 200, body = mock.json_encode(engine) }
-        end
-        return { status = 200, body = mock.json_encode({ decision = true }) }
-      end,
-    })
-    local conf = base_conf({ style = 'mcp', coaz_url = 'http://coaz-pep:9192', mcp_upstream_url = 'http://mcp:8090/mcp' })
-    for k, v in pairs(over or {}) do conf[k] = v end
-    mock.run_access(plugin, conf)
+local function checks(calls)
+  local out = {}
+  for _, c in ipairs(calls) do
+    if c.url:find('/v1/mcp/check', 1, true) then out[#out + 1] = mock.json_decode(c.body) end
+  end
+  return out
+end
+
+local TOOLS_CALL = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}'
+
+describe('an MCP route: every request goes to coaz-pep', function()
+  local function mcp(method, body, over, engine, extra)
+    local opts = { method = method, path = '/mcp', body = body,
+      headers = { authorization = token(), ['content-type'] = 'application/json' } }
+    for k, v in pairs(extra or {}) do opts[k] = v end
+    local plugin, state, calls = engine_route(engine, opts)
+    mock.run_access(plugin, mcp_conf(over))
     return state, calls
   end
 
-  it('delegates a tools/call to the engine and forwards its upstream headers', function()
-    local state, calls = mcp_route({
-      decision = true,
-      upstream_headers = { ['X-Auth-Principal'] = 'alice', ['X-Coaz'] = 'permit' },
+  it('sends every method and every JSON-RPC message, not only tools/call', function()
+    local cases = {
+      { 'POST', TOOLS_CALL },
+      { 'POST', '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' },
+      { 'POST', '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' },
+      { 'POST', '{"jsonrpc":"2.0","method":"notifications/initialized"}' },
+      { 'POST', '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"x"}}' },
+      { 'POST', '{"jsonrpc":"2.0","id":3,"result":{}}' }, -- a client's answer to a server request
+      { 'GET', nil },
+      { 'DELETE', nil },
+    }
+    for _, c in ipairs(cases) do
+      local state, calls = mcp(c[1], c[2])
+      assert.is_nil(state.exited, c[1] .. ' ' .. tostring(c[2]))
+      local sent = checks(calls)
+      assert.equal(1, #sent, c[1] .. ' ' .. tostring(c[2]))
+      assert.equal(c[1], sent[1].method)
+      assert.equal(c[2] or '', sent[1].body)
+      assert.equal(1, #calls, 'nothing but the check is called')
+    end
+  end)
+
+  it('sends the route\'s knobs and the five headers coaz-pep verifies', function()
+    local state, calls = mcp('POST', TOOLS_CALL, { require_user_login = true, pdp_layers = { 'static', 'resource' }, resource = 'https://mcp.example/' }, nil, {
+      headers = { authorization = token(), ['x-user-token'] = 'user.jwt.sig', dpop = 'proof', ['content-type'] = 'application/json',
+        ['content-encoding'] = 'identity', ['x-other'] = 'not forwarded' },
     })
     assert.is_nil(state.exited)
-    assert.is_truthy(calls[1]:find('/v1/mcp/check', 1, true), 'the tools/call should go to the engine')
-    assert.equal('permit', state.upstream_headers['X-Coaz'])
+    local sent = checks(calls)[1]
+    assert.equal('mcp', sent.config.style)
+    assert.equal('test-pep', sent.config.pep_label)
+    assert.equal('true', sent.config.coaz_defaults, 'default mappings are on unless the route turns them off')
+    assert.equal('true', sent.config.require_user_login)
+    assert.equal('true', sent.config.require_token)
+    assert.equal('http://mcp:8090/mcp', sent.config.mcp_upstream_url)
+    assert.equal('static,resource', sent.config.pdp_layers)
+    assert.equal('closed', sent.config.fail_mode)
+    assert.equal('https://mcp.example', sent.config.resource)
+    assert.equal('/mcp', sent.path)
+    assert.same({ authorization = token(), ['x-user-token'] = 'user.jwt.sig', dpop = 'proof',
+      ['content-type'] = 'application/json', ['content-encoding'] = 'identity' }, sent.headers)
+    assert.equal('Bearer check-token', calls[1].headers['Authorization'])
+    -- Only an explicit false opts out of the default mappings.
+    local _, calls2 = mcp('POST', TOOLS_CALL, { coaz_defaults = false })
+    assert.equal('false', checks(calls2)[1].config.coaz_defaults)
   end)
 
-  it('relays the engine JSON-RPC error body verbatim on a deny', function()
-    local rpc_error = '{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"denied by policy"}}'
-    local state = mcp_route({
-      decision = false,
-      response = { status = 200, body = rpc_error },
+  it('applies the engine\'s upstream headers on a permit, an empty value clearing one', function()
+    local state = mcp('POST', TOOLS_CALL, nil, {
+      decision = true,
+      upstream_headers = { ['X-Auth-Principal'] = 'alice', ['X-Auth-Agent'] = 'agent-1', ['X-Auth-Scope'] = '', ['X-Auth-Acr'] = '' },
+      response_headers = { ['X-PDP-Action'] = 'tools/call:get_customer', ['X-PDP-Reason'] = 'ok' },
     })
-    assert.is_truthy(state.exited)
+    assert.is_nil(state.exited)
+    assert.equal('alice', state.upstream_headers['X-Auth-Principal'])
+    assert.equal('agent-1', state.upstream_headers['X-Auth-Agent'])
+    assert.is_nil(state.upstream_headers['X-Auth-Scope'])
+    assert.is_nil(state.upstream_headers['X-Auth-Acr'])
+  end)
+
+  it('relays the engine\'s deny verbatim', function()
+    local rpc_error = '{"jsonrpc":"2.0","id":7,"error":{"code":-32001,"message":"denied by policy"}}'
+    local state = mcp('POST', TOOLS_CALL, nil, {
+      decision = false,
+      response = { status = 200, headers = { ['Content-Type'] = 'application/json', ['X-PDP-Decision'] = 'DENY' }, body = rpc_error },
+    })
     -- Relayed as-is: two renderings of one decision would drift.
     assert.equal(200, state.exited.status)
-    assert.matches('-32001', tostring(state.exited.body))
+    assert.equal(rpc_error, state.exited.body)
+    assert.equal('application/json', state.exited.headers['Content-Type'])
   end)
 
-  it('FAILS CLOSED when the engine is unreachable', function()
-    local state = mcp_route(false)
-    assert.is_truthy(state.exited)
-    assert.equal(503, state.exited.status)
-    assert.matches('unreachable', state.exited.body.reason)
-  end)
-
-  it('FAILS CLOSED when the engine errors', function()
-    local state = mcp_route(function() return { status = 500, body = 'boom' } end)
-    assert.is_truthy(state.exited)
-    assert.equal(503, state.exited.status)
-  end)
-
-  it('does not delegate JSON-RPC that is not a tools/call', function()
-    local calls = {}
-    local plugin, state = load_plugin({
-      method = 'POST', path = '/mcp',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
-      body = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
-      pdp = function(url)
-        calls[#calls + 1] = url
-        return { status = 200, body = mock.json_encode({ decision = true }) }
-      end,
-    })
-    mock.run_access(plugin, base_conf({ style = 'mcp', coaz_url = 'http://coaz-pep:9192' }))
-    for _, u in ipairs(calls) do
-      assert.is_nil(u:find('/v1/mcp/check', 1, true), 'only tools/call is delegated')
+  it('permits only on a JSON true: anything else from the engine is a refusal, closed', function()
+    for _, answer in ipairs({ { decision = 'true' }, { decision = 1 }, {}, '"yes"', 'not json' }) do
+      local engine = type(answer) == 'string'
+        and function() return { status = 200, body = answer } end or answer
+      local state = mcp('POST', TOOLS_CALL, nil, engine)
+      assert.equal(503, state.exited.status, mock.json_encode(answer))
+      assert.is_nil(state.upstream_headers['X-Auth-Principal'])
     end
   end)
 
-  it('does not delegate when coaz_url is unset', function()
-    local calls = {}
-    local plugin = load_plugin({
-      method = 'POST', path = '/mcp',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
-      body = tools_call,
-      pdp = function(url)
-        calls[#calls + 1] = url
-        return { status = 200, body = mock.json_encode({ decision = true }) }
-      end,
-    })
-    mock.run_access(plugin, base_conf({ style = 'mcp' }))
-    for _, u in ipairs(calls) do
-      assert.is_nil(u:find('/v1/mcp/check', 1, true))
+  it('FAILS CLOSED when the engine is unreachable, erroring or refusing the call', function()
+    for _, engine in ipairs({ false, 500, 429, 401, 400, 302 }) do
+      local state = mcp('POST', TOOLS_CALL, nil, engine)
+      assert.equal(503, state.exited.status, tostring(engine))
+      assert.equal('authorization_failed', state.exited.body.error)
     end
+  end)
+
+  it('a deny without a usable response is still a deny', function()
+    local state = mcp('POST', TOOLS_CALL, nil, { decision = false, response = { status = 'teapot' } })
+    assert.equal(403, state.exited.status)
+  end)
+
+  it('carries the engine\'s response headers to the client on a permit', function()
+    local plugin, _, _ = engine_route({
+      decision = true, upstream_headers = {},
+      response_headers = { ['X-PDP-Action'] = 'tools/call:get_customer', ['X-PDP-Reason'] = 'Permitted by policy.' },
+    }, { method = 'POST', path = '/mcp', body = TOOLS_CALL, headers = { authorization = token() } })
+    local state = mock.proxy(plugin, mcp_conf())
+    assert.equal('tools/call:get_customer', state.response_headers['X-PDP-Action'])
+    assert.equal('Permitted by policy.', state.response_headers['X-PDP-Reason'])
+    assert.equal('PERMIT', state.response_headers['X-PDP-Decision'])
+    assert.equal('test-pep', state.response_headers['X-PDP-PEP'])
+  end)
+
+  it('passes a body in well-formed UTF-8, multi-byte characters and all', function()
+    local body = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"caf\195\169","arguments":{"note":"\240\159\152\128 \226\130\172"}}}'
+    local state, calls = mcp('POST', body)
+    assert.is_nil(state.exited)
+    assert.equal(body, checks(calls)[1].body)
+  end)
+
+  it('refuses more headers than it will read, rather than miss a repeated one', function()
+    local headers = { authorization = token() }
+    for i = 1, 1001 do headers['x-pad-' .. i] = 'v' end
+    for _, conf in ipairs({ mcp_conf(), base_conf() }) do
+      local plugin, state, calls = engine_route(nil, { method = 'POST', path = '/mcp', body = TOOLS_CALL, headers = headers })
+      mock.run_access(plugin, conf)
+      assert.equal(431, state.exited.status)
+      assert.equal(0, #calls)
+    end
+  end)
+end)
+
+describe('an MCP route refuses a body it cannot read in full or parse strictly', function()
+  -- Contract section 1: a POST body must be exactly one JSON object the PEP positively
+  -- understands. Anything else is refused here, with no call to coaz-pep.
+  local function refused(body, over, extra)
+    local opts = { method = 'POST', path = '/mcp', body = body,
+      headers = { authorization = token(), ['content-type'] = 'application/json' } }
+    for k, v in pairs(extra or {}) do opts[k] = v end
+    if opts.headers_extra then
+      for k, v in pairs(opts.headers_extra) do opts.headers[k] = v end
+      opts.headers_extra = nil
+    end
+    local plugin, state, calls = engine_route(nil, opts)
+    mock.run_access(plugin, mcp_conf(over))
+    assert.is_truthy(state.exited, 'expected a refusal for ' .. tostring(body))
+    assert.equal(0, #calls, 'nothing may reach coaz-pep')
+    assert.equal('application/json', state.exited.headers['Content-Type'])
+    assert.equal('DENY', state.exited.headers['X-PDP-Decision'])
+    local rpc = state.exited.body
+    assert.equal('2.0', rpc.jsonrpc)
+    return state.exited.status, rpc.error.code, rpc.error.message, rpc.id
+  end
+
+  it('a body larger than the gateway will read is a 413, never an empty or partial body', function()
+    local big = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"pad":"'
+      .. string.rep('x', 9 * 1024) .. '"}}}'
+    -- On Kong before 3.9 anything past client_body_buffer_size is out of reach.
+    local status, code, message = refused(big, nil, { kong_version_num = 3007001 })
+    assert.equal(413, status); assert.equal(-32600, code)
+    assert.equal('Invalid Request: request body too large for the PEP to authorise', message)
+    -- On 3.9+ it is read back from disk up to max_request_body_size, and beyond it refused.
+    status = refused(big, { max_request_body_size = 4096 })
+    assert.equal(413, status)
+    -- Within the max, it is read whole and sent.
+    local plugin, state, calls = engine_route(nil, { method = 'POST', path = '/mcp', body = big, headers = { authorization = token() } })
+    mock.run_access(plugin, mcp_conf())
+    assert.is_nil(state.exited)
+    assert.equal(big, checks(calls)[1].body)
+  end)
+
+  it('a batch is refused, empty or not', function()
+    for _, body in ipairs({ '[' .. TOOLS_CALL .. ']', '[]', '  [ ]' }) do
+      local status, code, message = refused(body)
+      assert.equal(400, status); assert.equal(-32600, code)
+      assert.matches('^Invalid Request: ', message)
+    end
+  end)
+
+  it('a Content-Encoding other than identity is a 415', function()
+    for _, enc in ipairs({ 'gzip', 'br', 'identity, gzip' }) do
+      local status, code, message = refused(TOOLS_CALL, nil, { headers_extra = { ['content-encoding'] = enc } })
+      assert.equal(415, status); assert.equal(-32600, code)
+      assert.equal('Invalid Request: Content-Encoding not supported by the PEP', message)
+    end
+  end)
+
+  it('a BOM, invalid UTF-8, trailing data or anything not JSON is a parse error', function()
+    for _, body in ipairs({ '\239\187\191' .. TOOLS_CALL, '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"\255"}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"\237\160\128"}}',
+      TOOLS_CALL .. ' {}', 'not json', '' }) do
+      local status, code, message, id = refused(body)
+      assert.equal(400, status, body); assert.equal(-32700, code, body)
+      assert.equal('Parse error', message)
+      assert.equal(mock.null, id)
+    end
+  end)
+
+  it('anything but one JSON-RPC object is an invalid request', function()
+    for _, body in ipairs({ '"tools/call"', '42', 'null', 'true',
+      '{"jsonrpc":"2.0","id":1,"method":7}',
+      '{"jsonrpc":"2.0","id":1}',
+      '{"jsonrpc":"2.0","id":1,"result":{},"error":{}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call"}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":""}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":{"x":1}}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":["get_customer"]}' }) do
+      local status, code = refused(body)
+      assert.equal(400, status, body); assert.equal(-32600, code, body)
+    end
+  end)
+
+  it('member names that differ only in case are refused, at the top and in params', function()
+    for _, body in ipairs({
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list","Method":"tools/call","params":{"name":"t"}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_balance"},"Params":{"name":"make_payment"}}',
+      '{"jsonrpc":"2.0","id":1,"ID":2,"method":"ping"}',
+      '{"jsonrpc":"2.0","JSONRPC":"1.0","id":1,"method":"ping"}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_balance","Name":"make_payment"}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{},"ARGUMENTS":{"x":1}}}',
+      '{"jsonrpc":"2.0","id":1,"\\u004dethod":"tools/call","method":"ping"}' }) do
+      local status, code, message, id = refused(body)
+      assert.equal(400, status, body); assert.equal(-32600, code, body)
+      assert.matches('case', message)
+      assert.is_not_nil(id)
+    end
+  end)
+
+  it('echoes the request id when it could be read', function()
+    local _, _, _, id = refused('{"jsonrpc":"2.0","id":"req-9","method":"tools/call","params":{}}')
+    assert.equal('req-9', id)
+  end)
+
+  it('a body on anything but a POST is refused', function()
+    for _, method in ipairs({ 'GET', 'DELETE' }) do
+      local plugin, state, calls = engine_route(nil, { method = method, path = '/mcp', body = TOOLS_CALL, headers = { authorization = token() } })
+      mock.run_access(plugin, mcp_conf())
+      assert.equal(400, state.exited.status)
+      assert.equal(-32600, state.exited.body.error.code)
+      assert.equal(0, #calls)
+    end
+  end)
+
+  it('a repeated identity header is refused rather than guessed at', function()
+    local plugin, state, calls = engine_route(nil, { method = 'POST', path = '/mcp', body = TOOLS_CALL,
+      headers = { authorization = { token({ sub = 'alice' }), token({ sub = 'mallory' }) } } })
+    mock.run_access(plugin, mcp_conf())
+    assert.equal(400, state.exited.status)
+    assert.equal(0, #calls)
+  end)
+end)
+
+describe('a REST route with coaz_url: coaz-pep decides the whole request', function()
+  -- coaz-pep verifies the access token, X-User-Token and the DPoP proof itself, maps the
+  -- request, discovers the PDPs and evaluates the layers. The plugin sends it the
+  -- request and enforces the answer; it decodes no token and calls no PDP of its own.
+  local function rest(method, path, body, over, engine, headers)
+    local plugin, state, calls = engine_route(engine, { method = method, path = path, body = body,
+      headers = headers or { authorization = token(), ['x-user-token'] = 'user.jwt.sig' } })
+    mock.run_access(plugin, coaz_conf(over))
+    return state, calls
+  end
+
+  it('sends the request and the route\'s knobs, and nothing else is called', function()
+    local state, calls = rest('POST', '/payments', '{"from_account":"a","amount":50}',
+      { require_dpop = true, require_user_login = true, stepup_scope = 'payments:approve', forward_access_token = true, legacy_subject_identity = false })
+    assert.is_nil(state.exited)
+    assert.equal(1, #calls)
+    local sent = checks(calls)[1]
+    assert.equal('rest', sent.config.style)
+    assert.equal('true', sent.config.require_dpop)
+    assert.equal('true', sent.config.require_user_login)
+    assert.equal('payments:approve', sent.config.stepup_scope)
+    assert.equal('make_payment', sent.config.stepup_action)
+    assert.equal('true', sent.config.forward_access_token)
+    assert.equal('false', sent.config.legacy_subject_identity)
+    assert.equal('POST', sent.method)
+    assert.equal('/payments', sent.path)
+    assert.equal('{"from_account":"a","amount":50}', sent.body)
+    assert.equal('user.jwt.sig', sent.headers['x-user-token'])
+  end)
+
+  it('no longer asks /v1/dpop/verify: the proof travels in the check', function()
+    local _, calls = rest('GET', '/accounts/a/balance', nil, { require_dpop = true }, nil,
+      { authorization = 'DPoP ' .. mock.jwt({ sub = 'alice', cnf = { jkt = 'T' } }), dpop = 'the.proof.jws' })
+    for _, c in ipairs(calls) do assert.is_nil(c.url:find('/v1/dpop/verify', 1, true)) end
+    assert.equal('the.proof.jws', checks(calls)[1].headers.dpop)
+  end)
+
+  it('leaves login to coaz-pep, which verifies X-User-Token', function()
+    local challenge = '{"error":"login_required"}'
+    local state = rest('GET', '/accounts/a/balance', nil, { require_user_login = true }, {
+      decision = false,
+      response = { status = 401, headers = { ['WWW-Authenticate'] = 'Bearer error="insufficient_user_authentication"', ['Content-Type'] = 'application/json' }, body = challenge },
+    }, { authorization = token() })
+    assert.equal(401, state.exited.status)
+    assert.equal(challenge, state.exited.body)
+    assert.equal('Bearer error="insufficient_user_authentication"', state.exited.headers['WWW-Authenticate'])
+  end)
+
+  it('refuses a body it cannot read in full', function()
+    local state, calls = rest('POST', '/payments', '{"pad":"' .. string.rep('x', 9000) .. '"}', { max_request_body_size = 1024 })
+    assert.equal(413, state.exited.status)
+    assert.equal('authorization_failed', state.exited.body.error)
+    assert.equal(0, #calls)
   end)
 end)
 
@@ -520,7 +709,7 @@ describe('claim handling and remaining denials', function()
   it('denies a token with no readable subject', function()
     local plugin, state = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ scope = 'a' }) }, -- no sub
+      headers = { authorization = token({ scope = 'a' }) }, -- no sub
       pdp = { decision = true },
     })
     mock.run_access(plugin, base_conf())
@@ -534,28 +723,17 @@ describe('claim handling and remaining denials', function()
     -- looks direct and the agent disappears from the audit trail.
     local plugin, state = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice', act = '{"sub":"agent-9"}' }) },
+      headers = { authorization = token({ sub = 'alice', act = '{"sub":"agent-9"}' }) },
       pdp = { decision = true },
     })
     mock.run_access(plugin, base_conf())
     assert.equal('agent-9', state.upstream_headers['X-Auth-Agent'])
   end)
 
-  it('sends a login challenge with an acr hint when no user is present', function()
-    local plugin, state = load_plugin({
-      method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
-      pdp = { decision = true },
-    })
-    mock.run_access(plugin, base_conf({ require_user_login = true }))
-    assert.equal(401, state.exited.status)
-    assert.matches('insufficient_user_authentication', state.exited.headers['WWW-Authenticate'])
-  end)
-
   it('carries an internal_transfer flag and a default account type into the request', function()
     local plugin, state = load_plugin({
       method = 'POST', path = '/payments',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       body = '{"from_account":"a","to_account":"b","amount":5,"internal_transfer":true}',
       pdp = { decision = true },
     })
@@ -565,7 +743,7 @@ describe('claim handling and remaining denials', function()
 
     local plugin2, state2 = load_plugin({
       method = 'POST', path = '/accounts',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       body = '{}',
       pdp = { decision = true },
     })
@@ -579,7 +757,7 @@ describe('subject.identity -> subject.id migration', function()
   local function sent_subject(over)
     local plugin, state = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({
+      headers = { authorization = token({
         sub = 'alice', act = { sub = 'agent-7' }, client_id = 'c1' }) },
       pdp = { decision = true },
     })
@@ -617,7 +795,7 @@ describe('subject.identity -> subject.id migration', function()
   it('falls back to client_id then a placeholder', function()
     local plugin, state = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice', client_id = 'c1' }) },
+      headers = { authorization = token({ sub = 'alice', client_id = 'c1' }) },
       pdp = { decision = true },
     })
     mock.run_access(plugin, base_conf())
@@ -625,7 +803,7 @@ describe('subject.identity -> subject.id migration', function()
 
     local plugin2, state2 = load_plugin({
       method = 'GET', path = '/accounts/a/balance',
-      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) },
+      headers = { authorization = token({ sub = 'alice' }) },
       pdp = { decision = true },
     })
     mock.run_access(plugin2, base_conf())

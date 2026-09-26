@@ -1,6 +1,38 @@
 -- Config schema for the authzen-pdp Kong plugin.
 local typedefs = require "kong.db.schema.typedefs"
 
+local function set(v) return type(v) == "string" and v ~= "" end
+
+-- The cross-field rules. Each is a configuration a route must not run with: failing at
+-- config load is far better than discovering it per request. See ../README.md.
+local function validate(config)
+  local delegated = set(config.coaz_url)
+
+  -- An MCP route is decided by coaz-pep, every request of it: the JSON-RPC is parsed
+  -- strictly there, and a tool call is authorised per its mapping, which needs CEL.
+  if config.style == "mcp" and not delegated then
+    return nil, "style=mcp needs coaz_url: every request on an MCP route is decided by coaz-pep"
+  end
+  -- require_dpop needs somewhere to verify the proof. This plugin cannot: there is no
+  -- JOSE verifier available to it, so on its own it could only compare the proof's JWK
+  -- thumbprint to cnf.jkt without checking the proof's signature — and the proof carries
+  -- that JWK, so the comparison proves nothing.
+  if config.require_dpop == true and not delegated then
+    return nil, "require_dpop needs coaz_url: this plugin cannot verify a DPoP proof signature itself, so verification is delegated to coaz-pep"
+  end
+  -- The same for the user's token: its claims drive consent and step-up, so a forged one
+  -- is a bypass of both.
+  if config.require_user_login == true and not delegated then
+    return nil, "require_user_login needs coaz_url: this plugin cannot verify X-User-Token's signature, so the route is decided by coaz-pep"
+  end
+  -- Decided here, the route reads the access token's claims without verifying its
+  -- signature. That is safe only when something in front of it did.
+  if not delegated and config.access_token_verified_upstream ~= true and config.allow_insecure ~= true then
+    return nil, "without coaz_url this plugin reads the access token's claims unverified: set access_token_verified_upstream when an openid-connect or jwt plugin validates Authorization first, or set coaz_url so coaz-pep verifies it"
+  end
+  return true
+end
+
 return {
   name = "authzen-pdp",
   fields = {
@@ -15,25 +47,24 @@ return {
           { authzen_api_key = { type = "string", required = true, referenceable = true } },
           -- Label shown in denials and the X-PDP-PEP response header, e.g. "PEP#2 (Bank API edge)".
           { pep_label = { type = "string", default = "kong-pep" } },
-          -- Request-mapping style: "rest" (Resource Server) or "mcp" (MCP edge).
+          -- Request-mapping style: "rest" (Resource Server) or "mcp" (MCP edge, which
+          -- needs coaz_url).
           { style = { type = "string", default = "rest",
                       one_of = { "rest", "mcp" } } },
           -- Reject requests that carry no readable access token.
           { require_token = { type = "boolean", default = true } },
-          -- Enforce the DPoP sender-constraint binding (cnf.jkt) on the token.
+          -- Enforce the DPoP sender constraint (RFC 9449). Needs coaz_url.
           { require_dpop = { type = "boolean", default = false } },
-          -- Require a logged-in end user (X-User-Token). If absent, return a
-          -- 401 login-required challenge (RFC 9470 step-up) so the app logs in.
+          -- Require a logged-in end user (X-User-Token), verified by coaz-pep. Needs coaz_url.
           { require_user_login = { type = "boolean", default = false } },
           -- Step-up scope: for `stepup_action`, the user's token (X-User-Token)
           -- must carry this scope; if not, return 401 insufficient_scope.
           { stepup_scope = { type = "string" } },
           { stepup_action = { type = "string", default = "make_payment" } },
-          -- COAZ (OpenID AuthZEN MCP profile): base URL of the coaz-pep
-          -- engine's HTTP check API. When set on an "mcp"-style route,
-          -- tools/call requests are authorized per the tool's x-coaz-mapping
-          -- (discovery from tools/list, CEL evaluation, JSON-RPC errors) by
-          -- the shared engine — one spec implementation for every gateway.
+          -- coaz-pep's HTTP check API. Set, coaz-pep decides the whole request on this
+          -- route — verifying the access token, X-User-Token and the DPoP proof, mapping
+          -- it, finding the PDPs — and this plugin enforces the answer. Required for an
+          -- mcp route, require_dpop and require_user_login.
           { coaz_url = { type = "string" } },
           -- coaz-pep's HTTP base when this route is the resource's federation face: the
           -- plugin relays the resource's entity configuration and RFC 9728 document from
@@ -48,15 +79,29 @@ return {
           -- silently accepts any certificate has no integrity on the decision it is
           -- enforcing. Set false only for local development against self-signed certs.
           { pdp_ssl_verify = { type = "boolean", default = true } },
-          -- Authorize tools that declare no x-authzen-mapping against the COAZ-MCP
-          -- binding's default tools/call mapping, as it requires. Off keeps the
-          -- pass-through deployed routes expect — which is NOT conformant.
-          { coaz_defaults = { type = "boolean", default = false } },
+          -- Govern every MCP method by the COAZ-MCP binding's default mappings: tools
+          -- that declare no mapping, and every method that is not a tools/call. On by
+          -- default; false keeps the old pass-through for methods other than tools/call,
+          -- which is NOT conformant.
+          { coaz_defaults = { type = "boolean", default = true } },
           -- Also send the non-standard `subject.identity` alongside AuthZEN's
           -- `subject.id`. On by default so upgrading the gateway alone cannot break a
           -- policy still reading the old field. Set false once policies read
           -- subject.id; the field is removed in a later release.
           { legacy_subject_identity = { type = "boolean", default = true } },
+          -- Without coaz_url, the route is decided here on the access token's claims,
+          -- which this plugin does not verify. Set true when an openid-connect or jwt
+          -- plugin on the route validates Authorization first (it runs before this one);
+          -- without it, or coaz_url, or allow_insecure, the configuration is refused.
+          { access_token_verified_upstream = { type = "boolean", default = false } },
+          -- The escape hatch: lets the route run with what would otherwise refuse it —
+          -- unverified claims. For development and demos only; logged when the
+          -- configuration loads.
+          { allow_insecure = { type = "boolean", default = false } },
+          -- The largest request body, in bytes, the plugin reads to authorise a request.
+          -- A body Kong buffered to disk is read back up to this (Kong 3.9+); a larger one
+          -- is refused with a 413, never authorised unread.
+          { max_request_body_size = { type = "integer", default = 1048576, gt = 0 } },
           -- PDP discovery (see ../README.md#pdp-discovery). "off" is the static PDP
           -- with the AuthZEN default paths and no metadata fetch; "authzen" reads
           -- authzen_url's .well-known/authzen-configuration; "resource" reads the
@@ -98,21 +143,7 @@ return {
           -- decision, not a failure.
           { fail_mode = { type = "string", default = "closed", one_of = { "closed", "open" } } },
         },
-        -- require_dpop needs somewhere to verify the proof. This plugin cannot: there
-        -- is no JOSE verifier available to it, so on its own it can compare the proof's
-        -- JWK thumbprint to cnf.jkt without ever checking the proof's signature — and
-        -- the proof carries that JWK, so the comparison proves nothing. Verification is
-        -- delegated to coaz-pep, which means a route demanding sender-constrained
-        -- tokens with no coaz_url is misconfigured. Failing at config load is far
-        -- better than discovering it per request.
-        entity_checks = {
-          { conditional = {
-              if_field = "require_dpop", if_match = { eq = true },
-              then_field = "coaz_url",
-              then_match = { required = true },
-              then_err = "require_dpop needs coaz_url: this plugin cannot verify a DPoP proof signature itself, so verification is delegated to coaz-pep",
-          } },
-        },
+        custom_validator = validate,
       },
     },
   },
