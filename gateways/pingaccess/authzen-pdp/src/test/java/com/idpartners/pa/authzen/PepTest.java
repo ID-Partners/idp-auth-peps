@@ -425,21 +425,48 @@ class PepTest {
             c.mcp_upstream_url = "http://mcp:8090/mcp";
         }
         Verdict v = pep(c, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice", "act", obj("sub", "agent-1"))),
-            "x-user-token", "ut", "content-type", "application/json"), TOOLS_CALL));
+            "x-user-token", "ut", "content-type", "application/json", "dpop", "proof", "content-encoding", "identity"), TOOLS_CALL));
         return new Object[]{v, t};
     }
 
+    static AuthZenRuleConfiguration mcpConf() {
+        AuthZenRuleConfiguration c = baseConf();
+        c.style = "mcp";
+        c.coaz_url = COAZ;
+        c.coaz_api_key = "check-token";
+        return c;
+    }
+
+    static FakeTransport engine(Object verdict) {
+        return pdp(obj("decision", true)).route(COAZ + "/v1/mcp/check", verdict);
+    }
+
+    static Verdict mcpBody(FakeTransport t, byte[] body, String... headers) {
+        Map<String, java.util.List<String>> h = new java.util.LinkedHashMap<>();
+        h.put("authorization", List.of(bearer(obj("sub", "alice"))));
+        for (int i = 0; i + 1 < headers.length; i += 2) {
+            h.computeIfAbsent(headers[i], k -> new ArrayList<>()).add(headers[i + 1]);
+        }
+        return pep(mcpConf(), t).decide(new PepRequest("POST", "/mcp", h, body, true, null));
+    }
+
     @Test
-    void delegatesAToolsCallToTheEngineAndForwardsItsUpstreamHeaders() {
-        Object[] r = mcpRoute(obj("decision", true, "upstream_headers", obj("X-Auth-Principal", "alice", "X-Coaz", "permit"),
-            "response_headers", obj("X-PDP-Action", "tools/call:get_customer", "X-PDP-Reason", "ok")), null);
+    void delegatesAToolsCallToTheEngineWithTheFiveHeadersAndTheRawBody() {
+        Object[] r = mcpRoute(obj("decision", true, "upstream_headers", obj("X-Auth-Principal", "alice", "X-Auth-Agent", "agent-1",
+                "X-Auth-Scope", "", "X-Auth-Acr", "urn:mfa", "X-Coaz", "permit"),
+            "response_headers", obj("X-PDP-Action", "tools/call:get_customer", "X-PDP-Reason", "ok", "X-Trace", "t1", "Content-Length", "9")), null);
         Verdict v = (Verdict) r[0];
         FakeTransport t = (FakeTransport) r[1];
         assertTrue(v.permit);
-        assertTrue(t.hits.get(0).url().contains("/v1/mcp/check"), "the tools/call should go to the engine");
+        assertTrue(t.hits.get(0).url().endsWith("/v1/mcp/check"), "the tools/call should go to the engine");
+        assertEquals("alice", v.upstreamHeaders.get("X-Auth-Principal"));
+        assertEquals("", v.upstreamHeaders.get("X-Auth-Scope"), "empty means: leave the header off");
         assertEquals("permit", v.upstreamHeaders.get("X-Coaz"));
         assertEquals("tools/call:get_customer", v.responseHeaders.get("X-PDP-Action"));
         assertEquals("ok", v.responseHeaders.get("X-PDP-Reason"));
+        assertEquals("PERMIT", v.responseHeaders.get("X-PDP-Decision"));
+        assertEquals("t1", v.responseHeaders.get("X-Trace"), "response_headers are carried");
+        assertNull(v.responseHeaders.get("Content-Length"), "never a framing header");
         assertEquals(0, t.count("/access/v1/evaluation"), "the engine asked the PDP, not this rule");
         JsonNode sentBody = Json.parse(t.hits.get(0).body());
         assertEquals("mcp", sentBody.get("config").get("style").asText());
@@ -450,31 +477,60 @@ class PepTest {
         assertFalse(sentBody.get("config").has("fail_mode"));
         assertFalse(sentBody.get("config").has("resource"));
         assertFalse(sentBody.get("config").has("forward_access_token"));
-        assertEquals("ut", sentBody.get("headers").get("x-user-token").asText());
+        JsonNode h = sentBody.get("headers");
+        assertEquals("ut", h.get("x-user-token").asText());
+        assertEquals("application/json", h.get("content-type").asText());
+        assertEquals("proof", h.get("dpop").asText());
+        assertEquals("identity", h.get("content-encoding").asText());
+        assertTrue(h.get("authorization").asText().startsWith("Bearer "));
         assertEquals(TOOLS_CALL, sentBody.get("body").asText());
         assertEquals("POST", sentBody.get("method").asText());
         assertEquals("/mcp", sentBody.get("path").asText());
     }
 
     @Test
+    void aPermitWithoutUpstreamHeadersStillStripsEveryXAuthHeader() {
+        Verdict v = (Verdict) mcpRoute(obj("decision", true), null)[0];
+        assertTrue(v.permit);
+        for (String k : new String[]{"X-Auth-Principal", "X-Auth-Agent", "X-Auth-Scope", "X-Auth-Acr"}) {
+            assertEquals("", v.upstreamHeaders.get(k), k + " is removed: coaz-pep asserted nothing");
+        }
+        // coaz-pep's own fail-open marker is carried to the client.
+        Verdict marked = (Verdict) mcpRoute(obj("decision", true, "response_headers", obj("X-PDP-Fail-Open", "https://estate.example")), null)[0];
+        assertEquals("https://estate.example", marked.responseHeaders.get("X-PDP-Fail-Open"));
+    }
+
+    @Test
     void relaysTheEngineJsonRpcErrorBodyVerbatimOnADeny() {
         String rpcError = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"denied by policy\"}}";
         Verdict v = (Verdict) mcpRoute(obj("decision", false, "response", obj("status", 200, "body", rpcError,
-            "headers", obj("Content-Type", "application/json", "X-PDP-Reason", "no"))), null)[0];
+            "headers", obj("Content-Type", "application/json", "X-PDP-Reason", "no", "Transfer-Encoding", "chunked"))), null)[0];
         assertFalse(v.permit);
         // Relayed as-is: two renderings of one decision would drift.
         assertEquals(200, v.status);
         assertEquals(rpcError, v.bodyText());
         assertEquals("application/json", v.header("Content-Type"));
+        assertNull(v.header("Transfer-Encoding"), "framing belongs to this hop");
+        assertNull(v.header("X-PDP-Reason"), "each X-PDP-* header appears once, from the rule");
         assertEquals("DENY", v.responseHeaders.get("X-PDP-Decision"));
         assertEquals("tools/call:get_customer", v.responseHeaders.get("X-PDP-Action"));
         assertEquals("no", v.responseHeaders.get("X-PDP-Reason"));
-        // An engine verdict with nothing usable in it is still a deny, with defaults.
+        // A deny with no rendering, or one with a status that cannot be one, is a plain 403.
         Verdict bare = (Verdict) mcpRoute(obj("decision", false), null)[0];
-        assertEquals(200, bare.status);
-        assertEquals("", bare.bodyText());
-        Verdict junk = (Verdict) mcpRoute("[]", null)[0];
-        assertFalse(junk.permit);
+        assertEquals(403, bare.status);
+        assertEquals("authorization_failed", body(bare).get("error").asText());
+        for (Object status : new Object[]{0, 99, 600, "200"}) {
+            ObjectNode resp = obj("body", rpcError);
+            if (status instanceof Integer) {
+                resp.put("status", (Integer) status);
+            } else {
+                resp.put("status", (String) status);
+            }
+            assertEquals(403, ((Verdict) mcpRoute(obj("decision", false, "response", resp), null)[0]).status, String.valueOf(status));
+        }
+        Verdict noBody = (Verdict) mcpRoute(obj("decision", false, "response", obj("status", 401)), null)[0];
+        assertEquals(401, noBody.status);
+        assertEquals("", noBody.bodyText());
     }
 
     @Test
@@ -506,30 +562,117 @@ class PepTest {
     }
 
     @Test
-    void doesNotDelegateJsonRpcThatIsNotAToolsCallOrWhenCoazUrlIsUnset() {
-        FakeTransport t = pdp(obj("decision", true)).route(COAZ, obj("decision", true));
-        AuthZenRuleConfiguration c = baseConf();
-        c.style = "mcp";
-        c.coaz_url = COAZ;
-        Verdict v = pep(c, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"));
-        assertTrue(v.permit);
-        assertEquals(0, t.count("/v1/mcp/check"), "only tools/call is delegated");
-        assertEquals("mcp-handshake", v.responseHeaders.get("X-PDP-Action"));
-        assertEquals("alice", v.upstreamHeaders.get("X-Auth-Principal"));
-        assertEquals(0, t.count("/access/v1/evaluation"));
+    void sendsEveryRequestOnAnMcpRouteToCoazPepNotOnlyToolsCall() {
+        // What used to pass on a token alone is coaz-pep's to decide: every method, the
+        // handshake, notifications, a client's answer to the server, the SSE GET.
+        String[] bodies = {
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/read\",\"params\":{\"uri\":\"bank://accounts\"}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"s1\",\"result\":{\"content\":[]}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}",
+        };
+        String[] actions = {"initialize", "tools/list", "notifications/initialized", "resources/read", "jsonrpc-response", "ping"};
+        for (int i = 0; i < bodies.length; i++) {
+            FakeTransport t = engine(obj("decision", false, "response", obj("status", 200, "body", "{}")));
+            Verdict v = mcpBody(t, bodies[i].getBytes(StandardCharsets.UTF_8));
+            assertFalse(v.permit, bodies[i]);
+            assertEquals(1, t.count("/v1/mcp/check"), bodies[i]);
+            assertEquals(bodies[i], Json.parse(t.hits.get(0).body()).get("body").asText());
+            assertEquals(actions[i], v.responseHeaders.get("X-PDP-Action"), "the engine named none, so the rule does");
+            assertEquals(0, t.count("/access/v1/evaluation"), "the rule never asks the PDP itself on an MCP route");
+        }
+        // No body: the SSE GET and the session DELETE go too, and a body-less POST does not.
+        for (String method : new String[]{"GET", "DELETE", "OPTIONS"}) {
+            FakeTransport t = engine(obj("decision", true));
+            Verdict v = pep(mcpConf(), t).decide(req(method, "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), null));
+            assertTrue(v.permit, method);
+            assertEquals(method, Json.parse(t.hits.get(0).body()).get("method").asText());
+            assertEquals("", Json.parse(t.hits.get(0).body()).get("body").asText());
+            assertEquals("mcp:" + method.toLowerCase(java.util.Locale.ROOT), v.responseHeaders.get("X-PDP-Action"));
+        }
+    }
 
-        AuthZenRuleConfiguration noEngine = baseConf();
-        noEngine.style = "mcp";
-        FakeTransport t2 = pdp(obj("decision", true)).route(COAZ, obj("decision", true));
-        Verdict v2 = pep(noEngine, t2).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), TOOLS_CALL));
-        assertTrue(v2.permit);
-        assertEquals(0, t2.count("/v1/mcp/check"));
+    @Test
+    void refusesWhatItCannotReadExactlyOnceAndAsksNobody() {
+        // The contract's table: status, JSON-RPC code, and nothing sent anywhere.
+        Object[][] cases = {
+            {"[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}}]", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}} x", 400, -32700},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"Method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"a\",\"Name\":\"make_payment\"}}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"a\"},\"method\":\"ping\"}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}", 400, -32600},
+            {"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":7}", 400, -32600},
+            {"", 400, -32700},
+            {"not json", 400, -32700},
+            {"﻿{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}", 400, -32700},
+        };
+        for (Object[] c : cases) {
+            FakeTransport t = engine(obj("decision", true));
+            Verdict v = mcpBody(t, ((String) c[0]).getBytes(StandardCharsets.UTF_8));
+            assertFalse(v.permit, (String) c[0]);
+            assertEquals(c[1], v.status, (String) c[0]);
+            JsonNode b = body(v);
+            assertEquals("2.0", b.get("jsonrpc").asText());
+            assertEquals(c[2], b.get("error").get("code").intValue(), (String) c[0]);
+            assertEquals("application/json", v.header("Content-Type"));
+            assertEquals("DENY", v.responseHeaders.get("X-PDP-Decision"));
+            assertEquals(0, t.hits.size(), "neither coaz-pep nor the PDP was asked: " + c[0]);
+        }
+        // The id is echoed when it could be read.
+        Verdict withId = mcpBody(engine(obj("decision", true)), "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{}}".getBytes(StandardCharsets.UTF_8));
+        assertEquals(42, body(withId).get("id").intValue());
+        assertTrue(body(mcpBody(engine(obj("decision", true)), "[]".getBytes(StandardCharsets.UTF_8))).get("id").isNull());
+        // Invalid UTF-8: Node and Go would run it with U+FFFD in it; the rule refuses it.
+        byte[] latin1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"aÿ\"}}".getBytes(StandardCharsets.ISO_8859_1);
+        FakeTransport t = engine(obj("decision", true));
+        Verdict bad = mcpBody(t, latin1);
+        assertEquals(400, bad.status);
+        assertEquals(-32700, body(bad).get("error").get("code").intValue());
+        assertEquals(0, t.hits.size());
+    }
 
-        // The initialize handshake is a PDP question: access to the MCP service.
-        FakeTransport t3 = pdp(obj("decision", true));
-        pep(noEngine, t3).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"));
-        assertEquals("access_mcp", sent(t3).get("action").get("name").asText());
-        assertEquals("mcp-service", sent(t3).get("resource").get("type").asText());
+    @Test
+    void refusesACompressedBodyAndOneItCouldNotReadInFull() {
+        byte[] call = TOOLS_CALL.getBytes(StandardCharsets.UTF_8);
+        for (String[] enc : new String[][]{{"content-encoding", "gzip"}, {"content-encoding", "identity, gzip"},
+            {"content-encoding", "identity", "content-encoding", "br"}, {"Content-Encoding", "GZIP"}}) {
+            FakeTransport t = engine(obj("decision", true));
+            Verdict v = mcpBody(t, call, enc);
+            assertEquals(415, v.status, String.join(" ", enc));
+            assertEquals("Invalid Request: Content-Encoding not supported by the PEP", body(v).get("error").get("message").asText());
+            assertEquals(-32600, body(v).get("error").get("code").intValue());
+            assertEquals(0, t.hits.size());
+        }
+        for (String[] enc : new String[][]{{"content-encoding", "identity"}, {"content-encoding", ""}, {"content-encoding", " IDENTITY "}}) {
+            assertTrue(mcpBody(engine(obj("decision", true)), call, enc).permit, String.join(" ", enc));
+        }
+        // A body PingAccess could not hand over whole: never judge part of one.
+        FakeTransport t = engine(obj("decision", true));
+        Verdict partial = pep(mcpConf(), t).decide(new PepRequest("POST", "/mcp", Map.of("authorization", List.of(bearer(obj("sub", "alice")))), null, false, null));
+        assertEquals(413, partial.status);
+        assertEquals("Invalid Request: request body too large for the PEP to authorise", body(partial).get("error").get("message").asText());
+        assertEquals(0, t.hits.size());
+        // Any method: a body is a body.
+        Verdict get = pep(mcpConf(), t).decide(new PepRequest("GET", "/mcp", Map.of("authorization", List.of(bearer(obj("sub", "alice")))), null, false, null));
+        assertEquals(413, get.status);
+        Verdict getWithJunk = pep(mcpConf(), t).decide(req("GET", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "not json"));
+        assertEquals(400, getWithJunk.status);
+        assertEquals(0, t.hits.size());
+    }
+
+    @Test
+    void anMcpRouteStillChecksTheTokenAndTheIdentityFirst() {
+        FakeTransport t = engine(obj("decision", true));
+        Verdict none = pep(mcpConf(), t).decide(req("POST", "/mcp", Map.of(), TOOLS_CALL));
+        assertEquals(401, none.status);
+        AuthZenRuleConfiguration strict = mcpConf();
+        strict.allow_insecure = false;
+        Verdict unverified = pep(strict, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), TOOLS_CALL));
+        assertEquals(401, unverified.status);
+        assertEquals(0, t.hits.size());
     }
 
     @Test
@@ -554,10 +697,11 @@ class PepTest {
         c.coaz_api_key = "demo";
         Object[] r2 = mcpRoute(obj("decision", true), c);
         assertEquals("Bearer demo", ((FakeTransport) r2[1]).hits.get(0).headers().get("Authorization"));
-        // And a tools/call without a name still gets an action.
+        // A tools/call without a name is refused, not sent with a made-up action.
         FakeTransport t = pdp(obj("decision", true)).route(COAZ + "/v1/mcp/check", obj("decision", true));
         Verdict v = pep(c, t).decide(req("POST", "/mcp", Map.of("authorization", bearer(obj("sub", "alice"))), "{\"method\":\"tools/call\"}"));
-        assertEquals("tools/call:?", v.responseHeaders.get("X-PDP-Action"));
+        assertEquals(400, v.status);
+        assertEquals(0, t.hits.size());
     }
 
     // ---------- claim handling and remaining denials ----------

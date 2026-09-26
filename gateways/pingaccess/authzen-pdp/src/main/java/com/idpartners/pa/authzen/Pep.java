@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -129,25 +130,16 @@ final class Pep {
             }
         }
 
-        // 2b) COAZ: tools/call on an MCP route goes to the engine, which discovers the
-        //     tool's mapping, evaluates it, asks the PDP and returns either a permit or
-        //     the profile's JSON-RPC error to relay verbatim.
-        if ("mcp".equals(conf.style) && !blank(conf.coaz_url)) {
-            JsonNode rpc = Json.parse(req.body);
-            if (rpc instanceof ObjectNode && "tools/call".equals(Json.text(rpc, "method"))) {
-                return coazCheck(req, pep, rpc);
-            }
+        // 2b) MCP: every request on the route is coaz-pep's to decide, whatever its
+        //     method, once the rule is sure coaz-pep will judge exactly what the upstream
+        //     would run. Nothing on an MCP route is let through on a token alone.
+        if ("mcp".equals(conf.style)) {
+            return mcp(req, pep);
         }
 
         // 3) build the AuthZEN evaluation request
-        RequestMapper.Mapped m = RequestMapper.map(conf.style, req.method, req.path, req.body);
+        RequestMapper.Mapped m = RequestMapper.map(req.method, req.path, req.body);
         Map<String, String> upstream = authHeaders(sub, act, scope, acr);
-
-        // MCP handshake / non-tool traffic: allow on a valid token, skip the PDP.
-        if (RequestMapper.ALLOW.equals(m.action())) {
-            return Verdict.permit(upstream, pdpHeaders(pep, "PERMIT", "mcp-handshake",
-                "MCP handshake allowed (authenticated); policy applies to tool calls.", null));
-        }
 
         // 3b) Carry the USER's consented scope into the context. The step-up decision is
         //     the PDP's: it compares the amount to its threshold and checks whether this
@@ -402,7 +394,57 @@ final class Pep {
         return null;
     }
 
-    private Verdict coazCheck(PepRequest req, String pep, JsonNode rpc) {
+    /**
+     * An MCP request. A body is judged only when it is exactly one JSON-RPC message the
+     * rule has read in full, in plain JSON; anything else is refused here with the
+     * JSON-RPC error the contract names, and neither coaz-pep nor the upstream sees it.
+     * Then coaz-pep decides, every method, every time.
+     */
+    private Verdict mcp(PepRequest req, String pep) {
+        JsonRpc.Message msg = null;
+        boolean hasBody = req.body != null && req.body.length > 0;
+        if ("POST".equalsIgnoreCase(req.method) || hasBody || !req.bodyReadable) {
+            if (!identityEncoding(req.headerValues("content-encoding"))) {
+                return refusal(pep, 415, JsonRpc.INVALID_REQUEST, "Invalid Request: Content-Encoding not supported by the PEP", null);
+            }
+            if (!req.bodyReadable) {
+                return refusal(pep, 413, JsonRpc.INVALID_REQUEST, "Invalid Request: request body too large for the PEP to authorise", null);
+            }
+            try {
+                msg = JsonRpc.classify(req.body);
+            } catch (JsonRpc.Refusal r) {
+                log.warn("authzen-pdp '{}': refused an MCP body: {}", pep, r.getMessage());
+                return refusal(pep, r.status, r.code, r.getMessage(), r.id);
+            }
+        }
+        return coazCheck(req, pep, msg);
+    }
+
+    /** Absent, empty or identity, and nothing else: a body the rule cannot read as sent is not one it can judge. */
+    static boolean identityEncoding(List<String> values) {
+        for (String v : values) {
+            for (String coding : v.split(",")) {
+                String c = coding.trim();
+                if (!c.isEmpty() && !c.equalsIgnoreCase("identity")) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** The contract's refusal: a JSON-RPC error with the request's id when it was readable, and X-PDP-Decision: DENY. */
+    static Verdict refusal(String pep, int status, int code, String message, JsonNode id) {
+        ObjectNode body = Json.object();
+        body.put("jsonrpc", "2.0");
+        body.set("id", id == null ? Json.MAPPER.nullNode() : id);
+        ObjectNode err = body.putObject("error");
+        err.put("code", code);
+        err.put("message", message);
+        return Verdict.respond(status, headers(JSON), Json.bytes(body), pdpHeaders(pep, "DENY", "mcp", message, null));
+    }
+
+    private Verdict coazCheck(PepRequest req, String pep, JsonRpc.Message msg) {
         ObjectNode config = Json.object();
         config.put("pep_label", pep);
         config.put("style", "mcp");
@@ -429,11 +471,18 @@ final class Pep {
         ObjectNode h = body.putObject("headers");
         putIf(h, "authorization", req.header("authorization"));
         putIf(h, "x-user-token", req.header("x-user-token"));
+        putIf(h, "dpop", req.header("dpop"));
+        putIf(h, "content-type", req.header("content-type"));
+        List<String> encodings = req.headerValues("content-encoding");
+        if (!encodings.isEmpty()) {
+            h.put("content-encoding", String.join(", ", encodings));
+        }
+        // The body as the upstream will read it: validated UTF-8, so this is lossless.
         body.put("body", req.body == null ? "" : new String(req.body, StandardCharsets.UTF_8));
 
-        JsonNode params = rpc.get("params");
-        String toolName = Json.text(params, "name");
-        String fallbackAction = "tools/call:" + (toolName == null ? "?" : toolName);
+        String fallbackAction = msg == null ? "mcp:" + req.method.toLowerCase(Locale.ROOT)
+            : msg.tool() != null ? "tools/call:" + msg.tool()
+            : msg.method() != null ? msg.method() : "jsonrpc-response";
 
         Transport.Response res;
         try {
@@ -458,18 +507,56 @@ final class Pep {
             return deny(pep, 503, "COAZ authorization engine refused the request; denying (fail-closed).", null);
         }
         if (dec.booleanValue()) {
+            // Every X-Auth-* header the client sent goes; coaz-pep's upstream_headers say
+            // which come back, an empty value meaning "leave it off".
+            Map<String, String> upstream = authHeaders(null, null, null, null);
+            upstream.putAll(stringMap(verdict.get("upstream_headers")));
             Map<String, String> rh = stringMap(verdict.get("response_headers"));
-            String action = rh.getOrDefault("X-PDP-Action", fallbackAction);
-            return Verdict.permit(stringMap(verdict.get("upstream_headers")),
-                pdpHeaders(pep, "PERMIT", action, rh.get("X-PDP-Reason"), null));
+            Map<String, String> out = pdpHeaders(pep, "PERMIT", headerOr(rh, "X-PDP-Action", fallbackAction),
+                headerOr(rh, "X-PDP-Reason", null), headerOr(rh, "X-PDP-Fail-Open", null));
+            relayable(rh).forEach(out::putIfAbsent);
+            return Verdict.permit(upstream, out);
         }
+        // A deny is coaz-pep's rendering, relayed as it is (for a tools/call, the COAZ
+        // JSON-RPC error at HTTP 200); one with no rendering is a plain deny.
         JsonNode resp = verdict.get("response");
-        Map<String, String> rh = resp == null ? new LinkedHashMap<>() : stringMap(resp.get("headers"));
-        String action = rh.getOrDefault("X-PDP-Action", fallbackAction);
-        int status = resp != null && resp.get("status") != null && resp.get("status").isInt() ? resp.get("status").intValue() : 200;
-        String respBody = resp == null ? null : Json.text(resp, "body");
-        return Verdict.respond(status, rh, (respBody == null ? "" : respBody).getBytes(StandardCharsets.UTF_8),
-            pdpHeaders(pep, "DENY", action, rh.get("X-PDP-Reason"), null));
+        if (!(resp instanceof ObjectNode)) {
+            return deny(pep, 403, "Denied by policy.", pdpHeaders(pep, "DENY", fallbackAction, null, null));
+        }
+        Map<String, String> rh = stringMap(resp.get("headers"));
+        JsonNode s = resp.get("status");
+        int status = s != null && s.isInt() && s.intValue() >= 200 && s.intValue() <= 599 ? s.intValue() : 403;
+        String respBody = Json.text(resp, "body");
+        return Verdict.respond(status, relayable(rh), (respBody == null ? "" : respBody).getBytes(StandardCharsets.UTF_8),
+            pdpHeaders(pep, "DENY", headerOr(rh, "X-PDP-Action", fallbackAction), headerOr(rh, "X-PDP-Reason", null), null));
+    }
+
+    private static String headerOr(Map<String, String> headers, String name, String otherwise) {
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(name)) {
+                return e.getValue();
+            }
+        }
+        return otherwise;
+    }
+
+    /** Headers that decide how a message is framed or routed belong to this hop, never to a relayed answer. */
+    private static final java.util.Set<String> HOP = java.util.Set.of("content-length", "transfer-encoding", "connection",
+        "keep-alive", "upgrade", "te", "trailer", "proxy-connection", "host");
+
+    /**
+     * What of a coaz-pep header map may be put on a response: not the framing headers,
+     * and not X-PDP-*, which the rule sets itself so each appears once.
+     */
+    private static Map<String, String> relayable(Map<String, String> in) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : in.entrySet()) {
+            String k = e.getKey().toLowerCase(Locale.ROOT);
+            if (!HOP.contains(k) && !k.startsWith("x-pdp-")) {
+                out.put(e.getKey(), e.getValue());
+            }
+        }
+        return out;
     }
 
     /**

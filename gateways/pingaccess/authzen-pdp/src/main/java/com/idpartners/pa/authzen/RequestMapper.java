@@ -8,18 +8,13 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Maps the HTTP request to an AuthZEN (action, resource, context, resource properties).
- * A direct port of map_request in the Kong plugin and mapRequest in the Go PEP, so all
- * three send the PDP identical evaluation requests.
- *
- * <p>style="rest": Resource Server semantics (fine-grained, e.g. payment amount).
- * style="mcp": MCP edge (coarse; refine to access_mcp on the JSON-RPC initialize
- * handshake, everything else passes on a valid token).
+ * Maps a REST request to an AuthZEN (action, resource, context, resource properties):
+ * Resource Server semantics, fine-grained (a payment carries its amount). A port of
+ * map_request in the Kong plugin and mapRequest in the Go PEP, so all three send the PDP
+ * identical evaluation requests. An MCP route is never mapped here: every request on one
+ * is coaz-pep's to decide.
  */
 final class RequestMapper {
-    /** Authenticated MCP traffic that skips the PDP: non-initialize JSON-RPC, SSE GET, notifications. */
-    static final String ALLOW = "__allow__";
-
     private static final Pattern CUSTOMER_ACCOUNTS = Pattern.compile("/customers/([^/]+)/accounts");
     private static final Pattern ACCOUNT_BALANCE = Pattern.compile("/accounts/([^/]+)/balance");
 
@@ -29,26 +24,12 @@ final class RequestMapper {
     private RequestMapper() {
     }
 
-    static Mapped map(String style, String method, String path, byte[] body) {
+    static Mapped map(String method, String path, byte[] body) {
         ObjectNode rprops = Json.object();
         ObjectNode ctx = Json.object();
         ctx.put("channel", "ai-agent");
 
-        if ("mcp".equals(style)) {
-            // PEP #1 authorises the agent's ACCESS TO THE MCP SERVICE, evaluated once on
-            // the MCP initialize handshake. Everything else (tools/list, tools/call,
-            // notifications, ping, SSE GET) is allowed through on a valid token so the
-            // JSON-RPC session is not broken by a mid-stream 403; per-tool-call policy
-            // is the engine's, via coaz_url.
-            String action = ALLOW;
-            JsonNode rpc = Json.parse(body);
-            if (rpc instanceof ObjectNode && "initialize".equals(Json.text(rpc, "method"))) {
-                action = "access_mcp";
-            }
-            return new Mapped(action, "mcp-service", "northwind-bank", rprops, ctx);
-        }
-
-        // style == "rest". Patterns are prefix-tolerant: they match anywhere in the path,
+        // Patterns are prefix-tolerant: they match anywhere in the path,
         // so it does not matter whether the gateway strips an application context root
         // before or after the PEP sees the request.
         Matcher cust = CUSTOMER_ACCOUNTS.matcher(path);

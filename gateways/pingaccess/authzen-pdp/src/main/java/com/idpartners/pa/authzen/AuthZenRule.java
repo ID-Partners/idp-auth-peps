@@ -350,26 +350,50 @@ public class AuthZenRule extends AsyncRuleInterceptorBase<AuthZenRuleConfigurati
         String uri = request.getUri() == null ? "" : request.getUri();
         int q = uri.indexOf('?');
         String path = q >= 0 ? uri.substring(0, q) : uri;
-        Map<String, String> headers = new LinkedHashMap<>();
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         Headers h = request.getHeaders();
         if (h != null && h.getHeaderFields() != null) {
             for (HeaderField f : h.getHeaderFields()) {
-                headers.putIfAbsent(f.getHeaderName().toString(), f.getValue());
+                headers.computeIfAbsent(f.getHeaderName().toString(), k -> new ArrayList<>()).add(f.getValue());
             }
         }
         byte[] body = null;
+        boolean readable = true;
         Body b = request.getBody();
         if (b != null) {
             try {
                 if (!b.isRead()) {
                     b.read();
                 }
-                body = b.getContent();
+                byte[] content = b.getContent();
+                int length = content == null ? 0 : content.length;
+                // Read in full or not at all: past the rule's own cap, not held in memory,
+                // or shorter than PingAccess says the body is, it is a partial body.
+                if (length > PepRequest.MAX_BODY || (length > 0 && !b.isInMemory()) || (b.getLength() >= 0 && b.getLength() != length)) {
+                    readable = false;
+                } else {
+                    body = content == null ? new byte[0] : content;
+                }
             } catch (Exception e) {
-                log.warn("authzen-pdp: request body could not be read: {}", e.getMessage());
+                log.warn("authzen-pdp: the request body could not be read ({})", e.getClass().getSimpleName());
+                readable = false;
             }
         }
-        return new PepRequest(method, path, headers, body, identityClaims(exchange.getIdentity()));
+        // What the client declared it sent: a body that is not all of it is partial.
+        List<String> declared = headerValues(headers, "content-length");
+        if (readable && !declared.isEmpty() && !declared.get(0).trim().equals(String.valueOf(body == null ? 0 : body.length))) {
+            readable = false;
+        }
+        return new PepRequest(method, path, headers, body, readable, identityClaims(exchange.getIdentity()));
+    }
+
+    private static List<String> headerValues(Map<String, List<String>> headers, String name) {
+        for (Map.Entry<String, List<String>> e : headers.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(name)) {
+                return e.getValue();
+            }
+        }
+        return List.of();
     }
 
     /**

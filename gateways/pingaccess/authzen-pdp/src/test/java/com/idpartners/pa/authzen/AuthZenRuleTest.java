@@ -90,6 +90,8 @@ class AuthZenRuleTest {
             try {
                 when(body.isRead()).thenReturn(content != null);
                 when(body.getContent()).thenReturn(content);
+                when(body.isInMemory()).thenReturn(true);
+                when(body.getLength()).thenReturn(content == null ? 0 : content.length);
             } catch (Exception ignored) {
                 // mock setup
             }
@@ -596,14 +598,21 @@ class AuthZenRuleTest {
         assertEquals("c9", r.identityClaims.get("client_id").asText());
         assertEquals("a", r.identityClaims.get("scope").asText());
 
-        // An unread body is read first; a body that cannot be read is treated as absent.
+        assertTrue(r.bodyReadable);
+        // A header sent twice keeps both values: Content-Encoding is checked on all of them.
+        assertEquals(List.of("Bearer t", "second"), r.headerValues("Authorization"));
+
+        // An unread body is read first; a body that cannot be read is not a body at all.
         Fixture g = new Fixture("POST", "/payments", fields(), null, null);
         when(g.body.isRead()).thenReturn(false);
         org.mockito.Mockito.doThrow(new java.io.IOException("gone")).when(g.body).read();
-        assertNull(rule.read(g.exchange).body);
+        PepRequest gr = rule.read(g.exchange);
+        assertNull(gr.body);
+        assertFalse(gr.bodyReadable, "a read error is a partial body, never an empty one");
         Fixture h = new Fixture("POST", "/payments", fields(), null, null);
         when(h.body.isRead()).thenReturn(false);
         when(h.body.getContent()).thenReturn("x".getBytes(StandardCharsets.UTF_8));
+        when(h.body.getLength()).thenReturn(1);
         assertEquals("x", new String(rule.read(h.exchange).body, StandardCharsets.UTF_8));
         verify(h.body).read();
 
@@ -615,12 +624,87 @@ class AuthZenRuleTest {
         assertEquals("", e.method);
         assertEquals("", e.path);
         assertNull(e.body);
+        assertTrue(e.bodyReadable, "no body is not a partial body");
         assertNull(e.identityClaims);
         assertTrue(e.headers.isEmpty());
         // Headers present but without fields.
         Headers hh = mock(Headers.class);
         when(req.getHeaders()).thenReturn(hh);
         assertTrue(rule.read(empty).headers.isEmpty());
+    }
+
+    @Test
+    void aPepRequestToleratesWhatAnExchangeMightNotHave() {
+        java.util.Map<String, List<String>> odd = new java.util.LinkedHashMap<>();
+        odd.put(null, List.of("x"));
+        odd.put("X-Null", null);
+        odd.put("X-Values", java.util.Arrays.asList("a", null, "b"));
+        PepRequest r = new PepRequest(null, null, odd, null, true, null);
+        assertEquals("", r.method);
+        assertEquals("", r.path);
+        assertEquals(List.of("a", "b"), r.headerValues("x-values"));
+        assertEquals("a", r.header("X-VALUES"));
+        assertTrue(r.headerValues("x-null").isEmpty());
+        assertTrue(new PepRequest("GET", "/", (java.util.Map<String, List<String>>) null, null, true, null).headers.isEmpty());
+        assertTrue(new PepRequest("GET", "/", (java.util.Map<String, String>) null, null, null).headers.isEmpty());
+        // A body marked unreadable is never kept, whatever was passed.
+        assertNull(new PepRequest("POST", "/", java.util.Map.<String, List<String>>of(), new byte[]{1}, false, null).body);
+    }
+
+    @Test
+    void aBodyNotReadInFullIsNeverPassedOffAsTheBody() throws Exception {
+        AuthZenRule rule = new AuthZenRule(new FakeTransport(), DIRECT, new CapturingResponses(), () -> 0L);
+        byte[] call = "{\"method\":\"ping\"}".getBytes(StandardCharsets.UTF_8);
+        // Not held in memory, or shorter than PingAccess says it is.
+        Fixture spilled = new Fixture("POST", "/mcp", fields(), call, null);
+        when(spilled.body.isInMemory()).thenReturn(false);
+        assertFalse(rule.read(spilled.exchange).bodyReadable);
+        Fixture shortened = new Fixture("POST", "/mcp", fields(), call, null);
+        when(shortened.body.getLength()).thenReturn(call.length + 100);
+        assertFalse(rule.read(shortened.exchange).bodyReadable);
+        // Shorter than the client declared it.
+        Fixture declared = new Fixture("POST", "/mcp", fields("Content-Length", String.valueOf(call.length + 100)), call, null);
+        assertFalse(rule.read(declared.exchange).bodyReadable);
+        Fixture garbled = new Fixture("POST", "/mcp", fields("Content-Length", "lots"), call, null);
+        assertFalse(rule.read(garbled.exchange).bodyReadable);
+        Fixture honest = new Fixture("POST", "/mcp", fields("content-length", " " + call.length + " "), call, null);
+        assertTrue(rule.read(honest.exchange).bodyReadable);
+        // An unknown length is fine when the declared one matches, or there is none.
+        Fixture unknown = new Fixture("POST", "/mcp", fields(), call, null);
+        when(unknown.body.getLength()).thenReturn(-1);
+        assertTrue(rule.read(unknown.exchange).bodyReadable);
+        // Over the rule's own cap.
+        byte[] big = new byte[PepRequest.MAX_BODY + 1];
+        Fixture huge = new Fixture("POST", "/mcp", fields(), big, null);
+        assertFalse(rule.read(huge.exchange).bodyReadable);
+        // An empty body that is empty all the way through is readable, and empty.
+        Fixture none = new Fixture("GET", "/mcp", fields("Content-Length", "0"), new byte[0], null);
+        PepRequest n = rule.read(none.exchange);
+        assertTrue(n.bodyReadable);
+        assertEquals(0, n.body.length);
+        // A body PingAccess never produced, though one was declared.
+        Fixture missing = new Fixture("POST", "/mcp", fields("Content-Length", "10"), null, null);
+        when(missing.request.getBody()).thenReturn(null);
+        assertFalse(rule.read(missing.exchange).bodyReadable);
+    }
+
+    @Test
+    void theReviewersProbeABatchedToolsCallIsRefusedAndNothingIsAsked() throws Exception {
+        FakeTransport t = new FakeTransport().route("http://coaz-pep:9192", obj("decision", true)).route("http://pdp:8080", obj("decision", true));
+        CapturingResponses responses = new CapturingResponses();
+        AuthZenRule rule = new AuthZenRule(t, DIRECT, responses, () -> 0L);
+        AuthZenRuleConfiguration c = conf();
+        c.style = "mcp";
+        c.coaz_url = "http://coaz-pep:9192";
+        rule.configure(c);
+        byte[] batch = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"make_payment\"}}]".getBytes(StandardCharsets.UTF_8);
+        Fixture f = new Fixture("POST", "/mcp", fields("Authorization", "Bearer " + jwt(obj("sub", "alice"))), batch, null);
+        assertEquals(Outcome.RETURN, rule.handleRequest(f.exchange).toCompletableFuture().get(5, TimeUnit.SECONDS));
+        rule.getErrorHandlingCallback().writeErrorResponse(f.exchange);
+        assertEquals(400, responses.last.status);
+        assertEquals(-32600, Json.parse(responses.last.body).get("error").get("code").intValue());
+        assertEquals(0, t.hits.size(), "neither coaz-pep nor the PDP was asked");
+        assertFalse(f.setHeaders.containsKey("X-Auth-Principal"));
     }
 
     @Test
