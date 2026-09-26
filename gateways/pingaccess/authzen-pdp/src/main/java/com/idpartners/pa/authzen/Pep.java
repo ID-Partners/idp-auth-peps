@@ -137,8 +137,16 @@ final class Pep {
             return mcp(req, pep);
         }
 
-        // 3) build the AuthZEN evaluation request
-        RequestMapper.Mapped m = RequestMapper.map(req.method, req.path, req.body);
+        // 3) build the AuthZEN evaluation request. A request the rule cannot map to what
+        //    the upstream will do (a payment with no readable amount, a path that routes
+        //    two ways) is refused, never sent to the PDP as something vaguer.
+        RequestMapper.Mapped m;
+        try {
+            m = RequestMapper.map(req.method, req.path, req.body, req.bodyReadable);
+        } catch (RequestMapper.Unmappable e) {
+            log.warn("authzen-pdp '{}': cannot map {} {}: {}", pep, req.method, HeaderValues.brief(req.path, 200), e.getMessage());
+            return deny(pep, 400, "The request cannot be authorised as sent.", null);
+        }
         Map<String, String> upstream = authHeaders(sub, act, scope, acr);
 
         // 3b) Carry the USER's consented scope into the context. The step-up decision is
@@ -192,7 +200,7 @@ final class Pep {
         }
         ObjectNode request = m.ctx().putObject("request");
         request.put("method", req.method);
-        request.put("path", req.path);
+        request.put("path", m.path());
         if (conf.forward_access_token && token != null) {
             m.ctx().put("access_token", token.value());
         }

@@ -325,11 +325,36 @@ class PepTest {
         FakeTransport t = pdp(obj("decision", false, "context", obj("step_up_required", true)));
         AuthZenRuleConfiguration c = baseConf();
         c.stepup_scope = "route:scope";
-        Verdict v = pep(c, t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), "{}"));
+        String pay = "{\"from_account\":\"a\",\"amount\":9000}";
+        Verdict v = pep(c, t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), pay));
         assertEquals("route:scope", body(v).get("scope").asText());
         AuthZenRuleConfiguration none = baseConf();
-        Verdict empty = pep(none, pdp(obj("decision", false, "context", obj("step_up_required", true)))).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), "{}"));
+        Verdict empty = pep(none, pdp(obj("decision", false, "context", obj("step_up_required", true)))).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), pay));
         assertEquals("", body(empty).get("scope").asText());
+    }
+
+    @Test
+    void aPaymentThePdpCannotWeighIsRefusedBeforeAnyPdpIsAsked() {
+        // The REST twin sent make_payment with no amount; the PDP's threshold had nothing
+        // to compare, and a policy that treats absent as zero said yes.
+        for (String body : new String[]{null, "{}", "{\"from_account\":\"a\",\"amount\":\"5,000\"}", "{\"from_account\":\"a\",\"amount\":10,\"Amount\":5000}"}) {
+            FakeTransport t = pdp(obj("decision", true));
+            Verdict v = pep(baseConf(), t).decide(req("POST", "/payments", Map.of("authorization", bearer(obj("sub", "alice"))), body));
+            assertEquals(400, v.status, String.valueOf(body));
+            assertEquals(0, t.hits.size(), "no PDP asked: " + body);
+        }
+        FakeTransport t = pdp(obj("decision", true));
+        Verdict partial = pep(baseConf(), t).decide(new PepRequest("POST", "/payments", Map.of("authorization", List.of(bearer(obj("sub", "alice")))),
+            null, false, null));
+        assertEquals(400, partial.status);
+        // What the PDP is told is the path the upstream will route.
+        FakeTransport t2 = pdp(obj("decision", true));
+        pep(baseConf(), t2).decide(req("GET", "/x/../accounts/a1;v=1/balance", Map.of("authorization", bearer(obj("sub", "alice"))), null));
+        assertEquals("/accounts/a1/balance", sent(t2).get("context").get("request").get("path").asText());
+        assertEquals("a1", sent(t2).get("resource").get("id").asText());
+        Verdict odd = pep(baseConf(), pdp(obj("decision", true))).decide(req("GET", "/accounts/a%2Fb/balance",
+            Map.of("authorization", bearer(obj("sub", "alice"))), null));
+        assertEquals(400, odd.status);
     }
 
     @Test
