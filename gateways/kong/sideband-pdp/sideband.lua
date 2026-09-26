@@ -19,7 +19,13 @@ local S = {}
 
 S.REQUEST_PATH = "/sideband/request"
 S.RESPONSE_PATH = "/sideband/response"
-S.VERSION = "0.1.0"
+S.VERSION = "0.4.0"
+
+-- The identity headers a PEP asserts to its upstream. A client's own copies are removed
+-- from the upstream request and never shown to the policy provider; a layer may add them.
+S.AUTH_HEADERS = { "X-Auth-Principal", "X-Auth-Agent", "X-Auth-Scope", "X-Auth-Acr" }
+local AUTH = {}
+for _, name in ipairs(S.AUTH_HEADERS) do AUTH[name:lower()] = true end
 
 -- Response headers kept even when the policy provider leaves them out of its answer.
 local KEEP = { ["content-length"] = true, date = true, connection = true, vary = true }
@@ -58,6 +64,18 @@ function S.flatten_headers(list)
         out[name][#out[name] + 1] = v
       end
     end
+  end
+  return out
+end
+
+--- The policy provider's headers as a client is sent them: flattened, every value
+--- header-safe (no line break a value could smuggle a header through).
+function S.client_headers(list)
+  local out = {}
+  for name, values in pairs(S.flatten_headers(list)) do
+    local safe = {}
+    for _, v in ipairs(values) do safe[#safe + 1] = contract.header_value(v) end
+    if #safe > 0 then out[name] = safe end
   end
   return out
 end
@@ -102,7 +120,8 @@ local function client_certificate()
 end
 
 --- The request as the client sent it, in the sideband API's shape. A permit comes back in
---- the same shape, so this is also what travels from one layer to the next.
+--- the same shape, so this is also what travels from one layer to the next. Returns the
+--- payload, or nil and {status, reason (for the client), detail (for the log)}.
 function S.request_payload(conf)
   local p = {
     source_ip = ngx.var.remote_addr,
@@ -118,12 +137,18 @@ function S.request_payload(conf)
   local query = ngx.encode_args(args)
   if query ~= "" then url = url .. "?" .. query end
   p.url = url
-  local headers, herr = S.format_headers(kong.request.get_headers())
-  if not headers then return nil, herr end
+  local all = {}
+  for name, v in pairs(kong.request.get_headers()) do
+    if not AUTH[name:lower()] then all[name] = v end
+  end
+  local headers, herr = S.format_headers(all)
+  if not headers then
+    return nil, { status = 400, reason = "The request carries a header the gateway cannot pass on.", detail = herr }
+  end
   p.headers = headers
   if conf.forward_client_certificate ~= false then
     local cert, cerr = client_certificate()
-    if cerr then return nil, cerr end
+    if cerr then return nil, { status = 400, reason = "The client certificate could not be read.", detail = cerr } end
     p.client_certificate = cert
   end
   return p
@@ -315,7 +340,7 @@ end
 --- they did not: a header the policy provider left out is removed (Ping's plugin,
 --- unchanged). extra is set on top — the plugin's own X-PDP-* headers.
 function S.apply_response(final, extra)
-  local keep = S.flatten_headers(final.headers)
+  local keep = S.client_headers(final.headers)
   for name in pairs(kong.response.get_headers()) do
     local n = name:lower()
     if not keep[n] and not KEEP[n] then kong.response.clear_header(name) end

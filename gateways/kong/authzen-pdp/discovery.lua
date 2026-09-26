@@ -529,7 +529,10 @@ function D.resolve_layers(conf, resource, layers, default_open, opts)
       if err.kind == NOT_ALLOWED or not open then
         return nil, { kind = err.kind, msg = "layer " .. spec.name .. ": " .. err.msg }
       end
-      skipped[#skipped + 1] = spec.name .. " (" .. err.msg .. ")"
+      -- The skipped list is what a client is shown (X-PDP-Fail-Open): identifiers only.
+      -- Why a layer was skipped is for the log.
+      kong.log.warn("pdp discovery: layer ", spec.name, " could not be resolved (", err.msg, "); skipped (fail-open)")
+      skipped[#skipped + 1] = spec.name
     else
       if spec.name == "resource" and ep.resource and ep.resource.layers then
         -- What the document put in front of its PDP, in the document's order.
@@ -539,7 +542,8 @@ function D.resolve_layers(conf, resource, layers, default_open, opts)
             if gerr.kind == NOT_ALLOWED or not open then
               return nil, { kind = gerr.kind, msg = "layer resource: " .. resource .. " published layer " .. pdp .. ": " .. gerr.msg }
             end
-            skipped[#skipped + 1] = pdp .. " (published by " .. resource .. ": " .. gerr.msg .. ")"
+            kong.log.warn("pdp discovery: layer ", pdp, " published by ", resource, " could not be resolved (", gerr.msg, "); skipped (fail-open)")
+            skipped[#skipped + 1] = pdp
           else
             gate.source = D.SOURCE_PUBLISHED
             add(gate, {}, open, false)

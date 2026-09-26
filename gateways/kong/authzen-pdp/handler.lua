@@ -550,7 +550,7 @@ local function native(conf, pep)
         return deny(pep, 503, "Authorization service unavailable; denying (fail-closed).")
       end
       kong.log.warn("PDP layer ", ep.identifier, " unavailable (", detail, "); skipped (fail-open)")
-      skipped[#skipped + 1] = ep.identifier .. " (" .. detail .. ")"
+      skipped[#skipped + 1] = ep.identifier
     else
       decided = true
       decision = data.decision == true
@@ -567,8 +567,9 @@ local function native(conf, pep)
     end
   end
   if not decided then
+    -- Which layers were skipped goes in X-PDP-Fail-Open; why is in the log.
     decision, dctx = true, {}
-    reason = "fail-open: no policy layer could be reached (" .. table.concat(skipped, "; ") .. ")"
+    reason = "fail-open: no policy layer could be reached"
   end
   if #skipped > 0 then
     kong.log.warn("permit failed open past: ", table.concat(skipped, ", "))
@@ -623,11 +624,12 @@ local function native(conf, pep)
     return deny(pep, 403, reason)
   end
 
-  -- PERMIT: pass the delegation identity to the upstream for its audit trail
-  kong.service.request.set_header("X-Auth-Principal", sub or "")
-  kong.service.request.set_header("X-Auth-Agent", act or "")
-  kong.service.request.set_header("X-Auth-Scope", scope or "")
-  kong.service.request.set_header("X-Auth-Acr", acr or "")
+  -- PERMIT: pass the delegation identity to the upstream for its audit trail. What the
+  -- token does not assert stays absent (the client's copy was removed on the way in).
+  for name, value in pairs({ ["X-Auth-Principal"] = sub, ["X-Auth-Agent"] = act, ["X-Auth-Scope"] = scope, ["X-Auth-Acr"] = acr }) do
+    value = contract.header_value(value)
+    if value and value ~= "" then kong.service.request.set_header(name, value) end
+  end
 end
 
 -- ---------- the phases ----------
@@ -661,6 +663,10 @@ end
 function AuthzenPDP:access(conf)
   local pep = conf.pep_label or "kong-pep"
 
+  -- The identity headers are this plugin's to assert. A client's own copies go first,
+  -- before anything else, so no path through here can forward one.
+  for _, name in ipairs(AUTH_HEADERS) do kong.service.request.clear_header(name) end
+
   -- The resource's federation face, before any token is looked at: these documents
   -- are public by definition.
   if set(conf.federation_entity_url) then
@@ -672,19 +678,24 @@ function AuthzenPDP:access(conf)
   return native(conf, pep)
 end
 
+-- The decision on the response, for the demo transcript and anyone reading a trace. Every
+-- value is header-safe: a policy's reason is PDP data, and a line break in it would
+-- otherwise start a header of the policy's choosing.
 function AuthzenPDP:header_filter(conf)
   local c = kong.ctx.plugin
-  if c and c.decision then
-    for k, v in pairs(c.engine_headers or {}) do
-      local value = type(k) == "string" and contract.header_value(v) or nil
-      if value then kong.response.set_header(k, value) end
-    end
-    kong.response.set_header("X-PDP-PEP", c.pep or "")
-    kong.response.set_header("X-PDP-Decision", c.decision)
-    if c.fail_open then kong.response.set_header("X-PDP-Fail-Open", c.fail_open) end
-    if c.action then kong.response.set_header("X-PDP-Action", c.action) end
-    if c.reason then kong.response.set_header("X-PDP-Reason", c.reason) end
+  if not (c and c.decision) then return end
+  local function put(name, value)
+    value = contract.header_value(value)
+    if value then kong.response.set_header(name, value) end
   end
+  for k, v in pairs(c.engine_headers or {}) do
+    if type(k) == "string" then put(k, v) end
+  end
+  put("X-PDP-PEP", c.pep or "")
+  put("X-PDP-Decision", c.decision)
+  put("X-PDP-Fail-Open", c.fail_open)
+  put("X-PDP-Action", c.action)
+  put("X-PDP-Reason", c.reason)
 end
 
 -- Internals exposed for unit tests. Kong never reads this; it exists so the pure

@@ -27,11 +27,12 @@
 -- authzen-pdp, so both plugins find PDPs by the same rules.
 
 local discovery = require "kong.plugins.authzen-pdp.discovery"
+local contract = require "kong.plugins.authzen-pdp.contract"
 local sideband = require "kong.plugins.sideband-pdp.sideband"
 
 local SidebandPDP = {
-  PRIORITY = 999, -- as ping-auth: after Kong's own authentication plugins
-  VERSION = "0.1.0",
+  PRIORITY = 999, -- as ping-auth: after Kong's own authentication plugins; see ../README.md#plugin-order
+  VERSION = "0.4.0",
 }
 
 -- The modifiers a layer entry may carry beyond the shared fail-open / fail-closed.
@@ -42,15 +43,16 @@ local function trim_slash(s) return (tostring(s or ""):gsub("/+$", "")) end
 -- The response headers that say what happened, for the demo transcript and for anyone
 -- reading a trace. They ride on every exit this plugin makes: Kong will not load a plugin
 -- that has both a response phase and a header_filter, so there is no later phase to set
--- them in.
+-- them in. Header-safe, every one: identifiers and labels are configuration and PDP data.
 local function pdp_headers(c)
   local h = { ["X-PDP-PEP"] = c.pep, ["X-PDP-Decision"] = c.decision }
   local names = {}
   for _, a in ipairs(c.asked or {}) do names[#names + 1] = a.ep.identifier end
   if #names > 0 then h["X-PDP-Layers"] = table.concat(names, ", ") end
-  if c.layer then h["X-PDP-Layer"] = c.layer end
-  if c.source then h["X-PDP-Source"] = c.source end
-  if c.fail_open then h["X-PDP-Fail-Open"] = c.fail_open end
+  h["X-PDP-Layer"] = c.layer
+  h["X-PDP-Source"] = c.source
+  h["X-PDP-Fail-Open"] = c.fail_open
+  for k, v in pairs(h) do h[k] = contract.header_value(v) end
   return h
 end
 
@@ -106,8 +108,9 @@ end
 -- A 429 answers this request only: the next is asked afresh.
 local function fail_layer(c, ep, detail, skipped, phase)
   if ep.fail_open then
+    -- The client is told which layer was skipped (X-PDP-Fail-Open); why is for the log.
     kong.log.warn("PDP layer ", ep.identifier, " unavailable (", phase, "): ", detail.msg, "; skipped (fail-open)")
-    skipped[#skipped + 1] = ep.identifier .. " (" .. detail.msg .. ")"
+    skipped[#skipped + 1] = ep.identifier
     return
   end
   kong.log.err("PDP layer ", ep.identifier, " unavailable (", phase, "): ", detail.msg, "; denying (fail-closed)")
@@ -139,6 +142,11 @@ function SidebandPDP:access(conf)
   local c = kong.ctx.plugin
   c.pep = conf.pep_label or "kong-sideband-pep"
 
+  -- 0) A client's identity headers go before anything else: the policy provider is not
+  --    shown them as if a PEP had asserted them, and the upstream receives only what a
+  --    layer adds.
+  for _, name in ipairs(sideband.AUTH_HEADERS) do kong.service.request.clear_header(name) end
+
   -- 1) which PDPs, in what order, under what rules. A discovery failure is a 503, like an
   --    unreachable PDP: a request whose decider cannot be found is not one to let through.
   local dconf = discovery_conf(conf)
@@ -155,9 +163,9 @@ function SidebandPDP:access(conf)
   -- 2) the request as the client sent it, through every layer in order
   local original, perr = sideband.request_payload(conf)
   if not original then
-    kong.log.err("the sideband request could not be built: ", perr)
+    kong.log.err("the sideband request could not be built: ", perr.detail)
     c.decision = "DENY"
-    return deny(c, 400, perr)
+    return deny(c, perr.status, perr.reason)
   end
   local current, asked = original, {}
   for _, ep in ipairs(eps) do
@@ -172,7 +180,7 @@ function SidebandPDP:access(conf)
       -- policy's to write, and this plugin does not second-guess it.
       c.decision, c.layer, c.asked = "DENY", ep.identifier, asked
       debug(conf, "denied by ", ep.identifier, " with ", detail.status)
-      local h = sideband.flatten_headers(detail.headers)
+      local h = sideband.client_headers(detail.headers)
       for k, v in pairs(pdp_headers(c)) do h[k] = v end
       return kong.response.exit(detail.status, detail.body or "", h)
     else

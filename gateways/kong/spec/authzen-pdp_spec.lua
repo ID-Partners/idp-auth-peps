@@ -58,6 +58,35 @@ local function token(claims)
   return 'Bearer ' .. mock.jwt(claims or { sub = 'alice', act = { sub = 'agent-1' } })
 end
 
+-- The engine's side of a check, as a responder: `engine` is a table (the JSON answer),
+-- false (connection refused), a number (that status, empty body) or a function.
+local function engine_route(engine, opts)
+  local calls = {}
+  opts = opts or {}
+  opts.pdp = function(url, req)
+    calls[#calls + 1] = { url = url, body = req.body, headers = req.headers, ssl_verify = req.ssl_verify }
+    if url:find('/v1/mcp/check', 1, true) then
+      if type(engine) == 'function' then return engine(url, req) end
+      if engine == false then return nil, 'connection refused' end
+      if type(engine) == 'number' then return { status = engine, body = '' } end
+      return { status = 200, body = mock.json_encode(engine or { decision = true, upstream_headers = {} }) }
+    end
+    return { status = 200, body = mock.json_encode({ decision = true }) }
+  end
+  local plugin, state = load_plugin(opts)
+  return plugin, state, calls
+end
+
+local function checks(calls)
+  local out = {}
+  for _, c in ipairs(calls) do
+    if c.url:find('/v1/mcp/check', 1, true) then out[#out + 1] = mock.json_decode(c.body) end
+  end
+  return out
+end
+
+local TOOLS_CALL = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}'
+
 describe('pure helpers', function()
   -- Each test loads its own plugin: load_plugin reinstalls the globals, so a handle
   -- captured once at describe time would outlive the environment it was built against.
@@ -306,6 +335,90 @@ describe('step-up and PDP advice', function()
   end)
 end)
 
+describe('the identity headers are the PEP\'s, and what a client reads is generic and header-safe', function()
+  local FORGED = { ['x-auth-principal'] = 'mallory', ['x-auth-agent'] = 'evil-agent', ['x-auth-scope'] = 'admin', ['x-auth-acr'] = 'urn:staff' }
+  local function with_forged(h)
+    for k, v in pairs(FORGED) do h[k] = v end
+    return h
+  end
+  local function cleared(state)
+    local out = {}
+    for _, name in ipairs(state.cleared_upstream_headers or {}) do out[name:lower()] = true end
+    return out
+  end
+
+  it('removes a client\'s X-Auth-* before anything else, and sets only what it asserts', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = with_forged({ authorization = token({ sub = 'alice' }) }), -- no act, scope or acr
+      pdp = { decision = true },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.is_nil(state.exited)
+    local gone = cleared(state)
+    for name in pairs(FORGED) do assert.is_true(gone[name], name) end
+    assert.equal('alice', state.upstream_headers['X-Auth-Principal'])
+    -- Nothing asserted, nothing set: not the client's value, and not an empty one.
+    assert.is_nil(state.upstream_headers['X-Auth-Agent'])
+    assert.is_nil(state.upstream_headers['X-Auth-Scope'])
+    assert.is_nil(state.upstream_headers['X-Auth-Acr'])
+  end)
+
+  it('removes them on a delegated route too, whatever coaz-pep asserts', function()
+    local plugin, state = engine_route({ decision = true, upstream_headers = { ['X-Auth-Principal'] = 'alice' } },
+      { method = 'POST', path = '/mcp', body = TOOLS_CALL, headers = with_forged({ authorization = token() }) })
+    mock.run_access(plugin, mcp_conf())
+    assert.is_nil(state.exited)
+    local gone = cleared(state)
+    for name in pairs(FORGED) do assert.is_true(gone[name], name) end
+    assert.equal('alice', state.upstream_headers['X-Auth-Principal'])
+    assert.is_nil(state.upstream_headers['X-Auth-Agent'])
+  end)
+
+  it('removes them before relaying the federation face, too', function()
+    local plugin, state = load_plugin({ method = 'GET', path = '/.well-known/openid-federation', headers = with_forged({}),
+      pdp = function() return { status = 200, body = 'eyJ.a.b' } end })
+    mock.run_access(plugin, base_conf({ federation_entity_url = 'http://coaz-pep:9192' }))
+    assert.equal(200, state.exited.status)
+    assert.is_true(cleared(state)['x-auth-principal'])
+  end)
+
+  it('keeps line breaks and non-ASCII out of every header built from PDP data', function()
+    local plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a/balance',
+      headers = { authorization = token({ sub = 'alice' }) },
+      pdp = { decision = false, context = { reason = 'no\r\nSet-Cookie: pwned=1 caf\195\169' } },
+    })
+    mock.proxy(plugin, base_conf())
+    assert.equal(403, state.exited.status)
+    local reason = state.response_headers['X-PDP-Reason']
+    assert.is_nil(reason:find('[\r\n]'))
+    assert.is_nil(reason:find('[\128-\255]'))
+    assert.equal('no  Set-Cookie: pwned=1 caf', reason)
+    -- The JSON body keeps the policy's words as written.
+    assert.equal('no\r\nSet-Cookie: pwned=1 caf\195\169', state.exited.body.reason)
+  end)
+
+  it('escapes a WWW-Authenticate parameter as a quoted-string', function()
+    local plugin, state = load_plugin({
+      method = 'POST', path = '/payments', body = '{"from_account":"a","amount":9000}',
+      headers = { authorization = token({ sub = 'alice' }) },
+      pdp = { decision = false, context = { step_up_required = true, step_up_scope = 'pay"x\\y\r\nz' } },
+    })
+    mock.run_access(plugin, base_conf())
+    assert.equal('Bearer error="insufficient_scope", scope="pay\\"x\\\\y  z"', state.exited.headers['WWW-Authenticate'])
+  end)
+
+  it('sanitises what coaz-pep asks it to set, too', function()
+    local plugin, state = engine_route({ decision = true, upstream_headers = { ['X-Auth-Principal'] = 'alice\r\nX-Evil: 1' },
+      response_headers = { ['X-PDP-Reason'] = 'ok\nX-Evil: 1' } },
+      { method = 'POST', path = '/mcp', body = TOOLS_CALL, headers = { authorization = token() } })
+    mock.proxy(plugin, mcp_conf())
+    assert.equal('alice  X-Evil: 1', state.upstream_headers['X-Auth-Principal'])
+    assert.equal('ok X-Evil: 1', state.response_headers['X-PDP-Reason'])
+  end)
+end)
+
 describe('a JSON null from the PDP reads as absent', function()
   -- cjson decodes null to cjson.null, which is truthy: read straight, a null reason
   -- became a header value Kong refuses (a 500 from header_filter), and a null
@@ -399,35 +512,6 @@ describe('challenge parity with the other PEPs', function()
     assert.equal('identity_verification_required', state.exited.body.error)
   end)
 end)
-
--- The engine's side of a check, as a responder: `engine` is a table (the JSON answer),
--- false (connection refused), a number (that status, empty body) or a function.
-local function engine_route(engine, opts)
-  local calls = {}
-  opts = opts or {}
-  opts.pdp = function(url, req)
-    calls[#calls + 1] = { url = url, body = req.body, headers = req.headers, ssl_verify = req.ssl_verify }
-    if url:find('/v1/mcp/check', 1, true) then
-      if type(engine) == 'function' then return engine(url, req) end
-      if engine == false then return nil, 'connection refused' end
-      if type(engine) == 'number' then return { status = engine, body = '' } end
-      return { status = 200, body = mock.json_encode(engine or { decision = true, upstream_headers = {} }) }
-    end
-    return { status = 200, body = mock.json_encode({ decision = true }) }
-  end
-  local plugin, state = load_plugin(opts)
-  return plugin, state, calls
-end
-
-local function checks(calls)
-  local out = {}
-  for _, c in ipairs(calls) do
-    if c.url:find('/v1/mcp/check', 1, true) then out[#out + 1] = mock.json_decode(c.body) end
-  end
-  return out
-end
-
-local TOOLS_CALL = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_customer","arguments":{"id":"c1"}}}'
 
 describe('an MCP route: every request goes to coaz-pep', function()
   local function mcp(method, body, over, engine, extra)
