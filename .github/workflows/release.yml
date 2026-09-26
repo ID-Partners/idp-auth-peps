@@ -117,8 +117,10 @@ jobs:
         # because sideband-pdp depends on it: install them in that order too. The
         # rockspecs attached, and the ones inside the rocks, name the tag being released
         # - the candidate's own for a candidate, since the release tag does not exist yet.
+        # Ubuntu's luarocks (3.8) looks for the Lua headers before any build, a pure-Lua
+        # one included, hence liblua5.4-dev; installing the rocks needs no headers.
         run: |
-          sudo apt-get update && sudo apt-get install -y lua5.4 luarocks lua-sec
+          sudo apt-get update && sudo apt-get install -y lua5.4 liblua5.4-dev luarocks lua-sec
           base="${{ needs.versions.outputs.base }}"
           mkdir -p dist
           for p in authzen-pdp sideband-pdp; do
