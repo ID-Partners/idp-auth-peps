@@ -274,6 +274,12 @@ export interface McpGuardOptions {
   upstreamUrl?: string;
   /** How long a discovered tools/list is reused. Default 60s. */
   discoveryTtlMs?: number;
+  /**
+   * The deadline for one whole discovery — the session handshake, if the server wants
+   * one, and every page of tools/list. Default 10s. A discovery that misses it fails the
+   * calls waiting on it, closed.
+   */
+  discoveryTimeoutMs?: number;
   /** Headers for the discovery call (auth to the upstream MCP server). */
   discoveryHeaders?: Record<string, string>;
   /** Label for this PEP in challenges and logs. */
@@ -349,6 +355,18 @@ const SERVER_SCOPED_METHODS = new Set(['tools/list', 'resources/list', 'prompts/
 /** The identity headers a PEP asserts upstream, and removes when a client sends them. */
 const AUTH_HEADERS = ['X-Auth-Principal', 'X-Auth-Agent', 'X-Auth-Scope', 'X-Auth-Acr'] as const;
 
+/**
+ * The MCP revision gateway discovery speaks. 2025-06-18 is the first without JSON-RPC
+ * batching, which no PEP here will evaluate.
+ */
+const MCP_PROTOCOL_VERSION = '2025-06-18';
+/** Sent as clientInfo.version in the initialize handshake. */
+const SDK_VERSION = '0.4.0';
+/** The most pages of tools/list discovery reads before it gives up. */
+const MAX_TOOLS_PAGES = 32;
+/** The most one discovery answer may be. */
+const MAX_DISCOVERY_BYTES = 4 * 1_048_576;
+
 export class McpGuard {
   private readonly client: AuthzenClient;
   private readonly pep: string;
@@ -356,6 +374,7 @@ export class McpGuard {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly defaults: boolean;
   private cache: { at: number; tools: Map<string, ToolDefinition> } | null = null;
+  private inflight: Promise<Map<string, ToolDefinition>> | null = null;
 
   private readonly resource: string | undefined;
 
@@ -750,33 +769,140 @@ export class McpGuard {
       const list = typeof this.opts.tools === 'function' ? await this.opts.tools() : this.opts.tools;
       return new Map(list.map((t) => [t.name, t]));
     }
-    const now = Date.now();
-    if (this.cache && now - this.cache.at < this.ttl) return this.cache.tools;
-    const list = await this.discover();
-    this.cache = { at: now, tools: new Map(list.map((t) => [t.name, t])) };
-    return this.cache.tools;
+    if (this.cache && Date.now() - this.cache.at < this.ttl) return this.cache.tools;
+    // One discovery at a time: calls that arrive while it runs share its answer.
+    this.inflight ??= this.discover()
+      .then((tools) => {
+        this.cache = { at: Date.now(), tools };
+        return tools;
+      })
+      .finally(() => {
+        this.inflight = null;
+      });
+    return this.inflight;
   }
 
-  /** `tools/list` over MCP streamable HTTP. Handles both a JSON body and an SSE stream. */
-  private async discover(): Promise<ToolDefinition[]> {
+  /**
+   * `tools/list` over MCP streamable HTTP, every page of it, within one deadline — the
+   * Go engine's behaviour. A bare request first, which a stateless server answers; if
+   * that fails, the initialize handshake, and the list again inside the session. A tool
+   * on a page that was never read would be judged by the default mapping instead of its
+   * own declaration, so a list that cannot be read to the end is a failure, not a
+   * shorter list.
+   */
+  private async discover(): Promise<Map<string, ToolDefinition>> {
+    const timeoutMs = this.opts.discoveryTimeoutMs ?? 10_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const session = { id: '' };
+    try {
+      let tools: unknown[];
+      try {
+        tools = await this.listTools(session, controller.signal);
+      } catch (err) {
+        if (controller.signal.aborted) throw err;
+        await this.initialize(session, controller.signal);
+        tools = await this.listTools(session, controller.signal);
+      }
+      return indexTools(tools);
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error(`tools/list discovery timed out after ${timeoutMs}ms`);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async listTools(session: { id: string }, signal: AbortSignal): Promise<unknown[]> {
+    const tools: unknown[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 1; page <= MAX_TOOLS_PAGES; page++) {
+      const result = await this.upstreamRpc({ jsonrpc: '2.0', id: `coaz-discovery-${page}`, method: 'tools/list', params: cursor === undefined ? {} : { cursor } }, session, signal);
+      const list = isObject(result) ? result['tools'] : undefined;
+      if (!Array.isArray(list)) throw new Error('tools/list response carried no result.tools array');
+      tools.push(...(list as unknown[]));
+      const next = isObject(result) ? result['nextCursor'] : undefined;
+      if (next === undefined || next === null || next === '') return tools;
+      if (typeof next !== 'string') throw new Error('tools/list nextCursor is not a string');
+      if (cursors.has(next)) throw new Error('tools/list repeated a cursor');
+      cursors.add(next);
+      cursor = next;
+    }
+    throw new Error(`tools/list did not end within ${MAX_TOOLS_PAGES} pages`);
+  }
+
+  private async initialize(session: { id: string }, signal: AbortSignal): Promise<void> {
+    const init = await this.upstreamRpc(
+      {
+        jsonrpc: '2.0',
+        id: 'coaz-discovery-init',
+        method: 'initialize',
+        params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: '@id-partners/authzen-pep', version: SDK_VERSION } },
+      },
+      session,
+      signal,
+    );
+    if (!isObject(init)) throw new Error('initialize returned no result');
+    // Best effort, as the Go engine does: some servers want it before they serve a request.
+    await this.upstreamRpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, session, signal).catch(() => {});
+  }
+
+  /**
+   * POST one JSON-RPC message to the upstream and return the `result` of its answer,
+   * which may come as JSON or as an SSE stream. A redirect is not followed, a body over
+   * 4 MiB is refused, and an MCP error is a failure. Carries the session once there is one.
+   */
+  private async upstreamRpc(payload: Record<string, unknown>, session: { id: string }, signal: AbortSignal): Promise<unknown> {
+    const method = String(payload['method']);
     const res = await this.fetchImpl(this.opts.upstreamUrl!, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': MCP_PROTOCOL_VERSION,
         ...this.opts.discoveryHeaders,
+        ...(session.id ? { 'mcp-session-id': session.id } : {}),
       },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 'coaz-discovery', method: 'tools/list', params: {} }),
+      body: JSON.stringify(payload),
+      redirect: 'manual',
+      signal,
     });
-    if (!res.ok) throw new Error(`tools/list returned ${res.status}`);
-    const text = await res.text();
-    const payload = (res.headers.get('content-type') ?? '').includes('text/event-stream')
-      ? parseSse(text)
-      : safeJson(text);
-    const tools = (payload as { result?: { tools?: ToolDefinition[] } } | null)?.result?.tools;
-    if (!Array.isArray(tools)) throw new Error('tools/list response carried no result.tools array');
-    return tools;
+    session.id = res.headers.get('mcp-session-id') ?? session.id;
+    if (res.status === 202) {
+      await res.body?.cancel().catch(() => {});
+      return undefined;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`${method} returned ${res.status}`);
+    }
+    const text = await readCapped(res, MAX_DISCOVERY_BYTES);
+    const answer = (res.headers.get('content-type') ?? '').includes('text/event-stream') ? parseSse(text) : safeJson(text);
+    if (!isObject(answer)) throw new Error(`${method} answer is not JSON-RPC`);
+    const error = answer['error'];
+    if (isObject(error)) throw new Error(`${method} returned MCP error ${String(error['code'])}: ${String(error['message'])}`);
+    return answer['result'];
   }
+}
+
+/**
+ * A discovered tools/list, by name. An entry with no usable name is skipped; a name
+ * listed twice must be listed the same way both times, or nobody can say which
+ * declaration governs it.
+ */
+function indexTools(list: unknown[]): Map<string, ToolDefinition> {
+  const out = new Map<string, ToolDefinition>();
+  for (const t of list) {
+    if (!isObject(t) || typeof t['name'] !== 'string' || t['name'] === '') continue;
+    const prev = out.get(t['name']);
+    if (prev !== undefined) {
+      if (!sameJson(prev, t)) throw new Error(`tools/list names ${JSON.stringify(t['name'])} twice, differently`);
+      continue;
+    }
+    out.set(t['name'], t as ToolDefinition);
+  }
+  return out;
 }
 
 /** The claims a check reads, whether it was handed PepClaims, a bare claims map, or nothing. */
