@@ -112,10 +112,11 @@ export function parseBody(
   try {
     scan(text);
   } catch (err) {
+    // MAX_DEPTH keeps the scan far from the stack's limit; anything else unforeseen is,
+    // like a syntax error, a body the PEP could not read.
     if (err instanceof ScanFailure && err.kind === 'structure') {
       return { ok: false, refusal: invalid(err.message, err.key?.toLowerCase() === 'id' ? null : idOf(text)) };
     }
-    if (err instanceof RangeError) return { ok: false, refusal: invalid('nested too deeply') };
     return { ok: false, refusal: parseError() };
   }
   return { ok: true, value: JSON.parse(text) };

@@ -141,11 +141,7 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
   const requireToken = opts.requireToken !== false;
 
   return async function authzen(req: PepRequest, res: PepResponse, next: NextFunction): Promise<void> {
-    // Exactly one audit record per request, and one rendering path for every deny.
-    let reported = false;
     const report = (verdict: Verdict, claims: PepClaims) => {
-      if (reported) return;
-      reported = true;
       if (!opts.onDecision) return;
       try {
         opts.onDecision({ req, verdict, claims });
@@ -153,18 +149,19 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
         /* a broken audit hook must not open the gate */
       }
     };
-    const deny = (verdict: Verdict, claims: PepClaims) => {
+    // One rendering path for every deny, and one audit record: each path out of gate()
+    // either denies (and reports) or proceeds having reported, never both.
+    const deny = (verdict: Verdict, claims: PepClaims): false => {
       report(verdict, claims);
       respond(res, verdict, pep);
+      return false;
     };
 
     let claims: PepClaims = extractClaims(null);
-    try {
+    const gate = async (): Promise<boolean> => {
       const token = (opts.getToken ?? defaultGetToken)(req);
       if (!token) {
-        if (requireToken) {
-          return deny({ allow: false, kind: 'unauthenticated', reason: 'No access token presented.' }, claims);
-        }
+        if (requireToken) return deny({ allow: false, kind: 'unauthenticated', reason: 'No access token presented.' }, claims);
       } else if (opts.verifyToken) {
         let verified: unknown;
         try {
@@ -173,9 +170,7 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
           // A verifier that throws has rejected the token: the caller's problem, not ours.
           return deny({ allow: false, kind: 'unauthenticated', reason: 'Access token failed verification.', detail: message(err) }, claims);
         }
-        if (!isObject(verified)) {
-          return deny({ allow: false, kind: 'unauthenticated', reason: 'Access token failed verification.' }, claims);
-        }
+        if (!isObject(verified)) return deny({ allow: false, kind: 'unauthenticated', reason: 'Access token failed verification.' }, claims);
         claims = extractClaims(verified);
       } else {
         claims = extractClaims(decodeJwtClaims(token));
@@ -193,7 +188,7 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
       }
       if (request === null) {
         stripAuthHeaders(req);
-        return next();
+        return true;
       }
       if (!isObject(request)) {
         const detail = request === undefined ? 'map() returned undefined; return null to let a request through without the PDP' : `map() returned a ${typeof request}, not an evaluation`;
@@ -217,11 +212,18 @@ export function authzenMiddleware(opts: AuthzenMiddlewareOptions) {
       if (opts.forwardHeaders) assertAuthHeaders(req, claims);
       req.authz = { claims, verdict, request: evaluation };
       report(verdict, claims);
-      next();
+      return true;
+    };
+
+    let proceed: boolean;
+    try {
+      proceed = await gate();
     } catch (err) {
       // Anything unforeseen is still a deny — a PEP that throws is a PEP that is open.
-      deny({ allow: false, kind: 'pdp_error', reason: PDP_UNAVAILABLE_REASON, detail: message(err) }, claims);
+      proceed = deny({ allow: false, kind: 'pdp_error', reason: PDP_UNAVAILABLE_REASON, detail: message(err) }, claims);
     }
+    // Outside the try: an error downstream is the router's to handle, not a PEP failure.
+    if (proceed) next();
   };
 }
 

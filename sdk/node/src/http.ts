@@ -19,7 +19,7 @@ export class BodyTooLargeError extends Error {
 export async function readCapped(res: Response, max: number): Promise<string> {
   const declared = Number(res.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > max) {
-    await res.body?.cancel().catch(() => {});
+    await discard(res);
     throw new BodyTooLargeError(max);
   }
   if (!res.body) return '';
@@ -31,12 +31,25 @@ export async function readCapped(res: Response, max: number): Promise<string> {
     if (done) break;
     size += value.byteLength;
     if (size > max) {
-      await reader.cancel().catch(() => {});
+      try {
+        await reader.cancel();
+      } catch {
+        /* the stream is going away either way */
+      }
       throw new BodyTooLargeError(max);
     }
     chunks.push(value);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/** Let go of a body that will not be read, so its connection can be reused or closed. */
+export async function discard(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    /* already closed or errored: nothing left to release */
+  }
 }
 
 /**

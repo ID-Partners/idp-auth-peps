@@ -31,7 +31,7 @@ import type {
 } from './types.js';
 import { foldDecision } from './challenge.js';
 import { PdpDiscovery, resolveLayers, resourceMetadataOf, type LayerSpec, type PdpDiscoveryOptions, type PdpEndpoints, type PdpResolver, type ResolvedLayers, type ResourceMetadata } from './discovery.js';
-import { BodyTooLargeError, encodeJson, isHttpUrl, readCapped } from './http.js';
+import { BodyTooLargeError, discard, encodeJson, isHttpUrl, readCapped } from './http.js';
 
 /** Discovery knobs a client accepts; the static PDP, its key and fetch come from the client. */
 export type ClientDiscoveryOptions = Omit<PdpDiscoveryOptions, 'staticPdp' | 'apiKeys' | 'fetch'>;
@@ -327,11 +327,11 @@ export class AuthzenClient {
       }
       const status = res.status;
       if (status >= 500 || status === 429) {
-        await res.body?.cancel().catch(() => {});
+        await discard(res);
         return fail(`PDP ${endpoint} returned ${status}`, 'unavailable', status);
       }
       if (status < 200 || status >= 300) {
-        await res.body?.cancel().catch(() => {});
+        await discard(res);
         return fail(`PDP ${endpoint} returned ${status}${status >= 300 && status < 400 ? ' (redirects are not followed)' : ''}`, 'refusal', status);
       }
       let text: string;

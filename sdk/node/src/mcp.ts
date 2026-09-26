@@ -35,7 +35,7 @@
 import { AuthzenClient, PDP_UNAVAILABLE_REASON, type AuthzenClientOptions } from './client.js';
 import { toChallenge } from './challenge.js';
 import { extractClaims, type PepClaims } from './claims.js';
-import { BodyTooLargeError, isHttpUrl, readCapped, sanitizeHeaderValue } from './http.js';
+import { BodyTooLargeError, discard, isHttpUrl, readCapped, sanitizeHeaderValue } from './http.js';
 import { CODE_INVALID_REQUEST, CODE_PARSE_ERROR, headerValue, isPlainObject, parseBody, readMessage, type RpcId, type RpcRefusal } from './jsonrpc.js';
 import type { EvaluationRequest, EvaluationsRequest, Verdict } from './types.js';
 
@@ -720,7 +720,7 @@ export class McpGuard {
         signal: controller.signal,
       });
       if (!res.ok) {
-        await res.body?.cancel().catch(() => {});
+        await discard(res);
         const hint = res.status === 401 ? ' (set delegate.apiKey to its CHECK_API_TOKEN)' : '';
         return fail(`coaz-pep check returned ${res.status}${hint}`);
       }
@@ -845,7 +845,11 @@ export class McpGuard {
     );
     if (!isObject(init)) throw new Error('initialize returned no result');
     // Best effort, as the Go engine does: some servers want it before they serve a request.
-    await this.upstreamRpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, session, signal).catch(() => {});
+    try {
+      await this.upstreamRpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, session, signal);
+    } catch {
+      /* a server that minds will say so when it is asked for the list */
+    }
   }
 
   /**
@@ -870,11 +874,11 @@ export class McpGuard {
     });
     session.id = res.headers.get('mcp-session-id') ?? session.id;
     if (res.status === 202) {
-      await res.body?.cancel().catch(() => {});
+      await discard(res);
       return undefined;
     }
     if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
+      await discard(res);
       throw new Error(`${method} returned ${res.status}`);
     }
     const text = await readCapped(res, MAX_DISCOVERY_BYTES);
