@@ -230,8 +230,10 @@ and the matching SDK suite.
 A `v*` tag releases every component at one version: the `coaz-pep` image on
 `ghcr.io/id-partners/coaz-pep` (amd64 and arm64, signed with cosign, with an SBOM and build
 provenance), both Kong rocks, the PingAccess rule's jar, and `@id-partners/authzen-pep` on
-npm with provenance. What changed, and what to do about it when upgrading, is in
-[CHANGELOG.md](CHANGELOG.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
+npm with provenance. A tag like `v0.4.0-rc1` is a candidate for that version: the same
+jobs, the image pushed under the candidate's tag only, a prerelease on GitHub, and npm
+only as a dry run, since an npm version cannot be taken back. What changed, and what to
+do about it when upgrading, is in [CHANGELOG.md](CHANGELOG.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Licence
 

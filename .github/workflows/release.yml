@@ -4,6 +4,11 @@ name: Release
 # an SBOM, build provenance and a keyless cosign signature), the two Kong rocks, the
 # PingAccess rule's jar, and the Node SDK on npm. Every component must already say the
 # tag's version and CHANGELOG.md must have a section for it — the first job checks.
+#
+# A tag like v0.4.0-rc1 is a release candidate for 0.4.0, and runs the same jobs with
+# nothing final published: the components still say 0.4.0, the image is pushed as
+# 0.4.0-rc1 only (never latest or 0.4), the GitHub release is a prerelease, and npm
+# only does a dry run, because an npm version is permanent.
 on:
   push:
     tags: ['v*.*.*']
@@ -17,21 +22,35 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      base: ${{ steps.v.outputs.base }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: v
         run: |
           v="${GITHUB_REF_NAME#v}"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if ! [[ "$v" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-rc[0-9]+)?$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is neither vX.Y.Z nor vX.Y.Z-rcN"
+            exit 1
+          fi
+          base="${BASH_REMATCH[1]}"
+          prerelease=false
+          if [ -n "${BASH_REMATCH[2]}" ]; then prerelease=true; fi
+          {
+            echo "version=$v"
+            echo "base=$base"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          # A candidate is for the version the components already say.
           fail=0
-          check() { if ! eval "$2"; then echo "::error::$1 does not say $v"; fail=1; fi; }
-          check "Kong authzen-pdp rockspec" "test -f gateways/kong/authzen-pdp/kong-plugin-authzen-pdp-$v-1.rockspec"
-          check "Kong sideband-pdp rockspec" "test -f gateways/kong/sideband-pdp/kong-plugin-sideband-pdp-$v-1.rockspec"
-          check "Kong authzen-pdp handler" "grep -q 'VERSION = \"$v\"' gateways/kong/authzen-pdp/handler.lua"
-          check "Kong sideband-pdp handler" "grep -q 'VERSION = \"$v\"' gateways/kong/sideband-pdp/handler.lua"
-          check "PingAccess pom" "grep -q '<version>$v</version>' gateways/pingaccess/authzen-pdp/pom.xml"
-          check "Node package.json" "grep -q '\"version\": \"$v\"' sdk/node/package.json"
-          check "CHANGELOG.md" "grep -q '^## \[$v\]' CHANGELOG.md"
+          check() { if ! eval "$2"; then echo "::error::$1 does not say $base"; fail=1; fi; }
+          check "Kong authzen-pdp rockspec" "test -f gateways/kong/authzen-pdp/kong-plugin-authzen-pdp-$base-1.rockspec"
+          check "Kong sideband-pdp rockspec" "test -f gateways/kong/sideband-pdp/kong-plugin-sideband-pdp-$base-1.rockspec"
+          check "Kong authzen-pdp handler" "grep -q 'VERSION = \"$base\"' gateways/kong/authzen-pdp/handler.lua"
+          check "Kong sideband-pdp handler" "grep -q 'VERSION = \"$base\"' gateways/kong/sideband-pdp/handler.lua"
+          check "PingAccess pom" "grep -q '<version>$base</version>' gateways/pingaccess/authzen-pdp/pom.xml"
+          check "Node package.json" "grep -q '\"version\": \"$base\"' sdk/node/package.json"
+          check "CHANGELOG.md" "grep -q '^## \[$base\]' CHANGELOG.md"
           exit $fail
 
   image:
@@ -93,15 +112,19 @@ jobs:
       - name: Pack both rocks from the tag
         # Source rocks built from the tag: the rockspecs' module paths are repo-relative.
         # authzen-pdp first, because sideband-pdp depends on it — install them in that
-        # order too.
+        # order too. Packing clones the rockspec's source tag, so the packed copy names
+        # the tag being released: the same tag for a release, the candidate's for a
+        # candidate, since the release tag does not exist yet.
         run: |
           sudo apt-get update && sudo apt-get install -y lua5.4 luarocks lua-sec
-          v="${{ needs.versions.outputs.version }}"
+          base="${{ needs.versions.outputs.base }}"
           mkdir -p dist
           for p in authzen-pdp sideband-pdp; do
-            spec="gateways/kong/$p/kong-plugin-$p-$v-1.rockspec"
-            luarocks --lua-version=5.4 lint "$spec"
+            spec="gateways/kong/$p/kong-plugin-$p-$base-1.rockspec"
             cp "$spec" dist/
+            sed -i "s/^  tag = \"v[^\"]*\",$/  tag = \"$GITHUB_REF_NAME\",/" "dist/$(basename "$spec")"
+            grep -q "^  tag = \"$GITHUB_REF_NAME\",$" "dist/$(basename "$spec")"
+            luarocks --lua-version=5.4 lint "dist/$(basename "$spec")"
             (cd dist && luarocks --lua-version=5.4 pack "$(basename "$spec")")
           done
           ls -l dist
@@ -129,7 +152,8 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pingaccess
-          path: gateways/pingaccess/authzen-pdp/target/authzen-pdp-pingaccess-${{ needs.versions.outputs.version }}.jar
+          path: gateways/pingaccess/authzen-pdp/target/authzen-pdp-pingaccess-${{ needs.versions.outputs.base }}.jar
+          if-no-files-found: error
 
   npm:
     name: Node SDK on npm
@@ -149,10 +173,15 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run test:coverage
+      # A candidate stops short of publishing: an npm version is permanent, and the one
+      # package.json says is the release's to publish.
+      - if: needs.versions.outputs.prerelease == 'true'
+        run: npm publish --dry-run --access public
       # With an NPM_TOKEN secret it publishes with that; without one, npm's trusted
       # publishing (configured on npmjs.com for this repository and workflow) needs no
       # secret at all. Either way the package carries provenance.
-      - run: npm publish --provenance --access public
+      - if: needs.versions.outputs.prerelease != 'true'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -172,9 +201,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ needs.versions.outputs.version }}
+          BASE: ${{ needs.versions.outputs.base }}
+          PRERELEASE: ${{ needs.versions.outputs.prerelease }}
           DIGEST: ${{ needs.image.outputs.digest }}
         run: |
-          awk -v v="$V" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+          flags=()
+          : > notes.md
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+            printf 'A release candidate for %s. The rocks and the jar attached say %s, and nothing is on npm yet. The notes below are the ones %s will ship with.\n\n' \
+              "$BASE" "$BASE" "$BASE" >> notes.md
+          fi
+          awk -v v="$BASE" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md >> notes.md
           printf '\nImage: `ghcr.io/%s/coaz-pep:%s` (`%s`), signed with cosign (keyless) and attested.\n' \
             "${GITHUB_REPOSITORY_OWNER,,}" "$V" "$DIGEST" >> notes.md
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md assets/*
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}" assets/*

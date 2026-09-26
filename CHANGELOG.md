@@ -1,7 +1,8 @@
 # Changelog
 
 Every component — the `coaz-pep` image, the two Kong plugins, the PingAccess rule and the
-Node SDK — shares one version line from 0.4.0 on. A `v*` tag releases them all.
+Node SDK — shares one version line from 0.4.0 on. A `v*` tag releases them all; a
+`-rcN` tag is a candidate for that version and publishes nothing final.
 
 ## [0.4.0] - 2026-09-26
 
