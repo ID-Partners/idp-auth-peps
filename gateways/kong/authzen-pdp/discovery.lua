@@ -233,7 +233,12 @@ end
 local function rfc9728_lookup(resource, opts)
   local wk, err = D.well_known_url(resource, "oauth-protected-resource")
   if not wk then return fail(INVALID, err) end
-  local doc, ferr = get_json(wk, opts.resource_policy)
+  -- The allowlist bounds the resource identifier, checked before this is called. The
+  -- well-known URL is that identifier's own, on its origin, with the segment inserted
+  -- after the host, so it would never sit under a path-bearing entry: fetch it under the
+  -- rest of the policy (https unless insecure), not the allowlist again.
+  local p = opts.resource_policy
+  local doc, ferr = get_json(wk, { insecure = p.insecure, ssl_verify = p.ssl_verify, timeout_ms = p.timeout_ms })
   if not doc then return nil, ferr end
   -- §3.3: the echoed identifier MUST be identical, or whoever answers at that path has
   -- just named a PDP for someone else's resource.
@@ -337,7 +342,11 @@ local function fetch_config(pdp, opts)
   if not ok then return fail(NOT_ALLOWED, why) end
   local wk, err = D.well_known_url(pdp, "authzen-configuration")
   if not wk then return fail(INVALID, err) end
-  local doc, ferr = get_json(wk, opts.pdp_policy)
+  -- The identifier has passed the allowlist; its own metadata, on its origin with the
+  -- segment inserted after the host, is fetched under the rest of the policy. What the
+  -- metadata advertises is checked against the allowlist below.
+  local p = opts.pdp_policy
+  local doc, ferr = get_json(wk, { insecure = p.insecure, trusted_origin = p.trusted_origin, ssl_verify = p.ssl_verify, timeout_ms = p.timeout_ms })
   if not doc then
     if ferr.kind == NO_METADATA then return D.default_endpoints(pdp) end
     return nil, ferr

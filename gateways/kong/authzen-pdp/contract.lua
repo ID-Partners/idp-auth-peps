@@ -62,14 +62,17 @@ end
 
 -- ---------- the request ----------
 
---- The request body, whole, or nil and why. Kong keeps a body larger than
---- client_body_buffer_size on disk; from 3.9 it reads it back up to `max` bytes, and
---- before that the argument is ignored and the body is out of reach. Either way nil
---- means "cannot authorise", never "no body": an absent body is "".
+--- The request body, whole and no larger than max, or nil and why. Kong keeps a body
+--- larger than client_body_buffer_size on disk; from 3.9 it reads it back up to `max`
+--- bytes, and before that the argument is ignored and the body is out of reach. A body
+--- held in memory comes back whatever max is asked for, so the limit is checked here as
+--- well. Either way nil means "cannot authorise", never "no body": an absent body is "".
 function C.read_body(max)
-  local ok, body, err = pcall(kong.request.get_raw_body, max or C.MAX_BODY)
+  max = max or C.MAX_BODY
+  local ok, body, err = pcall(kong.request.get_raw_body, max)
   if not ok then return nil, tostring(body) end
   if body == nil then return nil, err or "the request body could not be read" end
+  if #body > max then return nil, "the request body is " .. #body .. " bytes, over the limit of " .. max end
   return body
 end
 

@@ -365,6 +365,39 @@ describe('discovery: resource mode', function()
     assert.is_nil(D._cache().resources[RES].err)
   end)
 
+  it('fetches the metadata of a resource a path-bearing allowlist entry permits', function()
+    -- The well-known URL inserts its segment after the host, so it never sits under a
+    -- path-bearing entry; the resource identifier is what the allowlist bounds, and its
+    -- own metadata is fetched on the same origin. Found in the live run.
+    local R = RES .. '/bank'
+    local fn = router({ [RES .. '/.well-known/oauth-protected-resource/bank'] = { resource = R, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD) })
+    local D = load({ pdp = fn })
+    local ep, err = D.resolve(conf({ resource_metadata_allowlist = { R } }), R)
+    assert.is_nil(err)
+    assert.equal(GOOD, ep.identifier)
+    -- And an identifier outside the entry is still refused.
+    local none, nerr = D.resolve(conf({ resource_metadata_allowlist = { R } }), RES .. '/other')
+    assert.is_nil(none); assert.equal('not_allowed', nerr.kind)
+  end)
+
+  it('fetches the metadata of a PDP a path-bearing allowlist entry permits, and still bounds what it advertises', function()
+    local TENANT = GOOD .. '/tenants/bank'
+    local r = {
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { TENANT } },
+      [GOOD .. '/.well-known/authzen-configuration/tenants/bank'] = pdp_config(TENANT, TENANT .. '/access/v1/evaluation'),
+    }
+    local D = load({ pdp = router(r) })
+    local ep, err = D.resolve(conf({ pdp_allowlist = { TENANT } }), RES)
+    assert.is_nil(err)
+    assert.equal(TENANT .. '/access/v1/evaluation', ep.evaluation)
+    -- An endpoint the PDP advertises outside the entry is still refused.
+    r[GOOD .. '/.well-known/authzen-configuration/tenants/bank'] = pdp_config(TENANT, GOOD .. '/elsewhere/eval')
+    local D2 = load({ pdp = router(r) })
+    local none, nerr = D2.resolve(conf({ pdp_allowlist = { TENANT } }), RES)
+    assert.is_nil(none); assert.equal('not_allowed', nerr.kind)
+  end)
+
   it('fails closed on a disallowed resource without fetching it', function()
     local fn, hits = router(routes())
     local D = load({ pdp = fn })

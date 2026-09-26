@@ -764,6 +764,10 @@ describe('an MCP route refuses a body it cannot read in full or parse strictly',
     -- On 3.9+ it is read back from disk up to max_request_body_size, and beyond it refused.
     status = refused(big, { max_request_body_size = 4096 })
     assert.equal(413, status)
+    -- The limit is the body's, wherever Kong buffered it: a body held in memory (a larger
+    -- client_body_buffer_size) comes back whatever max is asked for. Found in the live run.
+    status = refused(big, { max_request_body_size = 4096 }, { client_body_buffer_size = 65536 })
+    assert.equal(413, status)
     -- Within the max, it is read whole and sent.
     local plugin, state, calls = engine_route(nil, { method = 'POST', path = '/mcp', body = big, headers = { authorization = token() } })
     mock.run_access(plugin, mcp_conf())
