@@ -58,7 +58,12 @@ func newSignedResource(t *testing.T, mutate func(self string, doc map[string]any
 			if _, skip := doc["__unsigned"]; skip {
 				delete(doc, "__unsigned")
 			} else {
-				tok, err := jose.Sign(map[string]any{"alg": "ES256", "kid": pub["kid"]}, claims, key)
+				hdr := map[string]any{"alg": "ES256", "kid": pub["kid"]}
+				if typ, set := claims["__typ"]; set {
+					delete(claims, "__typ")
+					hdr["typ"] = typ
+				}
+				tok, err := jose.Sign(hdr, claims, key)
 				if err != nil {
 					t.Fatal(err)
 				}

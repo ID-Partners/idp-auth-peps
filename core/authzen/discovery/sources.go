@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/ID-Partners/idp-auth-peps/core/federation"
 	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
@@ -26,9 +27,24 @@ func (s StaticSource) Lookup(context.Context, string) (ResourceMetadata, error) 
 }
 
 // RFC9728Source reads the resource's own protected resource metadata.
-type RFC9728Source struct{ fetch *metafetch.Client }
+type RFC9728Source struct {
+	fetch *metafetch.Client
+	// now is the clock signed_metadata's exp and nbf are read against; nil is the wall
+	// clock.
+	now func() time.Time
+}
+
+// signedMetadataLeeway absorbs clock skew on signed_metadata's exp and nbf.
+const signedMetadataLeeway = 60 * time.Second
 
 func (*RFC9728Source) Name() string { return "rfc9728" }
+
+func (s *RFC9728Source) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
 
 func (s *RFC9728Source) Lookup(ctx context.Context, resource string) (ResourceMetadata, error) {
 	wk, err := WellKnownURL(resource, wellKnownResource)
@@ -52,7 +68,8 @@ func (s *RFC9728Source) Lookup(ctx context.Context, resource string) (ResourceMe
 		return ResourceMetadata{}, fmt.Errorf("%w: %s says resource is %q, expected %q", ErrInvalid, wk, echoed, resource)
 	}
 	// RFC 9728 §2.1 signed_metadata, when the resource published one.
-	if err := s.applySignedMetadata(ctx, doc, resource, wk); err != nil {
+	expires, err := s.applySignedMetadata(ctx, doc, resource, wk)
+	if err != nil {
 		return ResourceMetadata{}, err
 	}
 	raw, _ := doc[ParamPolicyDecisionPoints].([]any)
@@ -67,7 +84,7 @@ func (s *RFC9728Source) Lookup(ctx context.Context, resource string) (ResourceMe
 	// The whole document travels to the PDP. The PEP does not know or care which other
 	// members are in it — scopes_supported, acr requirements, DPoP requirements — only
 	// that the resource published them and the PDP may want them.
-	return ResourceMetadata{Source: "rfc9728", Document: doc, PDPs: pdps, Layers: layers}, nil
+	return ResourceMetadata{Source: "rfc9728", Document: doc, PDPs: pdps, Layers: layers, ExpiresAt: expires}, nil
 }
 
 // FederationSource reads the resolved oauth_resource metadata from a Trust Chain.
@@ -169,54 +186,71 @@ var jwtReserved = map[string]bool{"iss": true, "iat": true, "exp": true, "nbf": 
 // be a downgrade an attacker forces by breaking the signature, which is easier than
 // forging one.
 //
-// What this proves is narrow, and worth saying plainly: the body was signed by a key
-// published at the document's OWN jwks_uri. Both are served by the resource, so it is a
-// self-assertion either way. It catches a body altered in front of the resource — a cache,
-// a proxy, a compromised CDN — but it is not the federation's word about the resource.
-// That is what FederationSource is for, and why it is asked first.
-func (s *RFC9728Source) applySignedMetadata(ctx context.Context, doc map[string]any, resource, wk string) error {
+// What this proves is narrow, and worth saying plainly: the claims were signed by a key
+// published at the jwks_uri the same document names. Both are served by the resource,
+// so it is a self-assertion either way, and it is only as strong as the document: whoever
+// can rewrite the document can re-point jwks_uri at a key of their own. It is not the
+// federation's word about the resource. That is what FederationSource is for, and why
+// it is asked first. What it does add is that the signed claims are dated — exp and nbf
+// are enforced, and exp is when the document stops being served from cache — and typed:
+// a JWT minted for another purpose (typ other than JWT) is not signed metadata.
+//
+// The returned time is the signed exp, zero when there is none.
+func (s *RFC9728Source) applySignedMetadata(ctx context.Context, doc map[string]any, resource, wk string) (time.Time, error) {
 	raw, present := doc["signed_metadata"]
 	if !present {
-		return nil
+		return time.Time{}, nil
 	}
 	tok, _ := raw.(string)
 	if tok == "" {
-		return fmt.Errorf("%w: %s carries an empty signed_metadata", ErrInvalid, wk)
+		return time.Time{}, fmt.Errorf("%w: %s carries an empty signed_metadata", ErrInvalid, wk)
 	}
 	hdr, claims := jose.Header(tok), jose.Claims(tok)
 	if hdr == nil || claims == nil {
-		return fmt.Errorf("%w: %s signed_metadata is not a compact JWS", ErrInvalid, wk)
+		return time.Time{}, fmt.Errorf("%w: %s signed_metadata is not a compact JWS", ErrInvalid, wk)
 	}
 	// "MUST contain an iss claim denoting the party attesting to the claims." The only
 	// keys we can locate are the resource's own, so an assertion by anyone else is one we
 	// cannot validate — and an unvalidatable signature is not a reason to trust the body.
 	if iss, _ := claims["iss"].(string); iss != resource {
-		return fmt.Errorf("%w: %s signed_metadata is issued by %q, not the resource", ErrInvalid, wk, claims["iss"])
+		return time.Time{}, fmt.Errorf("%w: %s signed_metadata is issued by %q, not the resource", ErrInvalid, wk, claims["iss"])
 	}
 	// A signature lifted from another resource's document must not pass here.
 	if r, ok := claims["resource"].(string); ok && r != resource {
-		return fmt.Errorf("%w: %s signed_metadata is about %q", ErrInvalid, wk, r)
+		return time.Time{}, fmt.Errorf("%w: %s signed_metadata is about %q", ErrInvalid, wk, r)
+	}
+	// RFC 9728 defines no typ of its own, so a plain JWT, or no typ at all; anything else
+	// is a JWT minted for some other purpose — an entity statement, an access token —
+	// that the resource's key happened to sign.
+	if typ, present := hdr["typ"]; present {
+		if s, _ := typ.(string); !strings.EqualFold(s, "JWT") && !strings.EqualFold(s, "application/jwt") {
+			return time.Time{}, fmt.Errorf("%w: %s signed_metadata has typ %v, not JWT", ErrInvalid, wk, typ)
+		}
+	}
+	expires, err := s.validity(claims)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: %s signed_metadata %v", ErrInvalid, wk, err)
 	}
 	alg, _ := hdr["alg"].(string)
 	if _, err := jose.HashFor(alg); err != nil {
-		return fmt.Errorf("%w: %s signed_metadata alg %q is not acceptable", ErrInvalid, wk, alg)
+		return time.Time{}, fmt.Errorf("%w: %s signed_metadata alg %q is not acceptable", ErrInvalid, wk, alg)
 	}
 	jwksURI, _ := doc["jwks_uri"].(string)
 	if jwksURI == "" {
-		return fmt.Errorf("%w: %s has signed_metadata but no jwks_uri to verify it with", ErrInvalid, wk)
+		return time.Time{}, fmt.Errorf("%w: %s has signed_metadata but no jwks_uri to verify it with", ErrInvalid, wk)
 	}
 	body, err := s.fetch.Get(ctx, jwksURI, "application/json")
 	if err != nil {
 		// A refused URL stays refused; anything else means we cannot verify, and an
 		// unverified signed document is not usable.
 		if errors.Is(err, metafetch.ErrNotAllowed) {
-			return err
+			return time.Time{}, err
 		}
-		return fmt.Errorf("%w: fetching %s to verify signed_metadata: %v", ErrInvalid, jwksURI, err)
+		return time.Time{}, fmt.Errorf("%w: fetching %s to verify signed_metadata: %v", ErrInvalid, jwksURI, err)
 	}
 	keys, err := jose.ParseJWKSet(body)
 	if err != nil {
-		return fmt.Errorf("%w: %s served no usable JWK set: %v", ErrInvalid, jwksURI, err)
+		return time.Time{}, fmt.Errorf("%w: %s served no usable JWK set: %v", ErrInvalid, jwksURI, err)
 	}
 	kid, _ := hdr["kid"].(string)
 	verified := false
@@ -233,7 +267,7 @@ func (s *RFC9728Source) applySignedMetadata(ctx context.Context, doc map[string]
 		}
 	}
 	if !verified {
-		return fmt.Errorf("%w: %s signed_metadata does not verify against any key at %s", ErrInvalid, wk, jwksURI)
+		return time.Time{}, fmt.Errorf("%w: %s signed_metadata does not verify against any key at %s", ErrInvalid, wk, jwksURI)
 	}
 	// Precedence: the signed claims win over the plain members.
 	for k, v := range claims {
@@ -241,5 +275,32 @@ func (s *RFC9728Source) applySignedMetadata(ctx context.Context, doc map[string]
 			doc[k] = v
 		}
 	}
-	return nil
+	return expires, nil
+}
+
+// validity checks signed_metadata's exp and nbf, when present, against the clock with a
+// little leeway, and returns exp.
+func (s *RFC9728Source) validity(claims map[string]any) (time.Time, error) {
+	now := s.clock()
+	var expires time.Time
+	for _, name := range []string{"exp", "nbf"} {
+		v, present := claims[name]
+		if !present {
+			continue
+		}
+		n, ok := v.(float64)
+		if !ok {
+			return time.Time{}, fmt.Errorf("%s is not a number", name)
+		}
+		at := time.Unix(int64(n), 0)
+		switch {
+		case name == "exp" && !at.After(now.Add(-signedMetadataLeeway)):
+			return time.Time{}, fmt.Errorf("expired at %s", at.UTC().Format(time.RFC3339))
+		case name == "nbf" && at.After(now.Add(signedMetadataLeeway)):
+			return time.Time{}, fmt.Errorf("is not yet valid (nbf %s)", at.UTC().Format(time.RFC3339))
+		case name == "exp":
+			expires = at
+		}
+	}
+	return expires, nil
 }

@@ -32,9 +32,13 @@ const ProtectedResourceWellKnown = "/.well-known/oauth-protected-resource"
 // The protected resource metadata (RFC 9728) republishes what the federation resolved:
 // the PEP walks its own chain and serves the result, so a plain RFC 9728 consumer reads
 // the federation's word without knowing there is a federation. Until the controller has
-// onboarded the entity, the document is self-asserted from Asserted, and says so only
-// by carrying no more than that. Either way it carries signed_metadata, signed with the
-// same key the Entity Configuration is.
+// onboarded the entity, the document is self-asserted from Asserted. Either way it
+// carries signed_metadata, signed with the same key the Entity Configuration is, and
+// metadata_source ("federation" or "self") inside the signature, so the signature says
+// whose word it carries; jwks_uri names the key set that verifies it, served at
+// JWKSPath. The signed claims are metadata and nothing else: no parameter a superior
+// resolved can make the entity sign a JWT that reads as an assertion about someone,
+// for someone, or forever.
 type Entity struct {
 	// ID is the entity identifier: the resource identifier, an https URL.
 	ID string
@@ -50,6 +54,10 @@ type Entity struct {
 	Resolver *Resolver
 	// Lifetime of each Entity Configuration minted. Default 24h.
 	Lifetime time.Duration
+	// MetadataLifetime is how long each signed_metadata is valid: short, because the
+	// document is re-signed on every request and a copy should not outlive what it
+	// says. Never past the resolved chain's expiry. Default 10m.
+	MetadataLifetime time.Duration
 	// Logf receives one line when resolution fails; nil discards.
 	Logf func(string, ...any)
 	// Now is the clock; tests replace it.
@@ -123,6 +131,42 @@ func (e *Entity) Paths() (federationPath, resourcePath string) {
 	return path + WellKnown, ProtectedResourceWellKnown + path
 }
 
+// JWKSPath is where Handler serves the entity's public key set: beside its RFC 9728
+// document, so a gateway that already routes that document's prefix to the PEP routes
+// this too. (It is also where the metadata of a resource at {ID}/jwks.json would live,
+// under RFC 9728's path insertion; a PEP that fronts such a resource must not also be
+// its entity.)
+func (e *Entity) JWKSPath() string {
+	_, res := e.Paths()
+	return res + "/jwks.json"
+}
+
+// JWKSURL is JWKSPath on the entity's own origin: what the RFC 9728 document
+// advertises as jwks_uri. Empty when ID does not parse.
+func (e *Entity) JWKSURL() string {
+	u, err := url.Parse(e.ID)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + e.JWKSPath()
+}
+
+// JWKS is the entity's public key set (RFC 7517 §5): the Federation Entity Key that
+// signs both documents, marked for signatures under the one alg it signs with.
+func (e *Entity) JWKS() ([]byte, error) {
+	e.mu.Lock()
+	jwk, alg, err := e.keys()
+	e.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	pub := map[string]any{"use": "sig", "alg": alg}
+	for k, v := range jwk {
+		pub[k] = v
+	}
+	return json.Marshal(map[string]any{"keys": []any{pub}})
+}
+
 // Configuration mints (and briefly caches) the signed Entity Configuration.
 func (e *Entity) Configuration() (string, error) {
 	e.mu.Lock()
@@ -161,13 +205,17 @@ func (e *Entity) Configuration() (string, error) {
 
 // ProtectedResourceMetadata is the RFC 9728 document: the federation's resolved
 // oauth_resource metadata when the chain validates, Asserted otherwise, with
-// signed_metadata either way. Source is "federation" or "self".
+// signed_metadata either way. Source is "federation" or "self", and the document
+// carries it as metadata_source, signed.
 func (e *Entity) ProtectedResourceMetadata(ctx context.Context) (doc map[string]any, source string, err error) {
-	doc = map[string]any{"resource": e.ID}
-	for k, v := range e.Asserted {
-		doc[k] = v
-	}
+	params := e.Asserted
 	source = "self"
+	now := e.now()
+	lifetime := e.MetadataLifetime
+	if lifetime <= 0 {
+		lifetime = 10 * time.Minute
+	}
+	exp := now.Add(lifetime)
 	if e.Resolver != nil {
 		ec, err := e.Configuration()
 		if err != nil {
@@ -181,18 +229,24 @@ func (e *Entity) ProtectedResourceMetadata(ctx context.Context) (doc map[string]
 			e.logOnce(fmt.Sprintf("federation entity %s: chain resolved but carries no %s metadata, publishing self-asserted metadata", e.ID, EntityTypeResource))
 		default:
 			e.logOnce(fmt.Sprintf("federation entity %s: chain resolved via %s, publishing the federation's metadata", e.ID, res.TrustAnchor))
-			doc = map[string]any{}
-			for k, v := range res.Metadata[EntityTypeResource] {
-				doc[k] = v
+			params, source = res.Metadata[EntityTypeResource], "federation"
+			if res.ExpiresAt.Before(exp) {
+				exp = res.ExpiresAt // never outlive the chain that said it
 			}
-			// The identifier is not the controller's to change, and signed_metadata
-			// must not nest.
-			doc["resource"] = e.ID
-			delete(doc, "signed_metadata")
-			source = "federation"
 		}
 	}
-	signed, err := e.signMetadata(doc)
+	doc = map[string]any{}
+	for k, v := range params {
+		if !notMetadata[k] {
+			doc[k] = v
+		}
+	}
+	// The identifier is not the controller's to change, the key set is the one that
+	// verifies the signature below, and whose word this is belongs inside it.
+	doc["resource"] = e.ID
+	doc["jwks_uri"] = e.JWKSURL()
+	doc["metadata_source"] = source
+	signed, err := e.signMetadata(doc, now, exp)
 	if err != nil {
 		return nil, "", err
 	}
@@ -200,27 +254,41 @@ func (e *Entity) ProtectedResourceMetadata(ctx context.Context) (doc map[string]
 	return doc, source, nil
 }
 
+// notMetadata are the names a resolved parameter may not take in the document or its
+// signature. The JWT-registered claims (RFC 7519 §4.1) decide what a JWT is — who it
+// is from and about, who it is for, when it is valid, whether it is a replay — and the
+// rest make a JWT a credential when presented as one. A superior's metadata or a
+// policy value could otherwise have the entity sign, and publish, a well-formed client
+// assertion or access token with its federation key. None of them is an RFC 9728
+// parameter; signed_metadata must not nest.
+var notMetadata = map[string]bool{
+	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	"cnf": true, "nonce": true, "scope": true, "client_id": true, "azp": true, "act": true,
+	"may_act": true, "acr": true, "amr": true, "auth_time": true, "signed_metadata": true,
+}
+
 // signMetadata is RFC 9728 §2.1's signed_metadata: the document's parameters as claims
-// of a JWT whose iss is the resource, signed with the Federation Entity Key.
-func (e *Entity) signMetadata(doc map[string]any) (string, error) {
+// of a JWT issued by the resource, signed with the Federation Entity Key. iss, iat and
+// exp are set last, so nothing in doc can supply them.
+func (e *Entity) signMetadata(doc map[string]any, now, exp time.Time) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	jwk, alg, err := e.keys()
 	if err != nil {
 		return "", err
 	}
-	claims := map[string]any{"iss": e.ID, "iat": e.now().Unix()}
+	claims := make(map[string]any, len(doc)+3)
 	for k, v := range doc {
-		if k != "signed_metadata" {
-			claims[k] = v
-		}
+		claims[k] = v
 	}
+	claims["iss"], claims["iat"], claims["exp"] = e.ID, now.Unix(), exp.Unix()
 	return jose.Sign(map[string]any{"alg": alg, "typ": "JWT", "kid": jwk["kid"]}, claims, e.Key)
 }
 
-// Handler serves both documents at Paths(), and nothing else.
+// Handler serves both documents at Paths(), the key set at JWKSPath(), and nothing else.
 func (e *Entity) Handler() http.Handler {
 	fedPath, resPath := e.Paths()
+	jwksPath := e.JWKSPath()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
@@ -245,9 +313,18 @@ func (e *Entity) Handler() http.Handler {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "no-cache")
-			// Not a parameter of the document — a hint on the wire, for operators.
+			// A hint on the wire, for operators; the signed claim is the one to trust.
 			w.Header().Set("X-Resource-Metadata-Source", source)
 			_ = json.NewEncoder(w).Encode(doc)
+		case jwksPath:
+			set, err := e.JWKS()
+			if err != nil {
+				http.Error(w, "key set unavailable", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/jwk-set+json")
+			w.Header().Set("Cache-Control", "no-cache")
+			_, _ = w.Write(set)
 		default:
 			http.NotFound(w, r)
 		}

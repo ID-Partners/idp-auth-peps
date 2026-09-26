@@ -445,7 +445,7 @@ func New(o Options) (*Chain, error) {
 	case o.Sources != nil:
 		c.sources = o.Sources
 	case o.Mode == ModeResource:
-		c.sources = []MetadataSource{&RFC9728Source{fetch: c.resFetch}}
+		c.sources = []MetadataSource{&RFC9728Source{fetch: c.resFetch, now: o.Now}}
 	case o.Mode == ModeFederation:
 		c.sources = []MetadataSource{&FederationSource{Federation: o.Federation}}
 	}
