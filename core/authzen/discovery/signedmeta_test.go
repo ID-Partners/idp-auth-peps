@@ -58,7 +58,12 @@ func newSignedResource(t *testing.T, mutate func(self string, doc map[string]any
 			if _, skip := doc["__unsigned"]; skip {
 				delete(doc, "__unsigned")
 			} else {
-				tok, err := jose.Sign(map[string]any{"alg": "ES256", "kid": pub["kid"]}, claims, key)
+				hdr := map[string]any{"alg": "ES256", "kid": pub["kid"]}
+				if typ, set := claims["__typ"]; set {
+					delete(claims, "__typ")
+					hdr["typ"] = typ
+				}
+				tok, err := jose.Sign(hdr, claims, key)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -116,6 +121,11 @@ func TestUnverifiableSignedMetadataIsNeverDowngraded(t *testing.T) {
 		},
 		"jwks_uri unreachable":    func(s *signedResource) { s.jwksCode = http.StatusInternalServerError },
 		"jwks_uri serves no keys": func(s *signedResource) { s.jwksKeys = nil },
+		"jwks_uri serves more keys than a set may carry": func(s *signedResource) {
+			for len(s.jwksKeys) <= jose.MaxJWKSKeys {
+				s.jwksKeys = append(s.jwksKeys, s.jwksKeys[0])
+			}
+		},
 	}
 	for name, bend := range cases {
 		t.Run(name, func(t *testing.T) {

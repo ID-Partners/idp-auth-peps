@@ -22,12 +22,36 @@ import (
 	"strings"
 )
 
-// minRSABits is the smallest RSA modulus this package will verify against.
-const minRSABits = 2048
+const (
+	// minRSABits is the smallest RSA modulus this package will verify against.
+	minRSABits = 2048
+	// maxRSABits is the largest. Verification cost grows with the square of the
+	// modulus and nothing in stdlib bounds it, while the keys arrive in places an
+	// attacker writes: a DPoP proof's header, an Entity Statement's jwks. 8192 bits is
+	// twice what any issuer uses.
+	maxRSABits = 8192
+	// maxRSAExponent bounds e. Every mainstream library uses 65537 (a few legacy keys
+	// 3); the ceiling leaves room for the unusual without letting e decide the cost.
+	maxRSAExponent = 1<<24 - 1
+)
 
-// B64URLDecode decodes unpadded base64url, tolerating padding.
+// MaxJWKSKeys bounds the keys one JWK Set may carry. Rotation needs two or three; a set
+// of more than this is misconfigured, or someone making the verifier work.
+const MaxJWKSKeys = 32
+
+// b64 is base64url as JWS uses it (RFC 7515 §2): unpadded, and strict about the unused
+// trailing bits, so one value has exactly one spelling.
+var b64 = base64.RawURLEncoding.Strict()
+
+// B64URLDecode decodes base64url as JWS uses it: unpadded and canonical. Padding,
+// non-zero trailing bits and line breaks are refused rather than tolerated — each would
+// be a second spelling of the same bytes, which makes a signature segment malleable and
+// gives one key two thumbprints.
 func B64URLDecode(s string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, fmt.Errorf("base64url must not contain line breaks")
+	}
+	return b64.DecodeString(s)
 }
 
 // B64URLEncode encodes unpadded base64url.
@@ -36,9 +60,10 @@ func B64URLEncode(b []byte) string {
 }
 
 // Part decodes segment idx (0=header, 1=claims) of a compact JWS without verifying it.
+// Anything that is not exactly three segments is not a compact JWS.
 func Part(token string, idx int) map[string]any {
 	parts := strings.Split(token, ".")
-	if len(parts) < 3 || idx >= len(parts) {
+	if len(parts) != 3 || idx < 0 || idx > 1 {
 		return nil
 	}
 	raw, err := B64URLDecode(parts[idx])
@@ -135,11 +160,14 @@ func ECDSAFromJWK(jwk map[string]any) (*ecdsa.PublicKey, error) {
 	default:
 		return nil, fmt.Errorf("unsupported EC curve %q", crv)
 	}
-	x, err := b64urlBigInt(jwk, "x")
+	// RFC 7518 §6.2.1.2: each coordinate is the full size for the curve. A shortened one
+	// is the same point spelt differently, and a second thumbprint for the same key.
+	size := (curve.Params().BitSize + 7) / 8
+	x, err := coordinate(jwk, "x", size)
 	if err != nil {
 		return nil, err
 	}
-	y, err := b64urlBigInt(jwk, "y")
+	y, err := coordinate(jwk, "y", size)
 	if err != nil {
 		return nil, err
 	}
@@ -150,14 +178,31 @@ func ECDSAFromJWK(jwk map[string]any) (*ecdsa.PublicKey, error) {
 	return pub, nil
 }
 
-// RSAFromJWK parses an RSA public JWK, bounding the exponent.
+// RSAFromJWK parses an RSA public JWK, bounding the modulus on both sides and the
+// exponent.
 func RSAFromJWK(jwk map[string]any) (*rsa.PublicKey, error) {
 	if kty, _ := jwk["kty"].(string); kty != "RSA" {
 		return nil, fmt.Errorf("alg is RS*/PS* but the JWK kty is not RSA")
 	}
-	n, err := b64urlBigInt(jwk, "n")
-	if err != nil {
-		return nil, err
+	raw, err := B64URLDecode(str(jwk["n"]))
+	if err != nil || len(raw) == 0 {
+		return nil, fmt.Errorf("JWK field %q is not base64url", "n")
+	}
+	// Measured before anything is built from it: a multi-megabit modulus costs
+	// seconds to verify against and nothing to send. One leading zero octet is
+	// tolerated, as RFC 7518 §6.3.1.1 notes some libraries emit it.
+	if len(raw) > maxRSABits/8+1 {
+		return nil, fmt.Errorf("JWK RSA modulus is %d bits, the maximum is %d", 8*len(raw), maxRSABits)
+	}
+	n := new(big.Int).SetBytes(raw)
+	// A modulus this side of 2048 bits is not a key, it is an invitation: stdlib will
+	// verify a signature against it perfectly happily, and the holder of a short modulus
+	// is whoever cared to factor it.
+	switch bits := n.BitLen(); {
+	case bits < minRSABits:
+		return nil, fmt.Errorf("JWK RSA modulus is %d bits, the minimum is %d", bits, minRSABits)
+	case bits > maxRSABits:
+		return nil, fmt.Errorf("JWK RSA modulus is %d bits, the maximum is %d", bits, maxRSABits)
 	}
 	eBytes, err := B64URLDecode(str(jwk["e"]))
 	if err != nil || len(eBytes) == 0 || len(eBytes) > 8 {
@@ -166,15 +211,10 @@ func RSAFromJWK(jwk map[string]any) (*rsa.PublicKey, error) {
 	padded := make([]byte, 8)
 	copy(padded[8-len(eBytes):], eBytes)
 	e := binary.BigEndian.Uint64(padded)
-	if e > 1<<31 {
-		return nil, fmt.Errorf("JWK exponent is out of range")
-	}
-	// A modulus this side of 2048 bits is not a key, it is an invitation: stdlib will
-	// verify a signature against it perfectly happily, and the holder of a short modulus
-	// is whoever cared to factor it. The exponent was already bounded above; the size is
-	// the half that actually decides whether a signature means anything.
-	if bits := n.BitLen(); bits < minRSABits {
-		return nil, fmt.Errorf("JWK RSA modulus is %d bits, the minimum is %d", bits, minRSABits)
+	// Odd (an even e has no inverse modulo φ(n), so the key could not have signed),
+	// at least 3, and small enough that the modulus, not e, decides the cost.
+	if e < 3 || e%2 == 0 || e > maxRSAExponent {
+		return nil, fmt.Errorf("JWK exponent %d is out of range (odd, 3 to %d)", e, maxRSAExponent)
 	}
 	return &rsa.PublicKey{N: n, E: int(e)}, nil
 }
@@ -187,6 +227,64 @@ func b64urlBigInt(jwk map[string]any, field string) (*big.Int, error) {
 	return new(big.Int).SetBytes(raw), nil
 }
 
+// coordinate reads an EC coordinate that must be exactly size octets.
+func coordinate(jwk map[string]any, field string, size int) (*big.Int, error) {
+	raw, err := B64URLDecode(str(jwk[field]))
+	if err != nil || len(raw) == 0 {
+		return nil, fmt.Errorf("JWK field %q is not base64url", field)
+	}
+	if len(raw) != size {
+		return nil, fmt.Errorf("JWK field %q is %d octets, the curve needs %d", field, len(raw), size)
+	}
+	return new(big.Int).SetBytes(raw), nil
+}
+
+// ParseJWKSet reads a JWK Set document (RFC 7517 §5): an object whose "keys" member is
+// an array of between one and MaxJWKSKeys JWKs.
+func ParseJWKSet(raw []byte) ([]map[string]any, error) {
+	var set any
+	if err := json.Unmarshal(raw, &set); err != nil {
+		return nil, fmt.Errorf("JWK set is not JSON")
+	}
+	return JWKSKeys(set)
+}
+
+// JWKSKeys does the same for a JWK Set already decoded, such as an Entity Statement's
+// jwks claim.
+func JWKSKeys(set any) ([]map[string]any, error) {
+	obj, ok := set.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("JWK set is not an object")
+	}
+	list, ok := obj["keys"].([]any)
+	if !ok || len(list) == 0 {
+		return nil, fmt.Errorf("JWK set has no keys")
+	}
+	if len(list) > MaxJWKSKeys {
+		return nil, fmt.Errorf("JWK set has %d keys, the maximum is %d", len(list), MaxJWKSKeys)
+	}
+	keys := make([]map[string]any, 0, len(list))
+	for _, k := range list {
+		jwk, ok := k.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("JWK set contains a non-object key")
+		}
+		keys = append(keys, jwk)
+	}
+	return keys, nil
+}
+
+// curveFor is the one curve RFC 7518 §3.4 allows each ES alg.
+func curveFor(alg string) elliptic.Curve {
+	switch alg {
+	case "ES256":
+		return elliptic.P256()
+	case "ES384":
+		return elliptic.P384()
+	}
+	return elliptic.P521()
+}
+
 func str(v any) string {
 	s, _ := v.(string)
 	return s
@@ -194,10 +292,28 @@ func str(v any) string {
 
 // VerifyJWS checks a compact JWS against one public JWK under alg. ES* signatures are
 // the fixed-width R||S form JWS mandates, not ASN.1.
+//
+// alg must be the one the protected header declares, and the header may not carry
+// crit: RFC 7515 §4.1.11 requires rejecting a critical extension that is not
+// understood, and none is. A JWK that names its own alg verifies under that alg only
+// (RFC 8725 §3.1), and an ES alg only over its own curve (RFC 7518 §3.4).
 func VerifyJWS(token string, jwk map[string]any, alg string) error {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return fmt.Errorf("token is not a compact JWS")
+	}
+	hdr := Part(token, 0)
+	if hdr == nil {
+		return fmt.Errorf("token header is not readable")
+	}
+	if declared, _ := hdr["alg"].(string); declared != alg {
+		return fmt.Errorf("token header alg %q is not %q", declared, alg)
+	}
+	if _, present := hdr["crit"]; present {
+		return fmt.Errorf("token header names critical extensions (crit), which are not supported")
+	}
+	if own, _ := jwk["alg"].(string); own != "" && own != alg {
+		return fmt.Errorf("the JWK is published for %s, not %s", own, alg)
 	}
 	sig, err := B64URLDecode(parts[2])
 	if err != nil {
@@ -214,6 +330,9 @@ func VerifyJWS(token string, jwk map[string]any, alg string) error {
 		pub, err := ECDSAFromJWK(jwk)
 		if err != nil {
 			return err
+		}
+		if want := curveFor(alg); pub.Curve != want {
+			return fmt.Errorf("%s needs curve %s, the JWK is %s", alg, want.Params().Name, pub.Curve.Params().Name)
 		}
 		n := (pub.Curve.Params().BitSize + 7) / 8
 		if len(sig) != 2*n {
@@ -232,7 +351,7 @@ func VerifyJWS(token string, jwk map[string]any, alg string) error {
 			return fmt.Errorf("token signature does not verify")
 		}
 		return nil
-	case strings.HasPrefix(alg, "RS"):
+	default: // RS*: HashFor admits nothing else — HS* would mean a shared secret the PEP does not hold
 		pub, err := RSAFromJWK(jwk)
 		if err != nil {
 			return err
@@ -242,6 +361,4 @@ func VerifyJWS(token string, jwk map[string]any, alg string) error {
 		}
 		return nil
 	}
-	// HS* would mean a shared secret the PEP does not hold; anything else is unknown.
-	return fmt.Errorf("unsupported token alg %q", alg)
 }

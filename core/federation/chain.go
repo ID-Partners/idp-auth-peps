@@ -49,7 +49,10 @@ func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) (
 	frontier := []frontierItem{{chain: []*Statement{leaf}, seen: map[string]bool{entityID: true}}}
 	var best []*Statement
 	bestAnchor := ""
-	var lastErr error
+	// Why each path that did not reach an anchor stopped. A path that fails is a path
+	// not taken, never the answer for the whole search — the valid chain may be the
+	// next hint along — so the reasons are only ranked once nothing was found.
+	var why failures
 
 	for len(frontier) > 0 {
 		item := frontier[0]
@@ -70,30 +73,24 @@ func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) (
 			}
 			_, isAnchor := r.anchors[hint]
 			if !isAnchor && intermediates+1 > r.opts.MaxPathLength {
-				lastErr = fmt.Errorf("%w: path through %s exceeds max path length %d", ErrInvalidChain, hint, r.opts.MaxPathLength)
+				why.note(fmt.Errorf("%w: path through %s exceeds max path length %d", ErrInvalidChain, hint, r.opts.MaxPathLength))
 				continue
 			}
 			superior, err := w.entityConfiguration(hint)
 			if err != nil {
-				if errors.Is(err, ErrNotAllowed) {
-					return nil, "", err
-				}
-				lastErr = err
+				why.note(err)
 				continue
 			}
 			sub, err := w.subordinateStatement(superior, current)
 			if err != nil {
-				if errors.Is(err, ErrNotAllowed) {
-					return nil, "", err
-				}
-				lastErr = err
+				why.note(err)
 				continue
 			}
 			// §4: ES[j] is signed by a key in ES[j+1].jwks — the statement `current`
 			// issued must verify against the keys its Superior asserts for it, not
 			// only against its own Entity Configuration.
 			if err := child.verifyWith(sub.JWKS); err != nil {
-				lastErr = fmt.Errorf("%w: statement issued by %s does not verify against %s's subordinate statement: %v", ErrInvalidChain, current, hint, err)
+				why.note(fmt.Errorf("%w: statement issued by %s does not verify against %s's subordinate statement: %v", ErrInvalidChain, current, hint, err))
 				continue
 			}
 			chain := append(append([]*Statement{}, item.chain...), sub)
@@ -118,13 +115,56 @@ func (r *Resolver) walk(ctx context.Context, entityID string, seed *Statement) (
 	if best != nil {
 		return best, bestAnchor, nil
 	}
-	if lastErr != nil {
-		if errors.Is(lastErr, ErrInvalidChain) {
-			return nil, "", lastErr
-		}
-		return nil, "", fmt.Errorf("no trust chain to a configured anchor: %w", lastErr)
+	return nil, "", why.verdict(entityID)
+}
+
+// failures collects why each explored path stopped short of an anchor.
+type failures struct {
+	refused, unreachable, invalid, unknown error
+}
+
+func (f *failures) note(err error) {
+	switch {
+	case errors.Is(err, ErrNotAllowed):
+		f.refused = first(f.refused, err)
+	case errors.Is(err, ErrInvalidChain):
+		f.invalid = first(f.invalid, err)
+	case errors.Is(err, metafetch.ErrNotFound):
+		f.unknown = first(f.unknown, err)
+	default:
+		f.unreachable = first(f.unreachable, err)
 	}
-	return nil, "", fmt.Errorf("%w: no path from %s reaches a configured trust anchor", ErrInvalidChain, entityID)
+}
+
+func first(have, err error) error {
+	if have != nil {
+		return have
+	}
+	return err
+}
+
+// verdict ranks the reasons no chain was found, strongest first:
+//
+//   - a fetch the operator's policy refused: ErrNotAllowed, a refusal;
+//   - a superior that could not be reached: an outage, because the path it would have
+//     opened is unknown, not absent;
+//   - a statement or a link that failed validation: ErrInvalidChain;
+//   - superiors that answered 404 — they do not know the subject, or no longer do
+//     (§8.1.2's not_found). Nobody vouches for it: ErrNotFederated, the entity is not a
+//     member of any federation this resolver trusts;
+//   - nothing at all: every path dead-ended short of a configured anchor.
+func (f *failures) verdict(entityID string) error {
+	switch {
+	case f.refused != nil:
+		return fmt.Errorf("no trust chain to a configured anchor: %w", f.refused)
+	case f.unreachable != nil:
+		return fmt.Errorf("no trust chain to a configured anchor: %w", f.unreachable)
+	case f.invalid != nil:
+		return f.invalid
+	case f.unknown != nil:
+		return fmt.Errorf("%w: no trust chain to a configured anchor: no superior %s names vouches for it (%v)", ErrNotFederated, entityID, f.unknown)
+	}
+	return fmt.Errorf("%w: no path from %s reaches a configured trust anchor", ErrInvalidChain, entityID)
 }
 
 type walker struct {
@@ -137,10 +177,17 @@ type walker struct {
 
 func (w *walker) get(raw string, client *metafetch.Client) ([]byte, error) {
 	if w.budget <= 0 {
-		return nil, fmt.Errorf("fetch budget of %d exhausted", w.r.opts.MaxFetches)
+		// Deterministic, not transient: the same topology exhausts it every time.
+		return nil, fmt.Errorf("%w: fetch budget of %d exhausted", ErrInvalidChain, w.r.opts.MaxFetches)
 	}
 	w.budget--
-	return client.Get(w.ctx, raw, contentType)
+	body, err := client.GetTyped(w.ctx, raw, contentType)
+	if errors.Is(err, metafetch.ErrContentType) {
+		// §8.1.2: a statement is served as application/entity-statement+jwt; a response
+		// that is not is not a statement, whatever its body looks like.
+		return nil, fmt.Errorf("%w: %v", ErrInvalidChain, err)
+	}
+	return body, err
 }
 
 // entityConfiguration fetches and verifies the self-issued statement of entityID. A

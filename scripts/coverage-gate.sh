@@ -14,9 +14,9 @@ floor_for() {
     */core/cmd/coaz-pep)  echo 95 ;;
     */core/jose)          echo 98 ;;
     */core/federation)    echo 98 ;;
-    */core/authzen/discovery) echo 97 ;;
-    */core/internal/ttlcache)  echo 98 ;;
-    */core/internal/metafetch) echo 94 ;;
+    */core/authzen/discovery) echo 98 ;;
+    */core/internal/ttlcache)  echo 99 ;;
+    */core/internal/metafetch) echo 97 ;;
     # The console's handlers are exercised by the demo run; the unit tests guard the
     # /api/fetch host check, which is what a public deployment exposes.
     */core/cmd/demo-console)   echo 3 ;;

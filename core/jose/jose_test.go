@@ -79,6 +79,11 @@ func TestVerifyJWSRejects(t *testing.T) {
 	rsJWK, _ := PublicJWK(rs)
 	p384JWK, _ := PublicJWK(ecKey(t, elliptic.P384()))
 	tok, _ := Sign(map[string]any{"alg": "ES256"}, map[string]any{"a": 1}, ec)
+	// A token whose header declares alg, with sig as its signature segment.
+	withAlg := func(alg string, sig []byte) string {
+		return B64URLEncode([]byte(`{"alg":"`+alg+`"}`)) + "." + B64URLEncode([]byte(`{"a":1}`)) + "." + B64URLEncode(sig)
+	}
+	hdr := strings.Split(tok, ".")[0]
 
 	cases := map[string]struct {
 		tok  string
@@ -87,15 +92,17 @@ func TestVerifyJWSRejects(t *testing.T) {
 		want string
 	}{
 		"not compact":      {"a.b", ecJWK, "ES256", "not a compact JWS"},
-		"bad sig b64":      {"a.b.***", ecJWK, "ES256", "not base64url"},
-		"hs256":            {tok, ecJWK, "HS256", "unsupported"},
-		"none":             {tok, ecJWK, "none", "unsupported"},
+		"bad header":       {"a.b.c", ecJWK, "ES256", "header is not readable"},
+		"bad sig b64":      {hdr + ".b.***", ecJWK, "ES256", "not base64url"},
+		"hs256":            {withAlg("HS256", []byte("x")), ecJWK, "HS256", "unsupported"},
+		"none":             {withAlg("none", nil), ecJWK, "none", "unsupported"},
 		"es with rsa key":  {tok, rsJWK, "ES256", "kty is not EC"},
-		"rs with ec key":   {tok, ecJWK, "RS256", "kty is not RSA"},
-		"ps with ec key":   {tok, ecJWK, "PS256", "kty is not RSA"},
-		"wrong sig length": {tok, p384JWK, "ES256", "wrong length"},
-		"rs bad sig":       {strings.Join([]string{strings.Split(tok, ".")[0], strings.Split(tok, ".")[1], B64URLEncode(make([]byte, 256))}, "."), rsJWK, "RS256", "does not verify"},
-		"ps bad sig":       {strings.Join([]string{strings.Split(tok, ".")[0], strings.Split(tok, ".")[1], B64URLEncode(make([]byte, 256))}, "."), rsJWK, "PS256", "does not verify"},
+		"rs with ec key":   {withAlg("RS256", make([]byte, 256)), ecJWK, "RS256", "kty is not RSA"},
+		"ps with ec key":   {withAlg("PS256", make([]byte, 256)), ecJWK, "PS256", "kty is not RSA"},
+		"es wrong curve":   {tok, p384JWK, "ES256", "needs curve P-256"},
+		"wrong sig length": {withAlg("ES256", make([]byte, 63)), ecJWK, "ES256", "wrong length"},
+		"rs bad sig":       {withAlg("RS256", make([]byte, 256)), rsJWK, "RS256", "does not verify"},
+		"ps bad sig":       {withAlg("PS256", make([]byte, 256)), rsJWK, "PS256", "does not verify"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -114,10 +121,11 @@ func TestJWKParsingErrors(t *testing.T) {
 	if _, err := ECDSAFromJWK(map[string]any{"kty": "EC", "crv": "P-256", "x": "***"}); err == nil || !strings.Contains(err.Error(), `"x"`) {
 		t.Fatalf("want x error, got %v", err)
 	}
-	if _, err := ECDSAFromJWK(map[string]any{"kty": "EC", "crv": "P-256", "x": "AQ", "y": "***"}); err == nil || !strings.Contains(err.Error(), `"y"`) {
+	full := B64URLEncode([]byte(strings.Repeat("\x01", 32)))
+	if _, err := ECDSAFromJWK(map[string]any{"kty": "EC", "crv": "P-256", "x": full, "y": "***"}); err == nil || !strings.Contains(err.Error(), `"y"`) {
 		t.Fatalf("want y error, got %v", err)
 	}
-	if _, err := ECDSAFromJWK(map[string]any{"kty": "EC", "crv": "P-256", "x": "AQ", "y": "AQ"}); err == nil || !strings.Contains(err.Error(), "not a point") {
+	if _, err := ECDSAFromJWK(map[string]any{"kty": "EC", "crv": "P-256", "x": full, "y": full}); err == nil || !strings.Contains(err.Error(), "not a point") {
 		t.Fatalf("want off-curve error, got %v", err)
 	}
 	if _, err := RSAFromJWK(map[string]any{"kty": "RSA", "n": ""}); err == nil {
@@ -161,8 +169,8 @@ func TestThumbprintAndParts(t *testing.T) {
 	if Part("a.b", 0) != nil || Part("***.b.c", 0) != nil || Part(B64URLEncode([]byte("[]"))+".b.c", 0) != nil {
 		t.Fatal("malformed parts should decode to nil")
 	}
-	if got, err := B64URLDecode("YQ=="); err != nil || string(got) != "a" {
-		t.Fatalf("padded decode: %v %q", err, got)
+	if _, err := B64URLDecode("YQ=="); err == nil {
+		t.Fatal("padding is not base64url as JWS uses it")
 	}
 }
 

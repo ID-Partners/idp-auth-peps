@@ -23,6 +23,7 @@ import (
 
 	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
 	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
+	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
 // WellKnown is appended to an Entity Identifier to locate its Entity Configuration.
@@ -36,9 +37,13 @@ const (
 )
 
 var (
-	// ErrNotFederated: the entity publishes no Entity Configuration (404). The caller
-	// decides whether that is fine; the PEP falls back to its static PDP.
-	ErrNotFederated = errors.New("entity publishes no entity configuration")
+	// ErrNotFederated: the entity is not a member of any federation this resolver
+	// trusts. It publishes no Entity Configuration (404), or no superior it names
+	// vouches for it: every one asked answered 404, because it was never onboarded or
+	// has been offboarded. The caller decides whether that is fine; the PEP falls back
+	// to its static PDP. It replaces a cached chain at once — it is the federation's
+	// answer, not a failure to hear one.
+	ErrNotFederated = errors.New("entity is not a federation member")
 	// ErrInvalidChain is permanent: a statement failed validation, an invariant was
 	// broken, a constraint or a policy was violated. Never retried within NegativeTTL.
 	ErrInvalidChain = errors.New("trust chain invalid")
@@ -67,8 +72,16 @@ type Options struct {
 	// TTL caps how long a resolved chain is reused; min(exp) over the chain applies
 	// as well. Default 5m.
 	TTL time.Duration
-	// NegativeTTL caches ErrInvalidChain / ErrNotFederated. Default 60s.
+	// MaxStale bounds how long past the TTL a resolved chain is still served while
+	// re-resolving it fails for want of a reachable superior. Never past the chain's own
+	// expiry, and never after a refusal: an invalid chain, a refused fetch or an entity
+	// no superior vouches for replaces the cached chain at once. Default: the TTL.
+	MaxStale time.Duration
+	// NegativeTTL caches ErrInvalidChain / ErrNotAllowed / ErrNotFederated. Default 60s.
 	NegativeTTL time.Duration
+	// FetchTimeout bounds one resolution, which runs detached from the request that
+	// asked for it so a cancelled request cannot fail it for the others. Default 30s.
+	FetchTimeout time.Duration
 	// MaxEntries bounds the resolution cache. Default 1024.
 	MaxEntries int
 	// AllowInsecure permits http Entity Identifiers and endpoints (tests, dev).
@@ -130,6 +143,9 @@ func New(o Options) (*Resolver, error) {
 	if o.NegativeTTL <= 0 {
 		o.NegativeTTL = 60 * time.Second
 	}
+	if o.FetchTimeout <= 0 {
+		o.FetchTimeout = 30 * time.Second
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -140,6 +156,12 @@ func New(o Options) (*Resolver, error) {
 	for i, ta := range o.TrustAnchors {
 		if ta.EntityID == "" || len(ta.Keys) == 0 {
 			return nil, fmt.Errorf("federation: trust anchor %d needs an entity id and keys", i)
+		}
+		if !validEntityID(ta.EntityID, o.AllowInsecure) {
+			return nil, fmt.Errorf("federation: trust anchor %q is not a valid entity identifier", ta.EntityID)
+		}
+		if err := checkAnchorKeys(ta.Keys); err != nil {
+			return nil, fmt.Errorf("federation: trust anchor %s: %v", ta.EntityID, err)
 		}
 		if _, dup := r.anchors[ta.EntityID]; dup {
 			return nil, fmt.Errorf("federation: trust anchor %s listed twice", ta.EntityID)
@@ -153,12 +175,65 @@ func New(o Options) (*Resolver, error) {
 		r.subject = metafetch.New(o.HTTPClient, metafetch.Policy{AllowInsecure: o.AllowInsecure, Allow: o.SubjectAllowed}, "", 0)
 	}
 	r.cache = ttlcache.New[Resolved](ttlcache.Options{
-		TTL: o.TTL, NegativeTTL: o.NegativeTTL, MaxEntries: o.MaxEntries, Now: o.Now,
+		TTL: o.TTL, MaxStale: o.MaxStale, NegativeTTL: o.NegativeTTL, MaxEntries: o.MaxEntries, Now: o.Now,
+		FetchTimeout: o.FetchTimeout, IsRefusal: isRefusal,
 	})
 	return r, nil
 }
 
-// Resolve returns the Resolved Metadata for entityID, from cache when fresh.
+// checkAnchorKeys refuses at startup what would otherwise fail every resolution, or
+// should never have been there: a key with no kid or a kid another key shares, one that
+// is not published for signatures or cannot be parsed as an EC or RSA public key, and
+// private key material, which has no place in a list of anchors distributed to relying
+// parties.
+func checkAnchorKeys(keys []map[string]any) error {
+	if len(keys) > jose.MaxJWKSKeys {
+		return fmt.Errorf("%d keys, the maximum is %d", len(keys), jose.MaxJWKSKeys)
+	}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		kid, _ := k["kid"].(string)
+		if kid == "" {
+			return fmt.Errorf("every key needs a kid")
+		}
+		if seen[kid] {
+			return fmt.Errorf("kid %q is listed twice", kid)
+		}
+		seen[kid] = true
+		for _, private := range []string{"d", "p", "q", "dp", "dq", "qi", "k"} {
+			if _, present := k[private]; present {
+				return fmt.Errorf("key %q carries private key material (%s): anchor keys are public", kid, private)
+			}
+		}
+		if !usableForSigning(k) {
+			return fmt.Errorf("key %q is not published for signature verification", kid)
+		}
+		var err error
+		switch kty, _ := k["kty"].(string); kty {
+		case "EC":
+			_, err = jose.ECDSAFromJWK(k)
+		case "RSA":
+			_, err = jose.RSAFromJWK(k)
+		default:
+			err = fmt.Errorf("kty %q is not a signing key this resolver verifies with", kty)
+		}
+		if err != nil {
+			return fmt.Errorf("key %q: %v", kid, err)
+		}
+	}
+	return nil
+}
+
+// isRefusal separates the answers that replace a cached chain at once from the outages
+// it may ride out. A chain that no longer validates, a fetch the operator's policy
+// refused, and an entity no superior will vouch for any more are all the federation's
+// (or the operator's) word, not a failure to hear it.
+func isRefusal(err error) bool {
+	return errors.Is(err, ErrInvalidChain) || errors.Is(err, ErrNotAllowed) || errors.Is(err, ErrNotFederated)
+}
+
+// Resolve returns the Resolved Metadata for entityID, from cache when fresh. A cached
+// chain is never returned past its ExpiresAt, and a refusal replaces it.
 func (r *Resolver) Resolve(ctx context.Context, entityID string) (Resolved, error) {
 	return r.cache.Get(ctx, entityID, func(ctx context.Context, id string) (Resolved, time.Time, error) {
 		res, err := r.resolve(ctx, id, nil)

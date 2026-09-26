@@ -39,6 +39,7 @@ func newHeldEntity(t *testing.T, anchor *entity) (*Entity, *httptest.Server) {
 	fedPath, resPath := e.Paths()
 	mux.Handle(fedPath, e.Handler())
 	mux.Handle(resPath, e.Handler())
+	mux.Handle(e.JWKSPath(), e.Handler())
 	return e, srv
 }
 

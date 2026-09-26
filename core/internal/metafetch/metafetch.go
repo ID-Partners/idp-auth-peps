@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,10 +37,21 @@ type Policy struct {
 }
 
 // Check applies the policy to raw. trustedOrigin may be "".
+//
+// A path that could be resolved somewhere other than where it reads (PlainPath) and a
+// URL carrying credentials are refused before the allowlist is asked: the allowlist
+// compares what it is given, and should only ever be given a URL that means what it
+// says.
 func (p Policy) Check(raw, trustedOrigin string) error {
 	u, err := url.Parse(raw)
 	if err != nil || !u.IsAbs() || u.Host == "" {
 		return fmt.Errorf("%w: %q is not an absolute URL", ErrNotAllowed, raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%w: %q carries credentials", ErrNotAllowed, u.Redacted())
+	}
+	if err := PlainPath(u); err != nil {
+		return err
 	}
 	switch u.Scheme {
 	case "https":
@@ -52,6 +64,26 @@ func (p Policy) Check(raw, trustedOrigin string) error {
 	}
 	if p.Allow != nil && !p.Allow(raw) {
 		return fmt.Errorf("%w: %q is outside the allowlist", ErrNotAllowed, raw)
+	}
+	return nil
+}
+
+// PlainPath refuses a URL path spelt so that it names one place and matches another: a
+// dot segment ("." or "..", percent-encoded or not), an encoded slash or backslash, or
+// a literal backslash. An allowlist compares strings, while the server at the other end
+// resolves these — so https://pdp.example/tenants/a/../b passes a prefix check for
+// tenant a and is served by tenant b.
+func PlainPath(u *url.URL) error {
+	p := u.EscapedPath()
+	lower := strings.ToLower(p)
+	if strings.Contains(p, `\`) || strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") {
+		return fmt.Errorf("%w: path %q carries an encoded separator", ErrNotAllowed, p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		// EscapedPath is always a valid escaping, so unescaping cannot fail.
+		if s, _ := url.PathUnescape(seg); s == "." || s == ".." {
+			return fmt.Errorf("%w: path %q has a dot segment", ErrNotAllowed, p)
+		}
 	}
 	return nil
 }
@@ -104,35 +136,59 @@ func New(base *http.Client, policy Policy, trustedOrigin string, maxBytes int64)
 // Get fetches raw after checking it. accept is sent as the Accept header. A 404 yields
 // ErrNotFound; any other non-2xx is an error carrying the status.
 func (c *Client) Get(ctx context.Context, raw, accept string) ([]byte, error) {
-	if err := c.policy.Check(raw, c.origin); err != nil {
+	body, _, err := c.get(ctx, raw, accept)
+	return body, err
+}
+
+// ErrContentType marks a response whose media type is not the one asked for: it is not
+// the document it claims to be, whatever its body looks like.
+var ErrContentType = errors.New("unexpected content type")
+
+// GetTyped fetches a document that has a media type of its own (an Entity Statement is
+// application/entity-statement+jwt): mediaType is sent as Accept, and the response's
+// Content-Type must be it — compared case-insensitively, parameters aside — or the
+// result is ErrContentType.
+func (c *Client) GetTyped(ctx context.Context, raw, mediaType string) ([]byte, error) {
+	body, ct, err := c.get(ctx, raw, mediaType)
+	if err != nil {
 		return nil, err
+	}
+	if got, _, perr := mime.ParseMediaType(ct); perr != nil || !strings.EqualFold(got, mediaType) {
+		return nil, fmt.Errorf("%w: %s answered with content type %q, not %s", ErrContentType, raw, ct, mediaType)
+	}
+	return body, nil
+}
+
+func (c *Client) get(ctx context.Context, raw, accept string) ([]byte, string, error) {
+	if err := c.policy.Check(raw, c.origin); err != nil {
+		return nil, "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrNotFound
+		return nil, "", ErrNotFound
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("GET %s returned %d", raw, resp.StatusCode)
+		return nil, "", fmt.Errorf("GET %s returned %d", raw, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if int64(len(body)) > c.maxBytes {
-		return nil, fmt.Errorf("GET %s: body exceeds %d bytes", raw, c.maxBytes)
+		return nil, "", fmt.Errorf("GET %s: body exceeds %d bytes", raw, c.maxBytes)
 	}
-	return body, nil
+	return body, resp.Header.Get("Content-Type"), nil
 }
 
 // Check exposes the policy for callers that validate URLs they will not fetch, such as

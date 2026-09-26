@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/ID-Partners/idp-auth-peps/core/internal/metafetch"
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
@@ -236,7 +237,13 @@ func usableForSigning(jwk map[string]any) bool {
 
 func validEntityID(s string, allowInsecure bool) bool {
 	u, err := url.Parse(s)
-	if err != nil || !u.IsAbs() || u.Host == "" || u.Fragment != "" || u.RawQuery != "" {
+	if err != nil || !u.IsAbs() || u.Host == "" || u.Fragment != "" || u.RawQuery != "" || u.User != nil {
+		return false
+	}
+	// An identifier is compared byte for byte along the chain and against naming
+	// constraints, while the server it names resolves dot segments: one that could
+	// mean somewhere else is not an identifier.
+	if metafetch.PlainPath(u) != nil {
 		return false
 	}
 	if u.Scheme == "https" {
@@ -258,21 +265,18 @@ func numClaim(claims map[string]any, name string) (int64, bool) {
 }
 
 func parseJWKS(v any) ([]map[string]any, error) {
-	set, ok := v.(map[string]any)
-	if !ok {
+	if _, ok := v.(map[string]any); !ok {
 		return nil, fmt.Errorf("jwks missing or not an object")
 	}
-	raw, ok := set["keys"].([]any)
-	if !ok || len(raw) == 0 {
-		return nil, fmt.Errorf("jwks has no keys")
+	// Bounded like any other key set: a statement is at most 1 MiB, and that is room
+	// for a great many keys nobody needs.
+	list, err := jose.JWKSKeys(v)
+	if err != nil {
+		return nil, fmt.Errorf("jwks: %v", err)
 	}
 	seen := map[string]bool{}
-	keys := make([]map[string]any, 0, len(raw))
-	for _, k := range raw {
-		jwk, ok := k.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("jwks contains a non-object key")
-		}
+	keys := make([]map[string]any, 0, len(list))
+	for _, jwk := range list {
 		kid, _ := jwk["kid"].(string)
 		if kid == "" {
 			return nil, fmt.Errorf("every federation key needs a kid")
@@ -341,6 +345,22 @@ func stringList(v any, name string) ([]string, error) {
 	return out, nil
 }
 
+// namingList reads a naming_constraints list. An entry that is neither a domain name
+// constraint nor a URL is refused rather than guessed at: a guess could make the
+// constraint looser than whoever set it intended.
+func namingList(v any, name string) ([]string, error) {
+	list, err := stringList(v, name)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range list {
+		if !validNamingConstraint(s) {
+			return nil, fmt.Errorf("%s: %q is neither a domain name nor a URL", name, s)
+		}
+	}
+	return list, nil
+}
+
 func parseConstraints(v any) (*Constraints, error) {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -362,12 +382,12 @@ func parseConstraints(v any) (*Constraints, error) {
 		}
 		var err error
 		if p, present := obj["permitted"]; present {
-			if c.NamingPermitted, err = stringList(p, "naming_constraints.permitted"); err != nil {
+			if c.NamingPermitted, err = namingList(p, "naming_constraints.permitted"); err != nil {
 				return nil, err
 			}
 		}
 		if e, present := obj["excluded"]; present {
-			if c.NamingExcluded, err = stringList(e, "naming_constraints.excluded"); err != nil {
+			if c.NamingExcluded, err = namingList(e, "naming_constraints.excluded"); err != nil {
 				return nil, err
 			}
 		}
