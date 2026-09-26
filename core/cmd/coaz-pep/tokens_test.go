@@ -222,12 +222,12 @@ func TestUserClaimsDropsAForgedTokenWhenConfigured(t *testing.T) {
 	principal := validClaims()["sub"].(string)
 
 	forged := mintJWT(t, attacker, "k1", validClaims())
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": forged}, principal, "access"); got != nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": forged}, principal, "access", false); got != nil {
 		t.Fatalf("a forged X-User-Token yielded claims: %v", got)
 	}
 
 	genuine := mintJWT(t, real, "k1", validClaims())
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": genuine}, principal, "access"); got == nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": genuine}, principal, "access", false); got == nil {
 		t.Fatal("a genuine X-User-Token should yield claims")
 	}
 }
@@ -250,22 +250,30 @@ func TestUserClaimsBelongToThePrincipal(t *testing.T) {
 	}
 
 	someoneElse := user(map[string]any{"sub": "bob@example.com"})
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": someoneElse}, principal, "access"); got != nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": someoneElse}, principal, "access", false); got != nil {
 		t.Fatalf("another customer's login must not count for this principal: %v", got)
 	}
 	delegated := user(map[string]any{"act": map[string]any{"sub": "agent-1"}})
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": delegated}, principal, "access"); got != nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": delegated}, principal, "access", false); got != nil {
 		t.Fatalf("a delegated token is not a user's login: %v", got)
 	}
 	own := user(nil)
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, principal, own); got != nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, principal, own, false); got != nil {
 		t.Fatalf("the access token presented as the user token must not count: %v", got)
 	}
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, "", "access"); got != nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, "", "access", false); got != nil {
 		t.Fatalf("with no principal there is nobody for the login to belong to: %v", got)
 	}
-	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, principal, "access"); got == nil {
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": own}, principal, "access", false); got == nil {
 		t.Fatal("the principal's own verified login counts")
+	}
+	// On a route that lets the PDP judge who may approve, another subject's verified
+	// login counts — the PDP gets user_sub and decides. The other rules still hold.
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": someoneElse}, principal, "access", true); got == nil {
+		t.Fatal("with user_token_subject=pdp an approver's login counts, for the PDP to judge")
+	}
+	if got := s.userClaims(context.Background(), map[string]string{"x-user-token": delegated}, principal, "access", true); got != nil {
+		t.Fatal("a delegated token is never a login, whoever judges")
 	}
 }
 
@@ -275,15 +283,15 @@ func TestUserClaimsDecodingIsOptIn(t *testing.T) {
 	principal := validClaims()["sub"].(string)
 
 	// No verifier and decoding not allowed: an unverifiable token counts for nothing.
-	if got := (&server{}).userClaims(context.Background(), map[string]string{"x-user-token": tok}, principal, "access"); got != nil {
+	if got := (&server{}).userClaims(context.Background(), map[string]string{"x-user-token": tok}, principal, "access", false); got != nil {
 		t.Fatalf("an unverifiable token must not count, got %v", got)
 	}
 	s := &server{decodeUserTokens: true}
-	got := s.userClaims(context.Background(), map[string]string{"x-user-token": tok}, principal, "access")
+	got := s.userClaims(context.Background(), map[string]string{"x-user-token": tok}, principal, "access", false)
 	if got == nil || got["sub"] != principal {
 		t.Fatalf("decoding allowed should decode, got %v", got)
 	}
-	if s.userClaims(context.Background(), map[string]string{}, principal, "access") != nil {
+	if s.userClaims(context.Background(), map[string]string{}, principal, "access", false) != nil {
 		t.Fatal("no header should yield no claims")
 	}
 }

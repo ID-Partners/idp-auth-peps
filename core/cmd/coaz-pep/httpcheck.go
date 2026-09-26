@@ -55,9 +55,11 @@ type deniedResponse struct {
 	Body    string            `json:"body"`
 }
 
-// maxCheckRequestBytes bounds a check request: the relayed body plus the envelope. The
-// ext_authz path is bounded by the gateway's max_request_bytes; this one by us.
-const maxCheckRequestBytes = 1<<20 + 64<<10
+// maxCheckRequestBytes bounds a check request: the relayed body plus the envelope. A
+// gateway relays up to 1 MiB of body, which grows when it is escaped into a JSON string,
+// so this leaves room for that. The ext_authz path is bounded by the gateway's
+// max_request_bytes; this one by us.
+const maxCheckRequestBytes = 4<<20 + 64<<10
 
 func (s *server) handleHTTPCheck(w http.ResponseWriter, r *http.Request) {
 	var req checkRequest

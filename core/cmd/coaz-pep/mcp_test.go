@@ -359,3 +359,40 @@ func TestServiceFailOpenSkipsOnlyAnUnavailablePDP(t *testing.T) {
 		}
 	}
 }
+
+// A route that lets the PDP judge the approver still forwards whose login it is.
+func TestUserSubjectReachesThePDP(t *testing.T) {
+	pdp := newPDPStub(t, map[string]any{"decision": true}, 200)
+	s := newServer(t, pdp.URL)
+	h := map[string]string{
+		"authorization": "Bearer " + mintUnsigned(map[string]any{"sub": "customer"}),
+		"x-user-token":  mintUnsigned(map[string]any{"sub": "staff-7", "iss": "https://as", "scope": "payments:approve"}),
+	}
+	// Default: another subject's login counts for nothing.
+	s.check(context.Background(), restConf(nil), "GET", "/accounts/a1/balance", h, "")
+	ctx := pdp.requests[len(pdp.requests)-1]["context"].(map[string]any)
+	if ctx["user_scope"] != "" || ctx["user_sub"] != nil {
+		t.Fatalf("an approver's token must not count by default: %v", ctx)
+	}
+	if deniedStatus(s.check(context.Background(), restConf(map[string]string{"require_user_login": "true"}), "GET", "/accounts/a1/balance", h, "")) != 401 {
+		t.Fatal("require_user_login is not satisfied by someone else's login")
+	}
+	// user_token_subject=pdp: it counts, and the PDP is told whose it is.
+	s.check(context.Background(), restConf(map[string]string{"user_token_subject": "pdp"}), "GET", "/accounts/a1/balance", h, "")
+	ctx = pdp.requests[len(pdp.requests)-1]["context"].(map[string]any)
+	if ctx["user_sub"] != "staff-7" || ctx["user_iss"] != "https://as" || ctx["user_scope"] != "payments:approve" {
+		t.Fatalf("the PDP must see whose login it judges: %v", ctx)
+	}
+	if configFrom(map[string]string{"user_token_subject": "anyone"}).confErr == nil {
+		t.Fatal("an unknown user_token_subject fails the route closed")
+	}
+}
+
+// GET and DELETE carry no JSON-RPC message; one with a body is not passed on unread.
+func TestMCPTransportRequestWithABodyIsRefused(t *testing.T) {
+	s, _, mcpURL := mcpSetup(t, map[string]any{"decision": true}, nil)
+	conf := configFrom(map[string]string{"style": "mcp", "require_token": "true", "mcp_upstream_url": mcpURL})
+	if resp := s.check(context.Background(), conf, "GET", "/mcp", mcpHeaders(), mcpCall); deniedStatus(resp) != int(typev3.StatusCode_BadRequest) {
+		t.Fatalf("a GET with a JSON-RPC body is refused, got %d", deniedStatus(resp))
+	}
+}

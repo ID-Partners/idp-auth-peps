@@ -69,6 +69,10 @@ type pepConfig struct {
 	// coazV2Only refuses tools that declare only the superseded `coaz: true` mapping,
 	// whose subject can come from the caller's params.
 	coazV2Only bool
+	// userTokenForPDP lets an X-User-Token whose subject is not the principal count, for
+	// the PDP to judge: a staff approver's login, approving for a customer. Off, such a
+	// token counts for nothing.
+	userTokenForPDP bool
 	// legacySubjectIdentity additionally sends the non-standard `subject.identity`
 	// alongside the correct `subject.id`. On by default so upgrading the PEP alone
 	// cannot break a policy that still reads the old field; turn it off once the
@@ -145,6 +149,13 @@ func configFrom(ext map[string]string) pepConfig {
 		resource:              strings.TrimRight(ext["resource"], "/"),
 		forwardAccessToken:    flag("forward_access_token", false),
 	}
+	switch strings.ToLower(ext["user_token_subject"]) {
+	case "", "principal":
+	case "pdp":
+		c.userTokenForPDP = true
+	default:
+		errs = append(errs, fmt.Sprintf("user_token_subject %q is neither principal nor pdp", ext["user_token_subject"]))
+	}
 	if c.style != "rest" && c.style != "mcp" {
 		// An unknown style would otherwise fall to the REST mapping and skip COAZ.
 		errs = append(errs, fmt.Sprintf("style %q is neither rest nor mcp", ext["style"]))
@@ -210,10 +221,15 @@ type server struct {
 // amount cap — the step-up and consent gates. A forged token here is a bypass of both,
 // and so is a genuine one belonging to someone else: customer B's consent must not
 // authorise customer A's payment. So the token counts only when it verifies (or, with
-// no verifier, when decoding was allowed) AND it is the principal's own login: its sub is
-// the access token's sub, it is not the access token itself, and it is not a delegated
-// token (no act claim) — an agent's own token is not a user having logged in.
-func (s *server) userClaims(ctx context.Context, headers map[string]string, principal, accessToken string) map[string]any {
+// no verifier, when decoding was allowed), it is not the access token itself, and it is
+// not a delegated token (no act claim) — an agent's own token is not a user having
+// logged in — AND it is the principal's own login: its sub is the access token's sub.
+//
+// That last rule has one deliberate exception. A route with user_token_subject "pdp" is
+// one where someone else may approve — a staff member approving for a customer — so a
+// token with another subject counts there, and the PDP, which receives user_sub, decides
+// whether that person may approve for this principal.
+func (s *server) userClaims(ctx context.Context, headers map[string]string, principal, accessToken string, forPDP bool) map[string]any {
 	raw := headers["x-user-token"]
 	if raw == "" {
 		return nil
@@ -239,7 +255,10 @@ func (s *server) userClaims(ctx context.Context, headers map[string]string, prin
 	case claims["act"] != nil:
 		log.Printf("X-User-Token ignored: it is a delegated token (act), not a user's login")
 		return nil
-	case principal == "" || claimString(claims, "sub") != principal:
+	case claimString(claims, "sub") == "":
+		log.Printf("X-User-Token ignored: it has no subject")
+		return nil
+	case !forPDP && (principal == "" || claimString(claims, "sub") != principal):
 		log.Printf("X-User-Token ignored: its subject is not the access token's")
 		return nil
 	}
@@ -430,7 +449,7 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 
 	// 2) Step-up: require a logged-in END USER (RFC 9470 step-up challenge) — the
 	//    principal's own verified login, see userClaims.
-	uclaims := s.userClaims(ctx, headers, sub, token)
+	uclaims := s.userClaims(ctx, headers, sub, token, conf.userTokenForPDP)
 	if conf.requireUserLogin && claimString(uclaims, "sub") == "" {
 		log.Printf("[%s] 401 login_required %s %q", pep, method, path)
 		return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
@@ -474,6 +493,8 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 //	token_aud             the agent token's audience (RFC 8707 / FAPI 2.0).
 //	user_acr              how the user authenticated; the staff-approval channel is
 //	                      recognised by its acr.
+//	user_sub, user_iss    whose login it is — the principal's, or on a route that lets the
+//	                      PDP judge it, possibly an approver's.
 //
 // Both PEPs must send the same, or a payment authorised at the MCP edge is re-challenged
 // at the API edge and the flow loops on step-up.
@@ -482,6 +503,12 @@ func userContext(uclaims, claims map[string]any) map[string]any {
 		"user_scope": scopeString(uclaims),
 		"token_aud":  audString(claims),
 		"user_acr":   strClaim(uclaims, "acr"),
+	}
+	// Whose login it is: the principal's own unless the route lets the PDP judge an
+	// approver's (user_token_subject "pdp"), in which case the policy must compare it.
+	if sub := strClaim(uclaims, "sub"); sub != "" {
+		ctx["user_sub"] = sub
+		ctx["user_iss"] = strClaim(uclaims, "iss")
 	}
 	if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
 		ctx["authorization_details"] = ad
@@ -504,6 +531,11 @@ func (s *server) checkMCP(ctx context.Context, conf pepConfig, method, path stri
 	pep := conf.pepLabel
 	switch strings.ToUpper(method) {
 	case "GET", "HEAD", "DELETE":
+		// No JSON-RPC message travels on these. One that carries a body anyway is not
+		// passed on unread to an upstream that might read it.
+		if strings.TrimSpace(body) != "" {
+			return rpcRefusal(pep, typev3.StatusCode_BadRequest, "Invalid Request: a "+strings.ToUpper(method)+" to an MCP endpoint carries no body")
+		}
 		return permit(pep, "mcp:"+strings.ToLower(method), "MCP transport request; policy applies to JSON-RPC messages.", id)
 	case "POST":
 	default:
