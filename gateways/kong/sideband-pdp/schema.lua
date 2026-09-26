@@ -91,6 +91,10 @@ return {
           -- whole upstream response on any route this plugin is on, on or off: that is
           -- what a response phase costs, and why this plugin is for REST routes.
           { filter_response = { type = "boolean", default = true } },
+          -- The largest upstream response body, in bytes, sent to the policy provider. A
+          -- larger one is withheld with a 502 rather than filtered in part or passed
+          -- unfiltered. Kong has buffered it whole by then; this bounds what is re-sent.
+          { max_response_body_size = { type = "integer", default = 1048576, gt = 0 } },
           -- The largest request body, in bytes, sent to the policy provider. A body Kong
           -- buffered to disk is read back up to this (Kong 3.9+); a larger one is refused
           -- with a 413, never sent without its body.

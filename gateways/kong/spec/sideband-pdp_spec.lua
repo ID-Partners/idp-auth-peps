@@ -579,11 +579,92 @@ describe('the response phase', function()
     local fn = router({ [PAZ .. '/sideband/request'] = permit(), [PAZ .. '/sideband/response'] = false })
     local plugin, state, c = drive({}, { pdp = fn, upstream = upstream })
     mock.run_response(plugin, c)
-    assert.equal(503, state.exited.status)
+    assert.equal(502, state.exited.status)
     local plugin2, state2, c2 = drive({ fail_mode = 'open' }, { pdp = fn, upstream = upstream })
     mock.run_response(plugin2, c2)
     assert.is_nil(state2.exited)
     assert.matches('^' .. PAZ:gsub('%p', '%%%0'), state2.response_headers['X-PDP-Fail-Open'])
+  end)
+
+  it('a failure after the upstream ran withholds its response: every upstream header goes, and the client is told', function()
+    -- By now the upstream has done what it was asked. A 503 "unreachable" invited a retry
+    -- of a request that may not be safe to repeat, and left its Set-Cookie on the way out.
+    local with_cookie = { status = 201, headers = { ['set-cookie'] = 'session=abc', location = '/payments/9', ['content-type'] = 'application/json' }, body = '{}' }
+    for _, answer in ipairs({ false, 500, function() return { status = 429, headers = { ['Retry-After'] = '9' }, body = '' } end, 401, 'not json' }) do
+      local fn = router({ [PAZ .. '/sideband/request'] = permit(), [PAZ .. '/sideband/response'] = answer })
+      local plugin, state, c = drive({}, { method = 'POST', path = '/payments', body = '{}', pdp = fn, upstream = with_cookie })
+      mock.run_response(plugin, c)
+      assert.equal(502, state.exited.status, tostring(answer))
+      assert.matches('upstream processed the request', state.exited.body.reason)
+      assert.is_nil(state.exited.headers['Retry-After'])
+      local cleared = table.concat(state.cleared_response_headers, ' ')
+      assert.matches('set%-cookie', cleared)
+      assert.matches('location', cleared)
+      assert.equal('DENY', state.exited.headers['X-PDP-Decision'])
+    end
+  end)
+
+  it('withholds a response larger than it will send the policy provider', function()
+    local fn, hits = router({ [PAZ .. '/sideband/request'] = permit(), [PAZ .. '/sideband/response'] = echo_response })
+    local big = { status = 200, headers = { ['content-type'] = 'text/plain' }, body = string.rep('x', 2048) }
+    local plugin, state, c = drive({ max_response_body_size = 1024 }, { pdp = fn, upstream = big })
+    mock.run_response(plugin, c)
+    assert.equal(502, state.exited.status)
+    assert.equal(0, #urls(hits, '/sideband/response'))
+    -- Within the cap it is filtered as usual.
+    local plugin2, state2, c2 = drive({}, { pdp = fn, upstream = big })
+    mock.run_response(plugin2, c2)
+    assert.equal(200, state2.exited.status)
+  end)
+end)
+
+describe('a response the plugin would never see', function()
+  -- Kong runs a plugin's response phase only under buffered proxying, which it turns off
+  -- for a websocket upgrade and, before 3.9, for HTTP/2. The response would then go to the
+  -- client with no /sideband/response call and no X-PDP-* markers. So where any layer
+  -- filters responses, such a request is refused; and every permit is marked in access.
+  local function proxied(over, opts)
+    local fn, hits = router({ [PAZ .. '/sideband/request'] = permit(), [PAZ .. '/sideband/response'] = echo_response })
+    opts.pdp = fn
+    opts.upstream = opts.upstream or { status = 200, headers = { ['content-type'] = 'text/plain' }, body = 'ok' }
+    local plugin, state = load_plugin(opts)
+    local c = conf(over)
+    mock.proxy(plugin, c)
+    return state, hits
+  end
+
+  it('refuses an upgrade on a route that filters responses, before asking anyone', function()
+    local state, hits = proxied({}, { method = 'GET', path = '/ws', headers = { upgrade = 'websocket', connection = 'Upgrade' } })
+    assert.equal(400, state.exited.status)
+    assert.equal(0, #hits)
+    assert.equal('DENY', state.exited.headers['X-PDP-Decision'])
+  end)
+
+  it('refuses HTTP/2 there only where Kong would not buffer it (before 3.9)', function()
+    local old = proxied({}, { method = 'GET', path = '/a', http_version = 2, kong_version_num = 3007001 })
+    assert.equal(400, old.exited.status)
+    local new, hits = proxied({}, { method = 'GET', path = '/a', http_version = 2 })
+    assert.is_true(new.response_ran)
+    assert.equal(1, #urls(hits, '/sideband/response'))
+  end)
+
+  it('lets them through where nothing filters responses, and marks the permit anyway', function()
+    for _, over in ipairs({ { filter_response = false }, { pdp_layers = { 'resource request-only' } } }) do
+      local state = proxied(over, { method = 'GET', path = '/ws', headers = { upgrade = 'websocket' } })
+      assert.is_nil(state.exited)
+      assert.is_false(state.response_ran)
+      assert.equal('PERMIT', state.response_headers['X-PDP-Decision'])
+      assert.equal('test-pep', state.response_headers['X-PDP-PEP'])
+    end
+  end)
+
+  it('marks a fail-open permit when filtering is off', function()
+    local fn = router({ [PAZ .. '/sideband/request'] = false })
+    local plugin, state = load_plugin({ method = 'GET', path = '/a', pdp = fn })
+    mock.proxy(plugin, conf({ filter_response = false, fail_mode = 'open' }))
+    assert.is_nil(state.exited)
+    assert.equal('PERMIT', state.response_headers['X-PDP-Decision'])
+    assert.equal(PAZ, state.response_headers['X-PDP-Fail-Open'])
   end)
 end)
 

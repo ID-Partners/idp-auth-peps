@@ -103,6 +103,17 @@ local function debug(conf, ...)
   if conf.enable_debug_logging then kong.log.debug(...) end
 end
 
+-- The response phase runs after the upstream has done what it was asked, so a failure
+-- there cannot undo the request — only withhold what came back. Every upstream header
+-- goes (a Set-Cookie, a Location, the lot), and the client is told the request was
+-- processed: a 503 would invite a retry of something that may not be safe to repeat.
+local function withhold(c, layer)
+  local upstream_headers = kong.response.get_headers(1000)
+  for name in pairs(upstream_headers) do kong.response.clear_header(name) end
+  c.decision, c.layer = "DENY", layer
+  return deny(c, 502, "The upstream processed the request, but its response could not be authorised and has been withheld.")
+end
+
 -- One layer that could not be reached, under its rule: fail-open skips the layer and
 -- names it; fail-closed denies, with the reason a client can act on when there is one.
 -- A 429 answers this request only: the next is asked afresh.
@@ -114,6 +125,7 @@ local function fail_layer(c, ep, detail, skipped, phase)
     return
   end
   kong.log.err("PDP layer ", ep.identifier, " unavailable (", phase, "): ", detail.msg, "; denying (fail-closed)")
+  if phase == "response" then return withhold(c, ep.identifier) end
   c.decision, c.layer = "DENY", ep.identifier
   if detail.retry_after then
     return deny(c, 429, "Authorization service is rate-limiting this gateway; denying (fail-closed).",
@@ -126,8 +138,33 @@ end
 -- could not make): closed, whatever the layer's rule. A refusal is not an outage.
 local function refuse(c, ep, detail, phase)
   kong.log.err("PDP layer ", ep.identifier, " refused the ", phase, " call: ", detail.msg, "; denying (fail-closed)")
+  if phase == "response" then return withhold(c, ep.identifier) end
   c.decision, c.layer = "DENY", ep.identifier
   return deny(c, 503, "Authorization service refused the request; denying (fail-closed).")
+end
+
+-- Whether any layer will be asked about the response.
+local function filters(conf, eps)
+  if conf.filter_response == false then return false end
+  for _, ep in ipairs(eps) do
+    if not ep.request_only then return true end
+  end
+  return false
+end
+
+-- Why Kong would not run this plugin's response phase for the request, or nil. Kong runs
+-- it only under buffered proxying, which it turns off for a websocket upgrade and, before
+-- 3.9, for HTTP/2; the upstream's response would then reach the client unfiltered.
+local function unfilterable()
+  local upgrade = kong.request.get_header("upgrade")
+  if upgrade and upgrade ~= "" then
+    return "a protocol upgrade (" .. upgrade .. ")", "a protocol upgrade would bypass that"
+  end
+  local version = kong.request.get_http_version() or 1.1
+  if version >= 2 and (kong.version_num or 0) < 3009000 then
+    return "HTTP/" .. version .. " on Kong " .. tostring(kong.version), "this gateway cannot do that over HTTP/2"
+  end
+  return nil
 end
 
 -- ask posts one payload to one layer and classifies the answer with `classify`.
@@ -187,6 +224,18 @@ function SidebandPDP:access(conf)
   local eps, skipped = layers.pdps, layers.skipped
   c.source = layers.meta and layers.meta.source or "static"
 
+  -- 1b) a request whose response Kong would not let this plugin see is refused wherever a
+  --     layer would filter it: the response would otherwise go out unfiltered and
+  --     unmarked. Ping's plugin refused HTTP/2 outright; Kong 3.9+ buffers it.
+  if filters(conf, eps) then
+    local why, client_reason = unfilterable()
+    if why then
+      kong.log.warn("refusing ", why, ": this route filters responses and Kong would not run the response phase")
+      c.decision = "DENY"
+      return deny(c, 400, "This route filters responses through the policy provider; " .. client_reason .. ".")
+    end
+  end
+
   -- 2) the request as the client sent it, through every layer in order
   local original, perr = sideband.request_payload(conf)
   if not original then
@@ -216,25 +265,42 @@ function SidebandPDP:access(conf)
     end
   end
 
-  -- 3) permitted: forward the request as the layers rewrote it
+  -- 3) permitted: forward the request as the layers rewrote it, marked. Marked here and
+  --    not only in the response phase: with filtering off, or every layer request-only,
+  --    or an upgrade, that phase does not run, and a fail-open permit must still say so.
   c.decision, c.asked, c.skipped = "PERMIT", asked, skipped
   if #skipped > 0 then
     kong.log.warn("permit failed open past: ", table.concat(skipped, ", "))
     c.fail_open = table.concat(skipped, ", ")
   end
   sideband.apply_request(original, current, function(...) kong.log.warn(...) end)
+  for k, v in pairs(pdp_headers(c)) do kong.response.set_header(k, v) end
 end
 
 -- 4) the upstream's response, back through every layer that permitted, in reverse. Kong
 --    runs this phase only after a permit, with the whole response buffered.
 function SidebandPDP:response(conf)
   local c = kong.ctx.plugin
-  if not c or c.decision ~= "PERMIT" or conf.filter_response == false then return end
+  if not c or c.decision ~= "PERMIT" then return end
   local asked, skipped = c.asked or {}, c.skipped or {}
+  local permitted = {}
+  for _, a in ipairs(asked) do permitted[#permitted + 1] = a.ep end
+  if not filters(conf, permitted) then
+    -- Nothing to ask: the upstream's response goes as it is, marked again in case the
+    -- upstream sent X-PDP-* of its own.
+    for k, v in pairs(pdp_headers(c)) do kong.response.set_header(k, v) end
+    return
+  end
+  local body = kong.service.response.get_raw_body()
+  local max = conf.max_response_body_size or 1048576
+  if type(body) == "string" and #body > max then
+    kong.log.err("the upstream's response is ", #body, " bytes, over max_response_body_size (", max, "); withholding it")
+    return withhold(c, nil)
+  end
   local current = {
     status = kong.response.get_status(),
-    headers = sideband.format_headers(kong.response.get_headers()),
-    body = kong.service.response.get_raw_body(),
+    headers = sideband.format_headers(kong.response.get_headers(1000)),
+    body = body,
   }
   local filtered = 0
   for i = #asked, 1, -1 do
