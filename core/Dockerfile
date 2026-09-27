@@ -29,7 +29,7 @@ RUN go build -ldflags "-s -w -X main.version=${VERSION}" -o /coaz-pep ./cmd/coaz
 # the stubs write the anchors file for the PEPs; creating it here, owned by the demo
 # user, makes a fresh named volume mounted there writable without root. (A volume left
 # over from an older, root-run demo is not: `docker compose down -v` clears it.)
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0 AS demo-base
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS demo-base
 RUN adduser -D -u 65532 demo && mkdir -p /shared && chown demo:demo /shared
 
 FROM demo-base AS demo-stubs
