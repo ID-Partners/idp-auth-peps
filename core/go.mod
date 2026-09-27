@@ -8,7 +8,7 @@ require (
 	github.com/envoyproxy/go-control-plane/envoy v1.39.0
 	github.com/google/cel-go v0.31.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260921155816-b14227669459
-	google.golang.org/grpc v1.83.2
+	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )
 
