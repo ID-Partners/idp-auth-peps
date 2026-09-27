@@ -154,8 +154,9 @@ These change behaviour on purpose. Each is a secure default with an explicit way
 
 - A strict local guard, the same Unicode folding as Go at every depth; delegate mode
   forwards everything to coaz-pep; `evaluateAll` strict; redirects refused; paginated,
-  bounded gateway discovery; a hardened `FederationEntity`. ESM only, Node 22+, published
-  with provenance.
+  bounded gateway discovery; a hardened `FederationEntity`. ESM only, Node 22+. Attached
+  to every release as an npm package; on npm itself, with provenance, once npm publishing
+  is switched on.
 
 ### Delivery
 

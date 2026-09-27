@@ -11,10 +11,13 @@
 #       it. A candidate runs every release job and publishes nothing final.
 #   scripts/release.sh final [--dry-run] [--wait]
 #       Tag vX.Y.Z and push it: only on the commit its latest candidate was cut from, once
-#       that candidate's release run has passed, with NPM_TOKEN set and the image public.
+#       that candidate's release run has passed, and with the image public. The SDK goes
+#       to npm too while the repository variable NPM_PUBLISH is "true".
+#   scripts/release.sh npm vX.Y.Z [--dry-run] [--wait]
+#       Publish a released version's Node SDK to npm, when npm was off at release time.
 #
-# --dry-run runs every check and tags nothing. --wait follows the release run the tag
-# starts and fails unless it passes.
+# --dry-run runs every check and changes nothing. --wait follows the run it starts and
+# fails unless it passes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -152,18 +155,68 @@ final() {
     || die "$rc was cut from $(git rev-parse --short "$rc^{commit}"), not from this commit: cut a candidate of this one first"
   conclusion=$(gh run list --workflow Release --branch "$rc" --limit 1 --json conclusion --jq '.[0].conclusion // "missing"')
   [ "$conclusion" = success ] || die "$rc's release run is '$conclusion', not a pass"
-  gh secret list --json name --jq '.[].name' | grep -qx NPM_TOKEN \
-    || die "no NPM_TOKEN secret, so the npm job would fail: add one under Settings > Secrets and variables > Actions"
+  if [ "$(gh variable get NPM_PUBLISH 2>/dev/null)" = true ]; then
+    gh secret list --json name --jq '.[].name' | grep -qx NPM_TOKEN \
+      || echo "release: NPM_PUBLISH is on and there is no NPM_TOKEN: unless npm trusted publishing is set up for this workflow, the npm job fails" >&2
+    echo "npm: on - the Node SDK goes to npm with v$v"
+  else
+    echo "npm: off (NPM_PUBLISH is not \"true\") - the SDK is attached to the release; scripts/release.sh npm v$v publishes it later"
+  fi
   o=$(owner)
   public "$o" \
     || die "ghcr.io/$o/coaz-pep is private, so nobody could pull the release's image: https://github.com/orgs/$o/packages/container/coaz-pep/settings"
   tag_and_push "v$v" "$v" "$dry" "$wait"
 }
 
+# Publish a released version's Node SDK to npm, by hand: the release workflow, run with
+# the tag, builds and tests that tag's SDK and publishes it with provenance.
+to_npm() {
+  local tag=$1 dry=$2 wait=$3 v since id=""
+  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "npm takes a released version's tag, vX.Y.Z, not '$tag'"
+  v=${tag#v}
+  released "$v" || die "$tag is not released"
+  if npm view "@id-partners/authzen-pep@$v" version >/dev/null 2>&1; then
+    die "@id-partners/authzen-pep@$v is already on npm"
+  fi
+  if [ "$dry" = 1 ]; then
+    echo "would publish $tag's Node SDK to npm"
+    return 0
+  fi
+  since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  gh workflow run release.yml -f tag="$tag"
+  echo "started the npm publish of $tag"
+  [ "$wait" = 1 ] || return 0
+  for _ in $(seq 1 24); do
+    id=$(gh run list --workflow Release --event workflow_dispatch --limit 5 --json databaseId,createdAt \
+      --jq "[.[] | select(.createdAt >= \"$since\")] | .[0].databaseId // empty")
+    [ -n "$id" ] && break
+    sleep 5
+  done
+  [ -n "$id" ] || die "no npm publish run started for $tag"
+  gh run watch "$id" --interval 30 >/dev/null 2>&1 || true
+  [ "$(gh run view "$id" --json conclusion --jq .conclusion)" = success ] \
+    || die "the npm publish of $tag did not pass: $(gh run view "$id" --json url --jq .url)"
+  echo "@id-partners/authzen-pep@$v is on npm"
+}
+
 cmd=${1:-}
 [ $# -gt 0 ] && shift
 case "$cmd" in
   bump) bump "$@" ;;
+  npm)
+    tag=""
+    dry=0
+    wait=0
+    for a in "$@"; do
+      case "$a" in
+        --dry-run) dry=1 ;;
+        --wait) wait=1 ;;
+        -*) die "unknown option $a" ;;
+        *) tag=$a ;;
+      esac
+    done
+    to_npm "$tag" "$dry" "$wait"
+    ;;
   rc | final)
     dry=0
     wait=0
@@ -177,7 +230,7 @@ case "$cmd" in
     "$cmd" "$dry" "$wait"
     ;;
   *)
-    sed -n '2,19p' "$0" | sed -E 's/^# ?//'
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit 2
     ;;
 esac

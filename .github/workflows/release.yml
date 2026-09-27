@@ -2,8 +2,14 @@ name: Release
 
 # A tag like v0.4.0 releases every component at that version: the coaz-pep image (with
 # an SBOM, build provenance and a keyless cosign signature), the two Kong rocks, the
-# PingAccess rule's jar, and the Node SDK on npm. Every component must already say the
-# tag's version and CHANGELOG.md must have a section for it — the first job checks.
+# PingAccess rule's jar, and the Node SDK as a package attached to the release. Every
+# component must already say the tag's version and CHANGELOG.md must have a section for
+# it — the first job checks.
+#
+# npm is opt-in: a release publishes the SDK to npm, with provenance, only while the
+# repository variable NPM_PUBLISH is "true". Otherwise it stops at a dry run, and a run
+# of this workflow by hand (workflow_dispatch, with the tag) publishes that release's
+# SDK later - the image, rocks and release are not touched again.
 #
 # A tag like v0.4.0-rc1 is a release candidate for 0.4.0, and runs the same jobs with
 # nothing final published: the components still say 0.4.0, the image is pushed as
@@ -12,34 +18,60 @@ name: Release
 on:
   push:
     tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: A released tag (vX.Y.Z) whose Node SDK goes to npm now
+        required: true
 
 permissions:
   contents: read
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
   versions:
-    name: every component says ${{ github.ref_name }}
+    name: every component says ${{ inputs.tag || github.ref_name }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
       base: ${{ steps.v.outputs.base }}
       prerelease: ${{ steps.v.outputs.prerelease }}
+      npm: ${{ steps.v.outputs.npm }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
       - id: v
+        env:
+          NPM_PUBLISH: ${{ vars.NPM_PUBLISH }}
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           if ! [[ "$v" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-rc[0-9]+)?$ ]]; then
-            echo "::error::$GITHUB_REF_NAME is neither vX.Y.Z nor vX.Y.Z-rcN"
+            echo "::error::$TAG is neither vX.Y.Z nor vX.Y.Z-rcN"
             exit 1
           fi
           base="${BASH_REMATCH[1]}"
           prerelease=false
           if [ -n "${BASH_REMATCH[2]}" ]; then prerelease=true; fi
+          # Whether the SDK goes to npm: by hand always, and it must be a release's; with a
+          # release tag, only while NPM_PUBLISH is on; never for a candidate.
+          npm=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            if [ "$prerelease" = true ]; then
+              echo "::error::npm takes a release, not a candidate: $TAG"
+              exit 1
+            fi
+            npm=true
+          elif [ "$prerelease" = false ] && [ "$NPM_PUBLISH" = true ]; then
+            npm=true
+          fi
           {
             echo "version=$v"
             echo "base=$base"
             echo "prerelease=$prerelease"
+            echo "npm=$npm"
           } >> "$GITHUB_OUTPUT"
           # A candidate is for the version the components already say.
           scripts/check-versions.sh "$base"
@@ -47,6 +79,7 @@ jobs:
   image:
     name: coaz-pep image
     needs: versions
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -97,6 +130,7 @@ jobs:
   kong:
     name: Kong rocks
     needs: versions
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,6 +165,7 @@ jobs:
   pingaccess:
     name: PingAccess jar
     needs: versions
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -150,46 +185,71 @@ jobs:
           path: gateways/pingaccess/authzen-pdp/target/authzen-pdp-pingaccess-${{ needs.versions.outputs.base }}.jar
           if-no-files-found: error
 
-  npm:
-    name: Node SDK on npm
+  node:
+    name: Node SDK package
     needs: versions
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write # npm provenance, and trusted publishing when it is configured
     defaults:
       run:
         working-directory: sdk/node
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run test:coverage
+      # The package the release attaches and npm gets: the same tested file for both.
+      - run: npm pack
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: node
+          path: sdk/node/id-partners-authzen-pep-${{ needs.versions.outputs.base }}.tgz
+          if-no-files-found: error
+
+  npm:
+    name: Node SDK on npm
+    needs: [versions, node]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance, and trusted publishing when it is configured
+    env:
+      PACKAGE: id-partners-authzen-pep-${{ needs.versions.outputs.base }}.tgz
+    steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm run test:coverage
-      # A candidate stops short of publishing: an npm version is permanent, and the one
-      # package.json says is the release's to publish.
-      - if: needs.versions.outputs.prerelease == 'true'
-        run: npm publish --dry-run --access public
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: node
       # With an NPM_TOKEN secret it publishes with that; without one, npm's trusted
       # publishing (configured on npmjs.com for this repository and workflow) needs no
       # secret at all. Either way the package carries provenance.
-      - if: needs.versions.outputs.prerelease != 'true'
-        run: npm publish --provenance --access public
+      - if: needs.versions.outputs.npm == 'true'
+        run: npm publish "./$PACKAGE" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # A candidate, or a release while NPM_PUBLISH is off: everything but the publish.
+      - if: needs.versions.outputs.npm != 'true'
+        run: |
+          npm publish "./$PACKAGE" --dry-run --access public
+          echo "::notice::The Node SDK was not published to npm: $TAG is a candidate, or NPM_PUBLISH is off. It is attached to the release."
 
   release:
     name: GitHub release
-    needs: [versions, image, kong, pingaccess]
+    needs: [versions, image, kong, pingaccess, node]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The release carries the rocks and the jar, by name: a run also holds artifacts
-      # that are not the product, such as the Docker build record.
+      # The release carries the rocks, the jar and the SDK's package, by name: a run also
+      # holds artifacts that are not the product, such as the Docker build record.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: kong
@@ -198,22 +258,32 @@ jobs:
         with:
           name: pingaccess
           path: assets
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: node
+          path: assets
       - name: Notes from CHANGELOG.md, assets attached
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ needs.versions.outputs.version }}
           BASE: ${{ needs.versions.outputs.base }}
           PRERELEASE: ${{ needs.versions.outputs.prerelease }}
+          NPM: ${{ needs.versions.outputs.npm }}
           DIGEST: ${{ needs.image.outputs.digest }}
         run: |
           flags=()
           : > notes.md
           if [ "$PRERELEASE" = true ]; then
             flags+=(--prerelease)
-            printf 'A release candidate for %s. The rocks and the jar attached say %s, and nothing is on npm yet. The notes below are the ones %s will ship with.\n\n' \
+            printf 'A release candidate for %s. The rocks, the jar and the SDK package attached say %s, and nothing is on npm yet. The notes below are the ones %s will ship with.\n\n' \
               "$BASE" "$BASE" "$BASE" >> notes.md
           fi
           awk -v v="$BASE" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md >> notes.md
           printf '\nImage: `ghcr.io/%s/coaz-pep:%s` (`%s`), signed with cosign (keyless) and attested.\n' \
             "${GITHUB_REPOSITORY_OWNER,,}" "$V" "$DIGEST" >> notes.md
+          if [ "$NPM" = true ]; then
+            printf '\nNode SDK: `@id-partners/authzen-pep@%s` on npm, with provenance, and attached here.\n' "$BASE" >> notes.md
+          else
+            printf '\nNode SDK: attached here, not on npm yet - `npm install ./id-partners-authzen-pep-%s.tgz`.\n' "$BASE" >> notes.md
+          fi
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}" assets/*

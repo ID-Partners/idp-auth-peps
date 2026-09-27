@@ -48,6 +48,7 @@ import { AuthzenClient, FederationEntity } from '@id-partners/authzen-pep';
 import { authzenMiddleware, pathMapper } from '@id-partners/authzen-pep/express';
 import { McpGuard } from '@id-partners/authzen-pep/mcp';</code></pre>
   <p>Node 22 or later. ESM only: there is no CommonJS build. Types ship with the package, and so does the source its maps point at.</p>
+  <p>Until a version is on npm, install the package attached to its <a href="https://github.com/ID-Partners/idp-auth-peps/releases">GitHub release</a>: <code>npm install ./id-partners-authzen-pep-&lt;version&gt;.tgz</code>.</p>
 
   <h2 id="upgrading">Upgrading to 0.4.0</h2>
   <p>0.4.0 closes every way the SDK had of letting a request through that no PDP judged. A configuration that would trust something nobody checked now refuses to start; <code>allowInsecure: true</code> is the escape hatch everywhere, for demos and development, and it says so once at startup.</p>

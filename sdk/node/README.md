@@ -9,6 +9,10 @@ Node 22 or later. ESM only — there is no CommonJS build. No runtime dependenci
 npm install @id-partners/authzen-pep
 ```
 
+Until a version is on npm, install the package attached to its
+[GitHub release](https://github.com/ID-Partners/idp-auth-peps/releases):
+`npm install ./id-partners-authzen-pep-<version>.tgz`.
+
 Reach for this when the traffic cannot sit behind the Kong or Envoy PEPs in this repo,
 or when the decision needs request context only the application has. Everything fails
 closed: a timeout, a 500, an unparseable body and a mapping it cannot evaluate all deny,
