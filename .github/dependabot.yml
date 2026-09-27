@@ -13,7 +13,16 @@ updates:
   - package-ecosystem: npm
     directory: /sdk/node
     schedule: { interval: weekly }
+    ignore:
+      # Types for the oldest Node the SDK supports (22): newer ones describe APIs the
+      # SDK must not use, and drop ones it does.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
     groups:
+      # vitest and its coverage provider pin each other's exact version: one moves
+      # without the other and npm ci refuses.
+      vitest:
+        patterns: [vitest, "@vitest/*"]
       node-dev:
         update-types: [minor, patch]
 
@@ -23,6 +32,12 @@ updates:
     ignore:
       # Taken from the PingAccess image, not a repository: the image tag decides it.
       - dependency-name: com.pingidentity.pingaccess:pingaccess-sdk
+      # What PingAccess 9.1 ships in lib/, provided at runtime: the rule compiles against
+      # the engine's own versions, so these move with the PingAccess version, by hand.
+      - dependency-name: com.fasterxml.jackson.core:jackson-databind
+      - dependency-name: org.bitbucket.b_c:jose4j
+      - dependency-name: "org.slf4j:*"
+      - dependency-name: jakarta.validation:jakarta.validation-api
     groups:
       maven:
         update-types: [minor, patch]
@@ -37,3 +52,6 @@ updates:
   - package-ecosystem: docker
     directories: [/core, /demo/railway, /demo/pingaccess, /gateways/envoy/agentgateway]
     schedule: { interval: weekly }
+    ignore:
+      # The demo builds the PingAccess rule on JDK 17, its floor, on purpose.
+      - dependency-name: maven
