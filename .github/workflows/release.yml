@@ -30,10 +30,13 @@ permissions:
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
+# Runners pinned to ubuntu-24.04, not ubuntu-latest (Ubuntu 26 from 2026-10-19): the Kong
+# rocks are built and tested with that image's luarocks (3.8), and a new image is a change
+# to make on purpose, through a candidate.
 jobs:
   versions:
     name: every component says ${{ inputs.tag || github.ref_name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
       base: ${{ steps.v.outputs.base }}
@@ -80,7 +83,7 @@ jobs:
     name: coaz-pep image
     needs: versions
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -131,7 +134,7 @@ jobs:
     name: Kong rocks
     needs: versions
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build both rocks from the tag
@@ -166,7 +169,7 @@ jobs:
     name: PingAccess jar
     needs: versions
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: gateways/pingaccess/authzen-pdp
@@ -188,7 +191,7 @@ jobs:
   node:
     name: Node SDK package
     needs: versions
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: sdk/node
@@ -212,7 +215,7 @@ jobs:
   npm:
     name: Node SDK on npm
     needs: [versions, node]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write # npm provenance, and trusted publishing when it is configured
@@ -243,7 +246,7 @@ jobs:
     name: GitHub release
     needs: [versions, image, kong, pingaccess, node]
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

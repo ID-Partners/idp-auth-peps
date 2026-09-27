@@ -14,10 +14,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Actions are pinned to commit SHAs (the tag is in the comment); Dependabot moves both.
+# Runners pinned to ubuntu-24.04, not ubuntu-latest (Ubuntu 26 from 2026-10-19): the Kong
+# rocks are built and tested with that image's luarocks (3.8), and a new image is a change
+# to make on purpose, through a candidate.
 jobs:
   core:
     name: core (Go)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: core
@@ -39,7 +42,7 @@ jobs:
 
   image:
     name: core image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
@@ -59,7 +62,7 @@ jobs:
 
   site:
     name: site image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
@@ -73,7 +76,7 @@ jobs:
 
   demo:
     name: demo walkthrough
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -85,7 +88,7 @@ jobs:
 
   sdk:
     name: sdk/node
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: sdk/node
@@ -110,7 +113,7 @@ jobs:
 
   kong:
     name: gateways/kong (lua)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: gateways/kong
@@ -151,7 +154,7 @@ jobs:
 
   pingaccess:
     name: gateways/pingaccess (java ${{ matrix.java }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         java: ['17', '21'] # built for 17; PingAccess 9.1 runs 21
