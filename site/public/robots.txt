@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://federated-enforcement.idpartners.global/sitemap.xml

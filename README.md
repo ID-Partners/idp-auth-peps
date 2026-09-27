@@ -18,6 +18,9 @@ plugin's discovery in front of PingAuthorize's Sideband API instead of AuthZEN: 
 resolution and the same layers, but a deny — and so a challenge — is the policy's HTTP, not
 this contract's.
 
+The site, **[federated-enforcement.idpartners.global](https://federated-enforcement.idpartners.global)**,
+is the way in: what this is, the one-page overview and the configuration reference.
+
 They share [`core/`](core) — the Go COAZ engine and the `coaz-pep` service that the
 gateway surfaces call. That is the point: **a client gets the same challenge whichever
 PEP denies it**, because there is one implementation of the decision and one of the
@@ -57,13 +60,16 @@ doing the same discovery in front of the same resource.
 The **[reference site](docs/reference/index.html)** documents every configurable item
 of every component — coaz-pep, the Envoy family, the Kong plugin, the PingAccess rule, the
 Node SDK and the demo — with complete configurations and, where a component has a
-screen, screenshots of it. The hosted demo serves it at
+screen, screenshots of it. It lives at
+[federated-enforcement.idpartners.global/docs/](https://federated-enforcement.idpartners.global/docs/),
+and the hosted demo serves the same pages at
 [demo-production-6ee6.up.railway.app/docs/](https://demo-production-6ee6.up.railway.app/docs/).
 
 ## Layout
 
 ```
 docs/                        architecture.md — the explainer
+site/                        the site: federated-enforcement.idpartners.global
 demo/                        docker compose + scripts + a console: see discovery work
 core/                        Go: the COAZ engine + the coaz-pep service
   coaz/                        COAZ — discovery, CEL, envelopes, trust anchoring

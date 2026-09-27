@@ -1,0 +1,59 @@
+# federated-enforcement.idpartners.global. The image's entrypoint renders this into
+# /etc/nginx/conf.d/default.conf, substituting ${PORT} and nothing else (the Dockerfile's
+# NGINX_ENVSUBST_FILTER): Railway sets PORT, and 8080 is the default. Every other $name
+# below is nginx's own.
+
+# Cache by what was sent: a page revalidates every time, so a deploy shows at once; styles
+# and images may sit in a cache for a day.
+map $sent_http_content_type $site_cache_control {
+    default        "no-cache";
+    ~^text/css     "public, max-age=86400";
+    ~^image/       "public, max-age=86400";
+}
+
+server {
+    listen       ${PORT};
+    listen       [::]:${PORT};
+    server_name  _;
+    root         /usr/share/nginx/html;
+    index        index.html;
+
+    server_tokens     off;
+    absolute_redirect off;    # a directory redirect says /docs/, not http://host:port/docs/
+    charset           utf-8;
+
+    gzip            on;
+    gzip_vary       on;
+    gzip_min_length 1024;
+    gzip_types      text/css text/plain application/json application/xml image/svg+xml;
+
+    # Static pages, no scripts, fonts from Google, images from here (the overview page
+    # embeds its logos as data: URLs).
+    add_header Content-Security-Policy "default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'none'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Cache-Control $site_cache_control always;
+
+    # What Railway polls.
+    location = /healthz {
+        access_log   off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # /            the landing page          site/public
+    # /overview.html  the one-page overview  docs/overview.html
+    # /docs/       the configuration reference  docs/reference
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # docs/overview.html links to the reference as reference/…, its neighbour in the
+    # repository; here the reference is /docs/.
+    location /reference/ {
+        rewrite ^/reference/(.*)$ /docs/$1 permanent;
+    }
+
+    error_page 404 /404.html;
+}

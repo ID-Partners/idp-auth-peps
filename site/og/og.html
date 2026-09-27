@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- The social preview card, 1200x630. Not served; rendered to ../public/img/og.png with
+     headless Chrome (see ../README.md). System sans on purpose, so the render does not
+     depend on a font download. -->
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;width:1200px;height:630px;overflow:hidden}
+  body{background:#FFFFFF;color:#000;font-family:ui-sans-serif,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;position:relative}
+  .bar{position:absolute;left:0;top:0;right:0;height:14px;background:#FC6401}
+  .logo{position:absolute;left:72px;top:64px;width:260px;height:auto}
+  .eyebrow{position:absolute;left:72px;top:150px;font-size:20px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:#FC6401}
+  h1{position:absolute;left:66px;top:186px;margin:0;font-size:118px;line-height:.92;font-weight:900;letter-spacing:-.03em;text-transform:uppercase;width:1080px}
+  h1 .dot{color:#FC6401}
+  .lede{position:absolute;left:72px;top:434px;width:1056px;margin:0;font-size:27px;line-height:1.3;color:#000}
+  .domain{position:absolute;left:72px;bottom:44px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;color:#5A5A5A}
+  .idp{position:absolute;right:72px;bottom:44px;font-size:20px;color:#5A5A5A}
+</style>
+</head>
+<body>
+<div class="bar"></div>
+<img class="logo" src="../public/img/idpartners-logo-primary.png" alt="ID Partners">
+<div class="eyebrow">Open source · Apache-2.0</div>
+<h1>Federated<br>enforcement<span class="dot">.</span></h1>
+<p class="lede">AuthZEN enforcement points that read who decides from what a resource publishes, or the federation's word, and hand an AI agent a deny it can act on.</p>
+<div class="domain">federated-enforcement.idpartners.global</div>
+<div class="idp">Kong · PingAccess · Envoy · Istio · agentgateway · Node</div>
+</body>
+</html>

@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Federated Enforcement</title>
+<meta name="description" content="OpenID AuthZEN enforcement points for Kong, PingAccess, Envoy, Istio, agentgateway and Node that find their Policy Decision Point from what a resource publishes, or from a federation whose word outranks it, and hand an AI agent a deny it can act on. Open source, by ID Partners.">
+<link rel="canonical" href="https://federated-enforcement.idpartners.global/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Federated Enforcement">
+<meta property="og:title" content="Federated Enforcement">
+<meta property="og:description" content="AuthZEN enforcement points that find their PDP through what a resource publishes, or a federation's word, and hand an AI agent a deny it can act on. Kong, PingAccess, Envoy, Istio, agentgateway, Node.">
+<meta property="og:url" content="https://federated-enforcement.idpartners.global/">
+<meta property="og:image" content="https://federated-enforcement.idpartners.global/img/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#FC6401">
+<link rel="icon" type="image/png" sizes="32x32" href="/img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/img/favicon-192.png">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/site.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "idp-auth-peps",
+  "alternateName": "Federated Enforcement",
+  "url": "https://federated-enforcement.idpartners.global/",
+  "codeRepository": "https://github.com/ID-Partners/idp-auth-peps",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "programmingLanguage": ["Go", "Lua", "Java", "TypeScript"],
+  "author": { "@type": "Organization", "name": "ID Partners", "url": "https://idpartners.com.au" },
+  "description": "OpenID AuthZEN policy enforcement points for Kong, PingAccess, Envoy, Istio, agentgateway and Node, with PDP discovery through RFC 9728 metadata and OpenID Federation."
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top"><div class="wrap">
+  <a class="logo" href="/" aria-label="ID Partners"><picture><source srcset="/img/idpartners-logo-white-orange.png" media="(prefers-color-scheme: dark)"><img src="/img/idpartners-logo-primary.png" alt="ID Partners" width="180" height="24"></picture></a>
+  <span class="site">federated-enforcement.idpartners.global</span>
+  <nav aria-label="Sections">
+    <a href="#why">Why</a>
+    <a href="#federated">Federated</a>
+    <a href="#deny">The deny</a>
+    <a href="#surfaces">Surfaces</a>
+    <a href="#start">Get started</a>
+    <a href="/docs/">Reference</a>
+    <a href="https://demo-production-6ee6.up.railway.app">Demo</a>
+    <a href="https://github.com/ID-Partners/idp-auth-peps">GitHub</a>
+  </nav>
+</div></header>
+
+<main id="main">
+
+<section class="hero"><div class="wrap">
+  <span class="eyebrow">Open source · Apache-2.0 · ID Partners</span>
+  <h1>Federated enforcement<span class="dot">.</span></h1>
+  <p class="lede">OpenID AuthZEN enforcement points for Kong, PingAccess, Envoy, Istio, agentgateway and Node. Each one puts an AI agent's request to a Policy Decision Point before it goes through - and learns <em>which</em> PDP from what the resource publishes, or from a federation whose word outranks it. When the answer is no, the agent gets a challenge it can resolve, not a 403.</p>
+  <div class="ctas">
+    <a class="btn" href="https://demo-production-6ee6.up.railway.app">Open the demo</a>
+    <a class="btn alt" href="/overview.html">Read the overview</a>
+    <a class="btn alt" href="https://github.com/ID-Partners/idp-auth-peps">Source on GitHub</a>
+  </div>
+</div></section>
+
+<section class="facts band"><div class="wrap">
+  <dl>
+    <div><dt>Enforces at</dt><dd>Kong, PingAccess, Envoy, Istio, agentgateway, and inside a Node service</dd></div>
+    <div><dt>Speaks</dt><dd>OpenID AuthZEN 1.0, to any conformant PDP</dd></div>
+    <div><dt>Authorises</dt><dd>REST calls and MCP tool calls, per call</dd></div>
+    <div><dt>Finds the PDP</dt><dd>from the resource's published metadata, or the federation's word</dd></div>
+    <div><dt>On a deny</dt><dd>a challenge the agent can resolve, in the header, the body and the MCP error</dd></div>
+    <div><dt>When a PDP is down</dt><dd>closed by default, open only where you say, and never quietly</dd></div>
+  </dl>
+</div></section>
+
+<section id="why"><div class="wrap">
+  <span class="kicker">why</span>
+  <h2>An agent is not a session</h2>
+  <p class="intro">An AI agent calling a tool is one agent, acting for one human, touching one resource, right now. Whether that is allowed depends on all three, and it belongs in policy, not in tool code. AuthZEN gives an enforcement point a standard way to put that question to a decision point. These are the enforcement points.</p>
+  <div class="cards">
+    <div>
+      <h3>It acts under delegation</h3>
+      <p>The token an agent carries names two parties: the agent, and the customer it acts for. A gateway that only checks "is this token valid" cannot tell whether <em>this</em> agent may do <em>this</em> for <em>this</em> customer. The policy has to see the delegation, not just the bearer.</p>
+    </div>
+    <div>
+      <h3>The decision depends on the request</h3>
+      <p>A balance enquiry and a payment over ten thousand dollars arrive on the same connection with the same token. One is fine on a password; the other needs the customer's approval, or a verified credential. That is a policy decision, made per request.</p>
+    </div>
+    <div>
+      <h3>A flat 403 stops the agent dead</h3>
+      <p>A human reads an error page. An agent needs to know what would make the request succeed: which scope to obtain, which credential to present, whether anyone is logged in at all. A deny that says how to resolve it is the difference between an agent that completes the task and one that gives up.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="federated" class="band"><div class="wrap">
+  <span class="kicker">what federated means here</span>
+  <h2>The gateway reads who decides. It does not decide.</h2>
+  <p class="intro">Most enforcement points are told where their PDP is and stay pointed there. These read it per resource: from the resource's own metadata, or, when the resource belongs to an OpenID Federation, from a trust chain that runs back to an anchor you installed by hand. Then they hand the PDP the resource's own requirements and let the PDP do the matching. The gateway compares nothing.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 960 400" role="img" aria-label="An agent sends a request with a delegated token to the enforcement point. The enforcement point asks which PDP decides for the resource, reading either the resource's own RFC 9728 document or the federation's resolved word, which outranks it. That answer names the PDPs and their layers: an estate PDP first, then the resource's own PDP, each asked with an AuthZEN evaluation and each of which must permit. A permit goes on to the API with who acted for whom; a deny goes back to the agent as a challenge it can resolve.">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
+        <marker id="aho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#FC6401"/></marker>
+      </defs>
+      <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" font-weight="700" fill="currentColor" text-anchor="middle">
+        <rect x="20" y="30" width="180" height="44" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="110" y="57">agent / MCP client</text>
+        <rect x="390" y="30" width="180" height="44" fill="none" stroke="#FC6401" stroke-width="2"/><text x="480" y="57">enforcement point</text>
+        <rect x="760" y="30" width="180" height="44" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="850" y="57">your API or MCP server</text>
+      </g>
+      <g font-family="JetBrains Mono,ui-monospace,monospace" font-size="11" fill="currentColor" stroke="currentColor" stroke-width="1.5">
+        <line x1="202" y1="44" x2="387" y2="44" marker-end="url(#ah)"/>
+        <text x="295" y="25" text-anchor="middle" stroke="none">request +</text>
+        <text x="295" y="38" text-anchor="middle" stroke="none">delegated token</text>
+        <line x1="572" y1="44" x2="757" y2="44" marker-end="url(#ah)"/>
+        <text x="665" y="25" text-anchor="middle" stroke="none">permit, with who</text>
+        <text x="665" y="38" text-anchor="middle" stroke="none">acted for whom</text>
+        <line x1="388" y1="64" x2="203" y2="64" stroke="#FC6401" marker-end="url(#aho)"/>
+        <text x="295" y="86" text-anchor="middle" stroke="none" fill="#FC6401" font-weight="600">deny: a challenge the agent can resolve</text>
+      </g>
+      <g fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M480 74 V118 H360 V146"/><path d="M480 118 H600 V146" marker-end="url(#ah)"/>
+        <line x1="360" y1="146" x2="360" y2="148" marker-end="url(#ah)"/>
+      </g>
+      <text x="492" y="104" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="currentColor"><tspan font-family="JetBrains Mono,ui-monospace,monospace" fill="#FC6401" font-weight="600">1</tspan>  which PDP decides for this resource?</text>
+      <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="12.5" font-weight="700" fill="currentColor" text-anchor="middle">
+        <rect x="250" y="150" width="220" height="56" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <text x="360" y="172">the resource's own document</text>
+        <text x="360" y="192" font-family="JetBrains Mono,ui-monospace,monospace" font-size="10.5" font-weight="400" opacity=".8">RFC 9728 · self-asserted</text>
+        <rect x="490" y="150" width="220" height="56" fill="none" stroke="#FC6401" stroke-width="2"/>
+        <text x="600" y="172">the federation's word</text>
+        <text x="600" y="192" font-family="JetBrains Mono,ui-monospace,monospace" font-size="10.5" font-weight="400" opacity=".8">OpenID Federation 1.0 · authoritative</text>
+      </g>
+      <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="currentColor" opacity=".75" text-anchor="middle">
+        <text x="360" y="224">taken at its word, and labelled so</text>
+        <text x="600" y="224">resolved through the anchor's policy: it wins</text>
+      </g>
+      <g fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M360 232 V250 H600 V232"/><path d="M480 250 V272" marker-end="url(#ah)"/>
+      </g>
+      <text x="492" y="266" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="currentColor"><tspan font-family="JetBrains Mono,ui-monospace,monospace" fill="#FC6401" font-weight="600">2</tspan>  names the PDPs, the layers in front, and what the resource requires</text>
+      <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="12.5" font-weight="700" fill="currentColor" text-anchor="middle">
+        <rect x="300" y="276" width="160" height="44" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="380" y="303">estate PDP · first</text>
+        <rect x="520" y="276" width="180" height="44" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="610" y="303">the resource's PDP</text>
+      </g>
+      <g stroke="currentColor" stroke-width="1.5"><line x1="462" y1="298" x2="517" y2="298" marker-end="url(#ah)"/></g>
+      <text x="500" y="346" text-anchor="middle" font-family="JetBrains Mono,ui-monospace,monospace" font-size="11" fill="#FC6401" font-weight="600">AuthZEN 1.0 evaluation · every layer must permit · the first that does not is the answer</text>
+      <text x="500" y="378" text-anchor="middle" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="currentColor"><tspan font-family="JetBrains Mono,ui-monospace,monospace" fill="#FC6401" font-weight="600">3</tspan>  the PDP matches the token to what the resource published. The enforcement point compares nothing.</text>
+    </svg>
+    <figcaption><b>Orange is the decision path.</b> The enforcement point never sits in the data path: a permitted request is proxied on with the delegation recorded in headers, and the engine only ever answers "may this go through".</figcaption>
+  </figure>
+
+  <div class="sources">
+    <div class="auth">
+      <span class="tag">Authoritative</span>
+      <h3>The federation's word</h3>
+      <span class="m">OpenID Federation 1.0 trust chain</span>
+      <p>The resource's metadata as it survives every superior's policy, signed back to a trust anchor you configured. The federation operator can pin which PDPs may decide for a resource, put an estate PDP in front of every member, and set an authentication floor no member can lower by editing its own document.</p>
+    </div>
+    <div>
+      <span class="tag">Self-asserted</span>
+      <h3>The resource's own document</h3>
+      <span class="m">RFC 9728 protected resource metadata</span>
+      <p>What the resource publishes about itself: which PDP decides for it, the layers in front, the scopes it uses, the acr it expects. Good enough inside one trust domain, forwarded to the PDP verbatim and labelled as self-asserted.</p>
+    </div>
+    <div>
+      <span class="tag">Always there</span>
+      <h3>The PDP you configured</h3>
+      <span class="m">a static URL</span>
+      <p>Where a resource that publishes nothing lands, and the whole of today's behaviour if you turn discovery off. The static PDP is the only one that ever receives the configured API key.</p>
+    </div>
+  </div>
+
+  <ul class="rules">
+    <li><b>The federation's word wins.</b> When a trust anchor is configured, the gateway resolves the resource's chain and never reads the resource's own document.</li>
+    <li><b>An invalid chain fails closed.</b> A resource that claims membership and cannot prove it gets a 503, never a fall-back to its own word or to the static PDP.</li>
+    <li><b>Allowlists on every call.</b> A discovered PDP or metadata URL outside the allowlist is refused, whoever named it, and a refusal never falls through to a weaker source.</li>
+    <li><b>The PEP forwards, the PDP matches.</b> The resource's requirements reach the PDP as a document, with the endpoint hit and the token. Policy lives in one place, and the deny stays resolvable because the PDP's reason names the requirement and where it read it.</li>
+    <li><b>A metadata outage is not an authorisation outage.</b> Metadata is cached with stale-while-failing, refresh throttling and negative caching, so a down resource does not put a fetch in every request's path.</li>
+    <li><b>No guessed paths.</b> Endpoints come from the PDP's own AuthZEN metadata; a batch is only sent to a PDP that advertises a batch endpoint.</li>
+  </ul>
+
+  <div class="two">
+    <div>
+      <h3>Layered policy</h3>
+      <p>A route names an ordered list of PDPs, or the resource publishes one in <code>authzen_policy_layers</code>, or the federation adds its PDP to every member's. An estate-wide PDP that judges the token and the client goes first; the resource's own PDP after it. Every layer must permit. A layer may be marked fail-open, for the advisory PDP that is not worth an outage, and a permit that skipped one says so in a response header. A deny never opens.</p>
+      <pre><code><span class="c"># a route's layers: the estate PDP, then whatever the resource's document names</span>
+pdp_layers: "<span class="k">https://estate.example fail-open</span>, resource"</code></pre>
+    </div>
+    <div>
+      <h3>The gateway is the resource's federation face</h3>
+      <p>A federated resource publishes two things: a signed entity configuration the trust controller onboards, and its RFC 9728 metadata. The gateway is the resource's public face, so it publishes both. The split is deliberate: the gateway holds a key, the controller holds the policy. What the federation resolves is what the gateway republishes, signed, so a plain RFC 9728 consumer reads the federation's word without knowing a federation is behind it.</p>
+      <p class="small">The demo shows the flip: a gateway's document goes from self-asserted to the controller's word when the anchor onboards it, and nothing on the gateway changes.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="path"><div class="wrap">
+  <span class="kicker">how a request goes through</span>
+  <h2>One request, whichever edge it reaches</h2>
+  <ol class="steps">
+    <li><b>The agent calls</b><p>A REST endpoint or an MCP tool, with a delegated token: the customer is the subject, the agent is the actor.</p></li>
+    <li><b>The enforcement point reads it</b><p>Validates the token and the DPoP proof, reads who is acting for whom, and maps the request, or the tool call's arguments, into an AuthZEN evaluation.</p></li>
+    <li><b>It finds the PDP</b><p>From what the resource publishes, or what the federation resolved for it, and asks each layer of policy in turn.</p></li>
+    <li><b>The PDP decides</b><p>On the delegation, the request, the resource's own requirements and whatever risk signals it holds. Permit, deny, or deny with advice.</p></li>
+    <li><b>The agent goes on, or resolves</b><p>A permit is proxied upstream with the delegation recorded in headers. A deny comes back as a challenge: step up, prove identity, or log in.</p></li>
+  </ol>
+</div></section>
+
+<section id="deny" class="dark"><div class="wrap">
+  <span class="kicker">what the agent gets back</span>
+  <h2>A deny the agent can act on</h2>
+  <p class="intro">Three challenge types, the same three words from every enforcement point, in the HTTP header, the JSON body and the MCP error. An agent resolves them without a human reading prose.</p>
+  <div class="words">
+    <div><code>resource_authorisation</code><p>The customer approves this scope at the authorisation server, an RFC 9470 step-up. The agent retries with the scope.</p></div>
+    <div><code>identity_proofing</code><p>The customer presents a verified credential from their wallet, an mDL. The policy that asked for it is satisfied on the retry.</p></div>
+    <div><code>authn</code><p>There is no authenticated user yet. <code>login_required</code>, with the acr to log in at.</p></div>
+  </div>
+  <div class="challenges">
+    <figure>
+      <div class="t">step up · <b>insufficient_scope</b></div>
+      <pre><code>HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+  error="insufficient_scope",
+  scope="payments:approve"
+
+{ "error":  "insufficient_scope",
+  "scope":  "payments:approve",
+  "reason": "payments over 1000 need the
+             customer's approval" }</code></pre>
+      <figcaption>The RFC 9470 challenge. The app steps the customer up for that scope, and the same request goes through.</figcaption>
+    </figure>
+    <figure>
+      <div class="t">prove identity · <b>identity_verification_required</b></div>
+      <pre><code>HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+  error="identity_verification_required",
+  doctype="org.iso.18013.5.1.mDL"
+
+{ "error":   "identity_verification_required",
+  "doctype": "org.iso.18013.5.1.mDL",
+  "reason":  "no verified identity on file
+              for account origination" }</code></pre>
+      <figcaption>The policy asked for a document type. The wallet presents it; nothing about the retry is different but the evidence.</figcaption>
+    </figure>
+    <figure>
+      <div class="t">in MCP · <b>JSON-RPC error</b></div>
+      <pre><code>HTTP/1.1 200 OK
+
+{ "jsonrpc": "2.0", "id": 7,
+  "error": {
+    "code": -32001,
+    "message":
+      "insufficient_scope scope=payments:approve",
+    "data": { "authz_challenge": {
+      "type":  "resource_authorisation",
+      "scope": "payments:approve",
+      "pep":   "mcp-edge" } } } }</code></pre>
+      <figcaption>The same challenge as the COAZ-MCP binding carries it: the prose for a client that string-matches, the <code>data</code> member for one that parses.</figcaption>
+    </figure>
+  </div>
+</div></section>
+
+<section id="surfaces"><div class="wrap">
+  <span class="kicker">four surfaces, and a fifth</span>
+  <h2>Deploy where your traffic already is</h2>
+  <p class="intro">Each enforcement point takes the same per-route knobs, spelled the same way: REST or MCP style, whether a token is required, whether it must be DPoP-bound, which resource is guarded, which layers of policy to ask. Configure it in whichever gateway's own terms, and read every knob in the <a href="/docs/">configuration reference</a>.</p>
+  <div class="cards">
+    <div>
+      <span class="k">gateways/kong/authzen-pdp · Lua</span>
+      <h3>Kong Gateway</h3>
+      <p>A native plugin on a route or service, DB-less or with a database. Request mapping, discovery and challenges in Lua; DPoP and MCP tool calls delegated to the engine.</p>
+      <pre><code>luarocks install kong-plugin-authzen-pdp-0.4.0-1.all.rock</code></pre>
+      <p class="links"><a href="/docs/kong.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong">Source</a></p>
+    </div>
+    <div>
+      <span class="k">gateways/pingaccess/authzen-pdp · Java</span>
+      <h3>PingAccess</h3>
+      <p>An Add-on SDK rule on an application's API policy, configured in the PingAccess console. Reads the identity PingAccess validated, and verifies the customer's token itself. Drops into <code>deploy/</code>; no PingAccess upgrade.</p>
+      <pre><code>cp authzen-pdp-pingaccess-&lt;version&gt;.jar $PA_HOME/deploy/</code></pre>
+      <p class="links"><a href="/docs/pingaccess.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/pingaccess">Source</a></p>
+    </div>
+    <div>
+      <span class="k">gateways/envoy · ext_authz</span>
+      <h3>Envoy, Istio, agentgateway</h3>
+      <p>No plugin to install. The gateway attaches its external authorisation filter to the engine, and per-route settings travel as context extensions. One binary serves all three; the agentgateway and Istio attachments are in the tree.</p>
+      <pre><code>docker pull ghcr.io/id-partners/coaz-pep:0.4.0</code></pre>
+      <p class="links"><a href="/docs/envoy.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/envoy">Source</a></p>
+    </div>
+    <div>
+      <span class="k">sdk/node · TypeScript</span>
+      <h3>Your own Node service</h3>
+      <p>For a service that is its own enforcement point: Express middleware for REST and a guard for MCP tool calls, with the same client, verdict and challenge shapes. No runtime dependencies. An unmatched route is a deny.</p>
+      <pre><code>npm install @id-partners/authzen-pep</code></pre>
+      <p class="links"><a href="/docs/node.html">Every option</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/sdk/node">Source</a></p>
+    </div>
+    <div>
+      <span class="k">gateways/kong/sideband-pdp · Lua</span>
+      <h3>Kong, in front of PingAuthorize's Sideband API</h3>
+      <p>The same discovery, the same layers and the same failure rules, where the policy owns the request mapping and the deny. For an estate that already speaks Sideband and wants the federation's word on who decides.</p>
+      <pre><code>luarocks install kong-plugin-sideband-pdp-0.4.0-1.all.rock</code></pre>
+      <p class="links"><a href="/docs/kong-sideband.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong/sideband-pdp">Source</a></p>
+    </div>
+    <a href="https://demo-production-6ee6.up.railway.app">
+      <span class="k">demo · hosted, or docker compose</span>
+      <h3>See all of it run</h3>
+      <p>A stub trust anchor, resources that are and are not members, two banks' PDPs, an estate PDP and a rogue one that permits everything. A console runs one request through three discovery modes and shows what each read, forwarded and decided. Profiles add Kong and PingAccess in front of the same resource.</p>
+      <p class="links">Open the demo</p>
+    </a>
+  </div>
+</div></section>
+
+<section id="engine" class="band"><div class="wrap">
+  <span class="kicker">the engine</span>
+  <h2>Everything with a specification behind it, implemented once</h2>
+  <p class="intro"><code>coaz-pep</code> is one Go binary with two front doors: an Envoy <code>ext_authz</code> gRPC service and an HTTP check API. It carries the parts a gateway plugin cannot safely reimplement, so there is one evaluation and one challenge, not four that drift. The Kong plugin and the PingAccess rule call it for what needs a JOSE library; the Node SDK can delegate to it.</p>
+  <div class="two">
+    <div>
+      <h3>Authorises the tool call, not the endpoint</h3>
+      <p>For MCP the request is one HTTP POST. The engine reads the JSON-RPC body, finds the tool, and authorises that call under the COAZ framework and its MCP binding: the MCP server's tool list declares how a call's arguments and the token's claims become an AuthZEN question. A mapping cannot name a different subject than the token carries. Every method is decided; an unknown one is denied.</p>
+    </div>
+    <div>
+      <h3>Delegation in the decision</h3>
+      <p>The agent is the subject, the customer it acts for travels with it, and the context carries the customer token's scope, authentication level, any rich authorisation details and the audience. The policy reasons about the delegation, not just the bearer.</p>
+    </div>
+    <div>
+      <h3>Token and sender-constraint verification</h3>
+      <p>Access and user tokens verified against your JWKS, with issuer and audience checks. DPoP proofs (RFC 9449) verified, so a stolen token is useless without the key. Every surface delegates this to the one implementation.</p>
+    </div>
+    <div>
+      <h3>Refuses to run insecurely by accident</h3>
+      <p>It will not start without its check-API token, its upstream allowlist, and the JWKS, issuer and audience to verify tokens against, plus the discovery allowlists when discovery is on, and it names every missing one at once. <code>PEP_ALLOW_INSECURE=true</code> is the hatch, logged every time, for development and demos only.</p>
+    </div>
+  </div>
+  <pre><code><span class="c"># the image, amd64 and arm64, signed with cosign, with an SBOM and build provenance</span>
+docker run --rm -p 9191:9191 -p 9192:9192 \
+  -e AUTHZEN_URL=https://pdp.bank.example/tenants/bank-a -e AUTHZEN_API_KEY=… \
+  -e CHECK_API_TOKEN=… -e MCP_UPSTREAM_ALLOWLIST=https://mcp.bank.example \
+  -e ACCESS_TOKEN_JWKS_URL=… -e ACCESS_TOKEN_ISSUER=… -e ACCESS_TOKEN_AUDIENCE=… \
+  ghcr.io/id-partners/coaz-pep:0.4.0</code></pre>
+  <p class="small" style="margin-top:12px">Every environment variable, the per-route knobs, readiness, the SIGTERM drain, audit logs and metrics: <a href="/docs/coaz-pep.html">the coaz-pep reference</a>.</p>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <span class="kicker">get started</span>
+  <h2>From the demo to your gateway</h2>
+  <ol class="steps">
+    <li><b>See it</b><p>The <a href="https://demo-production-6ee6.up.railway.app">hosted demo</a>, or <code>cd demo &amp;&amp; docker compose up --build -d &amp;&amp; ./demo.sh</code>. Press Discover; pick <code>member</code>; watch the federation column deny what the resource column believed.</p></li>
+    <li><b>Pick a surface</b><p>The gateway your traffic already flows through, or the SDK where a service must enforce for itself. Each one's install and every knob is in the reference.</p></li>
+    <li><b>Give it a PDP</b><p>Any AuthZEN 1.0 PDP. Ours put that face on PingAuthorize: <a href="https://github.com/dphhyland/idp-authzen-adapter-go">a Go proxy</a>, or <a href="https://github.com/dphhyland/idp-pingauthorize">in-process as a Server SDK servlet</a>. Start static, with <code>AUTHZEN_URL</code>.</p></li>
+    <li><b>Turn discovery on</b><p>Publish the resource's RFC 9728 document with <code>authzen_policy_decision_points</code>, or join a federation and let the anchor say. Set the allowlists; nothing off them is ever asked.</p></li>
+  </ol>
+  <div class="cards">
+    <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/docs/architecture.md"><span class="k">docs/architecture.md</span><h3>The architecture</h3><p>What is in the repository, how the pieces fit, and the decisions behind them. The map.</p></a>
+    <a href="/overview.html"><span class="k">one page</span><h3>The overview</h3><p>Nobody tells the gateway where the PDP is: the two discoveries, who gets to say who decides, and what it buys you. For showing rather than reading.</p></a>
+    <a href="/docs/"><span class="k">docs/reference</span><h3>The configuration reference</h3><p>One page per component, every configurable item with its type, default and meaning, a complete configuration for each, and the screens where there are screens.</p></a>
+    <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/demo/README.md"><span class="k">demo/README.md</span><h3>The demo, explained</h3><p>The cast, the levers, the scripted walkthrough and the console, and the two arguments the demo keeps apart: is it safe, and is it worth turning on.</p></a>
+    <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/CHANGELOG.md"><span class="k">CHANGELOG.md</span><h3>What changed</h3><p>Every component shares one version line. A <code>v*</code> tag releases them all: the image, both Kong rocks, the PingAccess jar, the npm package. Upgrade notes lead each release.</p></a>
+    <a href="https://github.com/ID-Partners/idp-auth-peps/blob/main/SECURITY.md"><span class="k">SECURITY.md</span><h3>Reporting a vulnerability</h3><p>How to report one privately, and what to expect. Every suite runs offline; CI runs govulncheck and npm audit, and a coverage ratchet that only ever moves up.</p></a>
+  </div>
+</div></section>
+
+<section id="standards" class="band"><div class="wrap">
+  <span class="kicker">standards in play</span>
+  <h2>Built on standards, and one parameter of our own</h2>
+  <p class="intro">Everything here has a specification behind it, except the parameter that names a resource's PDPs in RFC 9728 metadata: <code>authzen_policy_decision_points</code> is this project's, a single constant in each codebase, provisional pending a working-group profile. <code>authzen_policy_layers</code> is its companion.</p>
+  <ul class="standards">
+    <li><b>OpenID AuthZEN 1.0</b> the evaluation contract, and the PDP metadata at <code>/.well-known/authzen-configuration</code></li>
+    <li><b>COAZ</b> the AuthZEN framework and its MCP binding: tool-call authorisation, per call</li>
+    <li><b>RFC 9728</b> protected resource metadata, <code>scopes_supported</code>, <code>signed_metadata</code></li>
+    <li><b>OpenID Federation 1.0</b> entity configurations, subordinate statements, trust chains, metadata policy</li>
+    <li><b>RFC 9470</b> step-up authentication challenges</li>
+    <li><b>RFC 9449</b> DPoP, sender-constrained tokens</li>
+    <li><b>RFC 8707</b> resource indicators: the identifier discovery starts from</li>
+    <li><b>RFC 8693 · RFC 9396</b> token exchange and rich authorisation requests, the delegation the policy sees</li>
+    <li><b>Envoy ext_authz</b> the gRPC attachment for Envoy, Istio and agentgateway</li>
+    <li><b>PingAccess Add-on SDK</b> the rule, and the console form it draws</li>
+  </ul>
+</div></section>
+
+<section id="idp"><div class="wrap">
+  <span class="kicker">who is behind it</span>
+  <h2>Built and run in the open by ID Partners</h2>
+  <p class="intro">ID Partners is an Australian digital identity consultancy. We built this, we run it in the open, and we work with the Ping products underneath it every week. We also contribute to the OpenID AuthZEN working group, where the profile that authorises tool calls is being written. The engagement fits the stage you are at.</p>
+  <div class="stages">
+    <div>
+      <span class="n">assess</span>
+      <h3>Architecture and policy workshop</h3>
+      <ul>
+        <li>Your agentic use cases mapped to enforcement points, decision points and the tokens between them</li>
+        <li>Which gateway carries which traffic, and where a service must enforce for itself</li>
+        <li>The delegation model: token exchange, the actor claim, step-up and consent, identity proofing</li>
+      </ul>
+    </div>
+    <div>
+      <span class="n">pilot</span>
+      <h3>One use case, end to end, in your environment</h3>
+      <ul>
+        <li>The enforcement point on your gateway, or the SDK in your service, in non-production</li>
+        <li>Your API's metadata published, discovery on, the PDP reached through the AuthZEN adapter</li>
+        <li>An agent that resolves the challenges, demonstrated to your stakeholders</li>
+      </ul>
+    </div>
+    <div>
+      <span class="n">run</span>
+      <h3>Production hardening and support</h3>
+      <ul>
+        <li>Allowlists, DPoP, user-token verification, federation trust anchors, fail mode per layer</li>
+        <li>Rollout across applications and the other gateways in the estate, one contract throughout</li>
+        <li>A named engineer, and the fix in the open-source line rather than a fork you carry</li>
+      </ul>
+    </div>
+  </div>
+  <div class="ctas" style="margin-top:28px">
+    <a class="btn" href="https://idpartners.com.au">Talk to ID Partners</a>
+    <a class="btn alt" href="https://github.com/ID-Partners/idp-auth-peps">Read the source</a>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <span>ID Partners · Australian digital identity consultancy · <a href="https://idpartners.com.au">idpartners.com.au</a></span>
+  <span><a href="https://github.com/ID-Partners/idp-auth-peps">ID-Partners/idp-auth-peps</a> on GitHub · Apache-2.0 · <a href="/overview.html">the overview</a> · <a href="/docs/">the reference</a> · <a href="https://demo-production-6ee6.up.railway.app">the demo</a></span>
+</div></footer>
+</body>
+</html>

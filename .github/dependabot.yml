@@ -50,7 +50,7 @@ updates:
         update-types: [minor, patch]
 
   - package-ecosystem: docker
-    directories: [/core, /demo/railway, /demo/pingaccess, /gateways/envoy/agentgateway]
+    directories: [/core, /demo/railway, /demo/pingaccess, /gateways/envoy/agentgateway, /site]
     schedule: { interval: weekly }
     ignore:
       # The demo builds the PingAccess rule on JDK 17, its floor, on purpose.
