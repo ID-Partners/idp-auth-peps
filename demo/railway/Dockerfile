@@ -18,7 +18,7 @@ RUN go build -ldflags "-s -w" -o /coaz-pep ./cmd/coaz-pep && \
 
 # Root, unlike the other images: entrypoint.sh maps "stubs" in /etc/hosts so the
 # identifiers match the compose run. Nothing in here is reachable but the console.
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 COPY --from=build /coaz-pep /demo-stubs /demo-console /usr/local/bin/
 COPY docs/reference /srv/docs
 COPY demo/railway/entrypoint.sh /usr/local/bin/demo
