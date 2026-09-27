@@ -1,0 +1,144 @@
+# Envoy-family gateways — agentgateway (solo.io), Istio, Envoy
+
+These gateways have no in-process plugin system the way Kong does. Their authorization
+extension point is the **Envoy External Authorization (`ext_authz`) filter**, so the "plugin"
+here is a gRPC service: `coaz-pep` from [`../../core`](../../core), listening on `:9191` and
+implementing `envoy.service.auth.v3.Authorization/Check`.
+
+One binary serves all three. What differs is only how you attach it.
+
+```
+client ──▶ gateway ──ext_authz gRPC──▶ coaz-pep ──AuthZEN──▶ PDP (Ping Authorize)
+              │                            │
+              ▼ PERMIT                     ▼ DENY
+        upstream service            401/403 + WWW-Authenticate, or a
+                                    JSON-RPC error for MCP — passed through verbatim
+```
+
+It is a 1:1 port of the Kong `authzen-pdp` plugin, so both gateways send the PDP identical
+evaluation requests:
+
+| Kong plugin | Envoy-family equivalent |
+| --- | --- |
+| per-route plugin `config` | ext_authz `context_extensions` |
+| claim extraction (`sub`, `act.sub`, `scope`, `cnf.jkt`, `acr`) | same logic in Go |
+| DPoP sender-constraint (RFC 9449) | same |
+| RFC 9470 step-up challenges | Envoy `DeniedHttpResponse` — status, `WWW-Authenticate` and body pass through unchanged |
+| request → AuthZEN mapping | same patterns |
+| `X-Auth-*` upstream headers | `OkHttpResponse.headers` |
+
+**Always set `failureMode: deny`.** A PEP that fails open is not a PEP.
+
+**Never send it a partial body.** The PEP decides every MCP message and reads payment
+bodies, so it has to see what the upstream will. With `allowPartialMessage: true` a body
+over the limit reaches the PEP truncated while the upstream gets all of it — the PEP
+refuses a body Envoy marks partial (413), but the right setting is `false`, with a
+`maxRequestBytes` above your largest legitimate request.
+
+## agentgateway (solo.io)
+
+[`agentgateway/`](agentgateway) holds a worked config — `config.yaml.template`, a
+Dockerfile and an entrypoint that substitutes `__PLACEHOLDER__` tokens at container start
+so one image works in compose and on Railway.
+
+It is a real deployment's config, not a generic sample: the routes and hostnames are a
+banking demo's. Read it for the shape of an `extAuthz` policy and its `context` map, then
+write your own routes.
+
+```yaml
+policies:
+  extAuthz:
+    host: coaz-pep:9191
+    failureMode: deny
+    includeRequestBody:            # the PEP decides every JSON-RPC message
+      maxRequestBytes: 1048576
+      allowPartialMessage: false
+    protocol:
+      grpc:
+        context:
+          pep_label: "PEP#1 (MCP edge)"
+          style: "mcp"
+          require_token: "true"
+          mcp_upstream_url: "http://my-mcp-server:8090/mcp"   # enables COAZ
+```
+
+## Istio
+
+[`istio/coaz-pep.yaml`](istio/coaz-pep.yaml) has the deployment, service,
+`AuthorizationPolicy` and an `EnvoyFilter`. One piece cannot be expressed as a CRD — the
+extension provider goes in the `istio` ConfigMap:
+
+```yaml
+# kubectl -n istio-system edit configmap istio   (under data.mesh)
+extensionProviders:
+  - name: coaz-pep
+    envoyExtAuthzGrpc:
+      service: coaz-pep.authz.svc.cluster.local
+      port: 9191
+      includeRequestBodyInCheck:
+        maxRequestBytes: 1048576
+        allowPartialMessage: false
+```
+
+Then `action: CUSTOM` with `provider.name: coaz-pep` on the workloads you want guarded.
+
+**The trap:** `AuthorizationPolicy` has no field for `context_extensions`, so without more
+work every request reaches the PEP with the defaults — `style=rest`, `require_token=false`,
+no COAZ. Fine for a plain REST service whose tokens a `RequestAuthentication` already
+validates; **not** fine for an MCP edge, where `style` and `mcp_upstream_url` have no
+sensible default. Either patch them in with the `EnvoyFilter` in the sample, or give the
+MCP edge its own provider pointing at its own `coaz-pep` Service.
+
+Note that `rules` on a CUSTOM policy select *which requests get sent for a decision*. They
+do not decide anything. Narrowing them is how you exempt `/healthz`, not how you authorise.
+
+## Plain Envoy
+
+Same filter, configured directly:
+
+```yaml
+http_filters:
+  - name: envoy.filters.http.ext_authz
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+      transport_api_version: V3
+      failure_mode_allow: false        # fail closed
+      with_request_body: { max_request_bytes: 1048576, allow_partial_message: false }
+      grpc_service:
+        envoy_grpc: { cluster_name: coaz_pep }
+        timeout: 2s
+```
+
+Per-route knobs go in `ExtAuthzPerRoute.check_settings.context_extensions`, exactly as in
+the Istio `EnvoyFilter` sample.
+
+## Knobs
+
+Read from `context_extensions` on every request:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `pep_label` | `coaz-pep` | Identifies this PEP in challenges and logs |
+| `style` | `rest` | `rest` (resource server) or `mcp` (MCP edge) |
+| `require_token` | `false` | Deny without a readable access token |
+| `require_dpop` | `false` | Enforce the `cnf.jkt` sender-constraint (RFC 9449) |
+| `require_user_login` | `false` | Deny without a valid `X-User-Token`, with a login challenge |
+| `stepup_scope` | — | Scope demanded for `stepup_action` |
+| `stepup_action` | `make_payment` | Action the step-up applies to |
+| `mcp_upstream_url` | — | Set to enable COAZ: where to discover `tools/list` |
+| `resource` | — | The protected resource's identifier (RFC 8707), the key [PDP discovery](../../core/README.md#pdp-discovery) starts from. MCP routes default to `mcp_upstream_url`; REST routes without it use the static PDP |
+| `forward_access_token` | `false` | Send the raw access token to the PDP as `context.access_token`, so the PDP can verify and inspect it itself. Only over a PDP connection that is TLS and authenticated |
+| `pdp_layers` | `PDP_LAYERS` | Ordered PDPs to ask, comma-separated: `static`, `resource`, or a PDP identifier (which must be on `PDP_ALLOWLIST`), each optionally suffixed ` fail-open` / ` fail-closed`. Every layer must permit; the first deny is the answer |
+| `fail_mode` | `PDP_FAIL_MODE` | `closed` or `open`: what a layer does when its PDP cannot be reached, unless the layer says for itself. Open skips it and marks the permit with `X-PDP-Fail-Open`; a deny or a refusal never opens |
+| `coaz_defaults` | `true` | Decide every MCP method: a tool's declared mapping, otherwise the binding's default one, and an unknown method is denied. `"false"` keeps the old pass-through for everything but declared tools — an explicit opt-out |
+| `coaz_v2_only` | `false` | Refuse tools that declare only the superseded `coaz: true` mapping, whose subject can come from the caller's params |
+| `user_token_subject` | `principal` | Whose `X-User-Token` counts: the access token's own subject's login, or with `pdp` also an approver's, for the PDP to judge with `user_sub` |
+| `legacy_subject_identity` | `true` | Also send the non-standard `subject.identity` beside AuthZEN's `subject.id`. Set `"false"` once policies read `subject.id` — see [core/README.md](../../core/README.md#migrating-subjectidentity---subjectid) |
+
+## The resource's well-known documents
+
+When `coaz-pep` is the federation entity for the resource it fronts (`FEDERATION_ENTITY_ID`),
+it serves `{path}/.well-known/openid-federation` and `/.well-known/oauth-protected-resource{path}`
+on its HTTP port. Route those two paths, on the resource's host, to that port as an
+ordinary upstream cluster rather than through ext_authz: they are public documents, and
+the trust controller fetches the first one to onboard the resource.
