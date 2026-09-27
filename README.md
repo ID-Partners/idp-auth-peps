@@ -233,8 +233,11 @@ provenance), both Kong rocks (install authzen-pdp's first), the PingAccess rule'
 `@id-partners/authzen-pep` on npm with provenance. A tag like `v0.4.0-rc1` is a candidate
 for that version: the same jobs, the image pushed under the candidate's tag only, a
 prerelease on GitHub, and npm only as a dry run, since an npm version cannot be taken
-back. What changed, and what to do about it when upgrading, is in
-[CHANGELOG.md](CHANGELOG.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
+back. [`scripts/release.sh`](scripts/release.sh) cuts them: `bump X.Y.Z` moves every
+component to a version, `rc` tags the next candidate, and `final` tags the release on the
+commit a passing candidate was cut from. What changed, and what to do about it when
+upgrading, is in [CHANGELOG.md](CHANGELOG.md). To report a vulnerability, see
+[SECURITY.md](SECURITY.md).
 
 ## Licence
 

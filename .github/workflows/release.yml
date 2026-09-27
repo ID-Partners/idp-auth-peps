@@ -42,16 +42,7 @@ jobs:
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
           # A candidate is for the version the components already say.
-          fail=0
-          check() { if ! eval "$2"; then echo "::error::$1 does not say $base"; fail=1; fi; }
-          check "Kong authzen-pdp rockspec" "test -f gateways/kong/authzen-pdp/kong-plugin-authzen-pdp-$base-1.rockspec"
-          check "Kong sideband-pdp rockspec" "test -f gateways/kong/sideband-pdp/kong-plugin-sideband-pdp-$base-1.rockspec"
-          check "Kong authzen-pdp handler" "grep -q 'VERSION = \"$base\"' gateways/kong/authzen-pdp/handler.lua"
-          check "Kong sideband-pdp handler" "grep -q 'VERSION = \"$base\"' gateways/kong/sideband-pdp/handler.lua"
-          check "PingAccess pom" "grep -q '<version>$base</version>' gateways/pingaccess/authzen-pdp/pom.xml"
-          check "Node package.json" "grep -q '\"version\": \"$base\"' sdk/node/package.json"
-          check "CHANGELOG.md" "grep -q '^## \[$base\]' CHANGELOG.md"
-          exit $fail
+          scripts/check-versions.sh "$base"
 
   image:
     name: coaz-pep image

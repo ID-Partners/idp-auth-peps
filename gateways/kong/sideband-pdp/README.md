@@ -60,8 +60,9 @@ volumes:
 
 Or install the rocks from the `v0.4.0` release, authzen-pdp's first:
 `luarocks install kong-plugin-authzen-pdp-0.4.0-1.all.rock`, then
-`kong-plugin-sideband-pdp-0.4.0-1.all.rock`. This one depends on `kong-plugin-authzen-pdp`
-0.4.0, which brings the shared modules; neither rock ships the other's. Kong Gateway 3.4 or later, 3.9 or later recommended — see
+`kong-plugin-sideband-pdp-0.4.0-1.all.rock`. This one depends on
+`kong-plugin-authzen-pdp` 0.4.0, which brings the shared modules; neither rock ships the
+other's. Kong Gateway 3.4 or later, 3.9 or later recommended — see
 [Kong versions](../README.md#kong-versions).
 
 ## Configure

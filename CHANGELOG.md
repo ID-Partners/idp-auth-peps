@@ -2,7 +2,9 @@
 
 Every component — the `coaz-pep` image, the two Kong plugins, the PingAccess rule and the
 Node SDK — shares one version line from 0.4.0 on. A `v*` tag releases them all; a
-`-rcN` tag is a candidate for that version and publishes nothing final.
+`-rcN` tag is a candidate for that version and publishes nothing final. What changes after
+a release goes under `## [Unreleased]`, which `scripts/release.sh bump` dates as the next
+version.
 
 ## [0.4.0] - 2026-09-26
 
@@ -161,6 +163,8 @@ These change behaviour on purpose. Each is a secure default with an explicit way
   build provenance, for amd64 and arm64.
 - Kong rocks as `.all.rock` files: the plugin alone, installed with `luarocks install`
   and nothing fetched.
+- `scripts/release.sh` cuts every release the same way: one version for every component,
+  a candidate first, and the final tag only on the commit a passing candidate proved.
 - CI: read-only permissions, SHA-pinned actions, the race detector, govulncheck,
   `npm audit`, both Kong plugins parsed, Java 17 and 21, an image boot check and the
   demo walkthrough end to end. Dependabot for every ecosystem.
