@@ -6,6 +6,11 @@ updates:
   - package-ecosystem: gomod
     directory: /core
     schedule: { interval: weekly }
+    ignore:
+      # 1.84.0 still carries GO-2026-6443 (govulncheck: reachable through
+      # grpc.Server.Serve); 1.83.2 has the fix. The next release that has it comes through.
+      - dependency-name: google.golang.org/grpc
+        versions: ["1.84.0"]
     groups:
       go:
         update-types: [minor, patch]
