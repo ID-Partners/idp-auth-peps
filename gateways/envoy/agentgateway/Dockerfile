@@ -8,7 +8,7 @@
 #
 # The AuthZEN PEP itself lives in the sibling authzen-ext/ service, attached in
 # config.yaml via the Envoy-compatible extAuthz policy.
-FROM ghcr.io/agentgateway/agentgateway:v1.3.1 AS upstream
+FROM ghcr.io/agentgateway/agentgateway:v1.5.0 AS upstream
 
 FROM debian:trixie-slim
 COPY --from=upstream /app/agentgateway /app/agentgateway
