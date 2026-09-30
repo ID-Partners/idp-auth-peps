@@ -135,6 +135,17 @@ return {
           -- A body Kong buffered to disk is read back up to this (Kong 3.9+); a larger one
           -- is refused with a 413, never authorised unread.
           { max_request_body_size = { type = "integer", default = 1048576, gt = 0 } },
+          -- Timeouts, in milliseconds, on each call the plugin makes: coaz-pep's check
+          -- API, each PDP layer, and each metadata document fetched or relayed. A call
+          -- that times out finds its PDP unavailable, and the layer's fail_mode decides.
+          { coaz_timeout_ms = { type = "integer", default = 15000, gt = 0 } },
+          { pdp_timeout_ms = { type = "integer", default = 10000, gt = 0 } },
+          { discovery_timeout_ms = { type = "integer", default = 5000, gt = 0 } },
+          -- What one decision may take, in milliseconds, counted from when the request
+          -- has been read: discovery and every layer. Each call gets its own timeout or
+          -- what is left of this, whichever is less; a layer with nothing left is
+          -- unavailable, and its fail_mode decides.
+          { decision_deadline_ms = { type = "integer", default = 20000, gt = 0 } },
           -- PDP discovery (see ../README.md#pdp-discovery). "off" is the static PDP
           -- with the AuthZEN default paths and no metadata fetch; "authzen" reads
           -- authzen_url's .well-known/authzen-configuration; "resource" reads the

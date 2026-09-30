@@ -922,6 +922,17 @@ describe('a REST route with coaz_url: coaz-pep decides the whole request', funct
   end)
 end)
 
+describe('the call to coaz-pep is bounded', function()
+  it('by coaz_timeout_ms, or the whole deadline when that is shorter', function()
+    for _, case in ipairs({ { {}, 15000 }, { { coaz_timeout_ms = 3000 }, 3000 }, { { decision_deadline_ms = 8000 }, 8000 } }) do
+      local plugin, state = engine_route(nil, { method = 'GET', path = '/accounts/a/balance', headers = { authorization = token() } })
+      mock.run_access(plugin, coaz_conf(case[1]))
+      assert.is_nil(state.exited)
+      assert.equal(case[2], state.pdp_requests[1].timeout)
+    end
+  end)
+end)
+
 describe('claim handling and remaining denials', function()
   it('denies a token with no readable subject', function()
     local plugin, state = load_plugin({

@@ -79,6 +79,7 @@ local function discovery_conf(conf)
     resource_metadata_allowlist = conf.resource_metadata_allowlist,
     pdp_discovery_insecure = conf.pdp_discovery_insecure,
     pdp_ssl_verify = conf.verify_service_certificate,
+    discovery_timeout_ms = conf.discovery_timeout_ms,
     federation_resolve_url = conf.federation_resolve_url,
     federation_trust_anchor = conf.federation_trust_anchor,
   }

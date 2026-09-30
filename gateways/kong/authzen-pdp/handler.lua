@@ -178,6 +178,29 @@ local function mcp_body_refusal(body)
   return nil
 end
 
+-- ---------- time ----------
+
+-- ngx.now() is when the worker's event loop last woke, which can be a whole PDP call
+-- behind; the budget needs the time now.
+local function clock()
+  ngx.update_time()
+  return ngx.now()
+end
+
+-- budget starts one decision's deadline and returns what a call made for it may take:
+-- its own timeout or what is left of the whole, whichever is less, or nil once nothing
+-- is left. Started only once the request has been read, so a client that sends slowly
+-- spends its own time: a deadline a client could run down would let it make a fail-open
+-- layer skip.
+local function budget(conf)
+  local ends = clock() + (tonumber(conf.decision_deadline_ms) or 20000) / 1000
+  return function(timeout_ms)
+    local left = math.floor((ends - clock()) * 1000)
+    if left <= 0 then return nil end
+    return math.min(timeout_ms, left)
+  end
+end
+
 -- ---------- delegation to coaz-pep ----------
 
 local function flag(v) return v == true and "true" or "false" end
@@ -252,8 +275,9 @@ local function delegate(conf, pep)
     body = body,
   })
 
+  -- One call is the whole decision, so it gets the whole deadline if that is shorter.
   local httpc = http.new()
-  httpc:set_timeout(15000)
+  httpc:set_timeout(math.min(tonumber(conf.coaz_timeout_ms) or 15000, tonumber(conf.decision_deadline_ms) or 20000))
   local res, err = httpc:request_uri(conf.coaz_url:gsub("/+$", "") .. "/v1/mcp/check", {
     method = "POST",
     body = payload,
@@ -526,7 +550,11 @@ local function native(conf, pep)
 
   -- 3) which PDP, and where. Off by default (authzen_url + the AuthZEN paths, no
   --    fetch). A discovery failure is a 503, like an unreachable PDP: a request whose
-  --    decider cannot be found is not one to let through.
+  --    decider cannot be found is not one to let through. The decision's deadline runs
+  --    from here. Discovery's time counts against it, but a metadata fetch is not cut
+  --    short by it: what a fetch finds is cached for every request, and a failure
+  --    brought on by one request's deadline would be cached as an outage for the rest.
+  local remaining = budget(conf)
   local layers, derr = discovery.resolve_layers(conf, discovery.resource_id(conf), conf.pdp_layers, conf.fail_mode == "open")
   if not layers then
     kong.log.err("PDP discovery failed: ", derr.msg)
@@ -557,7 +585,7 @@ local function native(conf, pep)
   -- 4) ask each layer in order. Every layer must permit; the first that does not is
   --    the answer, advice and all, and later layers are not consulted — a generic
   --    layer is a gate in front of a specific one. A layer whose PDP is unavailable (no
-  --    answer, a 5xx, a 429) fails closed unless it is fail-open, in which case it is
+  --    answer in time, a 5xx, a 429) fails closed unless it is fail-open, in which case it is
   --    skipped and named; if every layer was skipped the request is permitted and
   --    marked. A deny is never skipped, and nor is a refusal: a PDP that answered a 3xx
   --    or 4xx, or with no boolean decision, or a request that could not be encoded.
@@ -570,18 +598,24 @@ local function native(conf, pep)
   local dctx = {}
   local decided = false
   for _, ep in ipairs(eps) do
-    local httpc = http.new()
-    httpc:set_timeout(10000)
-    local res, err = httpc:request_uri(ep.evaluation, {
-      method = "POST",
-      body = body,
-      headers = {
-        ["Content-Type"] = "application/json",
-        -- Bound to the PDP it was configured for; a discovered PDP gets no key.
-        ["Authorization"] = ep.api_key and ("Bearer " .. ep.api_key) or nil,
-      },
-      ssl_verify = conf.pdp_ssl_verify ~= false,
-    })
+    local res, err
+    local timeout = remaining(tonumber(conf.pdp_timeout_ms) or 10000)
+    if timeout then
+      local httpc = http.new()
+      httpc:set_timeout(timeout)
+      res, err = httpc:request_uri(ep.evaluation, {
+        method = "POST",
+        body = body,
+        headers = {
+          ["Content-Type"] = "application/json",
+          -- Bound to the PDP it was configured for; a discovered PDP gets no key.
+          ["Authorization"] = ep.api_key and ("Bearer " .. ep.api_key) or nil,
+        },
+        ssl_verify = conf.pdp_ssl_verify ~= false,
+      })
+    else
+      err = "the decision deadline passed before it was asked"
+    end
     local kind, detail = contract.classify(res, err)
     local data
     if kind == "answer" then
@@ -697,7 +731,7 @@ end
 -- that republishes what the federation resolved. Kong cannot sign, so it relays.
 local function relay_well_known(conf, path)
   local httpc = http.new()
-  httpc:set_timeout(5000)
+  httpc:set_timeout(tonumber(conf.discovery_timeout_ms) or 5000)
   local res, err = httpc:request_uri(conf.federation_entity_url .. path, {
     method = "GET", ssl_verify = conf.pdp_ssl_verify ~= false,
   })

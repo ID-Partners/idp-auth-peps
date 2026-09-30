@@ -320,6 +320,24 @@ body decodes to infinity, which JSON cannot carry back out, so the evaluation we
 empty POST. A payment's `amount` must now be a finite number, and an evaluation that
 cannot be encoded is a refusal.
 
+## Timeouts and the decision deadline
+
+Each call the plugin makes has a timeout, in milliseconds: `coaz_timeout_ms` (15000) to
+coaz-pep's check API, `pdp_timeout_ms` (10000) to each PDP layer, and
+`discovery_timeout_ms` (5000) for each metadata document it fetches or relays. A call that
+times out finds its PDP unavailable, and the layer's rule decides.
+
+`decision_deadline_ms` (20000) bounds the decision as a whole - discovery and every layer.
+Each call gets its own timeout or what is left of the deadline, whichever is less, and a
+layer with nothing left is unavailable. Without it a route with three layers could hold a
+request for half a minute before the last one answered.
+
+The deadline starts once the request has been read. A client that sends its body slowly
+spends its own time, so it cannot run the deadline down to make a fail-open layer skip.
+Discovery's time counts against the deadline, but a metadata fetch is never cut short by
+it: what a fetch finds is cached for every request on the worker, and a failure caused by
+one request's deadline would be cached as an outage for all of them.
+
 ## REST mapping
 
 The mapping (`list_accounts`, `get_balance`, `open_account`, `make_payment`, and

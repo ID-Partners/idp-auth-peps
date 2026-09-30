@@ -104,6 +104,10 @@ The switch, on a route whose resource is a federation member:
 `referenceable`, so they take Kong vault references rather than literals, and the secrets
 are `encrypted` where Kong has a keyring.
 
+`connection_timeout_ms` (10000) bounds each sideband call and `discovery_timeout_ms`
+(5000) each metadata document or resolver answer discovery fetches. A call that times out
+finds its PDP unavailable, and the layer's rule decides.
+
 ## How a request flows
 
 1. **Which PDPs.** `pdp_layers` is resolved into an ordered list — configured entries, the

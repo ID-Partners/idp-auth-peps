@@ -728,6 +728,96 @@ describe('discovery: fail-open through access()', function()
   end)
 end)
 
+describe('timeouts and the decision deadline', function()
+  local SLOW = 'https://slow.example'
+  -- Two layers, SLOW first; SLOW's evaluation takes `took` seconds on the mock clock.
+  local function drive(over, took)
+    local state
+    local fn = router({
+      [RES .. '/.well-known/oauth-protected-resource'] = { resource = RES, authzen_policy_decision_points = { GOOD } },
+      [GOOD .. '/.well-known/authzen-configuration'] = pdp_config(GOOD),
+      [GOOD .. '/custom/eval'] = { decision = true },
+      [SLOW .. '/.well-known/authzen-configuration'] = 404,
+      [SLOW .. '/access/v1/evaluation'] = function()
+        state.now = state.now + (took or 0)
+        return { status = 200, body = json({ decision = true }) }
+      end,
+    })
+    local plugin
+    plugin, state = load_plugin({
+      method = 'GET', path = '/accounts/a1/balance',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = fn,
+    })
+    local c = { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', pdp_discovery = 'resource', resource = RES,
+      access_token_verified_upstream = true, pdp_layers = { SLOW, 'resource' } }
+    for k, v in pairs(over or {}) do c[k] = v end
+    mock.run_access(plugin, c)
+    plugin:header_filter(c)
+    return state
+  end
+  -- The timeout each call to a URL containing `needle` was made with.
+  local function timeouts(state, needle)
+    local out = {}
+    for _, r in ipairs(state.pdp_requests) do
+      if r.url:find(needle, 1, true) then out[#out + 1] = r.timeout end
+    end
+    return out
+  end
+
+  it('bounds each call by its own timeout, and the defaults are the ones 0.4.1 fixed', function()
+    local state = drive()
+    assert.is_nil(state.exited)
+    assert.same({ 10000 }, timeouts(state, SLOW .. '/access/v1/evaluation'))
+    assert.same({ 10000 }, timeouts(state, GOOD .. '/custom/eval'))
+    assert.same({ 5000 }, timeouts(state, 'oauth-protected-resource'))
+    assert.same({ 5000, 5000 }, timeouts(state, 'authzen-configuration'))
+    local tuned = drive({ pdp_timeout_ms = 2500, discovery_timeout_ms = 1500 })
+    assert.same({ 2500 }, timeouts(tuned, SLOW .. '/access/v1/evaluation'))
+    assert.same({ 2500 }, timeouts(tuned, GOOD .. '/custom/eval'))
+    assert.same({ 1500 }, timeouts(tuned, 'oauth-protected-resource'))
+    assert.same({ 1500, 1500 }, timeouts(tuned, 'authzen-configuration'))
+  end)
+
+  it('gives a later layer only what is left of the deadline', function()
+    local state = drive({}, 15)
+    assert.is_nil(state.exited)
+    assert.same({ 5000 }, timeouts(state, GOOD .. '/custom/eval'))
+    local short = drive({ decision_deadline_ms = 4000 })
+    assert.same({ 4000 }, timeouts(short, SLOW .. '/access/v1/evaluation'))
+  end)
+
+  it('finds a layer with nothing left unavailable: closed denies, fail-open skips it and says so', function()
+    local closed = drive({}, 21)
+    assert.equal(503, closed.exited.status)
+    assert.same({}, timeouts(closed, GOOD .. '/custom/eval'))
+    assert.matches('deadline passed', table.concat(closed.logs, '\n'), 1, true)
+    local open = drive({ pdp_layers = { SLOW, 'resource fail-open' } }, 21)
+    assert.is_nil(open.exited)
+    assert.same({}, timeouts(open, GOOD .. '/custom/eval'))
+    assert.equal(GOOD, open.response_headers['X-PDP-Fail-Open'])
+  end)
+
+  it('does not start the deadline until the request has been read', function()
+    local state
+    local fn = router({ [STATIC .. '/access/v1/evaluation'] = { decision = true } })
+    local plugin
+    plugin, state = load_plugin({
+      method = 'POST', path = '/payments', body = '{"from_account":"a1","amount":5}',
+      headers = { authorization = 'Bearer ' .. mock.jwt({ sub = 'alice' }) }, pdp = fn,
+    })
+    -- A client that takes a minute to send its body.
+    local read = kong.request.get_raw_body
+    kong.request.get_raw_body = function(...) state.now = state.now + 60; return read(...) end
+    mock.run_access(plugin, { authzen_url = STATIC, authzen_api_key = 'k', pep_label = 'test-pep', style = 'rest',
+      require_token = true, pdp_ssl_verify = true, stepup_action = 'make_payment', access_token_verified_upstream = true,
+      pdp_layers = { 'static fail-open' } })
+    assert.is_nil(state.exited)
+    assert.same({ 10000 }, timeouts(state, '/access/v1/evaluation'))
+    assert.is_nil(state.response_headers and state.response_headers['X-PDP-Fail-Open'])
+  end)
+end)
+
 describe('fail-open covers unavailability only', function()
   -- Contract section 3. A layer that cannot be reached may be skipped when its rule says
   -- so; a layer that answered and refused, or answered something unreadable, may not.
@@ -825,6 +915,20 @@ describe('federation entity relay', function()
     assert.equal(401, drive('/accounts/a1/balance').exited.status)
     -- And so is a well-known path on a route that is nobody's federation face.
     assert.equal(401, drive('/.well-known/openid-federation', { federation_entity_url = ngx.null }).exited.status)
+  end)
+
+  it('bounds the relay by discovery_timeout_ms', function()
+    local fn = router({ ['http://coaz-pep:9192/.well-known/openid-federation'] = 'eyJ.a.b' })
+    local function relayed(over)
+      local plugin, state = load_plugin({ method = 'GET', path = '/.well-known/openid-federation', headers = {}, pdp = fn })
+      local c = { authzen_url = STATIC, pep_label = 'test-pep', style = 'rest', require_token = true, pdp_ssl_verify = true,
+        federation_entity_url = 'http://coaz-pep:9192', access_token_verified_upstream = true }
+      for k, v in pairs(over or {}) do c[k] = v end
+      mock.run_access(plugin, c)
+      return state.pdp_requests[1].timeout
+    end
+    assert.equal(5000, relayed())
+    assert.equal(1234, relayed({ discovery_timeout_ms = 1234 }))
   end)
 end)
 

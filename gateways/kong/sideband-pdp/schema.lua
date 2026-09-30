@@ -75,6 +75,8 @@ return {
           { shared_secret = { type = "string", required = true, referenceable = true, encrypted = true } },
           { secret_header_name = { type = "string", required = true } },
           { connection_timeout_ms = { type = "integer", default = 10000, gt = 0 } },
+          -- Timeout, in milliseconds, on each metadata document discovery fetches.
+          { discovery_timeout_ms = { type = "integer", default = 5000, gt = 0 } },
           { connection_keepAlive_ms = { type = "integer", default = 60000, gt = 0 } },
           -- TLS verification on every sideband and metadata call. A PEP that accepts any
           -- certificate has no integrity on the decision it enforces. Off needs

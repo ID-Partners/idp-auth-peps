@@ -700,6 +700,20 @@ describe('discovery through the plugin', function()
     assert.equal(ESTATE .. ', ' .. BANKPDP, state.exited.headers['X-PDP-Layers'])
   end)
 
+  it('bounds each metadata fetch by discovery_timeout_ms, and each sideband call by connection_timeout_ms', function()
+    local fn = router(bank_routes())
+    local function sent(over)
+      local _, state = drive(resource_conf(over), { pdp = fn })
+      local out = {}
+      for _, r in ipairs(state.pdp_requests) do
+        out[r.url:find('oauth-protected-resource', 1, true) and 'metadata' or 'sideband'] = r.timeout
+      end
+      return out
+    end
+    assert.same({ metadata = 5000, sideband = 1000 }, sent())
+    assert.same({ metadata = 1234, sideband = 2345 }, sent({ discovery_timeout_ms = 1234, connection_timeout_ms = 2345 }))
+  end)
+
   it('calls a discovered PDP with the credential configured for it', function()
     local fn, hits = router(bank_routes())
     drive(resource_conf({ pdp_credentials = { { pdp = BANKPDP, shared_secret = 'bank-secret' } } }), { pdp = fn })

@@ -405,6 +405,7 @@ local function options(conf, opts)
   opts = opts or {}
   local static = trim_slash(conf.authzen_url or "")
   local insecure = conf.pdp_discovery_insecure == true
+  local timeout = tonumber(conf.discovery_timeout_ms) or 5000
   return {
     mode = conf.pdp_discovery or "off",
     static = static,
@@ -413,7 +414,7 @@ local function options(conf, opts)
     modifiers = opts.modifiers,
     resource_policy = {
       insecure = insecure, trusted_origin = nil, allowlist = conf.resource_metadata_allowlist,
-      ssl_verify = conf.pdp_ssl_verify, timeout_ms = 5000,
+      ssl_verify = conf.pdp_ssl_verify, timeout_ms = timeout,
     },
     pdp_policy = {
       -- The static PDP's own origin is trusted over http; the allowlist bounds what a
@@ -424,12 +425,12 @@ local function options(conf, opts)
         for _, e in ipairs(conf.pdp_allowlist) do l[#l + 1] = e end
         return l
       end)() or nil,
-      ssl_verify = conf.pdp_ssl_verify, timeout_ms = 5000,
+      ssl_verify = conf.pdp_ssl_verify, timeout_ms = timeout,
     },
     federation = { resolve_url = conf.federation_resolve_url, anchor = conf.federation_trust_anchor },
     -- The resolve endpoint is configuration, not something discovered, so no allowlist
     -- bounds it; the URL policy still applies.
-    federation_policy = { insecure = insecure, ssl_verify = conf.pdp_ssl_verify, timeout_ms = 5000 },
+    federation_policy = { insecure = insecure, ssl_verify = conf.pdp_ssl_verify, timeout_ms = timeout },
   }
 end
 

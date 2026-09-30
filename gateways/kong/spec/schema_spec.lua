@@ -55,6 +55,15 @@ describe('the authzen-pdp schema', function()
     end
   end)
 
+  it('bounds every call, and the decision as a whole', function()
+    for name, default in pairs({ coaz_timeout_ms = 15000, pdp_timeout_ms = 10000, discovery_timeout_ms = 5000, decision_deadline_ms = 20000 }) do
+      local f = field(config, name)
+      assert.equal('integer', f.type, name)
+      assert.equal(default, f.default, name)
+      assert.equal(0, f.gt, name)
+    end
+  end)
+
   it('governs every MCP method by default', function()
     assert.is_true(field(config, 'coaz_defaults').default)
   end)
@@ -200,7 +209,8 @@ describe('the sideband-pdp schema', function()
   it('loads, with its name and the fields the handler reads', function()
     local schema = load_schema('sideband-pdp/schema.lua')
     assert.equal('sideband-pdp', schema.name)
-    for _, name in ipairs({ 'service_url', 'shared_secret', 'secret_header_name', 'pdp_layers', 'pdp_credentials', 'allow_insecure' }) do
+    for _, name in ipairs({ 'service_url', 'shared_secret', 'secret_header_name', 'pdp_layers', 'pdp_credentials', 'allow_insecure',
+      'connection_timeout_ms', 'discovery_timeout_ms' }) do
       assert.is_table(field(config_of(schema), name), name)
     end
   end)

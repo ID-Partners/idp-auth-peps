@@ -6,6 +6,30 @@ Node SDK — shares one version line from 0.4.0 on. A `v*` tag releases them all
 a release goes under `## [Unreleased]`, which `scripts/release.sh bump` dates as the next
 version.
 
+## [Unreleased]
+
+The Kong timeouts 0.4.0 left fixed in the code. coaz-pep, the PingAccess rule and the
+Node SDK are unchanged apart from the version.
+
+### Upgrading from 0.4.1
+
+- **A Kong authzen-pdp decision now has a deadline**, 20 seconds by default. A route whose
+  layers may together take longer needs `decision_deadline_ms` raised.
+- **Upgrade the Kong plugins on every data plane before the control plane.** Kong refuses
+  a configuration carrying fields its plugin does not know, and the new fields have
+  defaults, so a control plane on 0.4.2 sends them.
+
+### Kong plugins
+
+- authzen-pdp's timeouts are settings: `coaz_timeout_ms` (15000), `pdp_timeout_ms`
+  (10000) and `discovery_timeout_ms` (5000), the values 0.4.1 fixed in the code.
+- New in authzen-pdp, `decision_deadline_ms` bounds a whole decision - discovery and every
+  layer - so a route with several layers no longer waits out each in turn. It starts once
+  the request has been read, so a slow client cannot spend it, and never cuts a metadata
+  fetch short, since that fetch's answer is cached for every request. A layer with nothing
+  left is unavailable, under its own rule.
+- sideband-pdp gains `discovery_timeout_ms` (5000) for its metadata and resolver fetches.
+
 ## [0.4.1] - 2026-09-30
 
 What 0.4.0's operability work left out. The Kong plugins, the PingAccess rule and the

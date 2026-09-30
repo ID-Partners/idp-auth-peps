@@ -370,6 +370,7 @@ function M.install(opts)
     null = NULL,
     -- A settable clock, so cache expiry can be driven without sleeping.
     now = function() return state.now end,
+    update_time = function() end,
     var = { remote_addr = opts.remote_addr or '203.0.113.7', remote_port = opts.remote_port or 51234 },
     req = {
       get_method = function() return opts.method or 'GET' end,
@@ -421,9 +422,9 @@ function M.install(opts)
   package.loaded['resty.http'] = {
     new = function()
       return {
-        set_timeout = function() end,
-        request_uri = function(_, url, req)
-          state.pdp_requests[#state.pdp_requests + 1] = { url = url, body = req.body, headers = req.headers, ssl_verify = req.ssl_verify }
+        set_timeout = function(self, ms) self.timeout = ms end,
+        request_uri = function(self, url, req)
+          state.pdp_requests[#state.pdp_requests + 1] = { url = url, body = req.body, headers = req.headers, ssl_verify = req.ssl_verify, timeout = self.timeout }
           local responder = opts.pdp
           if type(responder) == 'function' then return responder(url, req) end
           if responder == false then return nil, 'connection refused' end
