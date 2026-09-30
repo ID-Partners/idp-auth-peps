@@ -1,9 +1,9 @@
 package = "kong-plugin-sideband-pdp"
-version = "0.4.0-1"
+version = "0.4.1-1"
 
 source = {
   url = "git+https://github.com/ID-Partners/idp-auth-peps.git",
-  tag = "v0.4.0",
+  tag = "v0.4.1",
 }
 
 description = {
@@ -27,7 +27,7 @@ dependencies = {
   "lua >= 5.1",
   -- kong.plugins.authzen-pdp.discovery and .contract, required by name: one copy of
   -- each rule in Lua, owned by one rock.
-  "kong-plugin-authzen-pdp == 0.4.0",
+  "kong-plugin-authzen-pdp == 0.4.1",
 }
 
 build = {

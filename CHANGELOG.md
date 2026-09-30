@@ -6,7 +6,7 @@ Node SDK — shares one version line from 0.4.0 on. A `v*` tag releases them all
 a release goes under `## [Unreleased]`, which `scripts/release.sh bump` dates as the next
 version.
 
-## [Unreleased]
+## [0.4.1] - 2026-09-30
 
 What 0.4.0's operability work left out. The Kong plugins, the PingAccess rule and the
 Node SDK are unchanged apart from the version.

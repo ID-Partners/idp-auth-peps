@@ -1,6 +1,6 @@
 {
   "name": "@id-partners/authzen-pep",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "AuthZEN 1.0 Policy Enforcement Point for Node — Express/Connect middleware for REST APIs and a COAZ (AuthZEN MCP profile) guard for MCP tools/call.",
   "license": "Apache-2.0",
   "type": "module",

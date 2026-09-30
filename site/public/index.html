@@ -279,7 +279,7 @@ WWW-Authenticate: Bearer
       <span class="k">gateways/kong/authzen-pdp · Lua</span>
       <h3>Kong Gateway</h3>
       <p>A native plugin on a route or service, DB-less or with a database. Request mapping, discovery and challenges in Lua; DPoP and MCP tool calls delegated to the engine.</p>
-      <pre><code>luarocks install kong-plugin-authzen-pdp-0.4.0-1.all.rock</code></pre>
+      <pre><code>luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock</code></pre>
       <p class="links"><a href="/docs/kong.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong">Source</a></p>
     </div>
     <div>
@@ -293,7 +293,7 @@ WWW-Authenticate: Bearer
       <span class="k">gateways/envoy · ext_authz</span>
       <h3>Envoy, Istio, agentgateway</h3>
       <p>No plugin to install. The gateway attaches its external authorisation filter to the engine, and per-route settings travel as context extensions. One binary serves all three; the agentgateway and Istio attachments are in the tree.</p>
-      <pre><code>docker pull ghcr.io/id-partners/coaz-pep:0.4.0</code></pre>
+      <pre><code>docker pull ghcr.io/id-partners/coaz-pep:0.4.1</code></pre>
       <p class="links"><a href="/docs/envoy.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/envoy">Source</a></p>
     </div>
     <div>
@@ -307,7 +307,7 @@ WWW-Authenticate: Bearer
       <span class="k">gateways/kong/sideband-pdp · Lua</span>
       <h3>Kong, in front of PingAuthorize's Sideband API</h3>
       <p>The same discovery, the same layers and the same failure rules, where the policy owns the request mapping and the deny. For an estate that already speaks Sideband and wants the federation's word on who decides.</p>
-      <pre><code>luarocks install kong-plugin-sideband-pdp-0.4.0-1.all.rock</code></pre>
+      <pre><code>luarocks install kong-plugin-sideband-pdp-0.4.1-1.all.rock</code></pre>
       <p class="links"><a href="/docs/kong-sideband.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong/sideband-pdp">Source</a></p>
     </div>
     <a href="https://demo-production-6ee6.up.railway.app">
@@ -346,7 +346,7 @@ docker run --rm -p 9191:9191 -p 9192:9192 \
   -e AUTHZEN_URL=https://pdp.bank.example/tenants/bank-a -e AUTHZEN_API_KEY=… \
   -e CHECK_API_TOKEN=… -e MCP_UPSTREAM_ALLOWLIST=https://mcp.bank.example \
   -e ACCESS_TOKEN_JWKS_URL=… -e ACCESS_TOKEN_ISSUER=… -e ACCESS_TOKEN_AUDIENCE=… \
-  ghcr.io/id-partners/coaz-pep:0.4.0</code></pre>
+  ghcr.io/id-partners/coaz-pep:0.4.1</code></pre>
   <p class="small" style="margin-top:12px">Every environment variable, the per-route knobs, readiness, the SIGTERM drain, audit logs and metrics: <a href="/docs/coaz-pep.html">the coaz-pep reference</a>.</p>
 </div></section>
 

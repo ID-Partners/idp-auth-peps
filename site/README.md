@@ -50,7 +50,7 @@ changing it, from this directory, with headless Chrome:
 
 ## Versions in the page
 
-The install lines on the landing page name a version (`coaz-pep:0.4.0`,
-`kong-plugin-authzen-pdp-0.4.0-1.all.rock`). `scripts/release.sh bump` moves them with
+The install lines on the landing page name a version (`coaz-pep:0.4.1`,
+`kong-plugin-authzen-pdp-0.4.1-1.all.rock`). `scripts/release.sh bump` moves them with
 every other document, and `scripts/check-versions.sh` holds them to the release; do not
 edit them by hand.

@@ -58,10 +58,10 @@ volumes:
   - ../gateways/kong/sideband-pdp:/opt/kong/plugins/sideband-pdp:ro
 ```
 
-Or install the rocks from the `v0.4.0` release, authzen-pdp's first:
-`luarocks install kong-plugin-authzen-pdp-0.4.0-1.all.rock`, then
-`kong-plugin-sideband-pdp-0.4.0-1.all.rock`. This one depends on
-`kong-plugin-authzen-pdp` 0.4.0, which brings the shared modules; neither rock ships the
+Or install the rocks from the `v0.4.1` release, authzen-pdp's first:
+`luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock`, then
+`kong-plugin-sideband-pdp-0.4.1-1.all.rock`. This one depends on
+`kong-plugin-authzen-pdp` 0.4.1, which brings the shared modules; neither rock ships the
 other's. Kong Gateway 3.4 or later, 3.9 or later recommended — see
 [Kong versions](../README.md#kong-versions).
 
@@ -371,8 +371,8 @@ It runs at priority 999, after Kong's authentication plugins and before `ip-rest
   on a filtering route before Kong 3.9 (`Upgrade` on any release)** are refused rather than
   judged in part or filtered not at all.
 - **A response-phase failure is a 502 with the upstream's headers withheld**, not a 503.
-- **The rock is `kong-plugin-sideband-pdp-0.4.0-1`**, and it depends on
-  `kong-plugin-authzen-pdp` 0.4.0 instead of shipping the discovery module itself.
+- **The rock is `kong-plugin-sideband-pdp-0.4.1-1`**, and it depends on
+  `kong-plugin-authzen-pdp` 0.4.1 instead of shipping the discovery module itself.
 
 ## Tests
 

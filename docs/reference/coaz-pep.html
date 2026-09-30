@@ -59,7 +59,7 @@
   <h2 id="run">Run it</h2>
   <pre><code>go build ./... &amp;&amp; go test -race ./...
 
-docker build --build-arg VERSION=0.4.0 -t coaz-pep core/
+docker build --build-arg VERSION=0.4.1 -t coaz-pep core/
 docker run -p 9191:9191 -p 9192:9192 \
   -e AUTHZEN_URL=https://pdp.bank.example -e AUTHZEN_API_KEY=… \
   -e CHECK_API_TOKEN=… -e MCP_UPSTREAM_ALLOWLIST=https://mcp.bank.example/mcp \
@@ -70,7 +70,7 @@ docker run -p 9191:9191 -p 9192:9192 \
   <p>A production-shaped service, as a compose service. Every variable is explained in the reference below; the values here are a bank API fronted by a gateway, discovering its PDP from the federation, holding the key for its own federation face.</p>
   <pre><code>services:
   coaz-pep:
-    image: ghcr.io/id-partners/coaz-pep:0.4.0 <span class="c"># pin a release — better, its digest</span>
+    image: ghcr.io/id-partners/coaz-pep:0.4.1 <span class="c"># pin a release — better, its digest</span>
     environment:
       <span class="c"># the static PDP: for a resource that publishes nothing; the only PDP that gets the key</span>
       AUTHZEN_URL: https://pdp.bank.example
@@ -303,7 +303,7 @@ Content-Type: application/json
 
   <h2 id="log">What the log tells you</h2>
   <p>Logs are JSON. Every relaxation <code>PEP_ALLOW_INSECURE</code> allowed is a warning at startup, and every check leaves one <code>decision</code> record — never a token. This is the demo's federation-mode PEP starting and deciding, abridged.</p>
-  <div class="term">{"level":"INFO","msg":"coaz-pep 0.4.0"}
+  <div class="term">{"level":"INFO","msg":"coaz-pep 0.4.1"}
 {"level":"INFO","msg":"PDP discovery (federation): http://stubs:9002/tenants/bank-a evaluates at http://stubs:9002/tenants/bank-a/access/v1/evaluation"}
 <span class="w">{"level":"WARN","msg":"minted a new federation entity key into /tmp/entity-key.json (kid PFlZTqivykMP9Z1TomZCu8yuFcgTqih7Gc90fE2lZgo) — the trust controller must onboard this key before the chain resolves."}</span>
 <span class="w">{"level":"WARN","msg":"insecure setting allowed by PEP_ALLOW_INSECURE","gap":"PDP_DISCOVERY_INSECURE is set: discovered http URLs are accepted"}</span>

@@ -361,7 +361,7 @@ const AUTH_HEADERS = ['X-Auth-Principal', 'X-Auth-Agent', 'X-Auth-Scope', 'X-Aut
  */
 const MCP_PROTOCOL_VERSION = '2025-06-18';
 /** Sent as clientInfo.version in the initialize handshake. */
-const SDK_VERSION = '0.4.0';
+const SDK_VERSION = '0.4.1';
 /** The most pages of tools/list discovery reads before it gives up. */
 const MAX_TOOLS_PAGES = 32;
 /** The most one discovery answer may be. */

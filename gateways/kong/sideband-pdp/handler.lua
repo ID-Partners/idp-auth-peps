@@ -32,7 +32,7 @@ local sideband = require "kong.plugins.sideband-pdp.sideband"
 
 local SidebandPDP = {
   PRIORITY = 999, -- as ping-auth: after Kong's own authentication plugins; see ../README.md#plugin-order
-  VERSION = "0.4.0",
+  VERSION = "0.4.1",
 }
 
 -- The modifiers a layer entry may carry beyond the shared fail-open / fail-closed.

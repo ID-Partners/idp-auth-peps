@@ -67,7 +67,7 @@ PDP calls.
 go build ./...
 go test -race ./...    # the profile's worked examples, and everything else
 
-docker build --build-arg VERSION=0.4.0 -t coaz-pep .
+docker build --build-arg VERSION=0.4.1 -t coaz-pep .
 docker run -p 9191:9191 -p 9192:9192 \
   -e AUTHZEN_URL=http://authzen-adapter:8080 -e AUTHZEN_API_KEY=… \
   -e CHECK_API_TOKEN=… -e MCP_UPSTREAM_ALLOWLIST=http://bank-mcp:8090 \
