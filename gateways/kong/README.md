@@ -41,6 +41,9 @@ Mount `authzen-pdp/` at `/opt/kong/plugins/authzen-pdp/` (the module path Kong l
 is `kong.plugins.authzen-pdp.handler`). Or install the rock from the `v0.4.1` release,
 `luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock` - the plugin alone, nothing
 fetched. It also carries the `discovery` and `contract` modules `sideband-pdp` requires.
+Kong's Enterprise images (`kong/kong-gateway`, 3.9 and 3.15 at least) ship without
+`unzip`, which luarocks needs to open a rock: `apt-get install -y unzip` first, as root in
+your image. The open-source `kong` image has it.
 
 ## How a route is decided
 

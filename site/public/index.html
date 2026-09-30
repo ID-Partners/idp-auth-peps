@@ -279,7 +279,8 @@ WWW-Authenticate: Bearer
       <span class="k">gateways/kong/authzen-pdp · Lua</span>
       <h3>Kong Gateway</h3>
       <p>A native plugin on a route or service, DB-less or with a database. Request mapping, discovery and challenges in Lua; DPoP and MCP tool calls delegated to the engine.</p>
-      <pre><code>luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock</code></pre>
+      <pre><code>apt-get install -y unzip    # Kong's Enterprise images lack it
+luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock</code></pre>
       <p class="links"><a href="/docs/kong.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong">Source</a></p>
     </div>
     <div>
@@ -307,7 +308,9 @@ WWW-Authenticate: Bearer
       <span class="k">gateways/kong/sideband-pdp · Lua</span>
       <h3>Kong, in front of PingAuthorize's Sideband API</h3>
       <p>The same discovery, the same layers and the same failure rules, where the policy owns the request mapping and the deny. For an estate that already speaks Sideband and wants the federation's word on who decides.</p>
-      <pre><code>luarocks install kong-plugin-sideband-pdp-0.4.1-1.all.rock</code></pre>
+      <pre><code>apt-get install -y unzip    # Kong's Enterprise images lack it
+luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock
+luarocks install kong-plugin-sideband-pdp-0.4.1-1.all.rock</code></pre>
       <p class="links"><a href="/docs/kong-sideband.html">Every setting</a><a href="https://github.com/ID-Partners/idp-auth-peps/tree/main/gateways/kong/sideband-pdp">Source</a></p>
     </div>
     <a href="https://demo-production-6ee6.up.railway.app">

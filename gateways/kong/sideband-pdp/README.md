@@ -62,7 +62,9 @@ Or install the rocks from the `v0.4.1` release, authzen-pdp's first:
 `luarocks install kong-plugin-authzen-pdp-0.4.1-1.all.rock`, then
 `kong-plugin-sideband-pdp-0.4.1-1.all.rock`. This one depends on
 `kong-plugin-authzen-pdp` 0.4.1, which brings the shared modules; neither rock ships the
-other's. Kong Gateway 3.4 or later, 3.9 or later recommended — see
+other's. On Kong's Enterprise images, `apt-get install -y unzip` first: they ship without
+it, and luarocks needs it to open a rock. Kong Gateway 3.4 or later, 3.9 or later
+recommended — see
 [Kong versions](../README.md#kong-versions).
 
 ## Configure
