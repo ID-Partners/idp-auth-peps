@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ID-Partners/idp-auth-peps/core/federation"
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
@@ -298,6 +299,11 @@ func TestResourceMode(t *testing.T) {
 		}
 		if s := c.Status(); !s.Resources[res.URL].Cached || !reflect.DeepEqual(s.Sources, []string{"rfc9728"}) {
 			t.Fatalf("%+v", s)
+		}
+		// Each cache counts one fetch, then one fresh read.
+		want := ttlcache.Stats{Hits: 1, Misses: 1}
+		if s := c.CacheStats(); s["resource_metadata"] != want || s["pdp_metadata"] != want {
+			t.Fatalf("cache stats: %+v", s)
 		}
 	})
 	t.Run("empty resource uses static", func(t *testing.T) {

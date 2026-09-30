@@ -22,8 +22,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 	"github.com/ID-Partners/idp-auth-peps/core/jose"
 )
 
@@ -154,6 +156,8 @@ type jwksCache struct {
 	ttl    time.Duration
 	// maxStale bounds how long past ttl the keys are served while refreshes fail.
 	maxStale time.Duration
+	// What key lookups were answered with, for the metrics.
+	hits, misses, stale, errs atomic.Uint64
 
 	mu        sync.Mutex
 	keys      map[string]map[string]any
@@ -191,12 +195,18 @@ func (c *jwksCache) key(ctx context.Context, kid string) (map[string]any, error)
 		}
 		if ok {
 			c.mu.Unlock()
+			if age >= c.ttl {
+				c.stale.Add(1)
+			} else {
+				c.hits.Add(1)
+			}
 			return k, nil
 		}
 		// An unknown kid may be a rotation the cache has not seen yet — but only worth a
 		// fetch if one has not just been made.
 		if now.Before(c.nextAttempt) {
 			c.mu.Unlock()
+			c.errs.Add(1)
 			return nil, fmt.Errorf("no key in the JWKS matches kid %q", kid)
 		}
 	}
@@ -206,19 +216,28 @@ func (c *jwksCache) key(ctx context.Context, kid string) (map[string]any, error)
 	select {
 	case <-f.done:
 	case <-ctx.Done():
+		c.errs.Add(1)
 		return nil, fmt.Errorf("JWKS fetch: %w", ctx.Err())
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.keys != nil && time.Since(c.fetchedAt) < c.ttl+c.maxStaleOrDefault() {
 		if k, ok := c.lookupLocked(kid); ok {
+			c.misses.Add(1)
 			return k, nil
 		}
 	}
+	c.errs.Add(1)
 	if f.err != nil {
 		return nil, f.err
 	}
 	return nil, fmt.Errorf("no key in the JWKS matches kid %q", kid)
+}
+
+// Stats counts what key lookups have been answered with, in the discovery caches' terms:
+// a fresh key, a fetch waited on, a key past its TTL served while refreshing, an error.
+func (c *jwksCache) Stats() ttlcache.Stats {
+	return ttlcache.Stats{Hits: c.hits.Load(), Misses: c.misses.Load(), Stale: c.stale.Load(), Errors: c.errs.Load()}
 }
 
 // ready loads the keys once, for the readiness probe.

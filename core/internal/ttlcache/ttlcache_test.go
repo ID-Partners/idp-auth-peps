@@ -227,3 +227,80 @@ func TestDefaults(t *testing.T) {
 		t.Fatalf("defaults: %+v", c.opts)
 	}
 }
+
+// Stats counts every way Get answers: from a fresh value, a fetch, a stale value or an
+// error - including a full cache serving uncached, and callers who stop waiting.
+func TestStatsCountWhatGetAnsweredWith(t *testing.T) {
+	ctx := context.Background()
+	c, ck := newTest(t, Options{TTL: time.Minute, MinRefresh: 10 * time.Second, NegativeTTL: 5 * time.Second, IsRefusal: refusal})
+	f, _, fail := counting("a")
+	var want Stats
+	check := func(step string) {
+		t.Helper()
+		if got := c.Stats(); got != want {
+			t.Fatalf("%s: got %+v, want %+v", step, got, want)
+		}
+	}
+	c.Get(ctx, "k", f)
+	want.Misses++
+	check("the first read fetches")
+	c.Get(ctx, "k", f)
+	want.Hits++
+	check("a fresh value")
+	ck.tick(61 * time.Second)
+	*fail = errors.New("down")
+	c.Get(ctx, "k", f)
+	want.Stale++
+	check("a failed refresh serves the last good value")
+	c.Get(ctx, "k", f)
+	want.Stale++
+	check("and keeps serving it while refreshes are throttled")
+	c.Get(ctx, "gone", f)
+	want.Errors++
+	check("nothing to serve is an error")
+	c.Get(ctx, "gone", f)
+	want.Errors++
+	check("and so is the remembered failure")
+	c.Get(ctx, "refused", func(context.Context, string) (string, time.Time, error) { return "", time.Time{}, errRefused })
+	want.Errors++
+	check("a refusal is an error")
+
+	// Full of live entries: a new key is served uncached, and counted all the same.
+	full, _ := newTest(t, Options{TTL: time.Minute, MaxEntries: 1})
+	ok, _, _ := counting("a")
+	full.Get(ctx, "live", ok)
+	full.Get(ctx, "other", ok)
+	bad, _, badErr := counting("a")
+	*badErr = errors.New("down")
+	full.Get(ctx, "third", bad)
+	if got := full.Stats(); got != (Stats{Misses: 2, Errors: 1}) {
+		t.Fatalf("uncached reads: %+v", got)
+	}
+
+	// A caller who stops waiting gets the stale value when there is one, an error when not.
+	slow, sck := newTest(t, Options{TTL: time.Minute})
+	block := make(chan struct{})
+	defer close(block)
+	var n int32
+	blocking := func(context.Context, string) (string, time.Time, error) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			return "old", time.Time{}, nil
+		}
+		<-block
+		return "new", time.Time{}, nil
+	}
+	slow.Get(ctx, "k", blocking)
+	sck.tick(61 * time.Second)
+	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	slow.Get(short, "k", blocking)
+	short2, cancel2 := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel2()
+	slow.Get(short2, "never", func(context.Context, string) (string, time.Time, error) {
+		<-block
+		return "", time.Time{}, nil
+	})
+	if got := slow.Stats(); got != (Stats{Misses: 1, Stale: 1, Errors: 1}) {
+		t.Fatalf("callers who stopped waiting: %+v", got)
+	}
+}

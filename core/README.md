@@ -142,14 +142,26 @@ fails that route closed rather than reading as off.
 
 - **`/healthz`** is liveness. **`/readyz`** is readiness: false while draining, and false
   until the access-token JWKS has loaded once. A replica whose PDP is down stays ready —
-  it answers with a fail-closed deny, which beats no answer.
+  it answers with a fail-closed deny, which beats no answer. The gRPC health service on
+  the ext_authz port says the same, for the server and for
+  `envoy.service.auth.v3.Authorization`, re-checked every five seconds. Probe liveness
+  with `/healthz`, never gRPC health, or a JWKS outage restarts the pod.
 - **SIGTERM drains.** Readiness drops, gRPC health reports `NOT_SERVING`, in-flight checks
   finish (up to 25 s), then the listeners close. Give the pod a 30 s grace period.
 - **Logs are JSON**, one audit record per decision (`"msg":"decision"`): the route, the
   outcome and status, the action, the client-facing reason, any fail-open layers, the
   request id and whether the PEP started insecure. Never a token.
-- **`/metrics`** is Prometheus text: decisions by outcome, style and fail-open, and PDP
-  calls by result with a latency histogram.
+- **`/metrics`** is Prometheus text:
+  - `coazpep_decisions_total{outcome,style,fail_open}`, and each layer skipped because
+    its PDP could not be reached, `coazpep_fail_open_total{layer}`;
+  - PDP calls by result, `coazpep_pdp_calls_total{result}`, and their latency,
+    `coazpep_pdp_call_seconds`;
+  - DPoP proofs refused, `coazpep_dpop_rejections_total{reason}`: `replay`, `iat`, `htu`,
+    `htm`, `ath`, `binding`, `signature`, `malformed`, `missing` or `scheme`;
+  - what each cache answered a lookup with, `coazpep_cache_lookups_total{cache,result}`:
+    `hit`, `miss` (a fetch waited on), `stale` (past its TTL, served while refreshing) or
+    `error`, for `resource_metadata`, `pdp_metadata`, `trust_chains`, `jwks_access` and
+    `jwks_user`, whichever are configured.
 - **The gRPC server** recovers a panic into an error (which Envoy fails closed on), bounds
   messages at 4 MiB and recycles connections every five minutes, so a new replica gets its
   share of an Envoy's long-lived streams.

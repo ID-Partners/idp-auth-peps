@@ -21,7 +21,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 )
 
 func TestGRPCServerOptions(t *testing.T) {
@@ -104,27 +109,50 @@ func TestReadiness(t *testing.T) {
 
 func TestMetricsExposition(t *testing.T) {
 	m := newMetrics()
-	m.decision("permit", "rest", false)
-	m.decision("deny", "mcp", false)
-	m.decision("permit", "mcp", true)
+	m.decision("permit", "rest", "")
+	m.decision("deny", "mcp", "")
+	m.decision("permit", "mcp", "https://estate.example, https://pdp.example")
+	m.decision("permit", "rest", "https://estate.example")
 	m.pdpCall("ok", 30*time.Millisecond)
 	m.pdpCall("unavailable", 2*time.Second)
+	m.dpopRejected("replay")
+	m.dpopRejected("replay")
+	m.dpopRejected("htu")
+	m.dpopRejected("") // an accepted proof has no reason, and counts nothing
+	m.cache(func() map[string]ttlcache.Stats {
+		return map[string]ttlcache.Stats{"jwks_access": {Hits: 7, Misses: 1, Stale: 2, Errors: 3}}
+	})
+	m.cache(func() map[string]ttlcache.Stats { return map[string]ttlcache.Stats{"pdp_metadata": {}} })
 	rec := httptest.NewRecorder()
 	m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	for _, want := range []string{
 		`coazpep_decisions_total{outcome="permit",style="mcp",fail_open="true"} 1`,
+		`coazpep_decisions_total{outcome="permit",style="rest",fail_open="false"} 1`,
 		`coazpep_pdp_calls_total{result="unavailable"} 1`,
 		`coazpep_pdp_call_seconds_bucket{le="0.05"} 1`,
 		`coazpep_pdp_call_seconds_count 2`,
+		`coazpep_fail_open_total{layer="https://estate.example"} 2`,
+		`coazpep_fail_open_total{layer="https://pdp.example"} 1`,
+		`coazpep_dpop_rejections_total{reason="replay"} 2`,
+		`coazpep_dpop_rejections_total{reason="htu"} 1`,
+		`coazpep_cache_lookups_total{cache="jwks_access",result="hit"} 7`,
+		`coazpep_cache_lookups_total{cache="jwks_access",result="stale"} 2`,
+		`coazpep_cache_lookups_total{cache="jwks_access",result="error"} 3`,
+		// Every result of every cache is a series from the start, zero or not.
+		`coazpep_cache_lookups_total{cache="pdp_metadata",result="miss"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %s in\n%s", want, body)
 		}
 	}
+	if strings.Contains(body, `reason=""`) {
+		t.Error("an empty DPoP reason must not become a series")
+	}
 	var nilMetrics *metrics
-	nilMetrics.decision("permit", "rest", false) // a server built in a test has none
+	nilMetrics.decision("permit", "rest", "") // a server built in a test has none
 	nilMetrics.pdpCall("ok", time.Millisecond)
+	nilMetrics.dpopRejected("replay")
 }
 
 func TestAuditAndLoggingSetup(t *testing.T) {
@@ -136,6 +164,10 @@ func TestAuditAndLoggingSetup(t *testing.T) {
 	s.audit("http", configFrom(nil), "GET", "/x", nil, denySimple("pep", 403, codes.PermissionDenied, "no", nil), time.Now())
 	if s.metrics.decisions[[3]string{"permit", "rest", "true"}] != 1 || s.metrics.decisions[[3]string{"deny", "rest", "false"}] != 1 {
 		t.Fatalf("audit counts decisions: %v", s.metrics.decisions)
+	}
+	// And the layer the permit skipped, by the identifier X-PDP-Fail-Open names.
+	if s.metrics.failOpen["https://pdp"] != 1 || len(s.metrics.failOpen) != 1 {
+		t.Fatalf("audit counts skipped layers: %v", s.metrics.failOpen)
 	}
 }
 
@@ -248,6 +280,107 @@ func TestDenialReason(t *testing.T) {
 	} {
 		if got := denialReason(body); got != want {
 			t.Errorf("denialReason(%s) = %q, want %q", body, got, want)
+		}
+	}
+}
+
+// The gRPC health service says what /readyz says, for the server and for the ext_authz
+// service: serving once the JWKS has loaded, not serving while it cannot, and not
+// serving from the moment a drain begins.
+func TestGRPCHealthFollowsReadiness(t *testing.T) {
+	defer func(d time.Duration) { readinessEvery = d }(readinessEvery)
+	readinessEvery = 5 * time.Millisecond
+	key := newKey(t)
+	jwks := jwksServer(t, key, "k1")
+	defer jwks.Close()
+
+	watch := func(s *server) (*health.Server, func(healthpb.HealthCheckResponse_ServingStatus, string)) {
+		hs := health.NewServer()
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go s.followReadiness(ctx, hs)
+		return hs, func(want healthpb.HealthCheckResponse_ServingStatus, what string) {
+			t.Helper()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				all, err1 := hs.Check(ctx, &healthpb.HealthCheckRequest{})
+				authz, err2 := hs.Check(ctx, &healthpb.HealthCheckRequest{Service: authService})
+				if err1 == nil && err2 == nil && all.Status == want && authz.Status == want {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: want %v, got %v and %v (%v %v)", what, want, all.GetStatus(), authz.GetStatus(), err1, err2)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}
+	s := &server{accessValidator: newTestValidator(t, jwks.URL)}
+	_, expect := watch(s)
+	expect(healthpb.HealthCheckResponse_SERVING, "the JWKS loads")
+	s.draining.Store(true)
+	expect(healthpb.HealthCheckResponse_NOT_SERVING, "draining")
+
+	dead := &server{accessValidator: NewValidator(ValidatorConfig{JWKSURL: "http://127.0.0.1:1", Client: &http.Client{Timeout: time.Second}})}
+	_, expect = watch(dead)
+	expect(healthpb.HealthCheckResponse_NOT_SERVING, "a JWKS that cannot load")
+}
+
+// run registers the health service on the ext_authz listener, where a client sees it
+// serving (TestGRPCHealthFollowsReadiness has the drain turning it off).
+func TestRunServesGRPCHealth(t *testing.T) {
+	srv, httpSrv, _, err := buildServer(insecureEnv(map[string]string{"AUTHZEN_URL": "http://pdp:8080", "HTTP_ADDR": "127.0.0.1", "HTTP_PORT": "0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() { done <- run(srv, httpSrv, lis, nil, stop) }()
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := healthpb.NewHealthClient(conn)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r, err := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: authService})
+		if err == nil && r.Status == healthpb.HealthCheckResponse_SERVING {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ext_authz never reported serving: %v %v", r.GetStatus(), err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop <- os.Interrupt
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not drain")
+	}
+}
+
+// The service's caches are on /metrics: discovery's two, and the access token's JWKS.
+func TestBuildServerPutsTheCachesOnMetrics(t *testing.T) {
+	_, httpSrv, _, err := buildServer(secureEnv(map[string]string{
+		"PDP_DISCOVERY": "resource", "PDP_ALLOWLIST": "https://pdp.example", "RESOURCE_METADATA_ALLOWLIST": "https://api.example",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	httpSrv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, cache := range []string{"resource_metadata", "pdp_metadata", "jwks_access", "jwks_user"} {
+		if want := `coazpep_cache_lookups_total{cache="` + cache + `",result="hit"} `; !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("no %s cache on /metrics:\n%s", cache, rec.Body.String())
 		}
 	}
 }

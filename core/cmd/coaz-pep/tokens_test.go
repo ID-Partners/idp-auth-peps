@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 )
 
 // mintJWT signs a compact JWT with key, optionally naming a kid.
@@ -609,5 +611,50 @@ func TestJWKSRefusesAnOversizedKeySet(t *testing.T) {
 	c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
 	if _, err := c.fetch(context.Background()); err == nil {
 		t.Fatal("a JWKS with more keys than any issuer publishes is refused")
+	}
+}
+
+// The JWKS cache counts its lookups as the discovery caches do: a fetch waited on, a
+// fresh key, an unknown kid refused without a fetch, and a key past its TTL served while
+// a refresh runs.
+func TestJWKSCountsItsLookups(t *testing.T) {
+	key := newKey(t)
+	srv := jwksServer(t, key, "k1")
+	defer srv.Close()
+	c := &jwksCache{url: srv.URL, client: srv.Client(), ttl: time.Minute}
+	ctx := context.Background()
+	if _, err := c.key(ctx, "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.key(ctx, "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.key(ctx, "nope"); err == nil {
+		t.Fatal("an unknown kid right after a fetch is refused, not fetched again")
+	}
+	c.mu.Lock()
+	c.fetchedAt = time.Now().Add(-2 * time.Minute)
+	c.mu.Unlock()
+	if _, err := c.key(ctx, "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.Stats(), (ttlcache.Stats{Misses: 1, Hits: 1, Errors: 1, Stale: 1}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	// A fetch that fails is an error, and so is a caller who stops waiting for one.
+	dead := &jwksCache{url: "http://127.0.0.1:1", client: &http.Client{Timeout: time.Second}, ttl: time.Minute}
+	if _, err := dead.key(ctx, "k1"); err == nil {
+		t.Fatal("an unreachable JWKS has no keys")
+	}
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer slow.Close()
+	waiting := &jwksCache{url: slow.URL, client: &http.Client{Timeout: 200 * time.Millisecond}, ttl: time.Minute}
+	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := waiting.key(short, "k1"); err == nil {
+		t.Fatal("a caller who stops waiting gets an error")
+	}
+	if dead.Stats().Errors != 1 || waiting.Stats().Errors != 1 {
+		t.Fatalf("errors: dead %+v, waiting %+v", dead.Stats(), waiting.Stats())
 	}
 }

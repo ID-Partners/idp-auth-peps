@@ -711,6 +711,12 @@ func (c *Chain) Status() Status {
 	return s
 }
 
+// CacheStats counts what the resource-metadata and PDP-metadata caches have answered
+// with, for the service's metrics.
+func (c *Chain) CacheStats() map[string]ttlcache.Stats {
+	return map[string]ttlcache.Stats{"resource_metadata": c.resources.Stats(), "pdp_metadata": c.pdps.Stats()}
+}
+
 // plainIdentifier refuses an identifier whose path could resolve somewhere other than
 // where it reads (see metafetch.PlainPath). One that does not parse is left to the
 // sources, which say why.

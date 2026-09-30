@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -83,6 +84,8 @@ type call[T any] struct {
 	done chan struct{}
 	val  T
 	err  error
+	// stale: the fetch failed and val is the last good value, served for now.
+	stale bool
 }
 
 func (e *entry[T]) fresh(now time.Time) bool    { return e.ok && now.Before(e.soft) }
@@ -93,6 +96,38 @@ type Cache[T any] struct {
 	opts    Options
 	mu      sync.Mutex
 	entries map[string]*entry[T]
+
+	hits, misses, stale, errs atomic.Uint64
+}
+
+// Stats counts what Get has answered with since the cache was made.
+type Stats struct {
+	// Hits were answered from a fresh value.
+	Hits uint64
+	// Misses waited on a fetch and got the value it returned.
+	Misses uint64
+	// Stale were answered from a value past its TTL: a refresh had failed, or the caller
+	// left before the one under way finished.
+	Stale uint64
+	// Errors were answered with an error: nothing servable, or a refusal.
+	Errors uint64
+}
+
+// Stats returns the counts so far.
+func (c *Cache[T]) Stats() Stats {
+	return Stats{Hits: c.hits.Load(), Misses: c.misses.Load(), Stale: c.stale.Load(), Errors: c.errs.Load()}
+}
+
+// count records what one Get answered with.
+func (c *Cache[T]) count(err error, stale bool) {
+	switch {
+	case err != nil:
+		c.errs.Add(1)
+	case stale:
+		c.stale.Add(1)
+	default:
+		c.misses.Add(1)
+	}
 }
 
 // EntryStatus is a point-in-time view of one entry, for logs and tests.
@@ -135,6 +170,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string, fetch Fetch[T]) (T, erro
 		fctx, cancel := c.bound(ctx)
 		defer cancel()
 		v, _, err := fetch(fctx, key)
+		c.count(err, false)
 		return v, err
 	}
 
@@ -144,15 +180,18 @@ func (c *Cache[T]) Get(ctx context.Context, key string, fetch Fetch[T]) (T, erro
 	case e.fresh(now):
 		v := e.val
 		e.mu.Unlock()
+		c.hits.Add(1)
 		return v, nil
 	case !e.servable(now) && e.lastErr != nil && now.Before(e.negUntil):
 		err := e.lastErr
 		e.mu.Unlock()
+		c.errs.Add(1)
 		var zero T
 		return zero, err
 	case e.servable(now) && e.lastErr != nil && now.Sub(e.lastAttempt) < c.opts.MinRefresh:
 		v := e.val // stale, and a refresh failed recently: serve it, do not hammer
 		e.mu.Unlock()
+		c.stale.Add(1)
 		return v, nil
 	}
 	cl := e.call
@@ -165,13 +204,16 @@ func (c *Cache[T]) Get(ctx context.Context, key string, fetch Fetch[T]) (T, erro
 
 	select {
 	case <-cl.done:
+		c.count(cl.err, cl.stale)
 		return cl.val, cl.err
 	case <-ctx.Done():
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		if e.servable(c.opts.Now()) {
+			c.stale.Add(1)
 			return e.val, nil
 		}
+		c.errs.Add(1)
 		var zero T
 		return zero, ctx.Err()
 	}
@@ -213,7 +255,7 @@ func (c *Cache[T]) run(ctx context.Context, e *entry[T], cl *call[T], key string
 			e.negUntil = start.Add(c.opts.NegativeTTL)
 		}
 		if e.servable(c.opts.Now()) {
-			cl.val = e.val // serve stale rather than fail every request, for now
+			cl.val, cl.stale = e.val, true // serve stale rather than fail every request, for now
 		} else {
 			cl.err = err
 		}

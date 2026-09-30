@@ -271,6 +271,10 @@ func (r *Resolver) ResolveLeaf(ctx context.Context, entityConfiguration string) 
 // Status snapshots the resolution cache.
 func (r *Resolver) Status() map[string]ttlcache.EntryStatus { return r.cache.Status() }
 
+// CacheStats counts what the resolution cache has answered with, for the service's
+// metrics.
+func (r *Resolver) CacheStats() ttlcache.Stats { return r.cache.Stats() }
+
 // resolve walks and validates the chain for entityID. seed, when given, is the
 // subject's already-verified Entity Configuration.
 func (r *Resolver) resolve(ctx context.Context, entityID string, seed *Statement) (Resolved, error) {

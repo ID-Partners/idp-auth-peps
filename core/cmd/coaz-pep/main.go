@@ -85,6 +85,7 @@ import (
 	"github.com/ID-Partners/idp-auth-peps/core/authzen/discovery"
 	"github.com/ID-Partners/idp-auth-peps/core/coaz"
 	"github.com/ID-Partners/idp-auth-peps/core/federation"
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 )
 
 // version is set at build time (-ldflags "-X main.version=…").
@@ -230,6 +231,20 @@ func buildServer(getenv func(string) string) (*server, *http.Server, string, err
 	default:
 		// Only reachable without any JWKS, which is itself a gap above.
 		srv.decodeUserTokens = true
+	}
+
+	// What each cache answered with, read at every scrape of /metrics.
+	if resolver != nil {
+		srv.metrics.cache(resolver.CacheStats)
+	}
+	if fed != nil {
+		srv.metrics.cache(func() map[string]ttlcache.Stats { return map[string]ttlcache.Stats{"trust_chains": fed.CacheStats()} })
+	}
+	for name, v := range map[string]*Validator{"jwks_access": srv.accessValidator, "jwks_user": srv.userValidator} {
+		if v != nil {
+			name, jwks := name, v.jwks
+			srv.metrics.cache(func() map[string]ttlcache.Stats { return map[string]ttlcache.Stats{name: jwks.Stats()} })
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -523,8 +538,15 @@ func main() {
 func run(srv *server, httpSrv *http.Server, lis net.Listener, opts []grpc.ServerOption, stop <-chan os.Signal) error {
 	gs := grpc.NewServer(opts...)
 	authv3.RegisterAuthorizationServer(gs, srv)
+	// The gRPC health service reports readiness, as /readyz does: not serving until the
+	// server can decide, and not serving again from the moment a drain begins.
 	hs := health.NewServer()
+	hs.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
+	hs.SetServingStatus(authService, healthpb.HealthCheckResponse_NOT_SERVING)
 	healthpb.RegisterHealthServer(gs, hs)
+	readyCtx, stopReady := context.WithCancel(context.Background())
+	defer stopReady()
+	go srv.followReadiness(readyCtx, hs)
 
 	errc := make(chan error, 2)
 	go func() {

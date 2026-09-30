@@ -468,7 +468,8 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	//    §7.2: a DPoP-bound token presented as a bearer token MUST be rejected, or a
 	//    stolen bound token is as good as a bearer one wherever require_dpop is off.
 	if conf.requireDpop || scheme == "dpop" || dpopBound(claims) {
-		if resp := checkDpop(pep, scheme, method, path, s.dpopHTUBase, token, headers, claims); resp != nil {
+		if resp, why := dpopRefusal(pep, scheme, method, path, s.dpopHTUBase, token, headers, claims); resp != nil {
+			s.metrics.dpopRejected(why)
 			return resp
 		}
 	}
@@ -806,42 +807,52 @@ func dpopBound(claims map[string]any) bool {
 // carry an RSA key big enough to make that expensive. The comparison only MEANS anything
 // once the proof's signature verifies under that key: the JWK is public in every proof,
 // so without the signature anyone who has observed one proof can mint more.
+// checkDpop is dpopRefusal's answer without its reason.
 func checkDpop(pep, scheme, method, path, htuBase, accessToken string, headers map[string]string, claims map[string]any) *authv3.CheckResponse {
-	fail := func(reason string) *authv3.CheckResponse {
+	resp, _ := dpopRefusal(pep, scheme, method, path, htuBase, accessToken, headers, claims)
+	return resp
+}
+
+// dpopRefusal checks the DPoP proof for a request carrying a DPoP-bound token. It returns
+// nil and "" when the proof holds, and otherwise the 401 and why, as one of scheme,
+// missing, malformed, binding, signature, htm, htu, ath, iat or replay - the metrics'
+// reasons.
+func dpopRefusal(pep, scheme, method, path, htuBase, accessToken string, headers map[string]string, claims map[string]any) (*authv3.CheckResponse, string) {
+	fail := func(kind, reason string) (*authv3.CheckResponse, string) {
 		log.Printf("[%s] 401 DPoP: %s", pep, reason)
 		return denySimple(pep, typev3.StatusCode_Unauthorized, codes.Unauthenticated, reason, map[string]string{
 			"WWW-Authenticate": `DPoP error="invalid_dpop_proof"`,
-		})
+		}), kind
 	}
 	if scheme != "dpop" {
-		return fail("DPoP-bound token required but Authorization scheme was not DPoP.")
+		return fail("scheme", "DPoP-bound token required but Authorization scheme was not DPoP.")
 	}
 	proof := headers["dpop"]
 	if proof == "" {
-		return fail("Missing DPoP proof header.")
+		return fail("missing", "Missing DPoP proof header.")
 	}
 	phdr := jwtHeader(proof)
 	pclaims := jwtClaims(proof)
 	if phdr == nil || pclaims == nil {
-		return fail("DPoP proof is not a well-formed JWT.")
+		return fail("malformed", "DPoP proof is not a well-formed JWT.")
 	}
 	if typ := claimString(phdr, "typ"); typ != "dpop+jwt" {
-		return fail("DPoP proof typ header is not dpop+jwt.")
+		return fail("malformed", "DPoP proof typ header is not dpop+jwt.")
 	}
 	jwk, ok := phdr["jwk"].(map[string]any)
 	if !ok {
-		return fail("DPoP proof header carries no jwk.")
+		return fail("malformed", "DPoP proof header carries no jwk.")
 	}
 	// A private-key member in the JWK means the client leaked its key; treat the proof
 	// as unusable rather than quietly accepting it.
 	for _, priv := range []string{"d", "p", "q", "dp", "dq", "qi", "k"} {
 		if _, present := jwk[priv]; present {
-			return fail("DPoP proof jwk contains private key material.")
+			return fail("malformed", "DPoP proof jwk contains private key material.")
 		}
 	}
 	alg := claimString(phdr, "alg")
 	if alg == "" || alg == "none" {
-		return fail("DPoP proof has no usable alg.")
+		return fail("malformed", "DPoP proof has no usable alg.")
 	}
 	jkt := jwkThumbprint(jwk)
 	var cnfJkt string
@@ -849,43 +860,43 @@ func checkDpop(pep, scheme, method, path, htuBase, accessToken string, headers m
 		cnfJkt, _ = cnf["jkt"].(string)
 	}
 	if jkt == "" || cnfJkt == "" || !constantTimeEqual(jkt, cnfJkt) {
-		return fail("DPoP proof key does not match the token's cnf.jkt binding.")
+		return fail("binding", "DPoP proof key does not match the token's cnf.jkt binding.")
 	}
 	if err := verifyProofSignature(proof, jwk, alg); err != nil {
-		return fail("DPoP proof signature is invalid.")
+		return fail("signature", "DPoP proof signature is invalid.")
 	}
 	if claimString(pclaims, "htm") != method {
-		return fail("DPoP proof htm does not match the request method.")
+		return fail("htm", "DPoP proof htm does not match the request method.")
 	}
 	if !htuMatches(claimString(pclaims, "htu"), htuBase, path) {
-		return fail("DPoP proof htu does not match the request URI.")
+		return fail("htu", "DPoP proof htu does not match the request URI.")
 	}
 
 	// ath binds this proof to THIS access token. Presence alone is worthless: without
 	// the comparison a proof minted for any token replays against any other.
 	ath := claimString(pclaims, "ath")
 	if ath == "" {
-		return fail("DPoP proof missing ath (access-token hash).")
+		return fail("ath", "DPoP proof missing ath (access-token hash).")
 	}
 	if accessToken == "" || !constantTimeEqual(ath, accessTokenHash(accessToken)) {
-		return fail("DPoP proof ath does not match the presented access token.")
+		return fail("ath", "DPoP proof ath does not match the presented access token.")
 	}
 
 	// Freshness, then single-use. A proof with no iat, or one outside the window, is
 	// replayable indefinitely.
 	iatClaim, ok := numericClaim(pclaims, "iat")
 	if !ok {
-		return fail("DPoP proof missing iat.")
+		return fail("iat", "DPoP proof missing iat.")
 	}
 	now := time.Now()
 	iat := time.Unix(int64(iatClaim), 0)
 	if age := now.Sub(iat); age > dpopMaxAge || age < -dpopMaxSkew {
-		return fail("DPoP proof iat is outside the acceptance window.")
+		return fail("iat", "DPoP proof iat is outside the acceptance window.")
 	}
 	if !dpopReplay.observe(jkt, claimString(pclaims, "jti"), iat, now) {
-		return fail("DPoP proof jti is missing or has already been used.")
+		return fail("replay", "DPoP proof jti is missing or has already been used.")
 	}
-	return nil
+	return nil, ""
 }
 
 // htuMatches compares a proof's htu with the request (RFC 9449 §4.3: ignoring query and

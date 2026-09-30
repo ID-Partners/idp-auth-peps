@@ -6,6 +6,29 @@ Node SDK — shares one version line from 0.4.0 on. A `v*` tag releases them all
 a release goes under `## [Unreleased]`, which `scripts/release.sh bump` dates as the next
 version.
 
+## [Unreleased]
+
+What 0.4.0's operability work left out. The Kong plugins, the PingAccess rule and the
+Node SDK are unchanged apart from the version.
+
+### Upgrading from 0.4.0
+
+- **gRPC health now reports readiness.** If you probe coaz-pep's liveness through gRPC
+  health, move that probe to `/healthz`: a JWKS that cannot load now reads as
+  `NOT_SERVING`, and a liveness probe would restart the pod for it.
+
+### coaz-pep
+
+- The gRPC health service said `SERVING` from start-up until a drain. It now says what
+  `/readyz` says, for the server and for `envoy.service.auth.v3.Authorization`:
+  `NOT_SERVING` until the access-token JWKS has loaded, re-checked every five seconds,
+  and `NOT_SERVING` from the moment a drain begins.
+- `/metrics` gains the series 0.4.0 planned and did not ship:
+  `coazpep_fail_open_total{layer}` for each layer skipped because its PDP could not be
+  reached, `coazpep_dpop_rejections_total{reason}` for DPoP proofs refused, and
+  `coazpep_cache_lookups_total{cache,result}` for what the resource-metadata,
+  PDP-metadata, trust-chain and JWKS caches answered each lookup with.
+
 ## [0.4.0] - 2026-09-26
 
 The production-readiness release. A review found that every enforcement point had at

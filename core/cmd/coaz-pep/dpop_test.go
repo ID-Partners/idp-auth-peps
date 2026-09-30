@@ -421,7 +421,7 @@ func postVerify(t *testing.T, s *server, body string) (int, dpopVerifyResponse) 
 }
 
 func TestDpopVerifyEndpoint(t *testing.T) {
-	s := &server{}
+	s := &server{metrics: newMetrics()}
 	key := newKey(t)
 	thumb := jwkThumbprint(publicJWK(key))
 	token := mintUnsigned(map[string]any{"sub": "alice", "cnf": map[string]any{"jkt": thumb}})
@@ -470,12 +470,17 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 	})
 
 	t.Run("ath bound to another token", func(t *testing.T) {
+		// Right in every other respect, so the refusal is the ath's and nothing earlier's.
 		proof := mintProof(t, key, map[string]any{
-			"htm": "POST", "ath": accessTokenHash("a.different.token"),
+			"htm": "POST", "htu": "https://api.example.com/payments", "ath": accessTokenHash("a.different.token"),
 			"iat": float64(time.Now().Unix()), "jti": "verify-ath-1",
 		})
-		if _, out := postVerify(t, s, makeBody(proof)); out.Valid {
+		_, out := postVerify(t, s, makeBody(proof))
+		if out.Valid {
 			t.Fatal("a proof bound to a different token must not verify")
+		}
+		if !strings.Contains(out.Reason, "ath") {
+			t.Fatalf("refused for the wrong reason: %s", out.Reason)
 		}
 	})
 
@@ -523,6 +528,14 @@ func TestDpopVerifyEndpoint(t *testing.T) {
 		})
 		if _, out := postVerify(t, s, string(raw)); !out.Valid {
 			t.Fatalf("upper-cased headers should still be found: %+v", out)
+		}
+	})
+
+	t.Run("refusals are counted by reason", func(t *testing.T) {
+		for _, reason := range []string{"signature", "ath", "replay"} {
+			if s.metrics.dpop[reason] == 0 {
+				t.Errorf("no %s refusal counted: %v", reason, s.metrics.dpop)
+			}
 		}
 	})
 }

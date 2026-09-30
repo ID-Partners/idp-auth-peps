@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -23,8 +24,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 )
 
 // drainTimeout bounds a graceful shutdown. Kubernetes' default grace period is 30s.
@@ -87,24 +92,69 @@ func recoverUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, hand
 	return handler(ctx, req)
 }
 
-// handleReady is the readiness probe: false while draining, and false until the access
-// token JWKS — when one is configured — has been loaded once. A replica that cannot
-// verify a single token should not be taking traffic; one whose PDP is down still is,
-// because it answers with a fail-closed deny rather than nothing.
-func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+// errDraining is readiness while the server drains.
+var errDraining = errors.New("draining")
+
+// readiness is what /readyz and the gRPC health service both report: nil once the server
+// can decide, meaning it is not draining and the access token's JWKS is loaded when
+// there is one to verify tokens against.
+func (s *server) readiness(ctx context.Context) error {
 	if s.draining.Load() {
-		http.Error(w, "draining", http.StatusServiceUnavailable)
-		return
+		return errDraining
 	}
 	if s.accessValidator != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 		if err := s.accessValidator.jwks.ready(ctx); err != nil {
-			http.Error(w, "access token JWKS not loaded", http.StatusServiceUnavailable)
-			return
+			return fmt.Errorf("access token JWKS not loaded: %w", err)
 		}
 	}
-	_, _ = w.Write([]byte("ready"))
+	return nil
+}
+
+// handleReady is the readiness probe: false while draining, and false until the access
+// token JWKS has loaded when tokens are verified. /healthz stays liveness only.
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	switch err := s.readiness(r.Context()); {
+	case errors.Is(err, errDraining):
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+	case err != nil:
+		http.Error(w, "access token JWKS not loaded", http.StatusServiceUnavailable)
+	default:
+		_, _ = w.Write([]byte("ready"))
+	}
+}
+
+// authService is the name the ext_authz service is registered under. The gRPC health
+// service answers for it and for the server as a whole ("").
+const authService = "envoy.service.auth.v3.Authorization"
+
+// readinessEvery is how often the gRPC health service re-checks readiness.
+var readinessEvery = 5 * time.Second
+
+// followReadiness keeps the gRPC health service saying what /readyz says until ctx ends:
+// it checks at once, then every readinessEvery, and sets the status when it changes.
+// Once a drain calls Shutdown the health server ignores it and stays NOT_SERVING.
+func (s *server) followReadiness(ctx context.Context, hs *health.Server) {
+	t := time.NewTicker(readinessEvery)
+	defer t.Stop()
+	last := healthpb.HealthCheckResponse_UNKNOWN
+	for {
+		st := healthpb.HealthCheckResponse_SERVING
+		if s.readiness(ctx) != nil {
+			st = healthpb.HealthCheckResponse_NOT_SERVING
+		}
+		if st != last {
+			hs.SetServingStatus("", st)
+			hs.SetServingStatus(authService, st)
+			last = st
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // setupLogging makes every log line structured. Setting slog's default also routes the
@@ -134,7 +184,7 @@ func (s *server) audit(surface string, conf pepConfig, method, path string, head
 		reason = r
 	}
 	failOpen := hdrs["X-PDP-Fail-Open"]
-	s.metrics.decision(outcome, conf.style, failOpen != "")
+	s.metrics.decision(outcome, conf.style, failOpen)
 	slog.Info("decision",
 		"pep", conf.pepLabel, "surface", surface, "style", conf.style,
 		"method", method, "path", path, "request_id", headers["x-request-id"],
@@ -165,28 +215,58 @@ func denialReason(body string) string {
 }
 
 // metrics is a minimal Prometheus exposition, kept dependency-free: counters and one
-// latency histogram, all with small, bounded label sets.
+// latency histogram, all with small, bounded label sets. A layer is a PDP identifier the
+// configuration or the allowlist bounds; a DPoP reason is one of a fixed few.
 type metrics struct {
 	mu        sync.Mutex
 	decisions map[[3]string]uint64 // outcome, style, fail_open
+	failOpen  map[string]uint64    // layer
+	dpop      map[string]uint64    // reason
 	pdpCalls  map[string]uint64    // result
 	pdpBucket []uint64
 	pdpSum    float64
 	pdpCount  uint64
+	// caches report their counts when scraped: name -> what lookups were answered with.
+	caches []func() map[string]ttlcache.Stats
 }
 
 var pdpBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 func newMetrics() *metrics {
-	return &metrics{decisions: map[[3]string]uint64{}, pdpCalls: map[string]uint64{}, pdpBucket: make([]uint64, len(pdpBuckets))}
+	return &metrics{decisions: map[[3]string]uint64{}, failOpen: map[string]uint64{}, dpop: map[string]uint64{},
+		pdpCalls: map[string]uint64{}, pdpBucket: make([]uint64, len(pdpBuckets))}
 }
 
-func (m *metrics) decision(outcome, style string, failedOpen bool) {
+// decision counts one decision, and each layer it skipped: failedOpen is the
+// X-PDP-Fail-Open value, the skipped layers' identifiers, comma-separated.
+func (m *metrics) decision(outcome, style, failedOpen string) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	m.decisions[[3]string{outcome, style, fmt.Sprint(failedOpen)}]++
+	defer m.mu.Unlock()
+	m.decisions[[3]string{outcome, style, fmt.Sprint(failedOpen != "")}]++
+	for _, layer := range strings.Split(failedOpen, ",") {
+		if layer = strings.TrimSpace(layer); layer != "" {
+			m.failOpen[layer]++
+		}
+	}
+}
+
+// dpopRejected counts one DPoP proof refused, by reason.
+func (m *metrics) dpopRejected(reason string) {
+	if m == nil || reason == "" {
+		return
+	}
+	m.mu.Lock()
+	m.dpop[reason]++
+	m.mu.Unlock()
+}
+
+// cache registers a cache whose counts are read at each scrape.
+func (m *metrics) cache(stats func() map[string]ttlcache.Stats) {
+	m.mu.Lock()
+	m.caches = append(m.caches, stats)
 	m.mu.Unlock()
 }
 
@@ -237,5 +317,38 @@ func (m *metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	fmt.Fprintf(&b, "coazpep_pdp_call_seconds_bucket{le=\"+Inf\"} %d\ncoazpep_pdp_call_seconds_sum %g\ncoazpep_pdp_call_seconds_count %d\n",
 		m.pdpCount, m.pdpSum, m.pdpCount)
+	b.WriteString("# HELP coazpep_fail_open_total Layers skipped because their PDP could not be reached and the layer is fail-open, by layer.\n# TYPE coazpep_fail_open_total counter\n")
+	for _, l := range sortedKeys(m.failOpen) {
+		fmt.Fprintf(&b, "coazpep_fail_open_total{layer=%q} %d\n", l, m.failOpen[l])
+	}
+	b.WriteString("# HELP coazpep_dpop_rejections_total DPoP proofs refused, by reason.\n# TYPE coazpep_dpop_rejections_total counter\n")
+	for _, r := range sortedKeys(m.dpop) {
+		fmt.Fprintf(&b, "coazpep_dpop_rejections_total{reason=%q} %d\n", r, m.dpop[r])
+	}
+	b.WriteString("# HELP coazpep_cache_lookups_total What each cache answered a lookup with: a fresh value (hit), a fetch waited on (miss), a value past its TTL served while refreshing (stale), or an error.\n# TYPE coazpep_cache_lookups_total counter\n")
+	all := map[string]ttlcache.Stats{}
+	for _, f := range m.caches {
+		for name, st := range f() {
+			all[name] = st
+		}
+	}
+	for _, name := range sortedKeys(all) {
+		st := all[name]
+		for _, r := range []struct {
+			result string
+			n      uint64
+		}{{"hit", st.Hits}, {"miss", st.Misses}, {"stale", st.Stale}, {"error", st.Errors}} {
+			fmt.Fprintf(&b, "coazpep_cache_lookups_total{cache=%q,result=%q} %d\n", name, r.result, r.n)
+		}
+	}
 	_, _ = w.Write([]byte(b.String()))
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

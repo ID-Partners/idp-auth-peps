@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ID-Partners/idp-auth-peps/core/internal/ttlcache"
 )
 
 func ctx() context.Context { return context.Background() }
@@ -593,5 +595,9 @@ func TestNegativeCache(t *testing.T) {
 	r.Resolve(ctx(), f.leaf.id)
 	if atomic.LoadInt32(&f.leaf.hits) != 1 {
 		t.Fatalf("ErrNotFederated should be negatively cached: %d hits", f.leaf.hits)
+	}
+	// Both reads were errors: the fetch's, then the remembered one.
+	if s := r.CacheStats(); s != (ttlcache.Stats{Errors: 2}) {
+		t.Fatalf("cache stats: %+v", s)
 	}
 }
