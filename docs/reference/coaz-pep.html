@@ -51,7 +51,7 @@
   <h2 id="what">What it is</h2>
   <ul>
     <li><b>Envoy ext_authz</b> on <code>:9191</code> (gRPC, <code>envoy.service.auth.v3.Authorization/Check</code>). Envoy, Istio and agentgateway attach it; per-route knobs arrive as <code>context_extensions</code>.</li>
-    <li><b>HTTP check API</b> on <code>:9192</code>. <code>POST /v1/mcp/check</code> takes the same knobs as a <code>config</code> object; the Kong plugin and the PingAccess rule delegate to it, and the Node SDK can. <code>POST /v1/dpop/verify</code> checks a sender constraint on its own. <code>GET /healthz</code> is liveness, <code>GET /readyz</code> readiness, <code>GET /metrics</code> Prometheus.</li>
+    <li><b>HTTP check API</b> on <code>:9192</code>. <code>POST /v1/mcp/check</code> takes the same knobs as a <code>config</code> object; the Kong plugin and the PingAccess rule delegate to it, and the Node SDK can. <code>POST /v1/dpop/verify</code> checks a sender constraint on its own. <code>GET /healthz</code> is liveness, <code>GET /readyz</code> readiness (the gRPC health service on <code>:9191</code> reports the same, so probe liveness with <code>/healthz</code>), <code>GET /metrics</code> Prometheus: decisions, the layers that failed open, PDP calls and latency, DPoP refusals by reason, and what each cache answered.</li>
     <li><b>The resource's well-known documents</b>, on the same HTTP port, when the PEP is configured as the resource's federation entity.</li>
   </ul>
   <p>What it enforces: token presence and validation, the RFC 9449 sender constraint, RFC 9470 step-up and login challenges, REST and MCP request mapping to AuthZEN, a decision on every MCP message (a tool's declared mapping, otherwise the binding's default one), PDP discovery in four modes, ordered policy layers with per-layer failure modes, and forwarding the resource's own requirements to the PDP without judging them. A body it cannot read the way the upstream will — a batch, a truncated or encoded body, case-folded duplicate members — is refused, never waved through.</p>
@@ -59,7 +59,7 @@
   <h2 id="run">Run it</h2>
   <pre><code>go build ./... &amp;&amp; go test -race ./...
 
-docker build --build-arg VERSION=0.4.0 -t coaz-pep core/
+docker build --build-arg VERSION=0.4.1 -t coaz-pep core/
 docker run -p 9191:9191 -p 9192:9192 \
   -e AUTHZEN_URL=https://pdp.bank.example -e AUTHZEN_API_KEY=… \
   -e CHECK_API_TOKEN=… -e MCP_UPSTREAM_ALLOWLIST=https://mcp.bank.example/mcp \
@@ -70,7 +70,7 @@ docker run -p 9191:9191 -p 9192:9192 \
   <p>A production-shaped service, as a compose service. Every variable is explained in the reference below; the values here are a bank API fronted by a gateway, discovering its PDP from the federation, holding the key for its own federation face.</p>
   <pre><code>services:
   coaz-pep:
-    image: ghcr.io/id-partners/coaz-pep:0.4.0 <span class="c"># pin a release — better, its digest</span>
+    image: ghcr.io/id-partners/coaz-pep:0.4.1 <span class="c"># pin a release — better, its digest</span>
     environment:
       <span class="c"># the static PDP: for a resource that publishes nothing; the only PDP that gets the key</span>
       AUTHZEN_URL: https://pdp.bank.example
@@ -303,7 +303,7 @@ Content-Type: application/json
 
   <h2 id="log">What the log tells you</h2>
   <p>Logs are JSON. Every relaxation <code>PEP_ALLOW_INSECURE</code> allowed is a warning at startup, and every check leaves one <code>decision</code> record — never a token. This is the demo's federation-mode PEP starting and deciding, abridged.</p>
-  <div class="term">{"level":"INFO","msg":"coaz-pep 0.4.0"}
+  <div class="term">{"level":"INFO","msg":"coaz-pep 0.4.1"}
 {"level":"INFO","msg":"PDP discovery (federation): http://stubs:9002/tenants/bank-a evaluates at http://stubs:9002/tenants/bank-a/access/v1/evaluation"}
 <span class="w">{"level":"WARN","msg":"minted a new federation entity key into /tmp/entity-key.json (kid PFlZTqivykMP9Z1TomZCu8yuFcgTqih7Gc90fE2lZgo) — the trust controller must onboard this key before the chain resolves."}</span>
 <span class="w">{"level":"WARN","msg":"insecure setting allowed by PEP_ALLOW_INSECURE","gap":"PDP_DISCOVERY_INSECURE is set: discovered http URLs are accepted"}</span>

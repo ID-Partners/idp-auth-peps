@@ -43,10 +43,10 @@
 <main>
   <span class="eyebrow">gateways/kong/sideband-pdp · Lua</span>
   <h1>The Kong sideband plugin</h1>
-  <p class="lede"><code>sideband-pdp</code> is a Kong plugin that enforces through PingAuthorize's Sideband API — the request Kong will forward to <code>/sideband/request</code> in the access phase, the upstream's response to <code>/sideband/response</code> in the response phase — and finds the PDPs it calls from the resource it protects: the resource's RFC 9728 metadata, or, with the switch, a federation resolve endpoint. It is the <a href="kong.html">Kong plugin</a>'s discovery, layers and failure rules from the modules the two share, in front of a PDP protocol where the policy owns the request mapping and the shape of a deny. Every knob is plugin configuration on a route or service. Version 0.4.0; Kong Gateway 3.4 or later, 3.9 or later recommended.</p>
+  <p class="lede"><code>sideband-pdp</code> is a Kong plugin that enforces through PingAuthorize's Sideband API — the request Kong will forward to <code>/sideband/request</code> in the access phase, the upstream's response to <code>/sideband/response</code> in the response phase — and finds the PDPs it calls from the resource it protects: the resource's RFC 9728 metadata, or, with the switch, a federation resolve endpoint. It is the <a href="kong.html">Kong plugin</a>'s discovery, layers and failure rules from the modules the two share, in front of a PDP protocol where the policy owns the request mapping and the shape of a deny. Every knob is plugin configuration on a route or service. Version 0.4.1; Kong Gateway 3.4 or later, 3.9 or later recommended.</p>
 
   <h2 id="install">Install</h2>
-  <p>DB-less: mount <em>both</em> plugin directories and enable this one. The discovery and contract modules are <code>authzen-pdp</code>'s, required by name (<code>kong.plugins.authzen-pdp.discovery</code>, <code>…contract</code>), so that directory must be on the package path whether or not <code>authzen-pdp</code> is enabled. The rock, <code>kong-plugin-sideband-pdp-0.4.0-1.all.rock</code> on the release, depends on <code>kong-plugin-authzen-pdp</code> 0.4.0 for them: install that one first.</p>
+  <p>DB-less: mount <em>both</em> plugin directories and enable this one. The discovery and contract modules are <code>authzen-pdp</code>'s, required by name (<code>kong.plugins.authzen-pdp.discovery</code>, <code>…contract</code>), so that directory must be on the package path whether or not <code>authzen-pdp</code> is enabled. The rock, <code>kong-plugin-sideband-pdp-0.4.1-1.all.rock</code> on the release, depends on <code>kong-plugin-authzen-pdp</code> 0.4.1 for them: install that one first.</p>
   <pre><code><span class="c"># kong.conf, or environment</span>
 KONG_PLUGINS=bundled,sideband-pdp
 KONG_LUA_PACKAGE_PATH=/opt/?.lua;;
@@ -251,7 +251,7 @@ services:
     <li>The URL sent is the one Kong routed on, not <code>X-Forwarded-*</code>.</li>
     <li>Oversized bodies, too many headers or query arguments, and <code>Upgrade</code> (or, before Kong 3.9, HTTP/2) on a filtering route are refused rather than judged in part or not filtered at all.</li>
     <li>A response-phase failure is a 502 with the upstream's headers withheld.</li>
-    <li>The rock is <code>kong-plugin-sideband-pdp-0.4.0-1</code>, depending on <code>kong-plugin-authzen-pdp</code> 0.4.0.</li>
+    <li>The rock is <code>kong-plugin-sideband-pdp-0.4.1-1</code>, depending on <code>kong-plugin-authzen-pdp</code> 0.4.1.</li>
   </ul>
 </main>
 </div>

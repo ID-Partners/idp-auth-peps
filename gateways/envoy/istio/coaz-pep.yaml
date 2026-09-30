@@ -62,7 +62,7 @@ spec:
       containers:
         - name: coaz-pep
           # Pin a release, never :latest — better still, pin its digest.
-          image: ghcr.io/id-partners/coaz-pep:0.4.0
+          image: ghcr.io/id-partners/coaz-pep:0.4.1
           ports:
             - { name: grpc, containerPort: 9191 }
             - { name: http, containerPort: 9192 }

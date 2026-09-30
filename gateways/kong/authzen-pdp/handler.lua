@@ -36,7 +36,7 @@ local AuthzenPDP = {
   PRIORITY = 1000,  -- after Kong's authentication plugins; see ../README.md#plugin-order
   -- 0.4.0: coaz-pep decides the whole request when coaz_url is set; strict MCP parsing;
   -- fail-open on unavailability only. 0.3.0: PDP discovery. 0.2.0: COAZ via coaz-pep.
-  VERSION = "0.4.0",
+  VERSION = "0.4.1",
 }
 
 -- The identity headers this plugin asserts to the upstream. Whatever a client sent under

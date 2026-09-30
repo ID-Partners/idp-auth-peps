@@ -201,7 +201,7 @@ need the gate touched. Raise a floor when coverage rises; never lower one to mak
 | | Coverage | Floor set in |
 | --- | --- | --- |
 | `core/coaz` | 96.0% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
-| `core/cmd/coaz-pep` | 95.5% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
+| `core/cmd/coaz-pep` | 96.1% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `core/federation` | 98.8% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `core/jose` | 98.2% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |
 | `core/authzen/discovery` | 98.5% | [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) |

@@ -19,7 +19,7 @@ local S = {}
 
 S.REQUEST_PATH = "/sideband/request"
 S.RESPONSE_PATH = "/sideband/response"
-S.VERSION = "0.4.0"
+S.VERSION = "0.4.1"
 
 -- The identity headers a PEP asserts to its upstream. A client's own copies are removed
 -- from the upstream request and never shown to the policy provider; a layer may add them.

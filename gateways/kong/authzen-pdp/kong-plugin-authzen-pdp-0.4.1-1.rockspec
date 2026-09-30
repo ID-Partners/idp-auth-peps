@@ -1,9 +1,9 @@
 package = "kong-plugin-authzen-pdp"
-version = "0.4.0-1"
+version = "0.4.1-1"
 
 source = {
   url = "git+https://github.com/ID-Partners/idp-auth-peps.git",
-  tag = "v0.4.0",
+  tag = "v0.4.1",
 }
 
 description = {
