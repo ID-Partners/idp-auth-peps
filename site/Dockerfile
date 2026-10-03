@@ -9,7 +9,7 @@
 # nginx-unprivileged runs as its own user and listens on ${PORT} (Railway sets it; 8080
 # otherwise), which the entrypoint substitutes into the template. NGINX_ENVSUBST_FILTER
 # keeps it from touching any other $name in there.
-FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:6a23acdfca2b9cfbcec61419e3f1426bcbedb91362f2f19306a8567423bb4612
+FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:26b0bf6fbf07297983cb341998d79c831508787de26627dd2a112321b9c3a4af
 ENV PORT=8080 NGINX_ENVSUBST_FILTER=^PORT$
 COPY site/nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY site/public/ /usr/share/nginx/html/
